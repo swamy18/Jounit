@@ -1,0 +1,19 @@
+[package]
+name = "jnt-core"
+description = "Jounit protocol core: hybrid hash+neural PoW puzzle, UTXO ledger, difficulty, supply schedule."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+k256.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

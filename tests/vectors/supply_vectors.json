@@ -1,0 +1,45 @@
+{
+  "sat_per_jnt": 100000000,
+  "mainnet": {
+    "network": "mainnet",
+    "ladder_jnt": [
+      76,
+      38,
+      19,
+      9,
+      4,
+      2,
+      1,
+      0
+    ],
+    "halving_period_blocks": 262800,
+    "halving_period_years": 4.997,
+    "issued_after_first_period_jnt": 19972800,
+    "issued_after_two_periods_jnt": 29959200,
+    "max_reachable_jnt": 39157200,
+    "hard_cap_jnt": 39945600,
+    "unmintable_jnt": 788400,
+    "final_reward_jnt": 0
+  },
+  "mini": {
+    "network": "mini",
+    "ladder_jnt": [
+      76,
+      38,
+      19,
+      9,
+      4,
+      2,
+      1,
+      0
+    ],
+    "halving_period_blocks": 2000,
+    "halving_period_years": 0.0,
+    "issued_after_first_period_jnt": 152000,
+    "issued_after_two_periods_jnt": 228000,
+    "max_reachable_jnt": 298000,
+    "hard_cap_jnt": 304000,
+    "unmintable_jnt": 6000,
+    "final_reward_jnt": 0
+  }
+}

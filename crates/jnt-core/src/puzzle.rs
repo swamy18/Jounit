@@ -1,0 +1,617 @@
+//! Hybrid proof of work: Stage 1 hash chain -> Stage 2 integer-only neural
+//! network -> Stage 3 final hash. SPEC.md §5.
+//!
+//! Design intent (design doc Section 29):
+//! - security rests on the **hash** stages, where the only attack is brute force
+//! - the **NN** stage pulls mining onto GPU/AI hardware and gives the chain its
+//!   AI-native character; its share of work is auditable, not assumed
+//! - every quantity is integer-only and epoch-scoped, so results are identical
+//!   on any hardware and no weights can be precomputed before an epoch starts
+
+use sha2::{Digest, Sha256};
+
+use crate::block::Header;
+use crate::error::{Error, Result};
+use crate::hash::{sha256_dom, Hash, DOM_S1, DOM_S2, DOM_S3, DOM_W};
+use crate::ser::Writer;
+use crate::u256::{target_for_difficulty, U256};
+
+/// Bias index space is offset from weight indices so the two never collide.
+const BIAS_INDEX_OFFSET: u32 = 1_000_000;
+/// Post-shift right amount applied before ReLU.
+const ACTIVATION_SHIFT: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PuzzleSpec {
+    pub id: u64,
+    pub name: String,
+    pub hash_rounds: u32,
+    pub nn_input_dim: usize,
+    pub nn_hidden_dim: usize,
+    pub nn_layers: usize,
+    pub min_nn_share_bps: u32,
+    pub max_nn_share_bps: u32,
+}
+
+impl Default for PuzzleSpec {
+    fn default() -> Self {
+        Self::hybrid_v1()
+    }
+}
+
+impl PuzzleSpec {
+    /// `puzzle_id = 1`. SPEC.md §5.1.
+    pub fn hybrid_v1() -> Self {
+        PuzzleSpec {
+            id: 1,
+            name: "hybrid-v1".into(),
+            hash_rounds: 16,
+            nn_input_dim: 16,
+            nn_hidden_dim: 16,
+            nn_layers: 3,
+            min_nn_share_bps: 3_000,
+            max_nn_share_bps: 5_000,
+        }
+    }
+
+    fn in_dim(&self, layer: usize) -> usize {
+        if layer == 0 {
+            self.nn_input_dim
+        } else {
+            self.nn_hidden_dim
+        }
+    }
+
+    /// `nn_macs = layers * hidden^2`
+    pub fn nn_macs(&self) -> u128 {
+        (self.nn_layers * self.nn_hidden_dim * self.nn_hidden_dim) as u128
+    }
+
+    /// Hash stages: stage 1 initial + `hash_rounds` + stage 3.
+    pub fn hash_invocations(&self) -> u128 {
+        (1 + self.hash_rounds + 1) as u128
+    }
+
+    /// Cost model from SPEC.md §5.6: one SHA-256 is treated as 64 int32 MACs.
+    pub fn nn_share_bps(&self) -> u32 {
+        let macs = self.nn_macs();
+        let hash_cost = self.hash_invocations() * 64;
+        (((macs * 10_000) + (hash_cost / 2)) / (macs + hash_cost)) as u32
+    }
+
+    /// A registry entry must pass the Section 29.3 work-share audit.
+    pub fn validate(&self) -> Result<()> {
+        if self.nn_input_dim == 0 || self.nn_hidden_dim == 0 || self.nn_layers == 0 {
+            return Err(Error::BadPuzzleSpec(
+                "network dimensions must be non-zero".into(),
+            ));
+        }
+        if self.hash_rounds == 0 {
+            return Err(Error::BadPuzzleSpec(
+                "at least one hash round is required for brute-force security".into(),
+            ));
+        }
+        let share = self.nn_share_bps();
+        if share < self.min_nn_share_bps || share > self.max_nn_share_bps {
+            return Err(Error::BadPuzzleSpec(format!(
+                "nn_share_bps {share} outside [{}, {}]",
+                self.min_nn_share_bps, self.max_nn_share_bps
+            )));
+        }
+        // Keep the i64 accumulator provably overflow-free.
+        let worst = (self.nn_input_dim as i64) * 128 * 128 + 62;
+        if worst >= i64::MAX {
+            return Err(Error::BadPuzzleSpec("accumulator can overflow i64".into()));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Weight derivation
+// ---------------------------------------------------------------------------
+
+fn epoch_seed(epoch_id: u32) -> [u8; 32] {
+    let mut w = Writer::new();
+    w.u32le(epoch_id);
+    sha256_dom(DOM_W, &[w.as_slice()])
+}
+
+fn weight_stream(k: u32, epoch_id: u32) -> [u8; 32] {
+    let mut w = Writer::new();
+    w.u32le(k);
+    let seed = epoch_seed(epoch_id);
+    sha256_dom(DOM_W, &[&seed, w.as_slice()])
+}
+
+fn weight_index(spec: &PuzzleSpec, layer: usize, out: usize, inp: usize) -> u32 {
+    let k = (layer * spec.nn_hidden_dim + out) * spec.in_dim(layer) + inp;
+    k as u32
+}
+
+/// `weight(l,o,i) in [-128, 127]` — SPEC.md §5.3.
+pub fn weight(spec: &PuzzleSpec, layer: usize, out: usize, inp: usize, epoch_id: u32) -> i32 {
+    let b = weight_stream(weight_index(spec, layer, out, inp), epoch_id)[0] as i32;
+    if b > 127 {
+        b - 255
+    } else {
+        b
+    }
+}
+
+/// `bias(l,o) in [0, 62]`.
+pub fn bias(spec: &PuzzleSpec, layer: usize, out: usize, epoch_id: u32) -> i32 {
+    let k = BIAS_INDEX_OFFSET + (layer * spec.nn_hidden_dim + out) as u32;
+    (weight_stream(k, epoch_id)[0] as i32) % 63
+}
+
+/// Wrap a 64-bit accumulator into a signed 32-bit value, two's complement.
+#[inline]
+fn fold32(v: i64) -> i32 {
+    let u = (v as u64 & 0xFFFF_FFFF) as u32;
+    if u >= 0x8000_0000 {
+        (u as i64 - 0x1_0000_0000) as i32
+    } else {
+        u as i32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The three stages
+// ---------------------------------------------------------------------------
+
+/// Weights for one epoch, materialised once.
+///
+/// Deriving a single weight costs two SHA-256 evaluations. A forward pass touches
+/// 768 weights plus 48 biases, so deriving on demand means ~1 600 hashes per
+/// puzzle attempt instead of ~20 — mining runs about eighty times slower for no
+/// reason. The values are identical either way, so this is purely a caching layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochWeights {
+    pub epoch_id: u32,
+    /// `[layer * hidden * hidden + out * hidden + in_dim + in]`
+    weights: Vec<i32>,
+    /// `[layer * hidden + out]`
+    biases: Vec<i32>,
+}
+
+impl EpochWeights {
+    pub fn build(spec: &PuzzleSpec, epoch_id: u32) -> Self {
+        let mut weights = Vec::with_capacity(spec.nn_layers * spec.nn_hidden_dim * spec.nn_hidden_dim);
+        for layer in 0..spec.nn_layers {
+            for out in 0..spec.nn_hidden_dim {
+                for inp in 0..spec.in_dim(layer) {
+                    let b = weight_stream(weight_index(spec, layer, out, inp), epoch_id)[0] as i32;
+                    weights.push(if b > 127 { b - 255 } else { b });
+                }
+            }
+        }
+        let mut biases = Vec::with_capacity(spec.nn_layers * spec.nn_hidden_dim);
+        for layer in 0..spec.nn_layers {
+            for out in 0..spec.nn_hidden_dim {
+                let k = BIAS_INDEX_OFFSET + (layer * spec.nn_hidden_dim + out) as u32;
+                biases.push((weight_stream(k, epoch_id)[0] as i32) % 63);
+            }
+        }
+        EpochWeights {
+            epoch_id,
+            weights,
+            biases,
+        }
+    }
+
+    #[inline]
+    pub fn weight(&self, spec: &PuzzleSpec, layer: usize, out: usize, inp: usize) -> i32 {
+        self.weights[layer * spec.nn_hidden_dim * spec.nn_hidden_dim + out * spec.nn_hidden_dim + inp]
+    }
+
+    #[inline]
+    pub fn bias(&self, spec: &PuzzleSpec, layer: usize, out: usize) -> i32 {
+        self.biases[layer * spec.nn_hidden_dim + out]
+    }
+}
+
+/// Stage 1: hash chain over (header, nonce). SPEC.md §5.2.
+pub fn stage1_seed(spec: &PuzzleSpec, header: &Header) -> Hash {
+    let header_bytes = header.serialize();
+    let mut w = Writer::with_capacity(header_bytes.len() + 16);
+    w.u64le(header.nonce);
+    let mut v = sha256_dom(DOM_S1, &[&header_bytes, w.as_slice()]);
+    for r in 0..spec.hash_rounds {
+        let mut inner = Writer::new();
+        inner.u8(r as u8);
+        v = sha256_dom(DOM_S1, &[&v, inner.as_slice()]);
+    }
+    v
+}
+
+/// Stage 2 forward pass over pre-materialised weights.
+fn forward(spec: &PuzzleSpec, seed: &Hash, weights: &EpochWeights) -> Vec<u8> {
+    let mut acts = Vec::with_capacity(DOM_S2.len() + spec.nn_layers * spec.nn_hidden_dim * 4);
+    acts.extend_from_slice(DOM_S2);
+
+    let mut x: Vec<i32> = (0..spec.nn_input_dim).map(|j| seed[j] as i32 - 128).collect();
+    let mut z = vec![0i32; spec.nn_hidden_dim];
+
+    for layer in 0..spec.nn_layers {
+        let in_dim = spec.in_dim(layer);
+        for out in 0..spec.nn_hidden_dim {
+            // i64 accumulator; bounded by PuzzleSpec::validate.
+            let mut acc: i64 = weights.bias(spec, layer, out) as i64;
+            for inp in 0..in_dim {
+                acc += x[inp] as i64 * weights.weight(spec, layer, out, inp) as i64;
+            }
+            z[out] = fold32(acc);
+        }
+        // Every layer is committed to, so none can be skipped or approximated.
+        for value in &z {
+            acts.extend_from_slice(&value.to_le_bytes());
+        }
+        // Arithmetic shift then ReLU.
+        for (o, value) in z.iter().enumerate() {
+            x[o] = (*value >> ACTIVATION_SHIFT).max(0);
+        }
+    }
+    acts
+}
+
+fn digest_of(acts: &[u8]) -> Hash {
+    let mut h = Sha256::new();
+    h.update(acts);
+    h.finalize().into()
+}
+
+/// Stage 2: forward pass, returning the digest of *every* layer's
+/// pre-activation activations. SPEC.md §5.3.
+///
+/// Reference path: derives the epoch weights on every call. Use
+/// [`PuzzleSolver`] or [`stage2_activation_digest_with`] when hashing many
+/// candidates.
+pub fn stage2_activation_digest(spec: &PuzzleSpec, seed: &Hash, epoch_id: u32) -> Hash {
+    let weights = EpochWeights::build(spec, epoch_id);
+    stage2_activation_digest_with(spec, seed, &weights)
+}
+
+pub fn stage2_activation_digest_with(
+    spec: &PuzzleSpec,
+    seed: &Hash,
+    weights: &EpochWeights,
+) -> Hash {
+    digest_of(&forward(spec, seed, weights))
+}
+
+/// Stage 3: final hash. SPEC.md §5.4.
+///
+/// `_spec` is part of the signature so a future puzzle version can fold extra
+/// material in here; `hybrid-v1` needs none.
+pub fn stage3_final(
+    _spec: &PuzzleSpec,
+    seed: &Hash,
+    act_digest: &Hash,
+    nonce: u64,
+    epoch_id: u32,
+) -> Hash {
+    let mut w = Writer::with_capacity(16);
+    w.u64le(nonce).u32le(epoch_id);
+    sha256_dom(DOM_S3, &[seed, act_digest, w.as_slice()])
+}
+
+/// Full puzzle evaluation for a header. Returns the final hash and stage digests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PuzzleRun {
+    pub seed: Hash,
+    pub activation_digest: Hash,
+    pub final_hash: Hash,
+}
+
+pub fn run_puzzle(spec: &PuzzleSpec, header: &Header) -> PuzzleRun {
+    let seed = stage1_seed(spec, header);
+    let act = stage2_activation_digest(spec, &seed, header.epoch_id);
+    let final_hash = stage3_final(spec, &seed, &act, header.nonce, header.epoch_id);
+    PuzzleRun {
+        seed,
+        activation_digest: act,
+        final_hash,
+    }
+}
+
+/// PoW validity: `U256(final_hash) <= target(difficulty)`. SPEC.md §5.5.
+pub fn satisfies(spec: &PuzzleSpec, header: &Header) -> Result<bool> {
+    if header.difficulty == 0 {
+        return Err(Error::InvalidDifficulty(0));
+    }
+    let target: U256 = target_for_difficulty(header.difficulty)?;
+    let run = run_puzzle(spec, header);
+    Ok(U256::from_be_bytes(run.final_hash) <= target)
+}
+
+/// Puzzle evaluator that keeps the current epoch's weights in memory.
+///
+/// A miner evaluating one nonce per attempt would otherwise re-derive 1 632
+/// hashes of weights for every try. This holds them across attempts and
+/// rebuilds only when the epoch id changes.
+#[derive(Debug, Clone)]
+pub struct PuzzleSolver {
+    spec: PuzzleSpec,
+    weights: EpochWeights,
+}
+
+impl PuzzleSolver {
+    pub fn new(spec: PuzzleSpec) -> Self {
+        let weights = EpochWeights::build(&spec, 0);
+        PuzzleSolver { spec, weights }
+    }
+
+    pub fn spec(&self) -> &PuzzleSpec {
+        &self.spec
+    }
+
+    pub fn weights(&self) -> &EpochWeights {
+        &self.weights
+    }
+
+    pub fn weights_for(&mut self, epoch_id: u32) -> &EpochWeights {
+        if self.weights.epoch_id != epoch_id {
+            self.weights = EpochWeights::build(&self.spec, epoch_id);
+        }
+        &self.weights
+    }
+
+    /// Evaluate one candidate without touching the weight cache on a miss-free
+    /// path; the caller drives the nonce loop.
+    pub fn run(&mut self, header: &Header) -> PuzzleRun {
+        let epoch_id = header.epoch_id;
+        let weights = self.weights_for(epoch_id).clone();
+        let seed = stage1_seed(&self.spec, header);
+        let act = stage2_activation_digest_with(&self.spec, &seed, &weights);
+        let final_hash = stage3_final(&self.spec, &seed, &act, header.nonce, epoch_id);
+        PuzzleRun {
+            seed,
+            activation_digest: act,
+            final_hash,
+        }
+    }
+
+    pub fn satisfies(&mut self, header: &Header) -> Result<bool> {
+        if header.difficulty == 0 {
+            return Err(Error::InvalidDifficulty(0));
+        }
+        let target = target_for_difficulty(header.difficulty)?;
+        let run = self.run(header);
+        Ok(U256::from_be_bytes(run.final_hash) <= target)
+    }
+}
+
+/// Expected hashes to solve at this difficulty (== difficulty).
+pub fn expected_attempts(difficulty: u128) -> u128 {
+    difficulty
+}
+
+// ---------------------------------------------------------------------------
+// Versioned puzzle registry
+// ---------------------------------------------------------------------------
+
+/// Versioned puzzle registry (SPEC.md §5.1, design doc Section 19.3 item 3).
+///
+/// Supply, halving and base rules are immutable. Only puzzle *parameters* are
+/// upgradeable, and only through the governance timelock specced in
+/// `docs/roadmap.md`. v0.1 ships exactly one entry and has no upgrade path
+/// wired up yet — deliberately: an unaudited upgrade path is worse than none.
+#[derive(Debug, Clone, Default)]
+pub struct PuzzleRegistry {
+    entries: std::collections::BTreeMap<u64, PuzzleSpec>,
+}
+
+impl PuzzleRegistry {
+    /// Registry containing only `hybrid-v1`.
+    pub fn genesis() -> Self {
+        let mut r = PuzzleRegistry::default();
+        r.entries.insert(1, PuzzleSpec::hybrid_v1());
+        r
+    }
+
+    pub fn register(&mut self, spec: PuzzleSpec) -> Result<()> {
+        spec.validate()?;
+        self.entries.insert(spec.id, spec);
+        Ok(())
+    }
+
+    pub fn get(&self, id: u64) -> Result<&PuzzleSpec> {
+        self.get_opt(id).ok_or(Error::UnknownPuzzle(id))
+    }
+
+    pub fn get_opt(&self, id: u64) -> Option<&PuzzleSpec> {
+        self.entries.get(&id)
+    }
+
+    pub fn ids(&self) -> Vec<u64> {
+        self.entries.keys().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::genesis_block;
+
+    fn spec() -> PuzzleSpec {
+        PuzzleSpec::hybrid_v1()
+    }
+
+    fn header_at(height: u64, nonce: u64, epoch: u32) -> Header {
+        let mut h = genesis_block(1).header;
+        h.height = height;
+        h.nonce = nonce;
+        h.epoch_id = epoch;
+        h.timestamp_ms = 1_700_000_000_000;
+        h
+    }
+
+    #[test]
+    fn default_spec_satisfies_the_work_share_audit() {
+        let s = spec();
+        s.validate().unwrap();
+        assert_eq!(s.nn_share_bps(), 4_000);
+        assert!(
+            (s.min_nn_share_bps..=s.max_nn_share_bps).contains(&s.nn_share_bps()),
+            "NN must be 30-50% of mining work"
+        );
+    }
+
+    #[test]
+    fn more_hash_rounds_shrink_the_nn_share() {
+        let base = spec().nn_share_bps();
+        let mut s = spec();
+        s.hash_rounds = 64;
+        assert!(s.nn_share_bps() < base);
+        assert!(s.validate().is_err(), "share below the 30% floor must be rejected");
+
+        let mut s2 = spec();
+        s2.hash_rounds = 0;
+        assert!(s2.validate().is_err());
+    }
+
+    #[test]
+    fn weights_are_in_range_and_epoch_dependent() {
+        let s = spec();
+        for epoch in [0u32, 1, 7, 4_294_967_295] {
+            for layer in 0..s.nn_layers {
+                for o in 0..s.nn_hidden_dim {
+                    let b = bias(&s, layer, o, epoch);
+                    assert!((0..63).contains(&b), "bias out of range: {b}");
+                    for i in 0..s.in_dim(layer) {
+                        let w = weight(&s, layer, o, i, epoch);
+                        assert!((-128..=127).contains(&w), "weight out of range: {w}");
+                    }
+                }
+            }
+        }
+        let w0 = weight(&s, 0, 0, 0, 0);
+        let w1 = weight(&s, 0, 0, 0, 1);
+        assert_ne!(w0, w1, "weights must rotate every epoch");
+    }
+
+    #[test]
+    fn fold32_wraps_two_complement() {
+        assert_eq!(fold32(0), 0);
+        assert_eq!(fold32(127), 127);
+        assert_eq!(fold32(128), 128);
+        assert_eq!(fold32(-1), -1);
+        assert_eq!(fold32(i32::MAX as i64), i32::MAX);
+        assert_eq!(fold32(i32::MIN as i64), i32::MIN);
+        assert_eq!(fold32(i32::MAX as i64 + 1), i32::MIN);
+        assert_eq!(fold32(-(i32::MIN as i64) - 1), i32::MAX);
+    }
+
+    #[test]
+    fn seed_changes_with_every_header_field_that_matters() {
+        let s = spec();
+        let base = header_at(100, 7, 0);
+        let seed = stage1_seed(&s, &base);
+        assert_ne!(seed, stage1_seed(&s, &header_at(101, 7, 0)));
+        assert_ne!(seed, stage1_seed(&s, &header_at(100, 8, 0)));
+        assert_ne!(seed, stage1_seed(&s, &header_at(100, 7, 1)));
+        let mut ts = base.clone();
+        ts.timestamp_ms += 1;
+        assert_ne!(seed, stage1_seed(&s, &ts));
+        let mut en = base.clone();
+        en.extra_nonce[15] = 1;
+        assert_ne!(seed, stage1_seed(&s, &en));
+        let mut mh = base.clone();
+        mh.merkle_root[0] ^= 1;
+        assert_ne!(seed, stage1_seed(&s, &mh));
+        let mut ph = base.clone();
+        ph.prev_hash[31] ^= 1;
+        assert_ne!(seed, stage1_seed(&s, &ph));
+    }
+
+    #[test]
+    fn activation_digest_covers_every_layer() {
+        let s = spec();
+        let seed = [42u8; 32];
+        let d = stage2_activation_digest(&s, &seed, 0);
+        assert_ne!(d, [0u8; 32]);
+        // A different epoch must give a different digest: weights rotate.
+        assert_ne!(d, stage2_activation_digest(&s, &seed, 1));
+        // A different seed must give a different digest.
+        let mut seed2 = seed;
+        seed2[0] ^= 1;
+        assert_ne!(d, stage2_activation_digest(&s, &seed2, 0));
+    }
+
+    #[test]
+    fn activations_are_not_vanishing() {
+        // If ReLU zeroes every layer after the first, stage 2 becomes a
+        // constant and stops constraining anything. Check it does not.
+        let s = spec();
+        let mut non_zero = 0usize;
+        for n in 0..64u64 {
+            let seed = stage1_seed(&s, &header_at(0, n, 0));
+            let mut x: Vec<i32> = (0..s.nn_input_dim).map(|j| seed[j] as i32 - 128).collect();
+            for layer in 0..s.nn_layers {
+                let in_dim = s.in_dim(layer);
+                let mut z = Vec::with_capacity(s.nn_hidden_dim);
+                for o in 0..s.nn_hidden_dim {
+                    let mut acc: i64 = bias(&s, layer, o, 0) as i64;
+                    for i in 0..in_dim {
+                        acc += x[i] as i64 * weight(&s, layer, o, i, 0) as i64;
+                    }
+                    z.push(fold32(acc));
+                }
+                x = z.iter().map(|v| (*v >> ACTIVATION_SHIFT).max(0)).collect();
+            }
+            if x.iter().any(|v| *v != 0) {
+                non_zero += 1;
+            }
+        }
+        assert!(non_zero >= 60, "activations collapsed in {}/64 samples", 64 - non_zero);
+    }
+
+    #[test]
+    fn puzzle_is_deterministic() {
+        let s = spec();
+        let h = header_at(5, 99, 0);
+        assert_eq!(run_puzzle(&s, &h), run_puzzle(&s, &h));
+    }
+
+    #[test]
+    fn difficulty_one_always_solves() {
+        let s = spec();
+        for n in 0..32u64 {
+            let h = header_at(1, n, 0);
+            assert!(satisfies(&s, &h).unwrap());
+        }
+    }
+
+    #[test]
+    fn high_difficulty_rejects_something() {
+        let s = spec();
+        let mut solved = 0;
+        for n in 0..256u64 {
+            let mut h = header_at(1, n, 0);
+            h.difficulty = crate::u256::MAX_DIFFICULTY + 1; // beyond the 2^96 ceiling
+            assert!(matches!(
+                satisfies(&s, &h),
+                Err(Error::TargetOverflow(_))
+            ));
+
+            h.difficulty = 1u128 << 90;
+            if satisfies(&s, &h).unwrap() {
+                solved += 1;
+            }
+        }
+        // Probability ~256 / 2^90; expect none.
+        assert_eq!(solved, 0);
+    }
+
+    #[test]
+    fn zero_difficulty_is_rejected() {
+        let s = spec();
+        let mut h = header_at(1, 0, 0);
+        h.difficulty = 0;
+        assert!(matches!(
+            satisfies(&s, &h),
+            Err(Error::InvalidDifficulty(0))
+        ));
+    }
+}

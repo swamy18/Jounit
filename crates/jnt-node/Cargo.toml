@@ -1,0 +1,14 @@
+[package]
+name = "jnt-node"
+description = "Jounit node CLI: genesis, mine, submit, validate, status."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jnt-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
