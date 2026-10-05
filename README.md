@@ -1,60 +1,112 @@
 # Jounit (JNT)
 
-An AI-native cryptocurrency: mining that pulls compute onto GPU/AI hardware
-without weakening the security that a hash chain depends on.
+An AI-native cryptocurrency: mining that pulls compute onto GPU and AI hardware
+without weakening the security a hash chain depends on.
 
-**Status: base layer only, single node, not a usable network yet.** Read
-[Status](#status) before treating this as anything but a work-in-progress. The
-interesting part of this project — the useful-work layer — is not built.
+> **Status: base layer only, single node, not a usable network.** There is no
+> P2P layer, so one node cannot talk to another. The interesting part of this
+> project — the useful-work layer — is specced as a direction and **not
+> built**. Read [Status](#status) before treating this as anything other than a
+> work in progress.
 
-## The idea
+---
 
-Bitcoin's principle is that solving must be hard and verifying must be easy. Its
-mining is pure hashing, which means GPUs sit idle and the energy spent has no
-relationship to anything useful.
+## Table of contents
+
+- [Status](#status)
+- [What this is](#what-this-is)
+- [Quick start](#quick-start)
+- [Repository layout](#repository-layout)
+- [Architecture](#architecture)
+- [Protocol](#protocol)
+  - [Blocks and headers](#blocks-and-headers)
+  - [Proof of work](#proof-of-work)
+  - [Difficulty adjustment](#difficulty-adjustment)
+  - [Timestamp rules](#timestamp-rules)
+  - [Supply](#supply)
+  - [Fees and burn](#fees-and-burn)
+  - [Transactions and signatures](#transactions-and-signatures)
+- [Consensus rules](#consensus-rules)
+- [Network profiles](#network-profiles)
+- [Node CLI reference](#node-cli-reference)
+- [Testing and verification](#testing-and-verification)
+- [Security: defects found and fixed](#security-defects-found-and-fixed)
+- [Known limitations](#known-limitations)
+- [License](#license)
+
+---
+
+## Status
+
+**Built:** a complete, tested, specification-first L1 core — hybrid hash + neural
+proof of work, UTXO ledger with undo, LWMA difficulty adjustment, a burned
+EIP-1559-shaped base fee, a fixed-cap halving supply schedule, and deepest-chain
+fork choice with a finality rule.
+
+**Not built:** anything that would make it a *network*.
+
+| | |
+|---|---|
+| Layer 2 — Verified Work Certificates | Not implemented. This is the project's actual premise. |
+| P2P | No node discovery, no block or transaction relay, no mempool. |
+| Persisted UTXO indexing | State replays from genesis on every load. Will not scale to 40M coins. |
+| Coverage-guided fuzzing | Not done. Deterministic property tests cover the parsers instead. |
+| Licence file | `Cargo.toml` declares `MIT OR Apache-2.0`; no `LICENSE` file has been added. Needs resolving before distribution. |
+
+One node cannot talk to another, so there is nothing here you could mine on with
+a friend. [`docs/status.md`](docs/status.md) is the honest, current version of
+this list.
+
+---
+
+## What this is
+
+Bitcoin's principle is that *solving* must be hard and *verifying* must be easy.
+Its mining is pure hashing, which leaves GPUs largely idle and means the energy
+spent has no relationship to anything useful.
 
 Jounit keeps the principle and changes the work. Mining runs three stages:
 
-1. A SHA-256 hash chain — carries the security, and is the brute-force
-   expensive part.
-2. An integer-only neural network — makes mining meaningful for AI hardware.
-3. A final hash — binds both together.
+1. **A SHA-256 hash chain** — carries the security. This is the brute-force
+   expensive part, and it is what a quantum adversary has to break.
+2. **An integer-only neural network** — makes mining meaningful for AI hardware.
+3. **A final hash** — binds both together into the value that must fall below
+   the target.
 
-The NN stage is capped at 50% of measured work, so it can never become the
-weak link. Its weights are derived from the epoch id, so nothing can be
-precomputed before an epoch starts and every result is identical on any
-hardware — no floating point, no hardware-specific drift.
+Two properties make the NN stage a cost model rather than a liability:
 
-The base layer is this, plus an ordinary UTXO ledger. The intended second layer
-is a useful-work layer where miners submit checkable solutions to real problems
-(mathematical proofs, verified code fixes, circuit designs) and earn for
-correctness. That layer is specced as a direction and **not implemented**; see
-the design doc's Section 5.
+- **Capped share.** The NN is required to account for 30–50% of modelled work
+  (the default lands at exactly 40%). It can never become the weak link, because
+  a registry entry outside that band is rejected outright.
+- **No floating point, anywhere.** Weights are derived from the epoch id by
+  SHA-256, the forward pass accumulates in `i64` and wraps to `i32`, and every
+  integer is explicit. Two implementations on two machines produce identical
+  digests — which is checked, not assumed (see
+  [cross-implementation](#cross-implementation)).
 
-## Repository layout
+Because weights come from the epoch id, no miner can precompute them before an
+epoch starts.
 
-| Path | What it is |
-|---|---|
-| `SPEC.md` | **Normative.** The protocol specification. Where a disagreement exists, this wins. |
-| `crates/jnt-core` | The protocol implementation. |
-| `crates/jnt-node` | A CLI over `jnt-core`. Single-node chain; no P2P. |
-| `sim/` | Python: independent protocol reference, attack and supply simulations. |
-| `tests/vectors/` | Consensus vectors. Regenerate, never hand-edit. |
-| `docs/status.md` | What is verified, what is broken, what is missing. |
+The base layer is this plus an ordinary UTXO ledger. The intended second layer
+is a *useful-work* layer where miners submit checkable solutions to real problems
+— mathematical proofs, verified code fixes, circuit designs — and earn for
+correctness rather than for burned electricity. That layer is not implemented.
 
-`jnt-core` holds all consensus logic. The mini network profile is the same code
-with different parameters, never a second codebase — so anything tested on mini
-is the production code path.
+---
 
-## Building and running
+## Quick start
 
-Requires Rust 1.75+ (developed against 1.95) and Python 3.11+ for the
-simulations.
+Requires **Rust 1.75+** (`rust-version` in `Cargo.toml`; developed and tested
+against 1.95) and **Python 3.11+** for the simulations.
 
 ```sh
+git clone https://github.com/swamy18/Jounit.git
+cd Jounit
 cargo build --release
+```
 
-# Create a chain directory with a miner wallet.
+```sh
+# Create a chain directory and a miner wallet.
 ./target/release/jnt-node init --network mini --data-dir ./chain
 
 # Mine, spend, and verify.
@@ -63,54 +115,363 @@ cargo build --release
 ./target/release/jnt-node verify --network mini --data-dir ./chain
 ```
 
-`verify` replays the chain from genesis and diffs the resulting UTXO set and
-supply against stored state — it is the check worth running after any change.
+`verify` replays the whole canonical chain from genesis and diffs the resulting
+UTXO set and supply against stored state. It is the check worth running after
+any change, and `memory.md` §5 records a round-trip where the fee burn reconciled
+to the satoshi.
 
-Two profiles, selected with `--network`:
+Run `jnt-node help` for the full command list; every command accepts `--help`.
 
-| | mainnet | mini |
+---
+
+## Repository layout
+
+| Path | Lines | What it is |
+|---|---:|---|
+| [`SPEC.md`](SPEC.md) | — | **Normative.** The protocol specification. Where a disagreement exists, this wins. |
+| `crates/jnt-core/src/` | 6 922 | The protocol implementation, 17 modules. All consensus logic. |
+| `crates/jnt-core/tests/redteam.rs` | 637 | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
+| `crates/jnt-node/src/main.rs` | 674 | CLI over `jnt-core`. Single-node chain; no P2P. |
+| `sim/` | 1 201 | Python: independent protocol reference plus attack and supply simulations. |
+| `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
+| [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |
+| [`memory.md`](memory.md) | — | Working notes from the most recent audit. Not normative. |
+
+---
+
+## Architecture
+
+### Crate layout
+
+Two crates in one workspace, deliberately:
+
+```
+jnt-core   pure protocol library — no I/O, no clock, no network
+jnt-node   a thin CLI over it
+```
+
+All consensus logic lives in `jnt-core`. The `mini` network profile is **the same
+code with different parameters**, never a second codebase, so anything tested on
+mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
+
+### Module map
+
+| Module | Lines | Responsibility |
+|---|---:|---|
+| `lib.rs` | 35 | Crate root and scope statement |
+| `error.rs` | 196 | `Error` — 41 consensus-visible failure modes |
+| `params.rs` | 205 | `NetworkParams`: the mainnet and mini profiles, plus `validate()` |
+| `hash.rs` | 87 | SHA-256 helpers and the 10 frozen domain-separation tags |
+| `ser.rs` | 155 | `Reader`/`Writer` — canonical byte encoding, bounds-checked |
+| `hexserde.rs` | 58 | Serde helpers for the hex-encoded types |
+| `u256.rs` | 212 | 256-bit target arithmetic by long division. No floating point |
+| `fees.rs` | 182 | Base-fee schedule and the burn/tip split |
+| `supply.rs` | 335 | Halving ladder, cumulative issuance, the cap invariant |
+| `wallet.rs` | 362 | Keys, addresses, transaction building and signing |
+| `block.rs` | 465 | Header, block, merkle root, the genesis block |
+| `difficulty.rs` | 570 | LWMA retarget, median-time rule, local-clock policy |
+| `ledger.rs` | 596 | UTXO set, undo records, transaction checking |
+| `sig.rs` | 636 | Signature schemes and hybrid bundles |
+| `tx.rs` | 704 | Transactions, inputs, outputs, sighash |
+| `puzzle.rs` | 830 | The three PoW stages and the versioned puzzle registry |
+| `chain.rs` | 1 294 | Validation, application, fork choice, reorg, finality, mining |
+
+### Key types
+
+- **`Chain`** — validation, application, fork choice, reorg, finality. The whole
+  consensus state machine.
+- **`Block` / `Header`** — the header is *exactly* 145 bytes; the block hash
+  covers only the header, with the body committed transitively via the merkle
+  root.
+- **`UtxoSet` / `Undo`** — the ledger and what is needed to reverse one block, so
+  a reorg does not replay from genesis.
+- **`Transaction` / `Input` / `Output`** — the transaction model.
+- **`PuzzleSpec` / `PuzzleSolver` / `PuzzleRegistry`** — PoW parameters, an
+  epoch-cached weight set, and the versioned registry.
+- **`NetworkParams`** — every consensus constant, in one struct.
+- **`Error`** — 41 variants. Every one is *deterministic and consensus-visible*:
+  two conforming nodes evaluating the same block must produce the same variant,
+  because callers branch on it.
+
+### Data flow
+
+```
+bytes ──▶ Reader (bounds-checked) ──▶ Block/Transaction
+                                            │
+                          validate_standalone│  PoW, merkle, gas, epoch, size
+                                            │  (needs no chain state)
+                                            ▼
+                                          reselect ──▶ best_candidate
+                                            │           (most work, then
+                                            │            lower height,
+                                            │            then lowest hash)
+                                            ▼
+                                          apply_block ──▶ check_tx per body tx
+                                            │           ──▶ split_fees
+                                            │           ──▶ reward + tip ≤ cap
+                                            ▼
+                                     UTXO set + undo records
+```
+
+---
+
+## Protocol
+
+`SPEC.md` is normative and this section is a summary. Where they disagree,
+`SPEC.md` wins.
+
+### Blocks and headers
+
+The header is exactly **145 bytes**:
+
+| Field | Size | Notes |
+|---|---:|---|
+| `version` | 4 LE | |
+| `height` | 8 LE | `0` for genesis |
+| `prev_hash` | 32 | |
+| `merkle_root` | 32 | |
+| `timestamp_ms` | 8 LE | Unix milliseconds |
+| `base_fee_sat` | 8 LE | Fee for the *next* block |
+| `difficulty` | 16 LE | `u128`, `1 … 2^96` |
+| `nonce` | 8 LE | |
+| `puzzle_id` | 8 LE | Puzzle registry entry |
+| `epoch_id` | 4 LE | NN weight epoch |
+| `extra_nonce` | 16 | Miner-controlled |
+| `sig_scheme` | 1 | Signature agility |
+
+```
+block_hash = SHA256("jounit/blockhash/v1" ‖ header)
+```
+
+Merkle construction is Bitcoin-style with domain-separated leaves: `0x00 ‖ tx`
+for leaves, `0x01 ‖ l ‖ r` for internal nodes, and an odd node is duplicated.
+
+### Proof of work
+
+Three stages, `puzzle_id = 1` ("hybrid-v1").
+
+**Stage 1 — hash chain.** 16 rounds over the serialized header plus a nonce.
+
+**Stage 2 — integer-only neural network.** Weights derive from the epoch id via
+SHA-256, so nothing can be precomputed before the epoch starts. Three layers of
+16 units, `i64` accumulators, weights in `[-128, 127]`, biases in `[0, 62]`, an
+arithmetic shift followed by ReLU. Every layer's *pre-activation* values are
+committed to, so no layer can be skipped or approximated.
+
+**Stage 3 — final hash.** Binds seed, activation digest, nonce and epoch.
+
+```
+solve(header) = U256_BE(final) ≤ floor((2^256 − 1) / difficulty)
+```
+
+**The 30–50% audit rule.** The protocol cannot measure wall-clock, so the
+constraint is enforced as a cost model over puzzle parameters — one SHA-256
+counted as 64 int32 MACs. The default spec scores exactly 4000 bps (40%) and a
+registry entry outside `[3000, 5000]` is rejected. This is a proxy, not a
+stopwatch, and `docs/status.md` says so plainly.
+
+### Difficulty adjustment
+
+Zawy-style **linearly weighted moving average**, 60-block window, ±10% per
+block, clamped to `[min_difficulty, max_difficulty]`.
+
+```
+t_i   = clamp(tip[i].ts − tip[i+1].ts,  T/4,  5T)      newest first
+d_raw = d_prev · T / (Σ (window−i)² · t_i) / Σ (window−i)²
+```
+
+The retarget is **multiplicative**: `d_new = d_prev · T / avg_solve`. Perfect
+spacing is a fixed point at *every* difficulty, which the test suite asserts
+directly. (The scale-invariant alternative `avg_solve / T` has no restoring
+force at all — see [Security](#security-defects-found-and-fixed).)
+
+While the chain is shorter than the window, the available window is used with the
+same weight formula rather than pinning difficulty to a genesis value, which
+would hand the first hour to whoever arrives first.
+
+### Timestamp rules
+
+**Consensus:** `timestamp_ms ≥ median(previous 11 timestamps)`. Deterministic, no
+local clock.
+
+**Node policy:** `timestamp_ms ≤ local_now_ms + one block time`.
+
+There is deliberately **no consensus upper bound**. An upper bound needs a
+reference that advances with wall time, and the only such thing is the local
+clock — which would make validity depend on machine skew, so two honest nodes
+could disagree about the same block. The ceiling is policy, applied at
+`submit_at`. This is the same tradeoff Bitcoin makes, with a much tighter
+window, and `sim/difficulty_attack_sim.py` measures it.
+
+### Supply
+
+| | |
+|---|---|
+| Block reward | 76 JNT |
+| Halving period | 262 800 blocks (~5 years at 10 min) |
+| Premine | **0%** — enforced in code, not just in prose |
+| Hard cap | 39 945 600 JNT |
+
+The ladder halves in **whole JNT**, not by shifting satoshis:
+
+```
+76, 38, 19, 9, 4, 2, 1, 0
+```
+
+Because every halving rounds down, the seven non-zero steps pay out
+**39 157 200 JNT** in total — exactly 149 periods at the full reward — against a
+39 945 600 cap. The remaining **788 400 JNT is permanently unmintable**, not
+merely reserved: anyone can confirm it by summing the ladder. The cap is checked
+at the point of minting, against live UTXO state.
+
+### Fees and burn
+
+EIP-1559-shaped, and the base fee is **burned**. Only the tip reaches the miner,
+so no new supply is ever minted from usage and the cap cannot be crossed by
+demand.
+
+```
+gas_per_tx = 16 000 + 1 000 · inputs + 250 · outputs
+gas_cap    = 2 000 000 per block
+
+coinbase.value = block_reward(height) + (total_fees − base_fee · gas_used)
+```
+
+The base fee rises by 1/512 per block when the gas target is met exactly, and is
+clamped to `[base_fee_min, base_fee_max]`.
+
+### Transactions and signatures
+
+Scriptless by design. Validity is decided by the rules, and future primitives
+(bonds, certificates, channels) will add new `tx_type` values — never a
+scripting language.
+
+The signature commits to the whole transaction except the signatures themselves,
+so outputs cannot be swapped after signing:
+
+```
+sighash = SHA256(DOM_TXBODY ‖ serialize(tx with all sigs and keys blanked))
+msg_k   = SHA256(DOM_SIG ‖ U4LE(k) ‖ sighash ‖ U4LE(input[k].prevout_index))
+```
+
+**Signature agility and hybrid bundles.** Each input carries a *bundle* of
+signature components rather than one signature. Two rules make hybrids real
+rather than decorative:
+
+1. **Every component must verify.** A one-of-N rule would not be a hybrid: an
+   adversary who breaks one primitive forges that component and strips the rest.
+2. **The address commits to the whole key set**, so a hybrid key set cannot be
+   quietly reduced to a smaller one that omits a component.
+
+Two schemes ship: `1` secp256k1 ECDSA (low-`s` enforced), `2` BIP-340 Schnorr.
+Scheme 2 exercises the multi-scheme path end to end; it is not post-quantum and
+adds no quantum resistance on its own. A lattice scheme would slot into the
+existing encoding without changing anything. The bundle is sized for a real
+post-quantum signature from the start (4 096 bytes per component) rather than
+being retrofitted later.
+
+---
+
+## Consensus rules
+
+**Block.** Correct height and parent; valid PoW; difficulty equal to what the
+retarget rule produces from the tip history; merkle root matches the body;
+timestamp rule satisfied; `puzzle_id` exists and `epoch_id == height /
+nn_epoch_blocks`; `gas_used ≤ gas_cap`; every transaction valid; `tx_count ≤
+5 000` and serialized size ≤ 4 MB.
+
+**Transaction.** Coinbase first and only at index 0, with exactly one input
+referencing the parent and exactly one output; no coinbase txid collision
+(BIP30-style); no duplicate inputs; no already-spent outpoints;
+`Σ inputs ≥ Σ outputs + fee`; every signature verifies against the address
+owning the spent output; coinbase maturity enforced; and
+`coinbase.value ≤ reward + tip` — miners cannot over-claim.
+
+**Fork choice.** Deepest chain by cumulative difficulty. Every tie-break is a
+function of block data alone — more work, then lower height, then lowest block
+hash. Two nodes holding the same set of valid blocks always agree on the tip.
+
+**Finality.** `finality_depth` blocks below the tip are immutable; a reorg whose
+fork point lands at or below them is rejected as `ReorgWouldCrossFinality`.
+
+---
+
+## Network profiles
+
+Selected with `--network`. Same code, different numbers.
+
+| | `mainnet` | `mini` |
 |---|---|---|
-| Block time | 10 min | 1 s |
-| Halving period | 262 800 blocks (~5 y) | 2 000 blocks |
+| Target block time | 600 000 ms (10 min) | 1 000 ms |
+| Halving period | 262 800 blocks | 2 000 blocks |
+| Start reward | 76 JNT | 76 JNT |
 | Supply cap | 39 945 600 JNT | 304 000 JNT |
+| Difficulty window | 60 | 60 |
+| Change limit | ±10% / block | ±10% / block |
+| Genesis difficulty | 1 | 1 |
+| Max difficulty | 2^96 | 2^40 |
+| Coinbase maturity | 100 blocks | 10 blocks |
+| Finality depth | 100 blocks | 20 blocks |
+| Gas cap | 2 000 000 | 2 000 000 |
+| Initial base fee | 1 000 sat | 100 sat |
+| NN epoch | 50 000 blocks | 2 000 blocks |
+| Puzzle id | 1 | 1 |
 
-Other commands: `send`, `balance`, `wallet`, `show-block`, `export`. `--help` on
-any of them prints usage.
+---
 
-Note `send --amount` is in **satoshis**, while every printed figure is in JNT.
+## Node CLI reference
 
-## Supply
+```
+jnt-node <COMMAND> [OPTIONS]
 
-76 JNT per block, halving every 262 800 blocks, 0% premine. The ladder is
-halved in whole JNT, not by shifting satoshis, giving
-76, 38, 19, 9, 4, 2, 1, 0 JNT.
+COMMANDS
+  init        Create a chain directory, a miner wallet and the genesis block
+  mine        Mine blocks and extend the chain
+  send        Spend from a wallet address into a new block
+  status      Print chain tip, difficulty, supply and wallet balance
+  verify      Replay the chain from genesis and diff it against stored state
+  show-block  Print one block
+  balance     List the unspent outputs of an address
+  wallet      Create or list wallets
+  export      Write the canonical chain to JSON
 
-Because each halving rounds down, the seven non-zero steps of the ladder pay out
-39 157 200 JNT in total — the same as 149 periods at the full 76 JNT reward —
-against a 39 945 600 cap. The remaining 788 400 JNT is **permanently
-unmintable**, not merely reserved: anyone can confirm it by summing the ladder.
-The cap is enforced in code at the point of minting.
+COMMON OPTIONS
+  --network <mainnet|mini>   Default: mini
+  --data-dir <path>          Default: ./chain
+```
 
-## Testing
+Per-command options: `--blocks`, `--interval`, `--wallet`, `--amount`, `--to`,
+`--fee`, `--address`, `--height`, `--label`, `--out`, `--new`.
+
+> `send --amount` is denominated in **satoshis**, while every printed figure is
+> in JNT. This is a known rough edge.
+
+`--help` on any command prints usage without touching the chain directory.
+
+---
+
+## Testing and verification
 
 ```sh
-cargo test --workspace                                  # 114 tests
+cargo test --workspace                                   # 139 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-CI runs all of the above plus the vector cross-checks on every push.
+### Consensus vectors
 
-The protocol also has a second, independent implementation in Python
-(`sim/jounit_reference.py`), written from SPEC.md rather than from the Rust
-source. It reproduces all 21 puzzle digests in `tests/vectors/`. That
-agreement is the actual evidence SPEC.md is unambiguous rather than merely
-self-consistent with the code that implements it.
+`tests/vectors/` holds four files. A language implementation is correct only if
+it reproduces them byte for byte.
+
+| File | Covers |
+|---|---|
+| `puzzle_vectors.json` | Header serialization, stage 1 seed, stage 2 activation digest, stage 3 final, work-share accounting |
+| `ser_vectors.json` | Input, output, transaction and header byte layouts |
+| `difficulty_vectors.json` | LWMA output, timestamp clamp behaviour |
+| `supply_vectors.json` | Reward ladder, cumulative supply, cap invariant |
 
 ```sh
-python sim/puzzle_crosscheck.py         # Rust vs independent Python
-python sim/verify_vectors.py --check    # all four vector files
-python sim/difficulty_attack_sim.py     # timestamp-attack containment
+python sim/verify_vectors.py --check    # present, self-consistent, cross-checked
 ```
 
 Vectors are generated from the implementation and regenerated only by it:
@@ -122,62 +483,165 @@ UPDATE_SER_VECTORS=1        cargo test -p jnt-core --lib serialization_vectors_a
 python sim/supply_schedule_sim.py
 ```
 
-A second implementation disagreeing with these vectors has a consensus split,
+A second implementation disagreeing with these vectors has a **consensus split**,
 not a rounding difference.
 
-## Status
+### Cross-implementation
 
-The base layer is implemented and tested. **It is not a usable network.** One
-node cannot talk to another, so there is nothing here you could mine on with a
-friend.
+`sim/jounit_reference.py` is a second implementation of the PoW puzzle, written
+from the prose of `SPEC.md` rather than from the Rust source. It reproduces all
+21 puzzle digests.
 
-Not built:
+```sh
+python sim/puzzle_crosscheck.py          # Rust vs independent Python
+python sim/difficulty_attack_sim.py     # timestamp-attack containment
+python sim/difficulty_attack_sim.py --ablation --start-difficulty 100000
+python sim/supply_schedule_sim.py       # supply vectors
+```
 
-- **Layer 2, the useful-work layer** — the project's actual premise
-- **P2P** — no node discovery, no block or transaction relay, no mempool
-- **Persisted UTXO indexing** — state replays from genesis on every load, which
-  will not scale to 40M coins
-- **Coverage-guided fuzzing** (`cargo-fuzz`); deterministic property tests
-  cover the parsers instead
+That agreement is the actual evidence `SPEC.md` is unambiguous rather than
+merely self-consistent with the code implementing it.
 
-`docs/status.md` is the honest, current version of this list, along with the
-consensus bugs found and fixed so far and one design-doc claim that turned out
-not to hold.
+### CI
 
-### Known consensus bugs, found and fixed
+`.github/workflows/ci.yml` runs on every push and PR: format check, clippy with
+`-D warnings`, the full test suite, a release build, the vector cross-checks, the
+difficulty-attack containment simulation, and the supply cross-check.
 
-Recorded because the pattern matters more than the individual fixes.
+### Red-team suite
 
-**The difficulty retarget had no restoring force.** It computed
-`avg_solve / T`, which is scale-invariant — every difficulty was a fixed point.
-Halving the hashrate produced blocks at 2T, the rule answered "difficulty 2", and
-the interval ran away to 4T. It is now multiplicative from the previous
-difficulty. The Zawy weights were also inverted, weighting the oldest solve time
-most heavily.
+`crates/jnt-core/tests/redteam.rs` holds 9 adversarial integration tests, written
+attack-first. Each builds the hostile input a peer would send and asserts the
+node refuses it; each was confirmed to fail against the code it now guards.
 
-Both were invisible to the original tests because every one of them used
-*uniform* solve times, where neither the weighting direction nor the missing
-`d_prev` factor can show up.
+```sh
+cargo test -p jnt-core --test redteam
+```
 
-**`Transaction::value_out` could overflow.** Summing output values with `.sum()`
-panicked in debug and wrapped in release. Since the total is compared against
-resolved input value, a wrapped sum reads as a transaction creating value from
-nothing — an inflation primitive.
+They exploit hand-built blocks — difficulty 1 makes PoW free on `mini`, which is
+exactly what an attacker gets. The shapes here are the obvious seed corpus for a
+`cargo-fuzz` harness when one is built.
+
+---
+
+## Security: defects found and fixed
+
+Recorded because the pattern matters more than the individual fixes. Each was
+confirmed by restoring the faulty code and watching a test fail. Full detail in
+[`docs/status.md`](docs/status.md); working notes in [`memory.md`](memory.md).
+
+### From the most recent red-team pass
+
+**Fork choice was not deterministic.** The final tie-break was an arrival
+counter, so two nodes holding an *identical* set of valid blocks could select
+different tips. The module doc claimed the opposite. Every tie-break is now a
+function of the block graph alone.
+
+**The finality rule had a hole.** It refused reorgs only when the chain got
+*shorter*, so a rival forking below the finality point but ending up *longer*
+rewrote settled history. The existing test only built a shorter rival, which is
+why it stayed green.
+
+**`apply_tx` was not atomic.** Inputs were removed one at a time, so a
+transaction whose second input did not exist had already taken the first when the
+error fired — and the error discarded the undo record that could have restored
+it. One malformed transaction destroyed coins.
+
+**A block that could never be applied still counted as fork-choice work.** It was
+stored before being applied and never removed, while `cumulative_work` summed the
+declared difficulty of everything stored. An attacker could bank chain weight no
+reorganization could realize: fork choice kept picking the dead branch and
+rejected honest blocks.
+
+**The chain halted permanently once the reward ladder ran out.** A zero-value
+coinbase was rejected unconditionally, but `SPEC.md` §7 says the coinbase collects
+tips only and tips are legitimately zero on an empty block. Mainnet would have
+stopped dead at height 2 102 400.
+
+**`apply_block` was not atomic.** It wrote to the UTXO set transaction by
+transaction, so a failure partway through left earlier ones applied. Writes are
+now unwound by `apply_block` itself, which also keeps the happy path O(1) in UTXO
+size rather than cloning the set per block.
+
+Plus, in the same pass: `header.sig_scheme` was committed to by the block hash and
+read by nothing, despite `SPEC.md` §1 requiring rejection of unknown values; the
+deserializers bounded declared counts by raw remaining bytes rather than by the
+smallest entry that could follow, letting a 4 MB block force a reservation many
+times its own size; `total_gas_used` used `.sum()` and feeds both the base-fee
+schedule and the gas cap; `build_tx` accepted a `fee` argument and discarded it
+with `let _ = fee;`; and `halvings` / `expected_epoch` truncated a `u64` quotient
+with `as u32`.
+
+**Every vector file was byte-identical afterwards.** None of this touched hashing,
+the puzzle, the retarget or the serialization layout — the state layer changed and
+the consensus rules did not.
+
+### From earlier audits
+
+**The difficulty retarget had no restoring force.** It computed `avg_solve / T`,
+which is scale-invariant, so *every* difficulty was a fixed point: halving the
+hashrate produced blocks at 2T and the interval ran away to 4T. The Zawy weights
+were also inverted, weighting the oldest solve time most heavily. Both were
+invisible to the original tests because every one used *uniform* solve times,
+where neither weighting direction nor the missing `d_prev` factor can show up.
+
+**`Transaction::value_out` could overflow.** Summing with `.sum()` panicked in
+debug and wrapped in release. Since the total is compared against resolved input
+value, a wrapped sum reads as a transaction creating value from nothing — an
+inflation primitive.
 
 **A puzzle-spec overflow guard could not fire.** It computed its bound in `i64`
 from a `usize` input, so the cast wrapped before the comparison ran, passing
 exactly the inputs it existed to reject.
 
-Each was verified by restoring the faulty code and confirming a test fails.
+### A claim that did not survive measurement
 
-## Licence
+An earlier design document reported a 40% attacker with a two-hour
+future-timestamp allowance reaching ~104s average block time, and presented that
+as the reason to tighten the limit to one block time. **That figure is not
+reproducible and cannot be:** 104s is below the solve-time clamp floor (T/4 =
+150s), so no retarget can ask for a difficulty that low. The simulation's
+`--ablation` mode confirms this independently.
+
+What *is* established, per `sim/difficulty_attack_sim.py`: under this
+specification, block time stays within ~1% of target from a one-minute allowance
+up to Bitcoin's two hours. The tight allowance is retained anyway as defence in
+depth, for the case where an attacker reaches 50% and can move the median itself.
+
+---
+
+## Known limitations
+
+**Wedges the node under a finality-crossing heavier branch.** A valid branch that
+forks below `finality_depth` and carries more work than the tip is retained, and
+the node declines to reorganize — so it cannot accept honest blocks until the
+situation changes. This follows directly from treating `finality_depth` as a
+hard rule. Whether the node should instead follow the heavier chain, or how long
+to remember a branch it will not take, is a consensus design decision and is not
+settled here.
+
+**`adopt()` snapshots the entire UTXO set.** Correct, but O(chain length) per
+reorg. Acceptable at test scale; not at 40M coins. The incremental undo
+primitives it needs already exist.
+
+**State replays from genesis on every node load.** `Store::load_chain` re-submits
+every block. Fine at test scale, not at production scale.
+
+**`SPEC.md` references a `docs/roadmap.md` that does not exist.** The reference
+appears in `SPEC.md` (twice), `lib.rs`, `puzzle.rs` and `jnt-node/src/main.rs`.
+Layer 2 and the governance timelock are therefore described but not written
+down anywhere in the repository. Worth resolving before the specification is
+treated as complete.
+
+**`Cargo.toml` declares a `repository` URL that does not match the actual
+remote.** Cosmetic, but it is the first thing `cargo publish` would use.
+
+**Vector coverage is finite by construction.** The crosscheck exercises seven
+header/epoch combinations; a bug outside those cases would not be caught by it.
+
+---
+
+## License
 
 `Cargo.toml` declares `MIT OR Apache-2.0`. **No `LICENSE` file has been added
 yet** — this needs resolving before the code is distributed.
-
-## Status of the numbers
-
-Design-doc figures for a difficulty-manipulation attack could not be reproduced
-and should not be treated as established. `SPEC.md` §6.1 states what is actually
-measured: block time stays within ~1% of target from a one-minute
-future-timestamp allowance up to Bitcoin's two hours.
