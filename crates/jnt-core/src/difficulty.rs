@@ -429,4 +429,145 @@ mod tests {
         );
     }
 
+    /// Named cases pinned in `tests/vectors/difficulty_vectors.json`.
+    ///
+    /// These exist because the retarget is easy to "fix" in a way that still
+    /// passes a hand-written test: the multiplicative form and the
+    /// direction of the Zawy weights both have to be reproduced exactly by
+    /// any other implementation. A second implementation that disagrees
+    /// here is a consensus split, not a rounding difference.
+    fn vector_cases() -> Vec<(&'static str, u128, Vec<u64>, u128)> {
+        let p = NetworkParams::mainnet();
+        let t = p.target_block_time_ms;
+        let w = p.difficulty_window as usize;
+        let mut cases: Vec<(&'static str, u128, Vec<u64>, u128)> = Vec::new();
+
+        // Perfect spacing must not move difficulty at all.
+        let perfect: Vec<u64> = vec![t; w];
+        for start in [1u128, 7, 1_000] {
+            cases.push((
+                "perfect_spacing_fixed_point",
+                start,
+                history_with(&perfect),
+                next_difficulty(&p, start, &history_with(&perfect)),
+            ));
+        }
+
+        // Halved hashrate -> 2T spacing -> difficulty must fall.
+        let half: Vec<u64> = vec![2 * t; w];
+        cases.push((
+            "halved_hashrate_lowers",
+            1_000,
+            history_with(&half),
+            next_difficulty(&p, 1_000, &history_with(&half)),
+        ));
+
+        // Doubled hashrate -> T/2 spacing -> difficulty must rise.
+        let double: Vec<u64> = vec![t / 2; w];
+        cases.push((
+            "doubled_hashrate_raises",
+            1_000,
+            history_with(&double),
+            next_difficulty(&p, 1_000, &history_with(&double)),
+        ));
+
+        // Mixed spacing, newest-weighted: a fast tip outranks a fast tail.
+        let mut fast_tip = vec![5 * t; w];
+        fast_tip[..w / 2].fill(t / 4);
+        cases.push((
+            "newest_solve_times_weigh_most",
+            1_000_000,
+            history_with(&fast_tip),
+            next_difficulty(&p, 1_000_000, &history_with(&fast_tip)),
+        ));
+
+        cases
+    }
+
+    #[test]
+    fn difficulty_vectors_are_stable() {
+        // Regenerate with: UPDATE_DIFFICULTY_VECTORS=1 cargo test -p jnt-core
+        let cases = vector_cases();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/vectors/difficulty_vectors.json");
+
+        if std::env::var("UPDATE_DIFFICULTY_VECTORS").is_ok() {
+            let mut json = String::from("{\n");
+            json.push_str("  \"_comment\": \"Generated from jnt-core by difficulty_vectors_are_stable. Do not hand-edit.\",\n");
+            json.push_str("  \"target_block_time_ms\": 600000,\n");
+            json.push_str("  \"difficulty_window\": 60,\n");
+            json.push_str("  \"change_limit_bps\": 1000,\n");
+            json.push_str("  \"cases\": [\n");
+            for (i, (name, prev, hist, got)) in cases.iter().enumerate() {
+                json.push_str("    {\n");
+                json.push_str(&format!("      \"name\": \"{name}\",\n"));
+                json.push_str(&format!("      \"prev_difficulty\": {prev},\n"));
+                let ts: Vec<String> = hist
+                    .iter()
+                    .map(|v| format!("\"{v}\""))
+                    .collect();
+                json.push_str(&format!("      \"history_newest_first\": [{}],\n", ts.join(", ")));
+                json.push_str(&format!("      \"expected_difficulty\": {got}\n"));
+                json.push_str(if i + 1 == cases.len() {
+                    "    }\n"
+                } else {
+                    "    },\n"
+                });
+            }
+            json.push_str("  ]\n}\n");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, json).unwrap();
+            eprintln!("wrote {}", path.display());
+            return;
+        }
+
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["target_block_time_ms"], 600_000u64);
+        assert_eq!(v["difficulty_window"], 60u64);
+
+        let listed = v["cases"].as_array().expect("cases must be an array");
+        assert_eq!(
+            listed.len(),
+            cases.len(),
+            "vector file is stale: regenerate with UPDATE_DIFFICULTY_VECTORS=1"
+        );
+
+        let p = NetworkParams::mainnet();
+        for (entry, (name, prev, hist, expected)) in listed.iter().zip(cases.iter()) {
+            assert_eq!(entry["name"], *name, "vector order changed");
+            assert_eq!(
+                entry["prev_difficulty"].as_u64().unwrap(),
+                *prev as u64,
+                "vector {name}: prev_difficulty changed"
+            );
+            assert_eq!(
+                entry["expected_difficulty"].as_u64().unwrap(),
+                *expected as u64,
+                "vector {name}: retarget output changed -- this is a consensus change"
+            );
+            // And the vector must still describe the behaviour it claims.
+            let from_vector = next_difficulty(&p, *prev, hist);
+            assert_eq!(
+                from_vector, *expected,
+                "vector {name}: recomputing from the stored history disagrees"
+            );
+        }
+    }
+
+    #[test]
+    fn a_supply_vector_file_exists_to_show_the_pattern() {
+        // The difficulty vectors above are consumed by this test suite;
+        // supply_vectors.json is written by sim/supply_schedule_sim.py but
+        // nothing reads it yet. Assert the file is at least valid JSON so a
+        // truncated write is caught.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/vectors/supply_vectors.json");
+        let raw = std::fs::read_to_string(&path).expect("supply_vectors.json must exist");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("must be valid JSON");
+        assert_eq!(v["sat_per_jnt"], 100_000_000u64);
+    }
 }

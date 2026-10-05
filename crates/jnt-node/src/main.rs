@@ -10,6 +10,7 @@
 //! jnt-node show-block --height 10
 //! jnt-node balance  --address jt1...
 //! jnt-node send     --to jt1... --amount 1000       build a tx, mine it, keep it
+//!                                                   (--amount is in satoshis)
 //! jnt-node wallet   --new --label miner
 //! jnt-node export   --out chain.json
 //! ```
