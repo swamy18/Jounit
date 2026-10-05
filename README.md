@@ -36,13 +36,11 @@ the design doc's Section 5.
 | Path | What it is |
 |---|---|
 | `SPEC.md` | **Normative.** The protocol specification. Where a disagreement exists, this wins. |
-| `AI_Native_Currency_Idea (1).md` | The original design document (Hinglish). Intent and rationale; superseded by SPEC.md on any point of detail. |
 | `crates/jnt-core` | The protocol implementation. |
 | `crates/jnt-node` | A CLI over `jnt-core`. Single-node chain; no P2P. |
 | `sim/` | Python: independent protocol reference, attack and supply simulations. |
 | `tests/vectors/` | Consensus vectors. Regenerate, never hand-edit. |
 | `docs/status.md` | What is verified, what is broken, what is missing. |
-| `Researchpapers_wecanget_benefit/` | Third-party papers, included as reference. Not ours. |
 
 `jnt-core` holds all consensus logic. The mini network profile is the same code
 with different parameters, never a second codebase — so anything tested on mini

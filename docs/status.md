@@ -102,23 +102,26 @@ difficulty (correctly, they lower it), and one test used `expected + 1` as an
 "impossible" difficulty — under the fixed rule that is the legitimate next
 value at that spacing.
 
-## Design doc claims that do not hold
+## A claim that did not survive measurement
 
-Design doc §28.9 reports a 40% attacker with a two-hour future-timestamp
-allowance reaching ~104s average block time, and presents this as the reason for
-tightening the limit to one block time. That figure is **not reproducible** and
-cannot be: 104s is below the solve-time clamp floor (T/4 = 150s), so no
-retarget can ask for a difficulty that low. The simulation's `--ablation` mode
-strips the clamp and the difficulty floor and still does not land on 104s — it
-drives difficulty to zero — so the original table was produced by some further
-difference in its model that cannot be recovered from the document.
+An earlier design document reported a 40% attacker with a two-hour
+future-timestamp allowance reaching ~104s average block time, and presented
+that as the reason for tightening the limit to one block time. That document is
+no longer in this repository; the claim is recorded here because it shaped a
+consensus rule and because it does not hold.
+
+The figure is **not reproducible** and cannot be: 104s is below the solve-time
+clamp floor (T/4 = 150s), so no retarget can ask for a difficulty that low. The
+simulation's `--ablation` mode strips the clamp and the difficulty floor and
+still does not land on 104s — it drives difficulty to zero — so the original
+table came from some further difference in its model that is not recoverable.
 
 What *is* established: under this specification, block time stays within ~1% of
 target across every allowance from one minute to two hours. The short allowance
 is retained anyway as defence in depth, since it bounds how far ahead a single
 block can be stamped, which matters once an attacker reaches 50% and can move
-the median itself. SPEC.md §6.1 states this accurately rather than repeating
-the design doc's number.
+the median itself. SPEC.md §6.1 states this accurately rather than repeating the
+original number.
 
 The ablation table has a caveat worth knowing when reading it: any variant that
 never recovers ends up pinned on the difficulty floor, so rows matching the
