@@ -43,6 +43,14 @@ pub struct NetworkParams {
     /// transactions stay valid; flipping it on is how a network would declare
     /// itself post-quantum ready without a hard fork.
     pub require_hybrid_signatures: bool,
+    /// 4-byte discriminator checked on every incoming frame (§13.2/§13.3) and
+    /// mandatory in the handshake. `mainnet` and `mini` MUST differ; reuse
+    /// across two live networks lets a node accept a foreign chain's traffic.
+    /// Zero is rejected by `validate()`.
+    pub network_magic: [u8; 4],
+    /// Human-readable network tag exchanged in the handshake (§13.4). Also
+    /// distinguishes profiles when a magic collision is ever introduced.
+    pub network_id: String,
 }
 
 impl NetworkParams {
@@ -97,6 +105,8 @@ impl NetworkParams {
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
             require_hybrid_signatures: false,
+            network_magic: [0x6A, 0x4E, 0x54, 0x01],
+            network_id: "jounit/mainnet".into(),
         }
     }
 
@@ -126,6 +136,12 @@ impl NetworkParams {
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
             require_hybrid_signatures: false,
+            // Distinct 4-byte magic so a mini peer can never be mistaken for
+            // mainnet at the framing layer (§13.3). Genesis cannot do that job:
+            // both profiles have genesis_difficulty=1, so genesis_block() is
+            // identical, hence the identical genesis hash.
+            network_magic: [0x6A, 0x4E, 0x54, 0x02],
+            network_id: "jounit/mini".into(),
         }
     }
 
@@ -154,6 +170,12 @@ impl NetworkParams {
         }
         if self.start_reward_sat == 0 {
             return Err(Error::Malformed("start_reward_sat must be > 0"));
+        }
+        if self.network_magic == [0, 0, 0, 0] {
+            return Err(Error::Malformed("network_magic must be non-zero"));
+        }
+        if self.network_id.is_empty() {
+            return Err(Error::Malformed("network_id must be non-empty"));
         }
         Ok(())
     }
@@ -201,5 +223,28 @@ mod tests {
             NetworkParams::mini()
         );
         assert!(NetworkParams::by_name("nope").is_err());
+    }
+
+    #[test]
+    fn network_magic_is_distinct_and_nonzero() {
+        let m = NetworkParams::mainnet();
+        let n = NetworkParams::mini();
+        // Non-zero, lest a default profile silently pass for any network.
+        assert_ne!(m.network_magic, [0, 0, 0, 0]);
+        assert_ne!(n.network_magic, [0, 0, 0, 0]);
+        // Distinct across profiles: the whole reason it exists (§13.3). Genesis
+        // cannot do this job because both profiles have genesis_difficulty = 1.
+        assert_ne!(m.network_magic, n.network_magic);
+        assert_ne!(m.network_id, n.network_id);
+        assert!(m.network_id.starts_with("jounit/"));
+    }
+
+    #[test]
+    fn genesis_hash_is_identical_across_profiles() {
+        // The property that makes network_magic necessary: genesis_block() takes
+        // only difficulty, and both profiles set genesis_difficulty = 1.
+        let g = crate::block::genesis_block(NetworkParams::mainnet().genesis_difficulty);
+        let h = crate::block::genesis_block(NetworkParams::mini().genesis_difficulty);
+        assert_eq!(g.block_hash(), h.block_hash());
     }
 }

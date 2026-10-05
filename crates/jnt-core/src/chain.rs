@@ -27,6 +27,8 @@ struct Snapshot {
     canon: Vec<Hash>,
     utxo: UtxoSet,
     undo: HashMap<Hash, Undo>,
+    pscb_reserve: u64,
+    pscb_undo: HashMap<Hash, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,9 +38,23 @@ pub struct Chain {
     /// Caches the active epoch's neural weights across mining attempts.
     solver: PuzzleSolver,
     blocks: HashMap<Hash, Block>,
+    /// `cumulative_work` for each stored block, recorded at insert as
+    /// `parent_work + difficulty`. Lets fork choice be O(1) per block instead of
+    /// a walk to genesis, which makes `best_candidate` O(stored) rather than
+    /// O(stored²). Every block in `blocks` has an entry here.
+    work: HashMap<Hash, u128>,
     canon: Vec<Hash>,
     utxo: UtxoSet,
     undo: HashMap<Hash, Undo>,
+    /// Accumulated PSCB (Protocol Security & Compute Buffer) reserve.
+    /// M1 protocol mechanism: 50% of every block's base-fee portion is routed
+    /// here rather than burned. The reserve backs the M2 Time-Locked Compute
+    /// Reserve vault without touching the hard supply cap.
+    pscb_reserve: u64,
+    /// Per-block PSCB deltas, keyed by block hash. Required for reorg
+    /// correctness: when a canonical block is rolled back, its PSCB contribution
+    /// must be subtracted from the running total.
+    pscb_undo: HashMap<Hash, u64>,
 }
 
 impl Chain {
@@ -59,11 +75,15 @@ impl Chain {
             registry,
             solver: PuzzleSolver::new(PuzzleSpec::hybrid_v1()),
             blocks: HashMap::new(),
+            work: HashMap::new(),
             canon: Vec::new(),
             utxo: UtxoSet::new(),
             undo: HashMap::new(),
+            pscb_reserve: 0,
+            pscb_undo: HashMap::new(),
         };
         chain.blocks.insert(hash, genesis.clone());
+        chain.work.insert(hash, genesis.header.difficulty);
         // Genesis mints nothing, so the UTXO set stays empty; only the block
         // bookkeeping matters.
         chain.undo.insert(hash, Undo::default());
@@ -113,6 +133,16 @@ impl Chain {
         self.utxo.total_value()
     }
 
+    /// Accumulated Protocol Security & Compute Buffer reserve (M1).
+    ///
+    /// This is the 50% of every block's base-fee portion that is diverted from
+    /// the burn to the on-chain reserve. It does not count toward the hard
+    /// supply cap (it has already been destroyed for cap purposes), but it is
+    /// tracked here to power the M2 slash recovery vault.
+    pub fn pscb_reserve(&self) -> u64 {
+        self.pscb_reserve
+    }
+
     /// Height below which history is immutable.
     pub fn finalized_height(&self) -> u64 {
         self.height().saturating_sub(self.params.finality_depth)
@@ -140,7 +170,23 @@ impl Chain {
         self.registry.get(id)
     }
 
+    /// Cumulative PoW difficulty along the chain ending at `hash`.
+    ///
+    /// Recorded incrementally at insert time as `parent_work + difficulty`, so
+    /// this is an O(1) lookup rather than the O(chain-length) walk to genesis it
+    /// used to be. That walk made `best_candidate` O(stored²), which a peer
+    /// relaying many blocks could turn into a quadratic CPU amplifier.
+    ///
+    /// Every block in `blocks` is entered here on insert (`Chain::new` for
+    /// genesis, `submit_at` for every later block). A miss is therefore a logic
+    /// error, but the walk is kept as a defensive fallback so the value stays
+    /// correct for any block added outside that path; no consensus outcome
+    /// depends on which branch runs.
     fn cumulative_work(&self, hash: &Hash) -> u128 {
+        if let Some(&w) = self.work.get(hash) {
+            return w;
+        }
+        debug_assert!(false, "cumulative_work miss for a stored block");
         let mut total = 0u128;
         let mut cursor = *hash;
         loop {
@@ -380,6 +426,12 @@ impl Chain {
         }
 
         let hash = block.block_hash();
+        // Credit the PSCB reserve (M1). Saturate rather than panic: on a
+        // pathologically congested chain the accumulated PSCB could notionally
+        // exceed u64::MAX over millions of blocks, though in practice the
+        // hard-capped fee schedule makes this unreachable.
+        self.pscb_reserve = self.pscb_reserve.saturating_add(split.pscb);
+        self.pscb_undo.insert(hash, split.pscb);
         self.undo.insert(hash, body_undo);
         Ok(())
     }
@@ -446,6 +498,10 @@ impl Chain {
             }
         }
         self.undo.remove(hash);
+        // Undo the PSCB credit for this block (M1 reorg correctness).
+        if let Some(delta) = self.pscb_undo.remove(hash) {
+            self.pscb_reserve = self.pscb_reserve.saturating_sub(delta);
+        }
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -453,6 +509,8 @@ impl Chain {
             canon: self.canon.clone(),
             utxo: self.utxo.clone(),
             undo: self.undo.clone(),
+            pscb_reserve: self.pscb_reserve,
+            pscb_undo: self.pscb_undo.clone(),
         }
     }
 
@@ -460,6 +518,8 @@ impl Chain {
         self.canon = s.canon;
         self.utxo = s.utxo;
         self.undo = s.undo;
+        self.pscb_reserve = s.pscb_reserve;
+        self.pscb_undo = s.pscb_undo;
     }
 
     fn path_to(&self, target: &Hash) -> Option<Vec<Hash>> {
@@ -533,7 +593,14 @@ impl Chain {
             return Err(Error::UnknownParent);
         }
 
+        // Validate that the parent exists before recording work against it.
+        let parent_work = self.cumulative_work(&block.header.prev_hash);
+        let block_difficulty = block.header.difficulty; // before `block` is moved
         self.blocks.insert(hash, block);
+        // Work is parent_work + this block's difficulty, computed once. Fork
+        // choice reads it as an O(1) lookup instead of walking to genesis.
+        self.work
+            .insert(hash, parent_work.saturating_add(block_difficulty));
 
         let outcome = self.reselect(hash);
         if let Err(e) = &outcome {
@@ -549,6 +616,7 @@ impl Chain {
             // every later block already stacked on top of it.
             if !matches!(e, Error::ReorgWouldCrossFinality { .. }) {
                 self.blocks.remove(&hash);
+                self.work.remove(&hash);
             }
         }
         outcome

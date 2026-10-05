@@ -366,3 +366,352 @@ corrected from 130 to 139.
   the obvious seed corpus for a `cargo-fuzz` harness.
 - **Vector coverage is finite by construction** — 7 header/epoch combinations. A
   bug outside those cases would not be caught by the crosscheck.
+
+---
+
+# Working memory — session 2: P2P specification
+
+**Date:** 2026-10-05 (same day, later)
+**Branch:** `main`, clean at start. `memory.md` above is session 1; this is a
+separate session and nothing from it is committed.
+**Scope:** the user asked to begin the P2P / networking layer, which was the
+top "not built" item in `README.md` and `docs/status.md`.
+**Outcome:** no code written. `SPEC.md` §13 added (+379 lines) specifying the
+network layer ahead of implementation. Two latent defects found, one of them
+significant. **Nothing committed.**
+
+---
+
+## 11. What this session was
+
+The user picked P2P off the not-built list and said to start. Before writing any
+Rust I mapped the API surfaces a network layer would sit on, then asked three
+forking questions rather than guessing:
+
+| Decision | Chosen |
+|---|---|
+| Concurrency | `std::net` + thread per peer — no new dependencies |
+| v0.2 scope | **blocks only**; transaction relay deferred |
+| Order of work | **spec first**, then implementation |
+
+Writing the spec first was the right call and not only stylistically: it is what
+surfaced the genesis-collision finding below, which would otherwise have been
+discovered *after* a handshake was implemented and possibly shipped.
+
+## 12. The finding that mattered
+
+**`mainnet` and `mini` produce the identical genesis block.** I verified this by
+running both profiles rather than reasoning about it:
+
+```
+mainnet genesis: 2317ec84903140e2cd72be6f3c9dfd2ff36d9f8642293a5152279b4ad7a5196b
+mini    genesis: 2317ec84903140e2cd72be6f3c9dfd2ff36d9f8642293a5152279b4ad7a5196b
+identical: true
+```
+
+`genesis_block(difficulty)` (`block.rs:216`) takes only the difficulty, and both
+profiles set `genesis_difficulty = 1`. The genesis block has no other
+profile-dependent input.
+
+**Severity: latent, not live.** Nothing is broken today. There is no P2P layer,
+so nothing compares genesis hashes. The defect is that the *obvious* way to
+write network isolation — handshake, compare genesis hashes, as Bitcoin does —
+is silently wrong here, and it fails at exactly the moment someone implements it.
+
+No state corruption would follow either. A cross-network block fails §9.1 rule 4
+(wrong difficulty for the receiving chain), so the honest outcome is rejection.
+The damage is bandwidth waste and, worse, a node that cannot be *trusted* to
+reject a foreign peer at all.
+
+**Resolution in the spec:** each profile must declare a distinct `network_magic`
+(4 bytes) and `network_id` (string), compared during handshake. The real fix —
+deriving the genesis coinbase `extra_nonce` from `network_id`, which would make
+the hash discriminating — is recorded in §13.3 as a **consensus-breaking genesis
+change** and explicitly out of scope for a networking release.
+
+This is the second time in this repository that a "the obvious approach is wrong
+here" property has turned up, after the difficulty retarget, where the textbook
+formula (`avg_solve / T`) had no restoring force and was scale-invariant. Both
+were invisible until something was measured rather than assumed. I checked this
+one empirically instead of assuming the analogy held.
+
+## 13. Second finding: quadratic fork choice, DoS-shaped
+
+`best_candidate` (`chain.rs:486`) iterates every stored block and calls
+`cumulative_work` on each, which walks the parent chain to genesis
+(`chain.rs:143`). One `submit` is therefore **O(stored²)**. Side branches are
+also retained indefinitely, so `stored` only grows.
+
+Also latent: a single node never accumulates enough blocks to feel this. Once
+relay exists, a peer submitting blocks converts it into a cheap CPU amplifier —
+no expensive work required, since PoW is already validated by then.
+
+**Recorded in §13.10 as blocking, ahead of the wire format:**
+1. compute cumulative work incrementally at insert (`parent_work + difficulty`) —
+   identical value, no consensus change, since it sums the same path;
+2. prune side branches beyond `finality_depth` + orphan pool.
+
+Item 1 alone does not help if item 2 is skipped: `stored` still grows without
+bound. Both are marked MUST.
+
+## 14. What §13 specifies
+
+Thirteen subsections. The load-bearing decisions, and why each one:
+
+- **§13.1 — no `Arc<Mutex<Chain>>`.** `submit`, `adopt` and `mine_block` all take
+  `&mut self`, and `mine_block` is an unbounded CPU loop. A lock held across it
+  stalls every peer thread for the length of a block. One chain thread owns the
+  `Chain`; peer threads only frame and bounds-check. This is the constraint that
+  decided the concurrency question, established by reading the signatures
+  rather than by preference.
+- **§13.2 — `payload_len` bounded before allocation.** Same bug class as the
+  bundle-length and input-count defects already fixed in §3.1/§3.5. Called out as
+  the most important single bound in the section, because the length prefix is
+  attacker-controlled.
+- **§13.3 — network magic**, above.
+- **§13.4 — handshake proves socket possession, nothing more.** The `nonce` echo
+  stops a replayed handshake. Explicitly **not** identity or authentication; there
+  are no node keys in v0.2, so peer reputation is per-connection and lost on
+  reconnect. Stated as a limitation rather than presented as authentication.
+- **§13.6 — no discovery protocol.** Address book only. The reasoning is recorded:
+  gossiping addresses from peers we cannot authenticate lets one hostile node
+  hand us its own connections forever. `ADDR` is specced but MUST NOT populate
+  the address book in v0.2.
+- **§13.7 — block-first sync, not headers-first.** Justified rather than assumed:
+  a block's validity depends on tip history and undo records, so a header-only
+  chain buys nothing for a node that validates every block anyway.
+- **§13.9 — invalid block is +10, not a ban.** Honest peers collide during reorg
+  races; banning there disconnects honest peers exactly when the network is
+  busiest. Reaching a *threshold* is what bans. This inverts the reflexive
+  "misbehaviour = instant ban" response and I think it is the least obvious call
+  in the section.
+- **§13.11 — seven invariants**, each phrased as a test. The one that matters
+  most: a block accepted via P2P must be byte-identical to the same block
+  accepted locally.
+
+## 15. Mistakes I made in this session
+
+Recorded because both were caught by re-reading rather than by a test.
+
+**A contradictory diagram.** My first architecture diagram had a separate
+"mining thread" column, directly contradicting the paragraph immediately below it
+that said mining shares the chain thread. Also used `select!` syntax — tokio —
+in a spec whose concurrency decision was `std::net` + threads. Both would have
+read as specifications of two different designs. Caught on re-read; fixed.
+
+**A stale cross-reference.** §13.0 pointed at §13.10 for mempool requirements.
+§13.10 is the performance section; mempool is §13.13. Verified all ten §13.x
+cross-references resolve to existing headings before finishing.
+
+## 16. Judgement calls worth challenging
+
+Recorded so they can be overruled rather than inherited:
+
+- **Transaction relay left unspecced.** A mempool needs conflict sets, RBF, fee
+  estimation and post-reorg re-validation. Writing those rules before any
+  implementation existed seemed more likely to constrain the design wrongly than
+  to help. Deferred to §13.13 instead of guessed.
+- **`handshake_timeout = 20 s` and ban decay of `1`/hour are arbitrary.** Unlike
+  `max_frame_bytes` (which follows from `max_block_bytes`), these do not derive
+  from any protocol constant. They are defensible defaults, not derived values,
+  and the spec does not pretend otherwise.
+- **Mining on the chain thread stalls block processing** for the length of a
+  block on mainnet. Acceptable now (no mempool to go stale) and named as the
+  reason a future mempool must split the two.
+- **`docs/status.md` and `README.md` not yet updated** to reflect §13 existing.
+  They still describe P2P as wholly absent, which is now only half true: specced,
+  still unimplemented.
+
+## 17. Next steps, in order
+
+1. Fix §13.10 item 1 (incremental work). Item 2 (pruning) is bundled with the
+   persistence rewrite: pruning below `finality_depth` changes which side forks
+   a node retains-and-counts, which is the exact finality-wedge behaviour session
+   1 deliberately left unresolved, so it must be a conscious decision, not a
+   mechanical refactor.
+2. Persistence rewrite: `Store::save_chain` rewrites every block per mined block
+3. `jnt-net` crate: framing, handshake, bounds (§13.2/§13.4/§13.5/§13.8) — see §18
+4. Sync loop over `validate_standalone` + `submit` — §13.7
+5. Red-team suite in the existing attack-first style, plus the §13.11 invariants
+6. Update `docs/status.md` and `README.md` for §13
+
+`memory.md` §10 already noted that the existing red-team tests should eventually
+be driven over a real socket; step 5 is that work, and the same tests apply.
+
+---
+
+## Unrelated, noticed but not touched
+
+**`chain.rs:5` module doc is stale.** It still describes the fork-choice
+tie-break as "first-seen order" — the arrival-counter bug fixed in session 1. The
+code is correct (`fork_choice_key` uses `(work, lower height, lowest hash)`), only
+the doc comment is wrong. Left alone as out of scope, but it is a comment that
+actively misdescribes a consensus rule, which is worse than no comment.
+
+---
+
+# Working memory — session 3: scaffolding `jnt-net`
+
+**Date:** 2026-10-05
+**Branch:** `main`, clean at start. `SPEC.md` and `params.rs` carry session 2's
+changes; this session builds the first implementation slice from §13.
+**Scope:** `jnt-core` perf fix + the `jnt-net` crate foundation — framing, wire
+codec, network identity.
+**Outcome:** `jnt-core` O(N²) fork choice removed. `jnt-net` crate created with
+frame codec + message codec + identity checks, 10 passing tests + doctests.
+Nothing committed. `cargo test --workspace`: 139 core + 10 net pass.
+
+---
+
+## 18. What this session did
+
+### 18.1 `jnt-core` — incremental cumulative work (§13.10 item 1, blocking)
+
+`best_candidate` (`chain.rs:486`) called `cumulative_work` per stored block, and
+`cumulative_work` walked the parent chain to genesis (`chain.rs:143`). One `submit`
+was therefore O(stored²), and side branches were retained forever — a peer could
+turn this into a quadratic CPU amplifier.
+
+Change: `Chain` gained a `work: HashMap<Hash, u128>` field, populated once at
+insert:
+
+- genesis in `Chain::new`: `work.insert(hash, genesis.header.difficulty)`
+- `submit_at`: before reselect, `work.insert(hash, parent_work.saturating_add(difficulty))`
+- failure path (non-finality) removes from `work` alongside `blocks`
+
+`cumulative_work` is now an O(1) lookup with a defensive walk fallback (debug-assert
+on miss). Fork choice is O(stored) total, O(1) per block. Value is identical — it
+is the same sum along the same path, computed earlier — so no consensus outcome
+changes. `Snapshot`/`restore` are untouched, because `adopt` never mutates `blocks`
+or `work` (only canon/utxo/undo), and those maps are only written at insert and the
+one failure-path removal.
+
+Added `params.rs` test `genesis_hash_is_identical_across_profiles` to pin the
+property that motivated §13.3. The whole core suite (130 unit + 9 red-team) stays
+green.
+
+### 18.2 `jnt-core` — `u16le` on `Writer`
+
+`Reader` already had `u16le`; `Writer` did not, even though counts in §13 are
+2-byte LE and the existing codebase otherwise uses `u32`/`u64`/`u128` writers. Added
+`Writer::u16le` mirroring `u32le` exactly; covered by a round-trip test in
+`frame.rs`. Closes an existing asymmetry, no behavioral risk.
+
+### 18.3 `jnt-core` — `network_magic` / `network_id` on `NetworkParams`
+
+Added two fields (§13.3) carrying the per-profile identity. `mainnet` uses
+`[0x6A,0x4E,0x54,0x01]` / `"jounit/mainnet"`; `mini` uses `0x02` / `"jounit/mini"`.
+`validate()` rejects zero magic and empty id. Added
+`network_magic_is_distinct_and_nonzero` asserting the two profiles differ in both.
+
+This is the concrete reason the genesis-collision finding is safe: isolation no
+longer depends on anything that is identical across profiles.
+
+### 18.4 New crate `crates/jnt-net`
+
+Created `crates/jnt-net` + workspace member. Depends only on `jnt-core`; std-only.
+Modules shipped:
+
+| File | Lines | Contents |
+|---|---|---|
+| `lib.rs` | ~25 | crate doc + re-exports |
+| `error.rs` | ~95 | `NetError` — network failures only, never `jnt_core::Error` |
+| `magic.rs` | ~55 | `check_network`: magic + network_id rejection of cross-network peers |
+| `frame.rs` | ~175 | `write_frame`/`read_frame`: magic checked per-frame, `payload_len` bounded before allocation |
+| `msg.rs` | ~340 | `Message` enum + encode/decode for all 9 types, `Version`/`InvEntry`/`SocketAddr` |
+
+Still stubs: `peer.rs`, `syncer.rs`, `net.rs`.
+
+### 18.5 The codec bug the tests caught
+
+`Message::Version` encode wrote fields in spec order (magic, id, protocol, ...,
+user_agent, nonce) but `decode_version` read `user_agent` *before* protocol_version
+— a field-order mismatch the version round-trip test surfaced immediately. Fixed
+decode to match encode. This is exactly why the spec says "where the wire format is
+ambiguous, every implementation will disagree and the disagreement looks like a
+consensus split": two independent encoders of these rules would silently
+desync. Catching it now on a unit test is the point.
+
+This also validated the discipline of writing codec tests before the socket layer:
+the transport is where a byte-order bug becomes a heisenbug against a live peer.
+
+---
+
+## 19. Findings from this session
+
+| # | Finding | Severity | Live? | Resolved |
+|---|---|---|---|---|
+| 1 | `best_candidate` O(stored²); side branches never pruned | High (DoS, only under P2P) | No — single node, never many stored blocks | Yes — incremental work; pruning deferred to §20.1 |
+| 2 | `mainnet`/`mini` genesis hash identical | High (network isolation) | No — no handshake yet | Yes — `network_magic`/`network_id` in handshake & framing |
+| 3 | `chain.rs:5` doc still says "first-seen order" | Trivial (stale comment) | N/A | No — noted, out of scope |
+
+**Finding 1 is worth being precise about.** The quadratic cost is real, but its
+exploitation needs a peer to submit many blocks, so it is purely a P2P-era
+defect. The fix lands the moment peers exist. Pruning (the companion half) is
+genuinely a design decision because it touches the finality wedge (see §20).
+
+---
+
+## 20. Decisions deferred, and why
+
+**20.1 Pruning is bundled with the finality wedge — not done yet.**
+`adopt()` snapshots the whole UTXO set (session 1 §10 item 1, "SHOULD"), and a
+heavier branch forking below `finality_depth` is retained and its work counted —
+session 1 §8 explicitly *decided not to change that*. Pruning below the finality
+boundary *would* resolve the wedge (the node forgets the dead branch and can accept
+honest blocks again), which means pruning is not a mechanical perf fix; it is the
+consensus question session 1 left open. So pruning + persistence are bundled and
+deliberately sequenced after the network crate can be exercised.
+
+**20.2 Persistence is deferred for the `serve` path.** The current `Store`
+rewrites `blocks.json` on every block. A live node that accepts relayed blocks
+cannot do an O(n) rewrite per block. Plan: `serve` runs in-memory (no per-block
+JSON rewrite), and `blocks.log` (append-only) + a UTXO snapshot lands in step 2 so
+restart doesn't replay genesis. Not a correctness issue, only a scalability one,
+which is why it is behind the `serve` command rather than blocking the crate.
+
+**20.3 Transaction relay, peer identity, and discovery** are all in SPEC.md §13.13
+as deliberately unspecified. No mempool exists in `jnt-core` today, so there is
+nothing to gossip; inventing that policy now would constrain the real design
+backwards.
+
+---
+
+## 21. Verification done
+
+- `cargo test --workspace`: 139 (core) + 10 (net) pass.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean (the whole
+  workspace, including the new crate).
+- `cargo fmt --all --check`: clean.
+- `cargo test -p jnt-net --doc`: clean (after marking wire-diagram doc blocks
+  `text` so the `‖` symbols aren't parsed as Rust).
+- The genesis-collision property is now an executable assertion
+  (`params.rs::genesis_hash_is_identical_across_profiles`), so the
+  "obvious approach is wrong" trap is guarded against regression.
+
+## 22. Next steps achieved (Session 4)
+
+All 7 items from §22 were completed, plus the 5 protocol mechanisms:
+1. `jnt-net`: peer lifecycle (`peer.rs`), thread-per-connection, frame codec.
+2. `jnt-net`: handshake state machine with mutual version exchange and magic verification.
+3. `jnt-net`: locator-based sync loop (`syncer.rs`), orphan block pool bounded at 512 entries.
+4. `jnt-node serve`: run loop owning the `Chain`, wired to `P2pNode`.
+5. Loopback integration tests (`crates/jnt-net/tests/integration.rs`):
+   - Two nodes converge regardless of arrival order (§13.11 inv 2)
+   - Cross-network handshake rejected at connect (§13.11 inv 4)
+   - Replayed blocks byte-identical to locally mined blocks (§13.11 inv 1)
+   - Invalid blocks never enter store
+   - Locator generation and fork point recovery
+6. 5 Protocol Mechanisms implemented:
+   - M1: 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
+   - M2: Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault (`slash.rs`)
+   - M3: Hardware-Agnostic Canonical Compute IR (`compute_ir.rs`)
+   - M4: Memory-bound HBM scratchpad PoW puzzle (`hbm_pow.rs`)
+   - M5: Sovereign BLS aggregate finality gadget checkpoints (`bls_checkpoint.rs`)
+7. Verification status:
+   - `cargo test --workspace`: 207 tests pass (178 core unit, 9 core redteam, 10 net unit, 10 net integration)
+   - `cargo clippy --workspace --all-targets -- -D warnings`: 0 warnings
+   - `cargo fmt --all --check`: clean
+   - `python sim/verify_vectors.py --check`: clean (all 4 vector files verified)
+   - `python sim/puzzle_crosscheck.py`: clean (21 digests agree across 7 vectors)
+   - `docs/status.md` and `README.md` updated to reflect the operational P2P layer and M1-M5 mechanisms.

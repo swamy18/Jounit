@@ -1,0 +1,11 @@
+[package]
+name = "jnt-net"
+description = "Jounit peer-to-peer transport: framing, handshake, block relay over TCP (SPEC.md §13)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jnt-core.workspace = true

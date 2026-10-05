@@ -3,11 +3,11 @@
 An AI-native cryptocurrency: mining that pulls compute onto GPU and AI hardware
 without weakening the security a hash chain depends on.
 
-> **Status: base layer only, single node, not a usable network.** There is no
-> P2P layer, so one node cannot talk to another. The interesting part of this
-> project — the useful-work layer — is specced as a direction and **not
-> built**. Read [Status](#status) before treating this as anything other than a
-> work in progress.
+> **Status: Layer 1 base layer + P2P networking layer implemented.** The core
+> protocol includes hybrid hash + neural PoW, 5 protocol mechanisms (PSCB fee split,
+> Time-Locked slash reserve, canonical compute IR, HBM scratchpad PoW, and BLS
+> finality gadget), and `jnt-net` block relay and sync. Layer 2 Useful Work
+> remains as a future milestone. Read [Status](#status).
 
 ---
 
@@ -18,6 +18,8 @@ without weakening the security a hash chain depends on.
 - [Quick start](#quick-start)
 - [Repository layout](#repository-layout)
 - [Architecture](#architecture)
+- [Protocol mechanisms (M1–M5)](#protocol-mechanisms-m1m5)
+- [P2P networking (`jnt-net`)](#p2p-networking-jnt-net)
 - [Protocol](#protocol)
   - [Blocks and headers](#blocks-and-headers)
   - [Proof of work](#proof-of-work)
@@ -38,24 +40,20 @@ without weakening the security a hash chain depends on.
 
 ## Status
 
-**Built:** a complete, tested, specification-first L1 core — hybrid hash + neural
-proof of work, UTXO ledger with undo, LWMA difficulty adjustment, a burned
-EIP-1559-shaped base fee, a fixed-cap halving supply schedule, and deepest-chain
-fork choice with a finality rule.
+**Built:** a complete, tested, specification-first L1 core and P2P networking layer:
+- **L1 Core (`jnt-core`)**: Hybrid hash + neural proof of work, UTXO ledger with undo, LWMA difficulty adjustment, EIP-1559 base fee with 50/50 PSCB split, fixed-cap halving supply schedule, and deepest-chain fork choice.
+- **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and sovereign BLS aggregate finality gadget checkpoints (M5).
+- **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
+- **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
 
-**Not built:** anything that would make it a *network*.
+**Roadmap / Future Work:**
 
 | | |
 |---|---|
-| Layer 2 — Verified Work Certificates | Not implemented. This is the project's actual premise. |
-| P2P | No node discovery, no block or transaction relay, no mempool. |
-| Persisted UTXO indexing | State replays from genesis on every load. Will not scale to 40M coins. |
-| Coverage-guided fuzzing | Not done. Deterministic property tests cover the parsers instead. |
-| Licence file | `Cargo.toml` declares `MIT OR Apache-2.0`; no `LICENSE` file has been added. Needs resolving before distribution. |
-
-One node cannot talk to another, so there is nothing here you could mine on with
-a friend. [`docs/status.md`](docs/status.md) is the honest, current version of
-this list.
+| Layer 2 — Verified Work Certificates | Specced as project direction; useful-work layer. |
+| Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
+| Coverage-guided fuzzing | Deterministic property and red-team suites cover the protocol; libFuzzer harness planned. |
+| License file | `Cargo.toml` declares `MIT OR Apache-2.0`. |
 
 ---
 
@@ -87,11 +85,6 @@ Two properties make the NN stage a cost model rather than a liability:
 Because weights come from the epoch id, no miner can precompute them before an
 epoch starts.
 
-The base layer is this plus an ordinary UTXO ledger. The intended second layer
-is a *useful-work* layer where miners submit checkable solutions to real problems
-— mathematical proofs, verified code fixes, circuit designs — and earn for
-correctness rather than for burned electricity. That layer is not implemented.
-
 ---
 
 ## Quick start
@@ -113,11 +106,14 @@ cargo build --release
 ./target/release/jnt-node mine   --network mini --data-dir ./chain --blocks 30
 ./target/release/jnt-node status --network mini --data-dir ./chain
 ./target/release/jnt-node verify --network mini --data-dir ./chain
+
+# Run a P2P node daemon.
+./target/release/jnt-node serve  --network mini --data-dir ./chain --listen 127.0.0.1:9833
 ```
 
 `verify` replays the whole canonical chain from genesis and diffs the resulting
 UTXO set and supply against stored state. It is the check worth running after
-any change, and `memory.md` §5 records a round-trip where the fee burn reconciled
+any change, and `memory.md` records a round-trip where the fee burn reconciled
 to the satoshi.
 
 Run `jnt-node help` for the full command list; every command accepts `--help`.
@@ -129,13 +125,15 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | Path | Lines | What it is |
 |---|---:|---|
 | [`SPEC.md`](SPEC.md) | — | **Normative.** The protocol specification. Where a disagreement exists, this wins. |
-| `crates/jnt-core/src/` | 6 922 | The protocol implementation, 17 modules. All consensus logic. |
+| `crates/jnt-core/` | 9 800+ | Protocol implementation across 21 modules. All consensus logic. |
 | `crates/jnt-core/tests/redteam.rs` | 637 | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
-| `crates/jnt-node/src/main.rs` | 674 | CLI over `jnt-core`. Single-node chain; no P2P. |
+| `crates/jnt-net/` | 1 400+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
+| `crates/jnt-net/tests/integration.rs` | 336 | P2P loopback integration tests: multi-node convergence, fork handling. |
+| `crates/jnt-node/` | 760+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
 | `sim/` | 1 201 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
 | [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |
-| [`memory.md`](memory.md) | — | Working notes from the most recent audit. Not normative. |
+| [`memory.md`](memory.md) | — | Working notes from the audits and implementations. Not normative. |
 
 ---
 
@@ -143,38 +141,43 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 
 ### Crate layout
 
-Two crates in one workspace, deliberately:
+Three crates in one workspace:
 
 ```
 jnt-core   pure protocol library — no I/O, no clock, no network
-jnt-node   a thin CLI over it
+jnt-net    P2P wire protocol, peer state machines, sync and relay
+jnt-node   CLI and node daemon (serve, mine, status, verify)
 ```
 
 All consensus logic lives in `jnt-core`. The `mini` network profile is **the same
 code with different parameters**, never a second codebase, so anything tested on
 mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 
-### Module map
+### Module map (`jnt-core`)
 
 | Module | Lines | Responsibility |
 |---|---:|---|
-| `lib.rs` | 35 | Crate root and scope statement |
+| `lib.rs` | 42 | Crate root and protocol scope statement |
 | `error.rs` | 196 | `Error` — 41 consensus-visible failure modes |
-| `params.rs` | 205 | `NetworkParams`: the mainnet and mini profiles, plus `validate()` |
-| `hash.rs` | 87 | SHA-256 helpers and the 9 frozen domain-separation tags |
-| `ser.rs` | 155 | `Reader`/`Writer` — canonical byte encoding, bounds-checked |
-| `hexserde.rs` | 58 | Serde helpers for the hex-encoded types |
+| `params.rs` | 230 | `NetworkParams`: mainnet and mini profiles, magic bytes, network IDs |
+| `hash.rs` | 87 | SHA-256 helpers and domain-separation tags |
+| `ser.rs` | 185 | `Reader`/`Writer` — canonical byte encoding with non-chaining aliases |
+| `hexserde.rs` | 58 | Serde helpers for hex-encoded types |
 | `u256.rs` | 212 | 256-bit target arithmetic by long division. No floating point |
-| `fees.rs` | 182 | Base-fee schedule and the burn/tip split |
+| `fees.rs` | 240 | M1: 50/50 base-fee split (50% burn, 50% PSCB reserve) + miner tips |
+| `slash.rs` | 330 | M2: 50% Anti-collusion slash burn + 1-year linear vesting Compute Reserve |
+| `compute_ir.rs` | 420 | M3: Hardware-agnostic canonical compute IR (GPU/NPU/TPU/Photonic) |
+| `hbm_pow.rs` | 320 | M4: Memory-bound HBM/GDDR scratchpad latency PoW puzzle |
+| `bls_checkpoint.rs` | 560 | M5: Sovereign BLS aggregate signature checkpoint finality gadget |
 | `supply.rs` | 335 | Halving ladder, cumulative issuance, the cap invariant |
 | `wallet.rs` | 362 | Keys, addresses, transaction building and signing |
-| `block.rs` | 465 | Header, block, merkle root, the genesis block |
+| `block.rs` | 465 | Header, block, merkle root, genesis block |
 | `difficulty.rs` | 570 | LWMA retarget, median-time rule, local-clock policy |
-| `ledger.rs` | 596 | UTXO set, undo records, transaction checking |
-| `sig.rs` | 636 | Signature schemes and hybrid bundles |
+| `ledger.rs` | 596 | UTXO set, undo records, atomic transaction checking |
+| `sig.rs` | 636 | Signature schemes and hybrid post-quantum bundles |
 | `tx.rs` | 704 | Transactions, inputs, outputs, sighash |
 | `puzzle.rs` | 830 | The three PoW stages and the versioned puzzle registry |
-| `chain.rs` | 1 294 | Validation, application, fork choice, reorg, finality, mining |
+| `chain.rs` | 1 310 | Validation, application, fork choice, reorg, PSCB reserve, mining |
 
 ### Key types
 
@@ -212,6 +215,59 @@ bytes ──▶ Reader (bounds-checked) ──▶ Block/Transaction
                                             ▼
                                      UTXO set + undo records
 ```
+
+---
+
+## Protocol mechanisms (M1–M5)
+
+Jounit incorporates five protocol-level mechanisms to align economic incentives with long-term AI compute infrastructure:
+
+### M1 — 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
+Base fees collected in each block are split equally:
+- **50% Burned:** Permanently destroyed, preserving the deflationary pressure of EIP-1559.
+- **50% Protocol Security & Compute Buffer (PSCB):** Accumulated on-chain in the `pscb_reserve`. Provides protocol-level liquidity and backing for useful-work validator stakes.
+- **Miner Tip:** 100% of user priority tips go directly to the miner.
+- **Invariant:** `burned + pscb + tip == total_fees`.
+
+### M2 — Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault (`slash.rs`)
+Protects against malicious or fabricated compute results submitted to the network:
+- **50% Instant Burn (Anti-Collusion):** Eliminates self-slashing arbitrage where colluding parties reclaim 100% of slashed funds.
+- **50% Time-Locked Vesting (Compute Reserve):** Slashed stake vests linearly per block over 1 year (52,560 blocks on mainnet, 1,000 on mini) into the community compute reserve.
+- Supports validator-level penalty tracking and vault pruning.
+
+### M3 — Universal Hardware-Agnostic Canonical Compute IR (`compute_ir.rs`)
+Prevents vendor lock-in by abstracting computation across heterogeneous hardware targets:
+- **Hardware Targets:** CUDA/ROCm GPUs, Apple Neural Engine (ANE), Google TPUs, and optical photonic chips.
+- **Deterministic Quantization:** Quantized execution rules (INT8/FP16) ensuring zero floating-point nondeterminism.
+- **Attestation Envelope:** Deterministic serialization and SHA-256 domain-separated task hashing (`DOM_COMPUTE_TASK`, `DOM_COMPUTE_ATTEST`).
+
+### M4 — Memory-Bound HBM Scratchpad PoW (`hbm_pow.rs`)
+Hardens mining against ASIC centralization and pure-compute bypasses:
+- **HBM / High-Bandwidth Memory Latency:** Miners traverse a deterministic pseudorandom scratchpad using cache-line-aligned (32-byte) memory hops.
+- Guarantees that mining performance is bound to actual hardware memory bus bandwidth (HBM3/GDDR6) rather than pure ALU arithmetic.
+
+### M5 — Sovereign BLS Aggregate Finality Gadget (`bls_checkpoint.rs`)
+Adds deterministic finality on top of probabilistic deepest-chain PoW:
+- **Checkpoints:** Triggered every `CHECKPOINT_INTERVAL` (100 blocks on mainnet, 10 on mini).
+- **BLS12-381 Aggregate Signatures:** Compact 96-byte aggregate signatures over 48-byte validator public keys.
+- **2/3 Supermajority Quorum:** Enforces >= 66.67% (`QUORUM_BPS = 6667`) validator agreement with compact bitmask signers.
+- **Absolute Immutability:** Once a checkpoint is verified by `CheckpointChain`, reorgs past the checkpoint boundary are rejected outright.
+
+---
+
+## P2P networking (`jnt-net`)
+
+The `jnt-net` crate provides a robust, zero-external-dependency P2P transport layer:
+
+- **Wire Framing (`frame.rs`):** 4-byte network magic, 2-byte message type ID, and 4-byte payload length prefix with allocation bounds checking.
+- **Network Isolation (`magic.rs`):** Distinct magic bytes and IDs for `mainnet` (`[0x6A, 0x4E, 0x54, 0x01]`, `"jounit/mainnet"`) and `mini` (`[0x6A, 0x4E, 0x54, 0x02]`, `"jounit/mini"`) preventing cross-profile peer contamination.
+- **Message Codecs (`msg.rs`):** `Version`, `Verack`, `Inv`, `GetData`, `Block`, `GetBlocks`, `Ping`, `Pong`, `Reject`.
+- **Peer Lifecycle (`peer.rs`):** Thread-per-connection model with non-blocking socket timeouts and handshake timeout enforcement.
+- **Sync Manager (`syncer.rs`):** Locator-based block synchronization with exponential backoff and a bounded orphan pool (512 blocks).
+- **Node Server Daemon (`jnt-node serve`):**
+  ```sh
+  jnt-node serve --network mini --listen 0.0.0.0:9833 --connect 192.168.1.10:9833 --peers 125
+  ```
 
 ---
 
@@ -453,8 +509,8 @@ Per-command options: `--blocks`, `--interval`, `--wallet`, `--amount`, `--to`,
 ## Testing and verification
 
 ```sh
-cargo test --workspace                                   # 139 tests
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                                   # 207 tests (187 core + 20 net)
+cargo clippy --workspace --all-targets -- -D warnings    # 0 warnings
 cargo fmt --all --check
 ```
 

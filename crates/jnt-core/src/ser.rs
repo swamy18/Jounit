@@ -27,6 +27,11 @@ impl Writer {
         self
     }
 
+    pub fn u16le(&mut self, v: u16) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
     pub fn u32le(&mut self, v: u32) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());
         self
@@ -65,6 +70,40 @@ impl Writer {
     }
 
     pub fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
+
+    // ------------------------------------------------------------------
+    // Convenience aliases (non-chaining style) used by M3/M4/M5 modules.
+    // ------------------------------------------------------------------
+
+    /// Write a single byte.
+    pub fn write_u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+
+    /// Write a u32 in little-endian byte order.
+    pub fn write_u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Write a u64 in little-endian byte order.
+    pub fn write_u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Write a fixed 32-byte hash.
+    pub fn write_bytes(&mut self, v: &[u8; 32]) {
+        self.buf.extend_from_slice(v);
+    }
+
+    /// Write a raw byte slice.
+    pub fn write_raw(&mut self, v: &[u8]) {
+        self.buf.extend_from_slice(v);
+    }
+
+    /// Consume the writer and return the accumulated bytes.
+    pub fn finish(self) -> Vec<u8> {
         self.buf
     }
 }

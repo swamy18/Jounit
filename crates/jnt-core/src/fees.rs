@@ -1,9 +1,10 @@
-//! EIP-1559-shaped base fee that is burned rather than minted.
-//! SPEC.md §8.
+//! EIP-1559-shaped base fee: 50% burned, 50% routed to PSCB (Protocol Security
+//! & Compute Buffer). SPEC.md §8, M1 protocol mechanism.
 //!
-//! Design doc Sections 24.3 and 28.1: base fees are burned, only tips reach the
-//! miner, and no new supply comes from usage — so the hard cap can never be
-//! crossed by demand.
+//! Design doc Sections 24.3 and 28.1: base fees are the deflationary lever AND
+//! the on-protocol reserve that backs slashed compute stake recovery (M2). The
+//! 50% burn maintains supply pressure; the 50% PSCB accrual funds the Time-Locked
+//! Compute Reserve vault without touching the hard cap.
 
 use crate::error::{Error, Result};
 use crate::params::NetworkParams;
@@ -39,29 +40,50 @@ pub fn exceeds_base_fee(base_fee: u64, fee: u64, gas_used: u64) -> bool {
     fee < required_fee(base_fee, gas_used)
 }
 
-/// Split a block's fees into the part that is burned and the tip the miner keeps.
+/// Split a block's fees into burned, PSCB reserve, and miner tip.
+///
+/// M1 protocol mechanism (50/50 PSCB split):
+/// - `burned`  = 50% of the base-fee portion — permanently destroyed, no
+///   reissue possible. Provides EIP-1559 deflationary pressure.
+/// - `pscb`    = 50% of the base-fee portion — routed to the on-chain
+///   Protocol Security & Compute Buffer reserve. Funds slashed
+///   compute stake recovery (M2 Time-Locked Compute Reserve).
+/// - `tip`     = everything above the full base-fee obligation — goes to the
+///   miner, unchanged from EIP-1559 spec.
+///
+/// Invariant: burned + pscb + tip == total_fees.
 pub fn split_fees(total_gas: u64, total_fees: u64, base_fee: u64) -> Result<FeeSplit> {
-    let burned = base_fee.saturating_mul(total_gas);
-    if burned > total_fees {
+    let full_base = base_fee.saturating_mul(total_gas);
+    if full_base > total_fees {
         return Err(Error::BadFee("fees below required base fee"));
     }
+    // 50% burn, 50% PSCB. Integer arithmetic: burn gets the odd satoshi so
+    // burned + pscb == full_base exactly.
+    let pscb = full_base / 2;
+    let burned = full_base - pscb; // == ceil(full_base / 2)
+    let tip = total_fees - full_base;
     Ok(FeeSplit {
         total_fees,
         burned,
-        tip: total_fees - burned,
+        pscb,
+        tip,
     })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeeSplit {
     pub total_fees: u64,
-    /// Removed from the UTXO set and never reissued.
+    /// Permanently removed from the UTXO set and never reissued (50% of base fee).
     pub burned: u64,
+    /// Routed to the Protocol Security & Compute Buffer reserve (50% of base fee).
+    /// Funds the M2 Time-Locked Compute Reserve vault.
+    pub pscb: u64,
     /// Paid to the miner alongside the block reward.
     pub tip: u64,
 }
 
-/// Coinbase reward + tip. Base fees are *not* here — they are burned.
+/// Coinbase reward + tip. Burned and PSCB amounts are *not* here — they are
+/// handled separately by the chain state machine.
 pub fn coinbase_value(reward_sat: u64, split: &FeeSplit) -> u64 {
     reward_sat.saturating_add(split.tip)
 }
@@ -138,14 +160,49 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // M1: 50/50 PSCB split invariants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_m1_fifty_fifty_burn_and_pscb() {
+        let base_fee = 1_000u64;
+        let gas = tx(1, 2).gas_used();
+        let tip_extra = 500u64;
+        let total_fees = base_fee * gas + tip_extra;
+        let split = split_fees(gas, total_fees, base_fee).unwrap();
+
+        let full_base = base_fee * gas;
+        assert_eq!(split.pscb, full_base / 2, "PSCB = 50% of base fee");
+        // burned gets the odd satoshi on uneven amounts
+        assert_eq!(
+            split.burned,
+            full_base - split.pscb,
+            "burned = ceil(50%) of base fee"
+        );
+        assert_eq!(split.tip, tip_extra, "tip is unchanged");
+        // Invariant: components sum to total_fees
+        assert_eq!(
+            split.burned + split.pscb + split.tip,
+            split.total_fees,
+            "burned + pscb + tip must equal total_fees"
+        );
+    }
+
     #[test]
     fn split_burns_the_base_fee_and_keeps_the_tip() {
         let base_fee = 1_000u64;
         let gas = tx(1, 2).gas_used();
         let split = split_fees(gas, base_fee * gas + 500, base_fee).unwrap();
-        assert_eq!(split.burned, base_fee * gas);
+        let full_base = base_fee * gas;
+        // Under M1: burned is 50%, pscb is 50%
+        assert_eq!(
+            split.burned + split.pscb,
+            full_base,
+            "total base fee preserved"
+        );
         assert_eq!(split.tip, 500);
-        assert_eq!(split.total_fees, split.burned + split.tip);
+        assert_eq!(split.total_fees, split.burned + split.pscb + split.tip);
     }
 
     #[test]
@@ -168,7 +225,8 @@ mod tests {
     fn coinbase_gets_reward_plus_tip_only() {
         let split = FeeSplit {
             total_fees: 1_000,
-            burned: 900,
+            burned: 450,
+            pscb: 450,
             tip: 100,
         };
         let claim = coinbase_value(76 * 100_000_000, &split);
@@ -176,7 +234,18 @@ mod tests {
         assert_eq!(claim - 76 * 100_000_000, split.tip);
         assert!(
             split.tip < split.total_fees,
-            "the burned base fee must never reach the miner"
+            "the burned + pscb base fee must never reach the miner"
+        );
+    }
+
+    #[test]
+    fn pscb_is_nonzero_when_fees_are_paid() {
+        let gas = tx(1, 1).gas_used();
+        let base_fee = 2_000u64;
+        let split = split_fees(gas, base_fee * gas + 1, base_fee).unwrap();
+        assert!(
+            split.pscb > 0,
+            "PSCB must receive funds whenever fees are paid"
         );
     }
 }

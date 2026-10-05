@@ -31,6 +31,8 @@ use jnt_core::params::{NetworkParams, SAT_PER_JNT};
 use jnt_core::supply::{block_reward_sat, cumulative_supply_sat, halvings, max_issuance_sat};
 use jnt_core::tx::{OutPoint, Output};
 use jnt_core::wallet::Wallet;
+use jnt_net::net::{P2pConfig, P2pNode};
+use jnt_net::syncer::SyncManager;
 
 const USAGE: &str = "\
 jnt-node - Jounit base-layer node
@@ -48,11 +50,17 @@ COMMANDS:
   balance   List the unspent outputs of an address
   wallet    Create or list wallets
   export    Write the canonical chain to JSON
+  serve     Run a P2P node (block relay, multi-peer sync)
   help      This text
 
 COMMON OPTIONS:
   --network <mainnet|mini>   Default: mini
   --data-dir <path>          Default: ./chain
+
+SERVE OPTIONS:
+  --listen <host:port>       TCP address to accept inbound peers (optional)
+  --connect <host:port>      Dial an outbound peer (repeatable via CSV)
+  --peers <n>                Max total peers (default: 125)
 ";
 
 fn main() -> ExitCode {
@@ -110,6 +118,9 @@ impl Args {
                         | "from"
                         | "interval"
                         | "fee"
+                        | "listen"
+                        | "connect"
+                        | "peers"
                 );
                 if takes_value {
                     let value = raw
@@ -292,6 +303,7 @@ fn run(raw: &[String]) -> Result<(), String> {
         "balance" => cmd_balance(&args),
         "wallet" => cmd_wallet(&args),
         "export" => cmd_export(&args),
+        "serve" => cmd_serve(&args),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     }
 }
@@ -671,4 +683,82 @@ fn cmd_export(args: &Args) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     println!("wrote {} block(s) to {}", blocks.len(), out.display());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// serve — P2P node run loop (§13.1 chain-thread model)
+// ---------------------------------------------------------------------------
+
+fn cmd_serve(args: &Args) -> Result<(), String> {
+    let store = Store::open(args)?;
+    let mut chain = store.load_chain()?;
+    let wallets = store.load_wallets()?;
+
+    let listen_addr: Option<std::net::SocketAddr> = args
+        .str("listen")
+        .map(|s| s.parse().map_err(|e| format!("--listen: {e}")))
+        .transpose()?;
+
+    let connect_peers: Vec<std::net::SocketAddr> = args
+        .str("connect")
+        .map(|s| {
+            s.split(',')
+                .map(|a| {
+                    a.trim()
+                        .parse()
+                        .map_err(|e| format!("--connect `{a}`: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let max_peers = args.num("peers", 125)? as usize;
+    let mut config = P2pConfig::new(store.params.clone(), listen_addr);
+    config.max_peers = max_peers;
+
+    let node =
+        P2pNode::start(config, chain.height(), chain.tip_hash()).map_err(|e| e.to_string())?;
+
+    let mut syncer = SyncManager::new();
+
+    println!("network        {}", store.params.name);
+    println!("height         {}", chain.height());
+    println!("tip            {}", hash_to_hex(&chain.tip_hash()));
+    if let Some(addr) = listen_addr {
+        println!("listening      {addr}");
+    }
+
+    // Dial configured outbound peers
+    for addr in &connect_peers {
+        match node.connect(*addr, &chain) {
+            Ok(id) => println!("connected peer {id} -> {addr}"),
+            Err(e) => eprintln!("warn: connect {addr}: {e}"),
+        }
+    }
+
+    // Pick miner address if a wallet exists
+    let miner_addr = wallets.first().and_then(|w| w.address().ok());
+
+    println!("press Ctrl-C to stop");
+
+    // Chain thread: mine + relay loop
+    loop {
+        // Mine one block if we have a miner wallet
+        if let Some(addr) = miner_addr {
+            if let Ok(block) = chain.mine_block(addr, vec![], now_ms()) {
+                let hash = block.block_hash();
+                let height = block.header.height;
+                if chain.submit(block).is_ok() {
+                    store.save_chain(&chain).ok();
+                    store.write_meta(&chain).ok();
+                    println!("mined height {height}  {}", &hash_to_hex(&hash)[..16]);
+                    node.broadcast_block(hash, None);
+                }
+            }
+        }
+
+        // Drain inbound P2P events and apply to chain
+        node.poll_events(&mut chain, &mut syncer, Some(now_ms()));
+    }
 }

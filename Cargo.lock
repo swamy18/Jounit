@@ -198,11 +198,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jnt-net"
+version = "0.1.0"
+dependencies = [
+ "jnt-core",
+]
+
+[[package]]
 name = "jnt-node"
 version = "0.1.0"
 dependencies = [
  "hex",
  "jnt-core",
+ "jnt-net",
+ "rand",
  "serde",
  "serde_json",
 ]

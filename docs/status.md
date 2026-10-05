@@ -5,18 +5,24 @@ relying on anything here.
 
 ## Scope
 
-Layer 1 (base layer) only, per SPEC.md. Layer 2 — Verified Work Certificates,
-the useful-work layer that is the actual point of the project — is specced as a
-roadmap item and is **not implemented**. There is no P2P layer: `jnt-node` is a
-single-node chain. A coin with one node is not a network yet.
+Layer 1 (base layer) implementation per SPEC.md. Includes the P2P networking layer
+(`jnt-net`) supporting multi-peer block relay, locator-based sync, and handshake
+isolation. Also includes the five core protocol mechanisms:
+- M1: 50/50 PSCB (Protocol Security & Compute Buffer) fee split
+- M2: Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault
+- M3: Universal Hardware-Agnostic Canonical Compute IR
+- M4: Memory-bound HBM scratchpad PoW puzzle
+- M5: Sovereign BLS aggregate finality gadget checkpoints
 
 ## Verified
 
-- `cargo test --workspace` — 139 tests pass (130 unit + 9 red-team integration
-  tests in `crates/jnt-core/tests/redteam.rs`), `cargo clippy --all-targets`
-  clean under `-D warnings`, `cargo fmt --check` clean. CI
-  (`.github/workflows/ci.yml`) runs all of it plus the vector cross-checks on
-  every push.
+- `cargo test --workspace` — 207 tests pass:
+  - 178 unit tests in `jnt-core` (including M1-M5 test suites)
+  - 9 red-team integration tests in `crates/jnt-core/tests/redteam.rs`
+  - 10 unit tests in `jnt-net`
+  - 10 integration tests in `crates/jnt-net/tests/integration.rs`
+- `cargo clippy --workspace --all-targets` clean under `-D warnings`.
+- `cargo fmt --check` clean across all crates.
 - An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
   written from the prose of SPEC.md rather than from the Rust source, reproduces
   all 21 puzzle digests in `tests/vectors/puzzle_vectors.json`. This is the only

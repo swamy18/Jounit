@@ -1,10 +1,10 @@
 # JOUNIT PROTOCOL SPECIFICATION
 
-**Version:** 0.1 (foundation)
-**Status:** Draft — normative for `jnt-core` v0.1.x
-**Scope:** Layer 1 only (base layer). Layer 2 (useful work / Verified Work Certificates) is specced in `docs/roadmap.md`, not implemented here.
+**Version:** 0.2 (foundation + P2P transport)
+**Status:** Draft — §0–§12 normative for `jnt-core` v0.1.x; §13 normative for `jnt-net` v0.2.x (**not yet implemented**)
+**Scope:** Layer 1 only (base layer). Layer 2 (useful work / Verified Work Certificates) is specced in `docs/roadmap.md`, not implemented here. §13 covers block relay between nodes; transaction relay is deferred (§13.13).
 
-This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`.
+This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. The four vector files covering §0–§12 exist today; `net_vectors.json` (§13.12) does not yet, because §13 is specified ahead of its implementation.
 
 ---
 
@@ -35,6 +35,7 @@ This document is the **normative reference**. Any implementation in any language
 | `DOM_S3` | `jounit/puzzle/stage3/v1` |
 | `DOM_W` | `jounit/puzzle/weights/v1` |
 | `DOM_GENESIS` | `jounit/genesis/v1` |
+| `DOM_NET_HANDSHAKE` | `jounit/net/handshake/v1` |
 
 ---
 
@@ -527,3 +528,376 @@ The genesis block is **not** a premine: it contains zero value and no spendable 
 `sim/puzzle_crosscheck.py` is the important one: it re-derives every puzzle digest with `sim/jounit_reference.py`, a second implementation written from the prose of this document rather than from the Rust source. If the two disagree, the disagreement is in the spec, not in either implementation.
 
 Regenerate and verify everything with `python sim/verify_vectors.py` (`--check` to verify without writing).
+
+---
+
+## 13. Peer-to-peer layer (v0.2)
+
+**Status: Draft. Not implemented.** This section is normative for the network layer
+and describes what `jnt-net` MUST do. It is written before the code, per the same
+discipline as §5: where the wire format is ambiguous, every implementation will
+disagree and the disagreement will look like a consensus split.
+
+### 13.0 What this section is, and is not
+
+The P2P layer **relays data; it never decides anything.** Every rule that
+determines whether a block is valid lives in §9 and is unchanged by anything here.
+A node that receives a block MUST run the same `validate_standalone` +
+`submit` path it runs for a block it mined itself. There is no "trusted peer"
+fast path, no relaxed validation for relayed data, and no way for a peer to
+influence a consensus decision.
+
+**v0.2 relays blocks only.** Transactions are mined directly into blocks
+(`mine_block` takes a body), so there is nothing to gossip until a mempool exists.
+§13.13 records what a mempool will require; it is deliberately unspecified here
+rather than guessed at.
+
+### 13.1 Design constraints inherited from §9
+
+Three properties of the base layer constrain the network layer, and each one
+rules out an otherwise reasonable design:
+
+**Fork choice is deterministic (§9, `chain.rs`).** Selection depends only on the
+block graph. This is *why* the P2P layer needs no consensus changes: nodes may
+receive blocks in any order and still agree. It also means a peer cannot cause a
+split by withholding or reordering data.
+
+**Validation needs chain state.** `submit` checks difficulty against tip history
+and reorgs against undo records, so a block cannot be validated in isolation and
+then stored. Validation and application are one operation, and the network layer
+MUST NOT split them.
+
+**`Chain` is single-owner.** `submit`, `adopt` and `mine_block` all take
+`&mut self`. The network layer therefore MUST NOT hold `Arc<Mutex<Chain>>`: mining
+is an unbounded CPU loop inside `mine_block` (`chain.rs`), and a lock held across
+it would stall every peer thread for as long as the block takes to solve. Instead
+there is one **chain thread** owning the `Chain`, and peer threads exchange
+messages with it over channels. The chain thread is the only writer.
+
+```
+peer threads (N)                   chain thread (1)
+  read socket                        own the Chain (sole writer)
+  frame/deframe                      loop:
+  validate framing bounds              - drain inbound channel -> submit() -> canon/utxo
+  hand off Message ----------------->  - mine on request        -> submit(winner)
+  <--------------- outbound           - fan out resulting INV to peers
+```
+
+Mining runs **on** the chain thread rather than beside it, because `mine_block`
+needs `&mut Chain` to build the header against the current tip. A miner therefore
+cannot build against a stale tip; it asks the chain thread to mine, which is
+correct and costs nothing at v0.2 block times. On `mainnet` (10-minute blocks)
+this means block processing waits on mining — acceptable, because a node that is
+mining is by definition not required to process blocks at that instant, and
+v0.2 has no mempool whose contents would go stale. A future mempool makes this a
+real cost and is the reason that work must then split the two (§13.13).
+
+### 13.2 Transport and framing
+
+TCP. Every message is a length-prefixed frame:
+
+```
+frame = magic(4) ‖ msg_type(1) ‖ payload_len(4 LE) ‖ payload(payload_len)
+```
+
+- `magic` MUST be the 4-byte network magic (§13.3). It is re-checked on **every**
+  frame, not only at connect, so a peer cannot hand a valid handshake then switch
+  to garbage.
+- `payload_len` MUST be `≤ max_frame_bytes` (§13.8) **checked before any
+  allocation.** The length prefix is attacker-controlled; this is the same class of
+  bug as the bundle-length and input-count issues already fixed in §3.1/§3.5, and
+  it is the single most important bound in this section.
+- A frame larger than the cap MUST close the connection, not be skipped. There is
+  no resynchronisation point in a stream protocol, so skipping leaves the peer
+  desynchronised and able to confuse every later message.
+
+Framing is deliberately **not** domain-tagged or hashed. It is transport, not
+consensus: a frame is never hashed, never committed to by a block, and never
+compared across implementations. `DOM_NET_HANDSHAKE` (§0) exists for the one
+place where a hash *is* needed — the handshake challenge (§13.4).
+
+### 13.3 Network identity
+
+**The genesis hash does NOT identify the network.** `genesis_block(difficulty)`
+(`block.rs`) derives the genesis block from difficulty alone, and both profiles
+set `genesis_difficulty = 1`, so `mainnet` and `mini` produce the **identical**
+genesis block:
+
+```
+2317ec84903140e2cd72be6f3c9dfd2ff36d9f8642293a5152279b4ad7a5196b
+```
+
+A handshake that compared genesis hashes would consider a mainnet node and a mini
+node the same network and would relay `mainnet` blocks into a `mini` chain. Every
+block would then fail §9.1 rule 4 (wrong difficulty), so no state corruption
+would occur — but the node would waste bandwidth and, worse, could not be trusted
+to reject a cross-network peer at all. Discrimination MUST use an explicit
+parameter instead.
+
+Each profile therefore declares a `network_magic` and a `network_id` string.
+`mainnet` and `mini` MUST differ in both.
+
+| Parameter | `mainnet` | `mini` |
+|---|---|---|
+| `network_magic` | `0x6A 0x4E 0x54 0x01` | `0x6A 0x4E 0x54 0x02` |
+| `network_id` | `jounit/mainnet` | `jounit/mini` |
+
+A new profile MUST pick a magic no existing profile uses. Magic reuse across two
+live networks is the failure this rule exists to prevent.
+
+**Long-term fix, not in v0.2:** give the genesis coinbase an `extra_nonce`
+derived from `network_id`, which would make the genesis hash discriminating and
+let the handshake compare hashes as Bitcoin does. That is a **consensus-breaking
+change to the genesis block** and therefore out of scope for a networking release.
+It is recorded here so the option is not lost.
+
+### 13.4 Handshake
+
+The first frame on every connection MUST be `VERSION`; anything else closes the
+connection.
+
+| Field | Size | Notes |
+|---|---|---|
+| `network_magic` | 4 | §13.3 |
+| `network_id` | `1 + n` | length-prefixed string |
+| `protocol_version` | 4 LE | `1` in v0.2 |
+| `services` | 8 LE | bit 0 = serves blocks; v0.2 all nodes set it |
+| `height` | 8 LE | best height, `0` if at genesis |
+| `tip_hash` | 32 raw | tip block hash |
+| `user_agent` | `1 + n` | length-prefixed, `≤ 64` bytes |
+| `nonce` | 8 LE | see below |
+
+A responder MUST reject the connection if `network_magic` or `network_id` does
+not match its own, if `protocol_version` is greater than it supports, or if
+`height == 0` while `tip_hash` is not the genesis hash (an inconsistent claim,
+and free to reject before doing any work).
+
+`nonce` makes the handshake **proof of possession of the socket** and nothing
+more. The responder echoes the initiator's nonce in `VERACK`; the initiator
+requires the echo. This defeats a trivially replayed handshake, which is worth
+having on an unauthenticated transport. It is **not** peer identity: there is no
+node key, no certificate, and no authentication in v0.2. A node MUST NOT treat a
+successful handshake as evidence of anything beyond "something answered on the
+other end of this socket". Peer reputation is therefore per-connection and
+lost on reconnect — an acknowledged v0.2 limitation, not a design choice.
+
+Both directions send `VERSION`; both then send `VERACK`. A node MUST NOT relay
+anything before its own handshake completes.
+
+### 13.5 Messages
+
+`msg_type` values in v0.2. Values are frozen; unknown types MUST be ignored
+without disconnecting, so a later version can add messages safely.
+
+| Type | Name | Payload |
+|---:|---|---|
+| `1` | `VERSION` | §13.4 |
+| `2` | `VERACK` | echoed `nonce` (8) |
+| `3` | `PING` | `nonce` (8) |
+| `4` | `PONG` | `nonce` (8) |
+| `5` | `INV` | `count(2 LE) ‖ count × (kind(1) ‖ hash(32))` |
+| `6` | `GETDATA` | same shape as `INV` |
+| `7` | `BLOCK` | `serialize(block)` (§3.5) |
+| `8` | `GETBLOCKS` | `count(2 LE) ‖ locator(count × 32) ‖ stop_hash(32)` |
+| `9` | `ADDR` | `count(2 LE) ‖ count × (port(2 LE) ‖ ip(16))` |
+
+`kind` is `1` = block in v0.2; `0` is reserved so transaction announcements can
+reuse the message without a wire change.
+
+Every `count` field MUST be bounded by the smallest entry that could follow,
+checked before allocating — `INV` entries are 33 bytes, `ADDR` entries 18,
+`GETBLOCKS` locators 32. Bounding by remaining bytes alone is the defect already
+fixed in §3; the same bound applies here.
+
+`count` MUST additionally be capped at `max_inv_per_msg` (§13.8).
+
+**`ADDR` carries a 16-byte address, not 4.** IPv6-mapped IPv4 is the
+representation, matching Bitcoin's historical choice. v0.2 listens on IPv4 only
+and treats any address it cannot parse as a protocol violation rather than
+guessing at a conversion.
+
+### 13.6 Peer discovery
+
+v0.2 has **no discovery protocol.** There is no `ADDR` gossip, no DNS seed, no
+super-nodes. A node's peer set comes from its configured address book only.
+
+This is a real limitation and the reason is worth stating: peer discovery needs a
+sybil-resistance story that this protocol has not made yet. Gossiping addresses
+from peers we cannot authenticate means one hostile node hands us its own
+connections forever. That is acceptable for a small, operator-run network and is
+not acceptable for an open one, so v0.2 does the former. `ADDR` is specced in §13.5
+so the message exists, but a node MUST NOT populate its address book from it in
+v0.2.
+
+### 13.7 Relay and sync
+
+**Relay (steady state).** On accepting a block that extends or reorgs the tip, a
+node MUST `INV` it to every connected peer **except the one it came from**. On
+receiving an `INV` for an unknown block, a node MUST send `GETDATA` for it.
+
+**Invasion prevention.** A node MUST NOT relay a block it has not validated. This
+is the rule that stops a cheap-PoW attacker (`difficulty = 1` on `mini` makes PoW
+free) from using honest nodes as a bandwidth amplifier: an invalid block is
+dropped at `submit` and never announced.
+
+**Sync (initial).** Block-first, not headers-first. The requester sends `GETBLOCKS`
+with a locator:
+
+```
+locator[0]      = tip_hash
+locator[i]      = block_hash_at(height − 10ⁱ),   i = 1, 2, 3, …
+locator         = capped at 500 entries; append genesis hash if absent
+```
+
+The responder walks its canonical chain back to the **first** locator hash it
+recognises and `INV`s up to 500 hashes after it. The requester then `GETDATA`s
+them in batches of 16, submits each, and repeats.
+
+Headers-first would be faster and is what a mature node does, but it is
+unnecessary here: a block's validity depends on tip history and undo records
+(§13.1), so a header chain that cannot be applied buys nothing for a node that
+must validate every block anyway. Recorded as a future optimisation.
+
+**The requester MUST tolerate gaps.** A `BLOCK` whose parent is unknown MUST be
+retained in a bounded orphan pool and re-offered when its parent arrives, not
+discarded. `submit` returns `UnknownParent`, which is a normal outcome of racing
+a peer's relay, not an error.
+
+**The requester MUST NOT trust the responder's height.** A peer claiming height
+`10⁹` is making the requester queue work it will never finish; the batch size
+stays 16 and the requester advances only on blocks it has actually applied.
+
+### 13.8 Resource bounds
+
+Every bound here is attacker-controlled unless noted. A node that omits one has a
+remotely triggerable failure, so these are requirements, not tuning.
+
+| Bound | Value | Protects |
+|---|---|---|
+| `max_frame_bytes` | `4 100 000` | one `max_block_bytes` block + envelope |
+| `max_inv_per_msg` | `500` | 500 × 33 = 16.5 KB per `INV` |
+| `max_addr_per_msg` | `100` | 100 × 18 = 1.8 KB per `ADDR` |
+| `max_locator_len` | `500` | 500 × 32 = 16 KB per `GETBLOCKS` |
+| `max_peers` | `125` | thread count, fd count |
+| `max_inbound` | `32` | inbound connection flood |
+| `handshake_timeout` | `20 s` | half-open connection exhaustion |
+| `ban_score_threshold` | `100` | misbehaviour (below) |
+| `orphan_pool_max` | `64` | memory from parentless blocks |
+
+`max_frame_bytes` is `max_block_bytes + 100 000`, so a maximum-size block is
+relayable with room for its envelope. `max_inbound < max_peers` because inbound
+connections are the ones an attacker chooses; outbound are ours.
+
+A peer exceeding any inbound bound is **banned** (§13.9), not merely
+disconnected. `max_peers` alone is not a defence: an attacker who fills it stops
+honest nodes connecting, which is why inbound is capped lower and why exceeding
+inbound limits scores rather than merely closing.
+
+### 13.9 Misbehaviour and bans
+
+Each peer connection carries a ban score, starting at `0`, reset on reconnect.
+Reaching `100` bans the address. Scores decay by `1` per hour.
+
+| Misbehaviour | Score |
+|---|---:|
+| Frame over `max_frame_bytes` | `+100` (immediate ban) |
+| Bad `magic` after handshake | `+100` (immediate ban) |
+| Wrong `network_id` / `network_magic` | `+10`, disconnect |
+| Oversized declared `count` in any message | `+20` |
+| First frame not `VERSION` | `+20` |
+| `BLOCK` failing §9 validation | `+10` |
+| `BLOCK` whose parent is unknown, repeated | `+5` |
+| Unresponsive to `PING` (60 s) | `+10` |
+| `ADDR` ignored in v0.2, still sent | `+10` |
+
+**A block failing validation is +10, not a ban.** Difficulty and PoW failures are
+normal on a chain under hashrate churn, and an honest peer relaying a block during
+a reorg race can easily send one the receiver has already applied differently. A
+node that bans on this would disconnect honest peers precisely when the network is
+busiest. Reaching a threshold of *repeated* invalid blocks is what bans.
+
+**Invalid blocks MUST NOT enter the block store.** `submit_at` already drops a
+block that cannot be applied (§9.1), and that behaviour is load-bearing here: a
+stored block contributes its declared difficulty to `cumulative_work`, so retaining
+an unusable one lets a peer accumulate fork-choice weight no reorganisation can
+realise. `ReorgWouldCrossFinality` is the deliberate exception — the block is
+valid, and dropping it would orphan its descendants.
+
+### 13.10 Performance requirements
+
+These are consensus-adjacent. A single node never hits them; a node accepting
+relayed blocks does, and a peer can trigger them deliberately. **v0.2 MUST NOT ship
+without the two marked items.**
+
+**`cumulative_work` is O(chain length) and `best_candidate` calls it per stored
+block** (`chain.rs`). One `submit` is therefore O(stored²), and side branches are
+retained forever, so the cost only grows. A peer submitting blocks turns this into
+a quadratic amplifier — the cheapest possible way to burn a node's CPU.
+
+1. **MUST (blocking):** maintain cumulative work incrementally per stored block,
+   computed once at insert as `parent_work + difficulty`. Fork choice becomes
+   O(stored) to scan and O(1) per block to score. This changes no consensus
+   outcome: the value is identical, since it is a sum along the same path.
+2. **MUST (blocking):** prune side branches. Retain blocks within
+   `finality_depth` of the tip plus a bounded orphan pool; drop the rest. Without
+   this, `stored` grows without bound regardless of item 1.
+3. **SHOULD:** `adopt()` snapshots the whole UTXO set per reorg — O(chain length).
+   The incremental undo primitives already exist (`ledger.rs`), so a reorg should
+   unwind block by block. Not a DoS vector on its own: a reorg crossing
+   `finality_depth` is refused outright (§9.3), which bounds how often this runs.
+4. **SHOULD:** persist blocks append-only rather than rewriting the whole chain
+   file per block. `Store::save_chain` currently rewrites every block on every
+   mined block, which is O(n) per block and O(n²) over a sync.
+
+### 13.11 Invariants a node MUST preserve
+
+The point of this section, and the tests that must assert them:
+
+1. **Relay cannot change validity.** A block accepted via P2P MUST equal, byte for
+   byte, the block accepted via `submit` locally. Tested by running the same block
+   through both paths and comparing resulting state.
+2. **Two nodes converge regardless of delivery order.** Node A and node B fed the
+   same blocks in opposite orders MUST reach the same tip. This is the property
+   §13.1 exists to protect; it is already tested for direct submission
+   (`fork_choice_is_independent_of_block_arrival_order`) and MUST be extended to
+   the P2P path.
+3. **A node that has processed no blocks MUST equal a node that processed nothing.**
+   A fresh node receiving a genesis-only `VERSION` MUST stay at genesis.
+4. **Cross-network isolation.** A `mini` node MUST refuse a `mainnet` connection at
+   handshake and MUST NOT relay a single block.
+5. **Invalid blocks never enter the store.** After any sequence of invalid `BLOCK`
+   messages, the block store and `cumulative_work` MUST be unchanged.
+6. **No unbounded growth from hostile input.** A peer sending maximum-size frames,
+   maximum `count` fields and orphan blocks MUST NOT grow any bounded structure
+   past §13.8.
+7. **Handshake is not authentication.** No code path may treat a completed
+   handshake as authorisation for anything.
+
+### 13.12 Test vectors
+
+`net_vectors.json` covers the wire format, pinned the same way as the other
+vector files (§12): generated from source, never hand-edited, and a second
+implementation that disagrees has a bug, not a rounding difference.
+
+| Covers | Note |
+|---|---|
+| Frame encode/decode round-trip at `max_frame_bytes` | the boundary that matters |
+| Frame decode rejects `payload_len > max_frame_bytes` | must not allocate |
+| Every `msg_type` payload round-trip | frozen values from §13.5 |
+| `VERSION` field layout, all profiles | both networks |
+| Locator construction from a 1 000-block chain | exponential spacing, 500 cap |
+| `GETBLOCKS` response against 3 divergent chains | responder walk-back |
+
+### 13.13 Unresolved, deliberately
+
+Listed so these are decisions rather than oversights:
+
+- **Peer identity.** No node keys. Reputation is per-connection (§13.4).
+- **Discovery.** Address book only (§13.6). Sybil resistance unaddressed.
+- **Transaction relay.** Needs a mempool: conflict sets, RBF, fee estimation, and
+  re-validation after reorg. Unspecced — better specified from a real
+  implementation than guessed at now.
+- **Headers-first sync.** Deferred with justification (§13.7).
+- **Compact blocks / BIP-152.** Later; the 500-hash `INV` path is adequate first.
+- **Genesis network discrimination.** Needs a consensus-breaking genesis change
+  (§13.3); `network_magic` is the v0.2 workaround.
