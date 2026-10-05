@@ -211,9 +211,7 @@ impl P2pNode {
             count += 1;
             match event {
                 PeerEvent::Connected {
-                    peer_id,
-                    version,
-                    ..
+                    peer_id, version, ..
                 } => {
                     // If the peer is ahead, ask for blocks
                     if version.height > chain.height() {
