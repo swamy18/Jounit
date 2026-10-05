@@ -9,8 +9,12 @@ use crate::error::{Error, Result};
 use crate::params::NetworkParams;
 
 /// Number of halvings already elapsed at `height`.
+///
+/// Clamped rather than truncated by `as u32`: past ~1.1e15 blocks the quotient
+/// exceeds `u32::MAX` and a silent wrap would make the reported halving count
+/// disagree with the reward actually paid.
 pub fn halvings(params: &NetworkParams, height: u64) -> u32 {
-    (height / params.halving_period) as u32
+    (height / params.halving_period).min(u32::MAX as u64) as u32
 }
 
 /// Block reward in satoshis for the halving epoch at `period`.

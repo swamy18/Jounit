@@ -85,16 +85,27 @@ impl UtxoSet {
 
     /// Apply a transaction, returning what it spent. Caller must have already
     /// checked signature validity (SPEC.md §9.2 rule 6).
+    ///
+    /// Atomic: every input is resolved against a read-only view of the set
+    /// before anything is written. Removing inputs one at a time meant a
+    /// transaction whose *second* input did not exist took the first one with
+    /// it — the `Err` discarded the undo record that could have restored it, so
+    /// a single malformed transaction destroyed coins.
     pub fn apply_tx(&mut self, tx: &Transaction, height: u64) -> Result<Undo> {
         let mut undo = Undo::default();
 
+        // Resolve first, mutate second.
         for input in &tx.inputs {
             let op = input.outpoint();
             let u = self
                 .map
-                .remove(&(op.txid, op.index))
-                .ok_or(Error::UnknownOutPoint)?;
+                .get(&(op.txid, op.index))
+                .ok_or(Error::UnknownOutPoint)?
+                .clone();
             undo.spent.push((op, u));
+        }
+        for (op, _) in &undo.spent {
+            self.map.remove(&(op.txid, op.index));
         }
 
         for (index, out) in tx.outputs.iter().enumerate() {
@@ -110,15 +121,22 @@ impl UtxoSet {
         Ok(undo)
     }
 
-    /// Reverse [`Self::apply_tx`].
-    pub fn undo_tx(&mut self, tx: &Transaction, undo: &Undo) {
+    /// Reverse one or more [`Self::apply_tx`] operations. Newest first.
+    ///
+    /// This is the primitive a partially-applied block unwinds with, so it must
+    /// be usable without the transaction that produced the undo record.
+    pub fn undo(&mut self, undo: &Undo) {
         for (op, u) in &undo.spent {
             self.map.insert((op.txid, op.index), u.clone());
         }
         for op in &undo.created {
             self.map.remove(&(op.txid, op.index));
         }
-        let _ = tx;
+    }
+
+    /// Reverse [`Self::apply_tx`].
+    pub fn undo_tx(&mut self, _tx: &Transaction, undo: &Undo) {
+        self.undo(undo);
     }
 
     /// Remove a set of created outputs (coinbase, when only the tip matters).

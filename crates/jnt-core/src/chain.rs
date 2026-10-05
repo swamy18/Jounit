@@ -39,8 +39,6 @@ pub struct Chain {
     canon: Vec<Hash>,
     utxo: UtxoSet,
     undo: HashMap<Hash, Undo>,
-    first_seen: HashMap<Hash, u64>,
-    seen_counter: u64,
 }
 
 impl Chain {
@@ -64,11 +62,7 @@ impl Chain {
             canon: Vec::new(),
             utxo: UtxoSet::new(),
             undo: HashMap::new(),
-            first_seen: HashMap::new(),
-            seen_counter: 0,
         };
-        chain.first_seen.insert(hash, 0);
-        chain.seen_counter = 1;
         chain.blocks.insert(hash, genesis.clone());
         // Genesis mints nothing, so the UTXO set stays empty; only the block
         // bookkeeping matters.
@@ -183,6 +177,13 @@ impl Chain {
         if block.txs.is_empty() {
             return Err(Error::BadCoinbase("block has no transactions"));
         }
+        // SPEC.md §1: nodes MUST reject unknown `sig_scheme` values. The field
+        // is committed to by the block hash and is what a signature-scheme
+        // upgrade hangs off, so accepting an unrecognised value leaves the node
+        // unable to tell a v0.1 block from a hypothetical future one.
+        if block.header.sig_scheme != crate::hash::SIG_SCHEME_SECP256K1_ECDSA {
+            return Err(Error::UnsupportedSigScheme(block.header.sig_scheme));
+        }
         if block.header.merkle_root != block.merkle_root() {
             return Err(Error::BadMerkleRoot);
         }
@@ -196,7 +197,7 @@ impl Chain {
             });
         }
 
-        let gas_used = block.total_gas_used();
+        let gas_used = block.total_gas_used()?;
         if gas_used > self.params.gas_cap {
             return Err(Error::GasOverCap {
                 used: gas_used,
@@ -244,6 +245,15 @@ impl Chain {
                 got: block.header.height,
             });
         }
+        // The coinbase input commits to its own height through a `u32` index
+        // (SPEC.md 3.1). Past `u32::MAX` that encoding stops being injective,
+        // so refuse rather than compare a truncated index.
+        if height > u32::MAX as u64 {
+            return Err(Error::BadHeight {
+                expected: u32::MAX as u64,
+                got: height,
+            });
+        }
 
         // Difficulty: SPEC.md §6.
         let history = self.history(self.params.difficulty_window as usize + 1);
@@ -265,7 +275,7 @@ impl Chain {
             next_base_fee(
                 &self.params,
                 parent.header.base_fee_sat,
-                parent.total_gas_used(),
+                parent.total_gas_used()?,
             )
         };
         if block.header.base_fee_sat != expected_base_fee {
@@ -289,15 +299,104 @@ impl Chain {
                 "coinbase input must reference the parent block",
             ));
         }
-        if coinbase.has_zero_value_output() {
-            return Err(Error::BadCoinbase("coinbase output must be non-zero"));
-        }
+
+        // A zero-value coinbase is legitimate, not an error. SPEC.md §7 says
+        // that once the reward ladder is exhausted the coinbase collects the
+        // tips only, and tips can be zero on an empty block. Rejecting it
+        // unconditionally halted the chain at a fixed, known height.
 
         // Everything after the coinbase is an ordinary spend.
         let body = &block.txs[1..];
         let mut body_undo = Undo::default();
         let mut total_gas = 0u64;
         let mut total_fees = 0u64;
+
+        // Every write from here on is recorded so it can be unwound: a block
+        // that fails partway through must leave the ledger exactly as it found
+        // it, or the node credits outputs from a block it just rejected.
+        let mut applied: Vec<Undo> = Vec::new();
+        let outcome = self.apply_body(
+            block,
+            body,
+            height,
+            &mut applied,
+            &mut body_undo,
+            &mut total_gas,
+            &mut total_fees,
+        );
+        let split = match outcome {
+            Ok(split) => split,
+            Err(e) => {
+                for u in applied.iter().rev() {
+                    self.utxo.undo(u);
+                }
+                return Err(e);
+            }
+        };
+
+        // Reward + tip only: the base fee is burned (SPEC.md §8).
+        let reward = block_reward_sat(&self.params, height);
+        let max_claim = reward.saturating_add(split.tip);
+        let minted = coinbase.outputs[0].value;
+        if minted > max_claim {
+            for u in applied.iter().rev() {
+                self.utxo.undo(u);
+            }
+            return Err(Error::BadFee("coinbase claims more than reward plus tip"));
+        }
+
+        // Hard supply cap, checked against live state (SPEC.md §7).
+        let already = self.utxo.total_value();
+        let after = already.checked_add(minted).ok_or(Error::ValueOverflow)?;
+        if after > self.params.supply_cap_sat {
+            for u in applied.iter().rev() {
+                self.utxo.undo(u);
+            }
+            return Err(Error::SupplyCapExceeded {
+                already,
+                requested: minted,
+                cap: self.params.supply_cap_sat,
+            });
+        }
+
+        // Apply the coinbase last so its output is the freshest. A zero-value
+        // coinbase is not recorded at all: `check_tx` refuses to spend a
+        // zero-value output, so recording it would only grow the UTXO set with
+        // permanently unspendable entries.
+        let cb_txid = coinbase.txid();
+        let cb_op = OutPoint {
+            txid: cb_txid,
+            index: 0,
+        };
+        if minted > 0 {
+            body_undo.created.push(cb_op);
+            self.utxo.insert(
+                cb_op,
+                Utxo {
+                    out: coinbase.outputs[0],
+                    height,
+                },
+            );
+        }
+
+        let hash = block.block_hash();
+        self.undo.insert(hash, body_undo);
+        Ok(())
+    }
+
+    /// Apply every non-coinbase transaction of `block`, accumulating gas, fees
+    /// and undo data. Caller unwinds with the returned `applied` list on error.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_body(
+        &mut self,
+        block: &Block,
+        body: &[Transaction],
+        height: u64,
+        applied: &mut Vec<Undo>,
+        body_undo: &mut Undo,
+        total_gas: &mut u64,
+        total_fees: &mut u64,
+    ) -> Result<FeeSplit> {
         for tx in body {
             let delta = check_tx(
                 &self.utxo,
@@ -308,66 +407,23 @@ impl Chain {
                 self.params.coinbase_maturity,
             )?;
             let undo = self.utxo.apply_tx(tx, height)?;
+            applied.push(undo.clone());
             body_undo.spent.extend(undo.spent);
             body_undo.created.extend(undo.created);
             // Accumulated across the block, so use checked arithmetic: `+=`
             // panics in debug and wraps in release, and a wrapped total feeds
             // straight into the burn/tip split below, where wrapping could
             // understate the burned portion or invent a miner tip.
-            total_gas = total_gas
+            *total_gas = total_gas
                 .checked_add(delta.gas_used)
                 .ok_or(Error::ValueOverflow)?;
-            total_fees = total_fees
+            *total_fees = total_fees
                 .checked_add(delta.fee_total)
                 .ok_or(Error::ValueOverflow)?;
         }
         // Genesis-adjacent blocks pay no base fee on their first transaction;
         // the schedule above already starts at `base_fee_initial_sat`.
-
-        let split: FeeSplit = split_fees(total_gas, total_fees, block.header.base_fee_sat)?;
-
-        // Reward + tip only: the base fee is burned (SPEC.md §8).
-        let reward = block_reward_sat(&self.params, height);
-        let max_claim = reward.saturating_add(split.tip);
-        if coinbase.outputs[0].value > max_claim {
-            return Err(Error::BadFee("coinbase claims more than reward plus tip"));
-        }
-
-        // Hard supply cap, checked against live state (SPEC.md §7).
-        let minted = coinbase.outputs[0].value;
-        let after = self
-            .utxo
-            .total_value()
-            .checked_add(minted)
-            .ok_or(Error::ValueOverflow)?;
-        if after > self.params.supply_cap_sat {
-            return Err(Error::SupplyCapExceeded {
-                already: self.utxo.total_value(),
-                requested: minted,
-                cap: self.params.supply_cap_sat,
-            });
-        }
-
-        // Apply the coinbase last so its output is the freshest.
-        let cb_txid = coinbase.txid();
-        body_undo.created.push(OutPoint {
-            txid: cb_txid,
-            index: 0,
-        });
-        self.utxo.insert(
-            OutPoint {
-                txid: cb_txid,
-                index: 0,
-            },
-            Utxo {
-                out: coinbase.outputs[0],
-                height,
-            },
-        );
-
-        let hash = block.block_hash();
-        self.undo.insert(hash, body_undo);
-        Ok(())
+        split_fees(*total_gas, *total_fees, block.header.base_fee_sat)
     }
 
     fn rollback_block(&mut self, hash: &Hash) {
@@ -379,12 +435,14 @@ impl Chain {
             for tx in block.txs[1..].iter().rev() {
                 self.utxo.undo_tx(tx, &undo);
             }
-            let cb_undo = Undo {
-                spent: Vec::new(),
-                created: undo.created.iter().rev().copied().take(1).collect(),
-            };
+            // Identify the coinbase output directly rather than by its position
+            // at the end of `undo.created`: a zero-value coinbase is never
+            // recorded there, so position was not a reliable handle.
             if let Some(cb) = block.txs.first() {
-                self.utxo.undo_tx(cb, &cb_undo);
+                self.utxo.drop_created(&[OutPoint {
+                    txid: cb.txid(),
+                    index: 0,
+                }]);
             }
         }
         self.undo.remove(hash);
@@ -418,25 +476,40 @@ impl Chain {
         }
     }
 
+    /// Pick the tip: most work, then lower height, then lowest block hash.
+    ///
+    /// Every tie-break is a function of block data alone. An earlier version
+    /// used an arrival counter as the final tie-break, which made the result
+    /// depend on the order blocks happened to be delivered — two nodes holding
+    /// an identical set of valid blocks could and did choose different tips,
+    /// which is a consensus split rather than a rounding difference.
     fn best_candidate(&self) -> Hash {
-        let mut best = self.tip_hash();
-        let mut best_work = self.cumulative_work(&best);
-        let mut best_key = (best_work, std::cmp::Reverse(self.height()), 0u64);
+        let tip = self.tip_hash();
+        let mut best = tip;
+        let mut best_key = self.fork_choice_key(&tip);
 
         let mut candidates: Vec<(&Hash, &Block)> = self.blocks.iter().collect();
         candidates.sort_by(|a, b| a.0.cmp(b.0)); // deterministic iteration
         for (hash, block) in candidates {
-            let work = self.cumulative_work(hash);
-            let seen = self.first_seen.get(hash).copied().unwrap_or(u64::MAX);
-            let key = (work, std::cmp::Reverse(block.header.height), seen);
+            let key = self.fork_choice_key(hash);
+            debug_assert_eq!(key.1, std::cmp::Reverse(block.header.height));
             if key > best_key {
                 best_key = key;
                 best = *hash;
-                best_work = work;
             }
         }
-        let _ = best_work;
         best
+    }
+
+    /// Total ordering for fork choice: `(work, lower height first, lowest hash
+    /// first)`. Derived only from the block graph, never from arrival order.
+    fn fork_choice_key(
+        &self,
+        hash: &Hash,
+    ) -> (u128, std::cmp::Reverse<u64>, std::cmp::Reverse<Hash>) {
+        let work = self.cumulative_work(hash);
+        let height = self.blocks.get(hash).map(|b| b.header.height).unwrap_or(0);
+        (work, std::cmp::Reverse(height), std::cmp::Reverse(*hash))
     }
 
     /// Accept a block: store it, then re-run fork choice. Extends the tip or
@@ -461,19 +534,43 @@ impl Chain {
         }
 
         self.blocks.insert(hash, block);
-        self.first_seen.insert(hash, self.seen_counter);
-        self.seen_counter += 1;
 
-        let target = self.best_candidate();
-        if target != self.tip_hash() {
-            self.adopt(target)?;
-        } else if let Some(b) = self.blocks.get(&hash).cloned() {
-            // Direct extension: apply immediately.
-            if b.header.prev_hash == self.tip_hash() {
-                self.apply_block(&b)?;
-                self.canon.push(hash);
+        let outcome = self.reselect(hash);
+        if let Err(e) = &outcome {
+            // A block that cannot be applied must not stay in the store.
+            // `cumulative_work` sums the declared difficulty of every stored
+            // block, so retaining an unusable one lets an attacker accumulate
+            // chain weight that no reorganization can ever realize: fork choice
+            // keeps selecting the dead branch and every honest block is
+            // rejected until honest work catches up.
+            //
+            // A finality refusal is not that case: the block is valid, we
+            // simply decline to reorganize to it, and dropping it would orphan
+            // every later block already stacked on top of it.
+            if !matches!(e, Error::ReorgWouldCrossFinality { .. }) {
+                self.blocks.remove(&hash);
             }
         }
+        outcome
+    }
+
+    /// Run fork choice over the stored blocks and apply whatever wins.
+    fn reselect(&mut self, submitted: Hash) -> Result<()> {
+        let target = self.best_candidate();
+        if target != self.tip_hash() {
+            return self.adopt(target);
+        }
+        let Some(b) = self.blocks.get(&submitted).cloned() else {
+            return Ok(());
+        };
+        if b.header.prev_hash != self.tip_hash() {
+            // A side block that lost fork choice: stored, not canonical.
+            return Ok(());
+        }
+        // Extends the tip and nothing out-worked it. `apply_block` unwinds its
+        // own writes on failure, so no snapshot is needed here.
+        self.apply_block(&b)?;
+        self.canon.push(submitted);
         Ok(())
     }
 
@@ -489,9 +586,13 @@ impl Chain {
             common += 1;
         }
 
-        // A reorg must never rewrite finalized history.
+        // A reorg must never rewrite finalized history. The check is on the
+        // fork point alone: it used to be qualified with
+        // `self.canon.len() > new_canon.len()`, which meant a rival that forked
+        // below the finality point but ended up *longer* was adopted and
+        // rewrote settled history.
         let finalized = self.finalized_height() as usize;
-        if common <= finalized && self.canon.len() > new_canon.len() {
+        if common <= finalized {
             self.restore(saved);
             return Err(Error::ReorgWouldCrossFinality {
                 finalized_height: finalized as u64,
@@ -542,7 +643,7 @@ impl Chain {
             next_base_fee(
                 &self.params,
                 parent.header.base_fee_sat,
-                parent.total_gas_used(),
+                parent.total_gas_used()?,
             )
         };
         let timestamp_ms =
@@ -562,8 +663,12 @@ impl Chain {
                 self.params.coinbase_maturity,
             )?;
             probe.apply_tx(tx, height)?;
-            total_gas += delta.gas_used;
-            total_fees += delta.fee_total;
+            total_gas = total_gas
+                .checked_add(delta.gas_used)
+                .ok_or(Error::ValueOverflow)?;
+            total_fees = total_fees
+                .checked_add(delta.fee_total)
+                .ok_or(Error::ValueOverflow)?;
         }
         let split = split_fees(total_gas, total_fees, base_fee)?;
         let reward = block_reward_sat(&self.params, height);
@@ -665,11 +770,11 @@ impl Chain {
         if parent.header.height == 0 {
             self.params.base_fee_initial_sat
         } else {
-            next_base_fee(
-                &self.params,
-                parent.header.base_fee_sat,
-                parent.total_gas_used(),
-            )
+            // A canonical block's gas total cannot overflow (validate_standalone
+            // rejects anything over the cap); fall back to the cap if it somehow
+            // does rather than panicking on a display path.
+            let gas = parent.total_gas_used().unwrap_or(self.params.gas_cap);
+            next_base_fee(&self.params, parent.header.base_fee_sat, gas)
         }
     }
 

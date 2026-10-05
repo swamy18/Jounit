@@ -104,7 +104,10 @@ impl Header {
     }
 
     pub fn expected_epoch(&self, nn_epoch_blocks: u64) -> u32 {
-        (self.height / nn_epoch_blocks) as u32
+        // Clamped rather than truncated: `height / nn_epoch_blocks` exceeds
+        // `u32::MAX` past ~2.1e14 blocks, and a silent `as u32` wrap would make
+        // the epoch check disagree with itself.
+        (self.height / nn_epoch_blocks).min(u32::MAX as u64) as u32
     }
 }
 
@@ -140,7 +143,9 @@ impl Block {
         let signature = r.fixed()?;
         let signer_pubkey = r.fixed()?;
         let n = r.u32le()? as usize;
-        if n > r.remaining() {
+        // Bounded by the smallest a transaction can be, not by the raw byte
+        // count, so a small buffer cannot force a large reservation.
+        if n > r.remaining() / crate::tx::TX_MIN_SERIALIZED_LEN {
             return Err(Error::Malformed("tx_count exceeds buffer"));
         }
         let mut txs = Vec::with_capacity(n);
@@ -165,8 +170,15 @@ impl Block {
         merkle_root(&self.txs)
     }
 
-    pub fn total_gas_used(&self) -> u64 {
-        self.txs.iter().map(|t| t.gas_used()).sum()
+    /// Gas for the whole block.
+    ///
+    /// Checked, not `.sum()`: `sum` panics on overflow in debug and wraps in
+    /// release, and this feeds the base-fee schedule and the gas cap. A node
+    /// reading blocks from a file or the network must not be crashable by one.
+    pub fn total_gas_used(&self) -> Result<u64> {
+        self.txs.iter().try_fold(0u64, |acc, t| {
+            acc.checked_add(t.gas_used()).ok_or(Error::ValueOverflow)
+        })
     }
 }
 

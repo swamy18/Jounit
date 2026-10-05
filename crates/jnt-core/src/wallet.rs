@@ -90,9 +90,17 @@ impl Wallet {
 
     /// Build and fully sign a spend of `inputs` paying `outputs` plus `fee`.
     ///
-    /// Fee is explicit rather than computed from a UTXO scan: the caller knows
-    /// the node's base fee, and an implicit fee would let a builder silently
-    /// underpay and get its transaction rejected.
+    /// The caller is responsible for making `sum(outputs) + fee` equal the
+    /// resolved input total — that means including change in `outputs`. This
+    /// function cannot check it, because resolving input values needs the UTXO
+    /// set, which it does not have; `check_tx` is where that is enforced.
+    ///
+    /// `fee` is therefore an assertion, not a suggestion: it must be
+    /// representable alongside the outputs. It used to be accepted and then
+    /// discarded outright (`let _ = fee;`), so a caller following the doc —
+    /// sizing `outputs` to the inputs and passing the fee separately — got a
+    /// transaction paying whatever the leftover happened to be, which is zero
+    /// when no change output was added.
     pub fn build_tx(
         &self,
         inputs: &[OutPoint],
@@ -106,8 +114,13 @@ impl Wallet {
             inputs.iter().map(Input::unsigned).collect::<Vec<_>>(),
             outputs,
         );
+        if tx.value_out_overflows() {
+            return Err(Error::ValueOverflow);
+        }
+        tx.value_out()
+            .checked_add(fee)
+            .ok_or(Error::ValueOverflow)?;
         self.sign(&mut tx)?;
-        let _ = fee;
         Ok(tx)
     }
 

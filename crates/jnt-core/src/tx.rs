@@ -21,8 +21,16 @@ pub const TX_COINBASE: u8 = 1;
 /// today's ECDSA could ever hold one.
 pub const INPUT_FIXED_LEN: usize = 36;
 
+/// Smallest an input can serialize to: the fixed prefix plus two empty bundle
+/// counts. Used to bound a declared `input_count` before anything is reserved.
+pub const INPUT_MIN_SERIALIZED_LEN: usize = INPUT_FIXED_LEN + 2;
+
 /// `value(8) + address(20)`
 pub const OUTPUT_SERIALIZED_LEN: usize = 28;
+
+/// Smallest a transaction can serialize to: `version(4) + tx_type(1) +
+/// lock_time(8) + input_count(4) + output_count(4)`, with no entries.
+pub const TX_MIN_SERIALIZED_LEN: usize = 4 + 1 + 8 + 4 + 4;
 
 /// Gas model (SPEC.md §8). No scripts, so cost is linear in size.
 pub const GAS_TX_BASE: u64 = 16_000;
@@ -202,8 +210,13 @@ impl Transaction {
         let tx_type = r.u8()?;
         let lock_time = r.u64le()?;
         let n_in = r.u32le()? as usize;
-        // Guard against a tiny buffer claiming a huge input count.
-        if n_in > r.remaining() {
+        // A count field is attacker-controlled and is checked *before* the
+        // reservation it drives. Comparing it against the raw remaining-byte
+        // count is not enough: every input costs at least
+        // `INPUT_MIN_SERIALIZED_LEN`, so a buffer could declare up to its own
+        // length in entries and force a Vec of `Input` structs many times
+        // larger than the bytes describing them.
+        if n_in > r.remaining() / INPUT_MIN_SERIALIZED_LEN {
             return Err(Error::Malformed("input_count exceeds buffer"));
         }
         let mut inputs = Vec::with_capacity(n_in);
@@ -211,7 +224,7 @@ impl Transaction {
             inputs.push(Input::from_reader(r)?);
         }
         let n_out = r.u32le()? as usize;
-        if n_out > r.remaining() {
+        if n_out > r.remaining() / OUTPUT_SERIALIZED_LEN {
             return Err(Error::Malformed("output_count exceeds buffer"));
         }
         let mut outputs = Vec::with_capacity(n_out);

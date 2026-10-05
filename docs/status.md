@@ -12,9 +12,11 @@ single-node chain. A coin with one node is not a network yet.
 
 ## Verified
 
-- `cargo test --workspace` — 130 tests pass, `cargo clippy --all-targets` clean
-  under `-D warnings`, `cargo fmt --check` clean. CI (`.github/workflows/ci.yml`)
-  runs all of it plus the vector cross-checks on every push.
+- `cargo test --workspace` — 139 tests pass (130 unit + 9 red-team integration
+  tests in `crates/jnt-core/tests/redteam.rs`), `cargo clippy --all-targets`
+  clean under `-D warnings`, `cargo fmt --check` clean. CI
+  (`.github/workflows/ci.yml`) runs all of it plus the vector cross-checks on
+  every push.
 - An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
   written from the prose of SPEC.md rather than from the Rust source, reproduces
   all 21 puzzle digests in `tests/vectors/puzzle_vectors.json`. This is the only
@@ -102,6 +104,95 @@ difficulty (correctly, they lower it), and one test used `expected + 1` as an
 "impossible" difficulty — under the fixed rule that is the legitimate next
 value at that spacing.
 
+## Red-team pass: consensus and ledger defects
+
+A later adversarial pass (`crates/jnt-core/tests/redteam.rs`, written
+attack-first and each confirmed to fail against the pre-fix code) found six
+more defects, all in the state layer. None of them were visible to the
+arithmetic audit above, and none touched hashing, the puzzle, the retarget or
+the serialization layout — every vector file is byte-identical after these
+fixes, which is the point.
+
+**Fork choice was not deterministic.** The final tie-break in `best_candidate`
+was an arrival counter, so two nodes holding the same set of valid blocks could
+and did select different tips — the test builds two rival blocks at equal height
+and equal work and shows node A choosing one and node B the other, purely from
+delivery order. The module doc claimed "two nodes holding the same set of valid
+blocks always agree on the tip"; that was false. The tie-break is now the block
+hash, so every comparison is a function of the block graph alone. `first_seen`
+and `seen_counter` are gone.
+
+**The finality rule only guarded against reorgs that shortened the chain.**
+`adopt` refused when `common <= finalized && self.canon.len() > new_canon.len()`.
+The length qualification meant a rival forking *below* the finality point but
+ending up *longer* sailed through and rewrote settled history. The existing test
+only exercised the shrinking case, which is why it stayed green. The condition
+is now on the fork point alone.
+
+**`apply_tx` was not atomic.** Inputs were removed from the UTXO map one at a
+time, so a transaction whose *second* input did not exist had already taken the
+first one when the `Err` fired — and the `Err` discarded the undo record that
+could have restored it. One malformed transaction destroyed coins. All inputs
+are now resolved against a read-only view before anything is written.
+
+**A block that could never be applied was still counted as fork-choice work.**
+`submit_at` inserted into the block store before applying and never removed on
+failure, while `cumulative_work` summed the declared difficulty of everything
+stored. An attacker could therefore accumulate chain weight that no
+reorganization could realize: fork choice kept selecting the dead branch and
+every honest block was rejected until honest work caught up, with the store
+growing without bound. A state-invalid block is now dropped on submit. The one
+exception is `ReorgWouldCrossFinality`, where the block is valid and dropping it
+would orphan its descendants — the first attempt at this fix broke exactly that
+case and the existing test caught it.
+
+**`apply_block` could leave the ledger modified by a rejected block.** It wrote
+to the UTXO set transaction by transaction, so a failure partway through left
+earlier transactions applied. The reorganization path happened to be shielded by
+its snapshot, which is why a first attempt to exploit it appeared to fail; the
+direct-extension path was not, and would have been if fork choice had ever
+routed a tip-extending block there. Writes are now recorded and unwound on any
+failure, so no snapshot is needed and the happy path stays O(1) in UTXO size.
+
+**The chain halted permanently once the reward ladder ran out.** `apply_block`
+rejected a zero-value coinbase unconditionally, but SPEC.md §7 says the coinbase
+collects the tips only and tips are legitimately zero on an empty block. Every
+such block was refused, so the chain stopped dead at a fixed, known height
+(mainnet `8 x 262 800`). The zero-value check is gone; a zero-value coinbase is
+simply not recorded in the UTXO set, since `check_tx` already refuses to spend a
+zero-value output and recording it would only grow the set with unspendable
+entries. `rollback_block` now identifies the coinbase output directly instead of
+inferring it from its position at the end of the undo list, which stopped being
+reliable once that position became conditional.
+
+Smaller items from the same pass:
+
+- `header.sig_scheme` was committed to by the block hash and read by nothing.
+  SPEC.md §1 requires nodes to reject unknown values; a block declaring scheme
+  200 was accepted.
+- The `tx` and `block` deserializers bounded declared counts by the raw
+  remaining byte count rather than the smallest entry that could follow, so a
+  4 MB block could declare ~4 000 000 inputs and force a `Vec<Input>` reservation
+  many times the size of the bytes describing it.
+- `Block::total_gas_used` used `.sum()`, which panics on overflow in debug and
+  wraps in release, and feeds both the base-fee schedule and the gas cap. Now
+  checked; the one caller on a display path falls back rather than panicking.
+- `Wallet::build_tx` accepted a `fee` argument and then discarded it
+  (`let _ = fee;`). It now enforces that `sum(outputs) + fee` is representable,
+  and the doc says plainly that change is the caller's job because resolving
+  input values needs the UTXO set.
+- `halvings()` and `expected_epoch()` truncated a `u64` quotient with `as u32`.
+  Clamped instead. `apply_block` also now refuses heights past `u32::MAX`, where
+  the coinbase's `u32` height index stops being injective.
+
+One design limitation is called out rather than changed: a valid branch that
+forked below the finality point and is heavier than the tip is *retained* and
+its work *is* counted, so the node declines to reorganize and cannot accept
+honest blocks until the situation changes. That follows directly from treating
+`finality_depth` as a hard rule. Whether the node should instead follow the
+heavier chain, or how long to remember a branch it will not take, is a consensus
+design question and not a bug fix.
+
 ## A claim that did not survive measurement
 
 An earlier design document reported a 40% attacker with a two-hour
@@ -140,7 +231,9 @@ to separate them.
   every truncation of a valid block, count fields claiming more entries than
   the buffer holds, wire round-trip stability, output-encoding injectivity, and
   `undo_tx` proven an exact inverse over a 64-step spend sequence. Each was
-  checked to fail when the property it names is broken.
+  checked to fail when the property it names is broken. The red-team suite in
+  `crates/jnt-core/tests/redteam.rs` is the same idea applied to consensus and
+  ledger invariants rather than parsers.
 - Vector coverage is finite by construction. The crosscheck exercises seven
   header/epoch combinations; it does not cover every field permutation, and a
   Rust-only bug outside those cases would not be caught by it.
@@ -155,7 +248,8 @@ to separate them.
 ## Reproducing the difficulty work
 
 ```
-cargo test --workspace                                 # 130 tests
+cargo test --workspace                                 # 139 tests
+cargo test -p jnt-core --test redteam                   # red-team regression suite
 cargo clippy --workspace --all-targets -- -D warnings # clean
 cargo fmt --all --check                               # clean
 python sim/difficulty_attack_sim.py                     # attack containment
