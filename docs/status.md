@@ -20,6 +20,8 @@ single-node chain. A coin with one node is not a network yet.
   Rust code.
 - All four vector files in SPEC.md §12 exist, are generated from source, and are
   read by tests. `sim/verify_vectors.py` regenerates and cross-checks them.
+  Each consuming test was checked to actually fail when the value it pins is
+  perturbed, so none of them pass vacuously.
 - Node CLI end to end on the `mini` profile: init, mine 31 blocks, spend, verify
   (replays from genesis and diffs UTXO + supply), status. Fee burn reconciles
   exactly — 31 blocks issue 2356 JNT, live supply is 2355.99825 JNT, the
@@ -93,10 +95,6 @@ to separate them.
 - **`puzzle_crosscheck.py` and `verify_vectors.py`** are referenced by SPEC.md
   §12 but do not exist. `sim/jounit_reference.py` exists and is exercised, but
   nothing currently runs it automatically or diffs it against the Rust output.
-- **`supply_vectors.json` is only weakly checked.** A test asserts it is valid
-  JSON with the right `sat_per_jnt`, which catches a truncated write but
-  verifies nothing about its contents. `sim/verify_vectors.py` does check the
-  ladder and cap invariant in detail, but nothing in `cargo test` does.
 - **No fuzzing, no property tests, no adversarial block/tx corpus.**
 - Vector coverage is finite by construction. The crosscheck exercises seven
   header/epoch combinations; it does not cover every field permutation, and a

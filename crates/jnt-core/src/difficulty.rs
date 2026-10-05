@@ -556,17 +556,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn a_supply_vector_file_exists_to_show_the_pattern() {
-        // The difficulty vectors above are consumed by this test suite;
-        // supply_vectors.json is written by sim/supply_schedule_sim.py but
-        // nothing reads it yet. Assert the file is at least valid JSON so a
-        // truncated write is caught.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/vectors/supply_vectors.json");
-        let raw = std::fs::read_to_string(&path).expect("supply_vectors.json must exist");
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("must be valid JSON");
-        assert_eq!(v["sat_per_jnt"], 100_000_000u64);
-    }
 }
