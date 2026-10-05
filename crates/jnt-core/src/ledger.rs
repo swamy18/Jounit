@@ -167,6 +167,12 @@ pub fn check_tx(
     if tx.has_zero_value_output() {
         return Err(Error::BadFee("zero-value output"));
     }
+    // Reject an unrepresentable output total before it is used in the
+    // value_in >= value_out comparison below, where a wrapped sum would read
+    // as a transaction that creates less value than it spends.
+    if tx.value_out_overflows() {
+        return Err(Error::ValueOverflow);
+    }
 
     let mut seen: HashSet<Key> = HashSet::new();
     let mut value_in = 0u64;

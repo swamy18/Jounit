@@ -12,7 +12,7 @@ single-node chain. A coin with one node is not a network yet.
 
 ## Verified
 
-- `cargo test --workspace` — 105 tests pass, `cargo clippy --all-targets` clean
+- `cargo test --workspace` — 106 tests pass, `cargo clippy --all-targets` clean
   under `-D warnings`, `cargo fmt --check` clean. CI (`.github/workflows/ci.yml`)
   runs all of it plus the vector cross-checks on every push.
 - An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
@@ -33,6 +33,21 @@ single-node chain. A coin with one node is not a network yet.
   unmintable rather than merely reserved.
 
 ## Known bugs found and fixed
+
+**`Transaction::value_out` panicked on an unrepresentable total.** It summed
+output values with `.sum()`, so a transaction declaring outputs above `u64::MAX`
+raised `attempt to add with overflow` in debug builds and wrapped to a small
+number in release ones. `check_tx` compares `value_out` against the resolved
+input total, so a wrapped sum could read as a transaction that spends less than
+it creates — an inflation primitive. Confirmed by restoring the original
+expression and watching the new test fail with the overflow panic. `value_out`
+now saturates and a new `value_out_overflows` check runs in `check_tx` before
+the comparison is trusted.
+
+The rest of the arithmetic audit came back clean: `ser.rs` bounds-checks every
+read, both `tx` and `block` deserializers reject attacker-controlled counts
+larger than the remaining buffer before allocating, `value_in` already used
+`checked_add`, and `fees.rs` uses saturating operations throughout.
 
 **The puzzle overflow guard could not fire.** `PuzzleSpec::validate` computed
 its accumulator bound as `(nn_input_dim as i64) * 128 * 128 + 62` and compared
@@ -118,8 +133,6 @@ to separate them.
 
 ## Known rough edges
 
-- `jnt-node mine --help` tries to open a chain directory instead of printing
-  help, so it fails confusingly on a fresh checkout.
 - `--amount` on `send` is denominated in satoshis while every other printed
   figure is in JNT. This bit me during verification and is documented in the
   command's error message, but it should probably gain a unit suffix.
@@ -127,7 +140,7 @@ to separate them.
 ## Reproducing the difficulty work
 
 ```
-cargo test --workspace                                 # 105 tests
+cargo test --workspace                                 # 106 tests
 cargo clippy --workspace --all-targets -- -D warnings # clean
 cargo fmt --all --check                               # clean
 python sim/difficulty_attack_sim.py                     # attack containment

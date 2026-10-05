@@ -127,6 +127,9 @@ impl Args {
                     out.switches.push(name.to_string());
                     i += 1;
                 }
+            } else if a == "-h" {
+                out.switches.push("help".into());
+                i += 1;
             } else {
                 return Err(format!("unexpected argument `{a}`"));
             }
@@ -136,6 +139,14 @@ impl Args {
 
     fn str(&self, name: &str) -> Option<&str> {
         self.flags.get(name).map(|s| s.as_str())
+    }
+
+    /// True when the user asked for help rather than for work.
+    ///
+    /// `--help` parses as a boolean switch, but `-h` is not `--`-prefixed and
+    /// would otherwise be rejected as an unexpected argument.
+    fn wants_help(&self) -> bool {
+        self.switches.iter().any(|s| s == "help")
     }
 
     fn str_or(&self, name: &str, default: &str) -> String {
@@ -262,6 +273,15 @@ fn jnt(sat: u64) -> String {
 fn run(raw: &[String]) -> Result<(), String> {
     let command = raw[0].clone();
     let args = Args::parse(&raw[1..])?;
+
+    // `--help` and `-h` anywhere on the line means help, not work. Without
+    // this, `mine --help` opened a chain directory and failed on a fresh
+    // checkout, which reads like a broken install rather than a help request.
+    if args.wants_help() {
+        println!("{USAGE}");
+        return Ok(());
+    }
+
     match command.as_str() {
         "init" => cmd_init(&args),
         "mine" => cmd_mine(&args),

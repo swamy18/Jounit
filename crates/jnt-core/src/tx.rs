@@ -236,8 +236,31 @@ impl Transaction {
         sha256_dom(DOM_SIG, &[w.as_slice()])
     }
 
+    /// Total value of all outputs.
+    ///
+    /// Saturating, and the caller must treat `u64::MAX` as overflow: a
+    /// transaction can declare more output value than a `u64` holds, and
+    /// summing it with `.sum()` would panic in debug builds and wrap in
+    /// release ones. `check_tx` compares this against the resolved input
+    /// total and rejects it, so a wrapped sum could otherwise masquerade
+    /// as a transaction spending less than it creates.
     pub fn value_out(&self) -> u64 {
-        self.outputs.iter().map(|o| o.value).sum()
+        self.outputs
+            .iter()
+            .fold(0u64, |acc, o| acc.saturating_add(o.value))
+    }
+
+    /// True when the output total cannot be represented. `check_tx` calls
+    /// this before trusting `value_out`.
+    pub fn value_out_overflows(&self) -> bool {
+        let mut acc: u64 = 0;
+        for o in &self.outputs {
+            match acc.checked_add(o.value) {
+                Some(next) => acc = next,
+                None => return true,
+            }
+        }
+        false
     }
 
     /// Sum of input values. Only meaningful once inputs have been resolved
@@ -449,6 +472,51 @@ mod tests {
             tx.verify_input(0, &real, 99),
             Err(Error::UnsupportedSigScheme(99))
         ));
+    }
+
+    #[test]
+    fn an_unrepresentable_output_total_is_detected_not_wrapped() {
+        // Outputs summing past u64::MAX. `.sum()` used to panic in debug and
+        // wrap in release; `value_out_overflows` is what `check_tx` consults,
+        // and `value_out` saturates rather than lying about the total.
+        let tx = Transaction::standard(
+            vec![Input::unsigned(&OutPoint {
+                txid: [0; 32],
+                index: 0,
+            })],
+            vec![
+                Output {
+                    value: u64::MAX,
+                    address: [1; 20],
+                },
+                Output {
+                    value: 1,
+                    address: [2; 20],
+                },
+            ],
+        );
+        assert!(tx.value_out_overflows());
+        assert_eq!(tx.value_out(), u64::MAX, "must saturate, not wrap to 0");
+
+        // And a representable total must not be reported as overflow.
+        let ok = Transaction::standard(
+            vec![Input::unsigned(&OutPoint {
+                txid: [0; 32],
+                index: 0,
+            })],
+            vec![
+                Output {
+                    value: 1_000,
+                    address: [1; 20],
+                },
+                Output {
+                    value: 2_000,
+                    address: [2; 20],
+                },
+            ],
+        );
+        assert!(!ok.value_out_overflows());
+        assert_eq!(ok.value_out(), 3_000);
     }
 
     #[test]
