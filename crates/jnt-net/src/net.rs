@@ -213,7 +213,6 @@ impl P2pNode {
                 PeerEvent::Connected {
                     peer_id,
                     version,
-                    is_outbound: _,
                     ..
                 } => {
                     // If the peer is ahead, ask for blocks
