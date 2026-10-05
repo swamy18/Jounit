@@ -12,7 +12,9 @@ single-node chain. A coin with one node is not a network yet.
 
 ## Verified
 
-- `cargo test -p jnt-core` — 104 tests pass.
+- `cargo test --workspace` — 105 tests pass, `cargo clippy --all-targets` clean
+  under `-D warnings`, `cargo fmt --check` clean. CI (`.github/workflows/ci.yml`)
+  runs all of it plus the vector cross-checks on every push.
 - An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
   written from the prose of SPEC.md rather than from the Rust source, reproduces
   all 21 puzzle digests in `tests/vectors/puzzle_vectors.json`. This is the only
@@ -31,6 +33,22 @@ single-node chain. A coin with one node is not a network yet.
   unmintable rather than merely reserved.
 
 ## Known bugs found and fixed
+
+**The puzzle overflow guard could not fire.** `PuzzleSpec::validate` computed
+its accumulator bound as `(nn_input_dim as i64) * 128 * 128 + 62` and compared
+against `i64::MAX`. The dimensions are `usize`, so a large value wraps negative
+on the cast and the multiplication overflows *before* the comparison runs — the
+check passed exactly the inputs it existed to reject. It also only considered
+`nn_input_dim`, ignoring `nn_hidden_dim`, which is what every layer after the
+first actually accumulates over. Now computed in `u128` with saturating
+arithmetic, bounding the wider of the two, and moved ahead of the share audit
+that consumes those dimensions.
+
+Writing the test for that surfaced two more overflows on the same path:
+`nn_macs` multiplied `usize x usize x usize`, and `nn_share_bps` then
+multiplied by 10 000. Both are public methods a caller can reach before
+`validate()`, so a hostile puzzle registry entry could panic a node rather than
+be rejected. Both are saturating now.
 
 **The LWMA retarget had no restoring force.** `d_raw` was computed as
 `S / (T * W)`, which is `avg_solve / T`. That quantity is scale-invariant, so
@@ -92,13 +110,11 @@ to separate them.
 - **P2P.** No node discovery, no block/tx relay, no mempool gossip.
 - **Persisted UTXO indexing.** State is replayed from genesis on load, which is
   fine at test scale and will not be at 40M coins.
-- **`puzzle_crosscheck.py` and `verify_vectors.py`** are referenced by SPEC.md
-  §12 but do not exist. `sim/jounit_reference.py` exists and is exercised, but
-  nothing currently runs it automatically or diffs it against the Rust output.
 - **No fuzzing, no property tests, no adversarial block/tx corpus.**
 - Vector coverage is finite by construction. The crosscheck exercises seven
   header/epoch combinations; it does not cover every field permutation, and a
   Rust-only bug outside those cases would not be caught by it.
+- **No release or tagging process**, and no coverage report in CI.
 
 ## Known rough edges
 
@@ -111,7 +127,9 @@ to separate them.
 ## Reproducing the difficulty work
 
 ```
-cargo test -p jnt-core                                  # 104 tests
+cargo test --workspace                                 # 105 tests
+cargo clippy --workspace --all-targets -- -D warnings # clean
+cargo fmt --all --check                               # clean
 python sim/difficulty_attack_sim.py                     # attack containment
 python sim/difficulty_attack_sim.py --ablation \
     --start-difficulty 100000                           # which rule is load-bearing

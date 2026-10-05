@@ -97,8 +97,19 @@ impl Args {
                 // Flags that take a value; everything else is a boolean switch.
                 let takes_value = matches!(
                     name,
-                    "network" | "data-dir" | "blocks" | "amount" | "to" | "address" | "wallet"
-                        | "label" | "height" | "out" | "from" | "interval" | "fee"
+                    "network"
+                        | "data-dir"
+                        | "blocks"
+                        | "amount"
+                        | "to"
+                        | "address"
+                        | "wallet"
+                        | "label"
+                        | "height"
+                        | "out"
+                        | "from"
+                        | "interval"
+                        | "fee"
                 );
                 if takes_value {
                     let value = raw
@@ -279,8 +290,14 @@ fn cmd_init(args: &Args) -> Result<(), String> {
     let label = args.str_or("label", "miner");
     let w = Wallet::new_random(&label);
     println!("wallet `{}`", w.label);
-    println!("  address  {}", address_to_hex(&w.address().map_err(|e| e.to_string())?));
-    println!("  pubkey   {}", w.public_key_hex().map_err(|e| e.to_string())?);
+    println!(
+        "  address  {}",
+        address_to_hex(&w.address().map_err(|e| e.to_string())?)
+    );
+    println!(
+        "  pubkey   {}",
+        w.public_key_hex().map_err(|e| e.to_string())?
+    );
     wallets.push(w);
     store.save_wallets(&wallets)?;
 
@@ -291,10 +308,7 @@ fn cmd_init(args: &Args) -> Result<(), String> {
     println!("network        {}", store.params.name);
     println!("genesis        {}", hash_to_hex(&chain.tip_hash()));
     println!("block time     {} ms", store.params.target_block_time_ms);
-    println!(
-        "supply cap     {} JNT",
-        store.params.supply_cap_jnt()
-    );
+    println!("supply cap     {} JNT", store.params.supply_cap_jnt());
     println!(
         "reachable      {} JNT (the rest is permanently unmintable)",
         max_issuance_sat(&store.params) / SAT_PER_JNT
@@ -468,11 +482,26 @@ fn cmd_status(args: &Args) -> Result<(), String> {
         halvings(&store.params, tip.header.height),
         store.params.halving_period - (tip.header.height % store.params.halving_period)
     );
-    println!("block reward   {} JNT", jnt(block_reward_sat(&store.params, tip.header.height + 1)));
-    println!("puzzle         {} (id {})", chain.registry().get_opt(tip.header.puzzle_id).map(|p| p.name.clone()).unwrap_or_default(), tip.header.puzzle_id);
+    println!(
+        "block reward   {} JNT",
+        jnt(block_reward_sat(&store.params, tip.header.height + 1))
+    );
+    println!(
+        "puzzle         {} (id {})",
+        chain
+            .registry()
+            .get_opt(tip.header.puzzle_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default(),
+        tip.header.puzzle_id
+    );
     println!();
     println!("live supply    {} JNT", jnt(report.live_sat));
-    println!("issued to {}  {} JNT", report.height, jnt(cumulative_supply_sat(&store.params, report.height)));
+    println!(
+        "issued to {}  {} JNT",
+        report.height,
+        jnt(cumulative_supply_sat(&store.params, report.height))
+    );
     println!("reachable max  {} JNT", jnt(report.reachable_sat));
     println!("hard cap       {} JNT", jnt(report.cap_sat));
     println!(
@@ -524,16 +553,21 @@ fn cmd_show_block(args: &Args) -> Result<(), String> {
     let block = chain
         .block_at(height)
         .ok_or_else(|| format!("no block at height {height}"))?;
-    println!("{}", serde_json::to_string_pretty(block).map_err(|e| e.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(block).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
 fn cmd_balance(args: &Args) -> Result<(), String> {
     let store = Store::open(args)?;
     let chain = store.load_chain()?;
-    let addr =
-        address_from_hex(args.str("address").ok_or("--address <jt1...> is required")?)
-            .map_err(|e| e.to_string())?;
+    let addr = address_from_hex(
+        args.str("address")
+            .ok_or("--address <jt1...> is required")?,
+    )
+    .map_err(|e| e.to_string())?;
     let mut total = 0u64;
     let mut mature_total = 0u64;
     let maturity = store.params.coinbase_maturity;
@@ -588,8 +622,14 @@ fn cmd_wallet(args: &Args) -> Result<(), String> {
     let label = args.str_or("label", &format!("w{}", wallets.len()));
     let w = Wallet::new_random(&label);
     println!("created `{}`", w.label);
-    println!("  address  {}", address_to_hex(&w.address().map_err(|e| e.to_string())?));
-    println!("  pubkey   {}", w.public_key_hex().map_err(|e| e.to_string())?);
+    println!(
+        "  address  {}",
+        address_to_hex(&w.address().map_err(|e| e.to_string())?)
+    );
+    println!(
+        "  pubkey   {}",
+        w.public_key_hex().map_err(|e| e.to_string())?
+    );
     wallets.push(w);
     store.save_wallets(&wallets)
 }
@@ -604,8 +644,11 @@ fn cmd_export(args: &Args) -> Result<(), String> {
             blocks.push(b.clone());
         }
     }
-    fs::write(&out, serde_json::to_string_pretty(&blocks).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    fs::write(
+        &out,
+        serde_json::to_string_pretty(&blocks).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     println!("wrote {} block(s) to {}", blocks.len(), out.display());
     Ok(())
 }

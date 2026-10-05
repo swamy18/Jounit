@@ -8,6 +8,12 @@
 //! - every quantity is integer-only and epoch-scoped, so results are identical
 //!   on any hardware and no weights can be precomputed before an epoch starts
 
+// The forward pass below is written as nested `for i in 0..dim` loops to match
+// SPEC.md 5.3 literally, so it can be diffed against the document line by line.
+// Iterator rewrites are deliberately declined: the indexing is not incidental,
+// it is the specification.
+#![allow(clippy::needless_range_loop)]
+
 use sha2::{Digest, Sha256};
 
 use crate::block::Header;
@@ -63,20 +69,42 @@ impl PuzzleSpec {
     }
 
     /// `nn_macs = layers * hidden^2`
+    ///
+    /// Saturating: `validate()` rejects absurd dimensions, but this is a
+    /// public method a caller may reach first, and an overflow here would
+    /// panic rather than report a bad puzzle spec.
     pub fn nn_macs(&self) -> u128 {
-        (self.nn_layers * self.nn_hidden_dim * self.nn_hidden_dim) as u128
+        (self.nn_layers as u128)
+            .saturating_mul(self.nn_hidden_dim as u128)
+            .saturating_mul(self.nn_hidden_dim as u128)
     }
 
     /// Hash stages: stage 1 initial + `hash_rounds` + stage 3.
     pub fn hash_invocations(&self) -> u128 {
-        (1 + self.hash_rounds + 1) as u128
+        (1u128)
+            .saturating_add(self.hash_rounds as u128)
+            .saturating_add(1)
     }
 
     /// Cost model from SPEC.md §5.6: one SHA-256 is treated as 64 int32 MACs.
+    ///
+    /// Saturating throughout, and `u32::MAX` on a saturated numerator so a
+    /// pathological spec reads as "share far above the audit band" and is
+    /// rejected by `validate()` instead of wrapping into the band.
     pub fn nn_share_bps(&self) -> u32 {
         let macs = self.nn_macs();
-        let hash_cost = self.hash_invocations() * 64;
-        (((macs * 10_000) + (hash_cost / 2)) / (macs + hash_cost)) as u32
+        let hash_cost = self.hash_invocations().saturating_mul(64);
+        let scaled = macs.saturating_mul(10_000).saturating_add(hash_cost / 2);
+        let denom = macs.saturating_add(hash_cost);
+        if denom == 0 {
+            return 0;
+        }
+        let bps = scaled / denom;
+        if bps > u32::MAX as u128 {
+            u32::MAX
+        } else {
+            bps as u32
+        }
     }
 
     /// A registry entry must pass the Section 29.3 work-share audit.
@@ -91,17 +119,33 @@ impl PuzzleSpec {
                 "at least one hash round is required for brute-force security".into(),
             ));
         }
+
+        // Keep the i64 accumulator provably overflow-free (SPEC.md 5.3:
+        // `|s| <= in_dim x 128 x 128 + 62`).
+        //
+        // Checked *before* the share audit below, which consumes these
+        // dimensions. Both widths matter: layer 0 accumulates over
+        // `nn_input_dim`, every later layer over `nn_hidden_dim`.
+        //
+        // Computed in u128 rather than i64: the dimensions are `usize`, so an
+        // absurd registry entry would make `dim as i64` wrap negative and
+        // `* 128 * 128` would overflow *this guard* before the comparison ever
+        // ran. A guard has to survive the inputs it exists to reject.
+        let widest = (self.nn_input_dim as u128).max(self.nn_hidden_dim as u128);
+        let worst = widest
+            .saturating_mul(128)
+            .saturating_mul(128)
+            .saturating_add(62);
+        if worst >= i64::MAX as u128 {
+            return Err(Error::BadPuzzleSpec("accumulator can overflow i64".into()));
+        }
+
         let share = self.nn_share_bps();
         if share < self.min_nn_share_bps || share > self.max_nn_share_bps {
             return Err(Error::BadPuzzleSpec(format!(
                 "nn_share_bps {share} outside [{}, {}]",
                 self.min_nn_share_bps, self.max_nn_share_bps
             )));
-        }
-        // Keep the i64 accumulator provably overflow-free.
-        let worst = (self.nn_input_dim as i64) * 128 * 128 + 62;
-        if worst >= i64::MAX {
-            return Err(Error::BadPuzzleSpec("accumulator can overflow i64".into()));
         }
         Ok(())
     }
@@ -177,7 +221,8 @@ pub struct EpochWeights {
 
 impl EpochWeights {
     pub fn build(spec: &PuzzleSpec, epoch_id: u32) -> Self {
-        let mut weights = Vec::with_capacity(spec.nn_layers * spec.nn_hidden_dim * spec.nn_hidden_dim);
+        let mut weights =
+            Vec::with_capacity(spec.nn_layers * spec.nn_hidden_dim * spec.nn_hidden_dim);
         for layer in 0..spec.nn_layers {
             for out in 0..spec.nn_hidden_dim {
                 for inp in 0..spec.in_dim(layer) {
@@ -202,7 +247,8 @@ impl EpochWeights {
 
     #[inline]
     pub fn weight(&self, spec: &PuzzleSpec, layer: usize, out: usize, inp: usize) -> i32 {
-        self.weights[layer * spec.nn_hidden_dim * spec.nn_hidden_dim + out * spec.nn_hidden_dim + inp]
+        self.weights
+            [layer * spec.nn_hidden_dim * spec.nn_hidden_dim + out * spec.nn_hidden_dim + inp]
     }
 
     #[inline]
@@ -230,7 +276,9 @@ fn forward(spec: &PuzzleSpec, seed: &Hash, weights: &EpochWeights) -> Vec<u8> {
     let mut acts = Vec::with_capacity(DOM_S2.len() + spec.nn_layers * spec.nn_hidden_dim * 4);
     acts.extend_from_slice(DOM_S2);
 
-    let mut x: Vec<i32> = (0..spec.nn_input_dim).map(|j| seed[j] as i32 - 128).collect();
+    let mut x: Vec<i32> = (0..spec.nn_input_dim)
+        .map(|j| seed[j] as i32 - 128)
+        .collect();
     let mut z = vec![0i32; spec.nn_hidden_dim];
 
     for layer in 0..spec.nn_layers {
@@ -459,12 +507,53 @@ mod tests {
     }
 
     #[test]
+    fn overflow_guard_rejects_absurd_widths_without_itself_overflowing() {
+        // The guard computing `dim * 128 * 128` in i64 would wrap negative
+        // for a `usize` dimension near 2^63 and then overflow before the
+        // comparison ran, so the check passed the very inputs it exists to
+        // reject. Both widths must be covered: layers after the first
+        // accumulate over `nn_hidden_dim`.
+        let mut s = spec();
+        s.nn_input_dim = usize::MAX;
+        assert!(
+            matches!(s.validate(), Err(Error::BadPuzzleSpec(_))),
+            "absurd input dim must be rejected"
+        );
+
+        let mut s2 = spec();
+        s2.nn_input_dim = 16;
+        s2.nn_hidden_dim = usize::MAX;
+        assert!(
+            matches!(s2.validate(), Err(Error::BadPuzzleSpec(_))),
+            "absurd hidden dim must be rejected even when the input dim is sane"
+        );
+
+        // A far wider network is still legitimate as long as the hash
+        // rounds are retuned to bring the NN share back into the audit
+        // band: 256-wide layers bound the accumulator at 4_194_366, sixteen
+        // times the default, and remain valid. The guard must reject only
+        // genuinely unbounded widths, not merely unusual ones.
+        let mut wide = spec();
+        wide.nn_input_dim = 256;
+        wide.nn_hidden_dim = 256;
+        wide.hash_rounds = 3_070;
+        assert_eq!(wide.nn_share_bps(), 5_000);
+        assert!(
+            wide.validate().is_ok(),
+            "a wide-but-tuned spec must be accepted"
+        );
+    }
+
+    #[test]
     fn more_hash_rounds_shrink_the_nn_share() {
         let base = spec().nn_share_bps();
         let mut s = spec();
         s.hash_rounds = 64;
         assert!(s.nn_share_bps() < base);
-        assert!(s.validate().is_err(), "share below the 30% floor must be rejected");
+        assert!(
+            s.validate().is_err(),
+            "share below the 30% floor must be rejected"
+        );
 
         let mut s2 = spec();
         s2.hash_rounds = 0;
@@ -564,7 +653,11 @@ mod tests {
                 non_zero += 1;
             }
         }
-        assert!(non_zero >= 60, "activations collapsed in {}/64 samples", 64 - non_zero);
+        assert!(
+            non_zero >= 60,
+            "activations collapsed in {}/64 samples",
+            64 - non_zero
+        );
     }
 
     #[test]
@@ -590,10 +683,7 @@ mod tests {
         for n in 0..256u64 {
             let mut h = header_at(1, n, 0);
             h.difficulty = crate::u256::MAX_DIFFICULTY + 1; // beyond the 2^96 ceiling
-            assert!(matches!(
-                satisfies(&s, &h),
-                Err(Error::TargetOverflow(_))
-            ));
+            assert!(matches!(satisfies(&s, &h), Err(Error::TargetOverflow(_))));
 
             h.difficulty = 1u128 << 90;
             if satisfies(&s, &h).unwrap() {
@@ -672,10 +762,7 @@ Do not hand-edit.\",\n",
             json.push_str(&format!("      \"nonce\": {nonce},\n"));
             json.push_str(&format!("      \"epoch_id\": {epoch},\n"));
             json.push_str(&format!("      \"header_len\": {header_len},\n"));
-            json.push_str(&format!(
-                "      \"seed\": \"{}\",\n",
-                hex::encode(run.seed)
-            ));
+            json.push_str(&format!("      \"seed\": \"{}\",\n", hex::encode(run.seed)));
             json.push_str(&format!(
                 "      \"activation_digest\": \"{}\",\n",
                 hex::encode(run.activation_digest)
@@ -684,7 +771,11 @@ Do not hand-edit.\",\n",
                 "      \"final_hash\": \"{}\"\n",
                 hex::encode(run.final_hash)
             ));
-            json.push_str(if i + 1 == cases.len() { "    }\n" } else { "    },\n" });
+            json.push_str(if i + 1 == cases.len() {
+                "    }\n"
+            } else {
+                "    },\n"
+            });
         }
         json.push_str("  ]\n}\n");
 
@@ -704,7 +795,10 @@ Do not hand-edit.\",\n",
             )
         });
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["spec"]["nn_share_bps"], 4_000u64, "SPEC.md 5.6 audit band");
+        assert_eq!(
+            v["spec"]["nn_share_bps"], 4_000u64,
+            "SPEC.md 5.6 audit band"
+        );
 
         let listed = v["cases"].as_array().expect("cases must be an array");
         assert_eq!(
@@ -713,9 +807,7 @@ Do not hand-edit.\",\n",
             "vector file is stale: regenerate with UPDATE_PUZZLE_VECTORS=1"
         );
 
-        for (entry, (height, nonce, epoch, run, header_len)) in
-            listed.iter().zip(cases.iter())
-        {
+        for (entry, (height, nonce, epoch, run, header_len)) in listed.iter().zip(cases.iter()) {
             let name = format!("h{height}_n{nonce}_e{epoch}");
             assert_eq!(entry["header_len"].as_u64().unwrap(), *header_len);
             assert_eq!(

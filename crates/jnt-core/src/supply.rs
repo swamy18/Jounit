@@ -104,11 +104,7 @@ mod tests {
         let expect = [76u64, 38, 19, 9, 4, 2, 1, 0];
         for (i, jnt) in expect.iter().enumerate() {
             let h = (i as u64) * p.halving_period;
-            assert_eq!(
-                block_reward_sat(&p, h) / SAT_PER_JNT,
-                *jnt,
-                "halving {i}"
-            );
+            assert_eq!(block_reward_sat(&p, h) / SAT_PER_JNT, *jnt, "halving {i}");
         }
         assert_eq!(block_reward_sat(&p, 8 * p.halving_period), 0);
     }
@@ -123,7 +119,10 @@ mod tests {
                 "reward changed at offset {off} of the first period"
             );
         }
-        assert_eq!(block_reward_sat(&p, p.halving_period), 38 * crate::params::SAT_PER_JNT);
+        assert_eq!(
+            block_reward_sat(&p, p.halving_period),
+            38 * crate::params::SAT_PER_JNT
+        );
     }
 
     #[test]
@@ -135,10 +134,7 @@ mod tests {
                 p.start_reward_sat,
                 "one mined block pays exactly one reward"
             );
-            assert_eq!(
-                cumulative_supply_sat(&p, 5),
-                p.start_reward_sat * 5
-            );
+            assert_eq!(cumulative_supply_sat(&p, 5), p.start_reward_sat * 5);
         }
     }
 
@@ -150,7 +146,10 @@ mod tests {
         let issued = cumulative_supply_sat(&p, 8 * p.halving_period);
         assert_eq!(issued / SAT_PER_JNT, 149 * p.halving_period);
         assert_eq!(issued / SAT_PER_JNT, 39_157_200);
-        assert!(issued < p.supply_cap_sat, "issuance must stay under the cap");
+        assert!(
+            issued < p.supply_cap_sat,
+            "issuance must stay under the cap"
+        );
         // 39,945,600 - 39,157,200 = 788,400 JNT is permanently unmintable.
         assert_eq!(p.supply_cap_sat - issued, 788_400 * SAT_PER_JNT);
     }
@@ -223,11 +222,7 @@ mod tests {
             !reward_exceeds_remaining(&p, issued, 1),
             "a JNT of headroom still exists, so the ladder is the binding limit"
         );
-        assert!(reward_exceeds_remaining(
-            &p,
-            p.supply_cap_sat,
-            1
-        ));
+        assert!(reward_exceeds_remaining(&p, p.supply_cap_sat, 1));
     }
 
     #[test]
@@ -305,8 +300,7 @@ mod tests {
                 "{name}: reachable issuance must stay strictly under the cap"
             );
 
-            let listed_unmintable =
-                sec["unmintable_jnt"].as_u64().unwrap() * SAT_PER_JNT;
+            let listed_unmintable = sec["unmintable_jnt"].as_u64().unwrap() * SAT_PER_JNT;
             assert_eq!(
                 p.supply_cap_sat - reachable_sat,
                 listed_unmintable,

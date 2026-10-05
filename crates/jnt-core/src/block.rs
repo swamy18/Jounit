@@ -211,7 +211,7 @@ pub fn genesis_block(difficulty: u128) -> Block {
         },
     );
     debug_assert!(coinbase.is_coinbase());
-    let header = Header::genesis(merkle_root(&[coinbase.clone()]), difficulty);
+    let header = Header::genesis(merkle_root(std::slice::from_ref(&coinbase)), difficulty);
     Block {
         header,
         signature: [0u8; 64],
@@ -255,7 +255,10 @@ mod tests {
     #[test]
     fn header_hash_is_domain_separated() {
         let g = genesis_block(1);
-        assert_eq!(g.header.block_hash(), sha256_dom(DOM_BLOCK, &[&g.header.serialize()]));
+        assert_eq!(
+            g.header.block_hash(),
+            sha256_dom(DOM_BLOCK, &[&g.header.serialize()])
+        );
         assert_ne!(g.header.block_hash(), sha256(&[&g.header.serialize()]));
     }
 
@@ -299,7 +302,10 @@ mod tests {
         let lc = sha256(&[&[LEAF_TAG], &c.serialize()]);
         let left = sha256(&[&[INTERNAL_TAG], &la, &lb]);
         let right = sha256(&[&[INTERNAL_TAG], &lc, &lc]);
-        assert_eq!(merkle_root(&[a, b, c]), sha256(&[&[INTERNAL_TAG], &left, &right]));
+        assert_eq!(
+            merkle_root(&[a, b, c]),
+            sha256(&[&[INTERNAL_TAG], &left, &right])
+        );
     }
 
     #[test]

@@ -60,7 +60,11 @@ pub enum Error {
     /// address derived from the input pubkey does not own the spent output
     WrongAddress,
     /// would mint past the hard supply cap
-    SupplyCapExceeded { already: u64, requested: u64, cap: u64 },
+    SupplyCapExceeded {
+        already: u64,
+        requested: u64,
+        cap: u64,
+    },
     /// key material was not 32 bytes, or a keypair was not generated
     BadKey(&'static str),
     /// puzzle registry entry fails its own work-share audit
@@ -123,7 +127,11 @@ impl fmt::Display for Error {
             Error::UnsupportedSigScheme(s) => write!(f, "unsupported sig_scheme {s}"),
             Error::BadPubkey => write!(f, "invalid compressed secp256k1 pubkey"),
             Error::WrongAddress => write!(f, "pubkey does not own the spent output"),
-            Error::SupplyCapExceeded { already, requested, cap } => write!(
+            Error::SupplyCapExceeded {
+                already,
+                requested,
+                cap,
+            } => write!(
                 f,
                 "mint would exceed cap: issued {already} + reward {requested} > cap {cap}"
             ),

@@ -101,13 +101,8 @@ impl UtxoSet {
                 txid: tx.txid(),
                 index: index as u32,
             };
-            self.map.insert(
-                (op.txid, op.index),
-                Utxo {
-                    out: *out,
-                    height,
-                },
-            );
+            self.map
+                .insert((op.txid, op.index), Utxo { out: *out, height });
             undo.created.push(op);
         }
 
@@ -159,7 +154,9 @@ pub fn check_tx(
         ));
     }
     if tx.inputs.is_empty() {
-        return Err(Error::Malformed("standard transaction needs at least one input"));
+        return Err(Error::Malformed(
+            "standard transaction needs at least one input",
+        ));
     }
     if tx.outputs.is_empty() {
         return Err(Error::Malformed("transaction needs at least one output"));
@@ -189,7 +186,9 @@ pub fn check_tx(
             return Err(Error::BadFee("spending a zero-value output"));
         }
         tx.verify_input(k, &held.out.address, tx_sig_scheme(tx))?;
-        value_in = value_in.checked_add(held.out.value).ok_or(Error::ValueOverflow)?;
+        value_in = value_in
+            .checked_add(held.out.value)
+            .ok_or(Error::ValueOverflow)?;
     }
 
     let value_out = tx.value_out();
@@ -233,10 +232,18 @@ mod tests {
 
     /// Every spend in these tests is fully signed, because `check_tx` verifies
     /// signatures before it looks at anything else.
-    fn signed_spend(wallet: &Wallet, op: OutPoint, pay: u64, to: crate::hash::Address) -> Transaction {
+    fn signed_spend(
+        wallet: &Wallet,
+        op: OutPoint,
+        pay: u64,
+        to: crate::hash::Address,
+    ) -> Transaction {
         let mut tx = Transaction::standard(
             vec![Input::unsigned(&op)],
-            vec![Output { value: pay, address: to }],
+            vec![Output {
+                value: pay,
+                address: to,
+            }],
         );
         wallet.sign(&mut tx).unwrap();
         tx
@@ -272,7 +279,10 @@ mod tests {
         let tx = signed_spend(&w, op, FUNDED - 100, dest);
         let undo = s.apply_tx(&tx, 10).unwrap();
         assert_eq!(s.len(), before, "one spent, one created");
-        assert!(s.contains(&OutPoint { txid: tx.txid(), index: 0 }));
+        assert!(s.contains(&OutPoint {
+            txid: tx.txid(),
+            index: 0
+        }));
         s.undo_tx(&tx, &undo);
         assert_eq!(s.len(), before);
         assert!(s.contains(&op), "the spent output must come back");
@@ -343,7 +353,10 @@ mod tests {
         let tx = signed_spend(&w, op, FUNDED - 100, dest);
         assert!(matches!(
             check_tx(&s, &tx, 55, &NetworkParams::mainnet(), 0, 100),
-            Err(Error::ImmatureCoinbase { height: 50, required: 150 })
+            Err(Error::ImmatureCoinbase {
+                height: 50,
+                required: 150
+            })
         ));
         // Mature exactly at height + maturity.
         assert_eq!(

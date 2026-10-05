@@ -42,12 +42,15 @@ impl Wallet {
     }
 
     pub fn signing_key(&self) -> Result<SigningKey> {
-        SigningKey::from_bytes((&self.private_key).into()).map_err(|_| Error::BadKey("scalar out of range"))
+        SigningKey::from_bytes((&self.private_key).into())
+            .map_err(|_| Error::BadKey("scalar out of range"))
     }
 
     pub fn pubkey(&self) -> Result<[u8; 33]> {
         let sk = self.signing_key()?;
-        Ok(sk.verifying_key().to_encoded_point(true).as_bytes()[..33].try_into().unwrap())
+        Ok(sk.verifying_key().to_encoded_point(true).as_bytes()[..33]
+            .try_into()
+            .unwrap())
     }
 
     pub fn address(&self) -> Result<Address> {
@@ -86,10 +89,7 @@ impl Wallet {
             return Err(Error::BadKey("transaction needs at least one input"));
         }
         let mut tx = Transaction::standard(
-            inputs
-                .iter()
-                .map(Input::unsigned)
-                .collect::<Vec<_>>(),
+            inputs.iter().map(Input::unsigned).collect::<Vec<_>>(),
             outputs,
         );
         self.sign(&mut tx)?;
@@ -215,7 +215,14 @@ mod tests {
     #[test]
     fn coinbase_is_never_signed() {
         let w = wallet();
-        let mut cb = Transaction::coinbase([0u8; 32], 1, Output { value: 1, address: w.address().unwrap() });
+        let mut cb = Transaction::coinbase(
+            [0u8; 32],
+            1,
+            Output {
+                value: 1,
+                address: w.address().unwrap(),
+            },
+        );
         assert!(w.sign(&mut cb).is_err());
     }
 }

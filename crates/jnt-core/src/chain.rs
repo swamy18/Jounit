@@ -94,7 +94,8 @@ impl Chain {
     }
 
     pub fn tip(&self) -> &Block {
-        self.block_by_hash(&self.tip_hash()).expect("tip is in canon")
+        self.block_by_hash(&self.tip_hash())
+            .expect("tip is in canon")
     }
 
     pub fn block_hash_at(&self, height: u64) -> Option<Hash> {
@@ -246,8 +247,7 @@ impl Chain {
 
         // Difficulty: SPEC.md §6.
         let history = self.history(self.params.difficulty_window as usize + 1);
-        let expected_diff =
-            next_difficulty(&self.params, parent.header.difficulty, &history);
+        let expected_diff = next_difficulty(&self.params, parent.header.difficulty, &history);
         if block.header.difficulty != expected_diff {
             return Err(Error::BadDifficulty {
                 expected: expected_diff,
@@ -342,11 +342,15 @@ impl Chain {
 
         // Apply the coinbase last so its output is the freshest.
         let cb_txid = coinbase.txid();
-        body_undo
-            .created
-            .push(OutPoint { txid: cb_txid, index: 0 });
+        body_undo.created.push(OutPoint {
+            txid: cb_txid,
+            index: 0,
+        });
         self.utxo.insert(
-            OutPoint { txid: cb_txid, index: 0 },
+            OutPoint {
+                txid: cb_txid,
+                index: 0,
+            },
             Utxo {
                 out: coinbase.outputs[0],
                 height,
@@ -522,9 +526,8 @@ impl Chain {
         let height = parent.header.height + 1;
 
         let history = self.history(self.params.difficulty_window as usize + 1);
-        let difficulty = difficulty_override.unwrap_or_else(|| {
-            next_difficulty(&self.params, parent.header.difficulty, &history)
-        });
+        let difficulty = difficulty_override
+            .unwrap_or_else(|| next_difficulty(&self.params, parent.header.difficulty, &history));
         let base_fee = if height == 1 {
             self.params.base_fee_initial_sat
         } else {
@@ -534,9 +537,8 @@ impl Chain {
                 parent.total_gas_used(),
             )
         };
-        let timestamp_ms = now_ms.max(
-            crate::difficulty::median_previous_timestamp(&history).unwrap_or(0),
-        );
+        let timestamp_ms =
+            now_ms.max(crate::difficulty::median_previous_timestamp(&history).unwrap_or(0));
 
         // Fee split needs a UTXO view with the body applied. Do it on a copy.
         let mut probe = self.utxo.clone();
@@ -675,31 +677,31 @@ impl Chain {
     }
 
     /// Replay the whole canonical chain from genesis and compare the result with
-/// the live state. Used by `jnt-node verify` and after every reorg in tests:
-/// if undo data were wrong, a replay would diverge here.
-pub fn verify_canonical_chain(&self) -> Result<()> {
-    let mut probe = Chain::new(self.params.clone())?;
-    if probe.canon[0] != self.canon[0] {
-        return Err(Error::BadPrevHash);
-    }
-for hash in self.canon.iter().skip(1) {
+    /// the live state. Used by `jnt-node verify` and after every reorg in tests:
+    /// if undo data were wrong, a replay would diverge here.
+    pub fn verify_canonical_chain(&self) -> Result<()> {
+        let mut probe = Chain::new(self.params.clone())?;
+        if probe.canon[0] != self.canon[0] {
+            return Err(Error::BadPrevHash);
+        }
+        for hash in self.canon.iter().skip(1) {
             let block = self.blocks.get(hash).ok_or(Error::UnknownParent)?;
             probe.validate_standalone(block)?;
             probe.blocks.insert(*hash, block.clone());
             probe.apply_block(block)?;
             probe.canon.push(*hash);
         }
-    if probe.canon != self.canon {
-        return Err(Error::Malformed("canonical path differs from replay"));
+        if probe.canon != self.canon {
+            return Err(Error::Malformed("canonical path differs from replay"));
+        }
+        if probe.utxo.len() != self.utxo.len() {
+            return Err(Error::Malformed("utxo entry count diverged on replay"));
+        }
+        if probe.utxo.total_value() != self.utxo.total_value() {
+            return Err(Error::Malformed("utxo value diverged on replay"));
+        }
+        Ok(())
     }
-    if probe.utxo.len() != self.utxo.len() {
-        return Err(Error::Malformed("utxo entry count diverged on replay"));
-    }
-    if probe.utxo.total_value() != self.utxo.total_value() {
-        return Err(Error::Malformed("utxo value diverged on replay"));
-    }
-    Ok(())
-}
 
     /// Provable statements for `status` / the whitepaper.
     pub fn supply_report(&self) -> SupplyReport {
@@ -751,7 +753,11 @@ mod tests {
     fn genesis_is_valid_and_mines_nothing() {
         let mut chain = Chain::new(NetworkParams::mini()).unwrap();
         assert_eq!(chain.height(), 0);
-        assert_eq!(chain.total_supply_sat(), 0, "0% premine is enforced in code");
+        assert_eq!(
+            chain.total_supply_sat(),
+            0,
+            "0% premine is enforced in code"
+        );
         let genesis = chain.tip().clone();
         chain.validate_standalone(&genesis).unwrap();
     }
@@ -763,7 +769,10 @@ mod tests {
             let b = chain.mine_block(addr(1), vec![], ts(h)).unwrap();
             chain.submit(b).unwrap();
             assert_eq!(chain.height(), h);
-            assert_eq!(chain.total_supply_sat(), block_reward_sat(chain.params(), h) * h);
+            assert_eq!(
+                chain.total_supply_sat(),
+                block_reward_sat(chain.params(), h) * h
+            );
         }
         chain.verify_canonical_chain().unwrap();
     }
@@ -825,7 +834,10 @@ mod tests {
     fn signed_spend(wallet: &Wallet, op: OutPoint, pay: u64, to: Address) -> Transaction {
         let mut tx = Transaction::standard(
             vec![crate::tx::Input::unsigned(&op)],
-            vec![crate::tx::Output { value: pay, address: to }],
+            vec![crate::tx::Output {
+                value: pay,
+                address: to,
+            }],
         );
         wallet.sign(&mut tx).unwrap();
         tx
@@ -838,7 +850,7 @@ mod tests {
         chain.submit(b.clone()).unwrap();
         assert!(matches!(chain.submit(b), Err(Error::AlreadyKnown)));
     }
-#[test]
+    #[test]
     fn tampering_with_a_header_breaks_the_proof_of_work() {
         let mut chain = Chain::new(NetworkParams::mini()).unwrap();
         for h in 1..=6u64 {
@@ -921,7 +933,6 @@ mod tests {
 
     #[test]
     fn heavier_fork_wins_and_state_rewinds() {
-
         // Node A: 1..=4.
         let mut a = Chain::new(NetworkParams::mini()).unwrap();
         let mut a_blocks = Vec::new();
@@ -953,8 +964,14 @@ mod tests {
             a.submit(b_blocks[7].clone()),
             Err(Error::UnknownParent)
         ));
-        assert!(matches!(a.submit(b_blocks[0].clone()), Err(Error::AlreadyKnown)));
-        assert!(matches!(a.submit(b_blocks[1].clone()), Err(Error::AlreadyKnown)));
+        assert!(matches!(
+            a.submit(b_blocks[0].clone()),
+            Err(Error::AlreadyKnown)
+        ));
+        assert!(matches!(
+            a.submit(b_blocks[1].clone()),
+            Err(Error::AlreadyKnown)
+        ));
         for blk in b_blocks.iter().skip(2) {
             a.submit(blk.clone()).unwrap();
         }
@@ -962,7 +979,11 @@ mod tests {
         assert_eq!(a.height(), 8);
         assert_eq!(a.tip_hash(), b_tip, "heavier branch must win");
         assert_ne!(a.tip_hash(), a_tip);
-        assert_eq!(a.total_supply_sat(), b.total_supply_sat(), "state must rewind");
+        assert_eq!(
+            a.total_supply_sat(),
+            b.total_supply_sat(),
+            "state must rewind"
+        );
         a.verify_canonical_chain().unwrap();
 
         // The abandoned branch is still stored, just no longer canonical.
@@ -1048,7 +1069,10 @@ mod tests {
                 rejected += 1;
             }
         }
-        assert!(rejected > 0, "a reorg across the finality point was accepted");
+        assert!(
+            rejected > 0,
+            "a reorg across the finality point was accepted"
+        );
         assert_eq!(
             chain.height(),
             25,

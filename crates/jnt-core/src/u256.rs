@@ -142,11 +142,7 @@ mod tests {
             let q = U256::max_div_u128(d).unwrap();
 
             let prod = mul_256x128(to_limbs(&q), d);
-            assert_eq!(
-                (prod[4], prod[5]),
-                (0, 0),
-                "q*d overflowed 2^256 for d={d}"
-            );
+            assert_eq!((prod[4], prod[5]), (0, 0), "q*d overflowed 2^256 for d={d}");
             assert!(
                 prod[..4] <= max_limbs()[..],
                 "q*d must fit in 2^256-1 for d={d}"

@@ -164,14 +164,20 @@ mod tests {
         assert_eq!(p.start_reward_jnt(), 76);
         assert_eq!(p.halving_period, 5 * 365 * 144);
         assert_eq!(p.target_block_time_ms, 10 * 60 * 1000);
-        assert_eq!(p.genesis_difficulty, 1, "genesis must be trivially mineable");
+        assert_eq!(
+            p.genesis_difficulty, 1,
+            "genesis must be trivially mineable"
+        );
     }
 
     #[test]
     fn mini_cap_is_two_halving_periods_of_rewards() {
         let p = NetworkParams::mini();
         p.validate().unwrap();
-        assert_eq!(p.supply_cap_jnt(), 2 * p.halving_period * p.start_reward_jnt());
+        assert_eq!(
+            p.supply_cap_jnt(),
+            2 * p.halving_period * p.start_reward_jnt()
+        );
         assert_eq!(p.target_block_time_ms, 1_000);
     }
 
@@ -183,7 +189,10 @@ mod tests {
 
     #[test]
     fn profiles_resolve_by_name() {
-        assert_eq!(NetworkParams::by_name("mini").unwrap(), NetworkParams::mini());
+        assert_eq!(
+            NetworkParams::by_name("mini").unwrap(),
+            NetworkParams::mini()
+        );
         assert!(NetworkParams::by_name("nope").is_err());
     }
 }

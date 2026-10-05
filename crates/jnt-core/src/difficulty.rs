@@ -20,9 +20,7 @@ pub const MAX_SOLVE_TIME_NUM: u64 = 5; // *1
 
 pub fn clamp_solve_time(t: i64, target_ms: u64) -> u64 {
     let lo = (target_ms / MIN_SOLVE_TIME_DEN).max(1);
-    let hi = target_ms
-        .saturating_mul(MAX_SOLVE_TIME_NUM)
-        .max(lo);
+    let hi = target_ms.saturating_mul(MAX_SOLVE_TIME_NUM).max(lo);
     let t = t.max(0) as u64;
     t.clamp(lo, hi)
 }
@@ -188,7 +186,9 @@ mod tests {
         // starting value, not just 1.
         let p = NetworkParams::mainnet();
         let t = p.target_block_time_ms;
-        let h: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * t).collect();
+        let h: Vec<u64> = (0..=WINDOW)
+            .map(|i| 100_000_000_000 - (i as u64) * t)
+            .collect();
         for start in [1u128, 2, 17, 1_000, 999_999] {
             assert_eq!(
                 next_difficulty(&p, start, &history(&h)),
@@ -205,7 +205,9 @@ mod tests {
         // old `avg_solve / T` formula returned 2 here and ran away to 4T.
         let p = NetworkParams::mainnet();
         let t = p.target_block_time_ms;
-        let h: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * 2 * t).collect();
+        let h: Vec<u64> = (0..=WINDOW)
+            .map(|i| 100_000_000_000 - (i as u64) * 2 * t)
+            .collect();
         // Exact value is 0.5, floored to 0, so the per-block change limit
         // from prev=1000 gives floor(1000 * 0.9) = 900.
         assert_eq!(next_difficulty(&p, 1_000, &history(&h)), 900);
@@ -218,7 +220,9 @@ mod tests {
         // Blocks taking T/2 means double the hash rate; difficulty must rise.
         let p = NetworkParams::mainnet();
         let t = p.target_block_time_ms;
-        let h: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * t / 2).collect();
+        let h: Vec<u64> = (0..=WINDOW)
+            .map(|i| 100_000_000_000 - (i as u64) * t / 2)
+            .collect();
         assert_eq!(next_difficulty(&p, 1_000, &history(&h)), 1_100);
         assert_eq!(next_difficulty(&p, 1_000_000, &history(&h)), 1_100_000);
     }
@@ -230,12 +234,13 @@ mod tests {
         let p = NetworkParams::mainnet();
         let t = p.target_block_time_ms;
         // Absurdly fast blocks, but the clamp floors them at t/4 => 4x up.
-        let fast: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * 1).collect();
+        let fast: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - i as u64).collect();
         assert_eq!(next_difficulty(&p, 1_000, &history(&fast)), 1_100);
         // Absurdly slow blocks, clamped at 5t => 5x down, but the 10% step
         // from 1000 binds first and gives 900.
-        let slow: Vec<u64> =
-            (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * t * 50).collect();
+        let slow: Vec<u64> = (0..=WINDOW)
+            .map(|i| 100_000_000_000 - (i as u64) * t * 50)
+            .collect();
         assert_eq!(next_difficulty(&p, 1_000, &history(&slow)), 900);
     }
 
@@ -244,7 +249,7 @@ mod tests {
         // Without the +1 floor on the upper bound, a chain starting at
         // difficulty 1 could never bootstrap upwards: 1 * 1.1 floors to 1.
         let p = NetworkParams::mainnet();
-        let fast: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * 1).collect();
+        let fast: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - i as u64).collect();
         assert_eq!(next_difficulty(&p, 1, &history(&fast)), 2);
         assert_eq!(next_difficulty(&p, 2, &history(&fast)), 3);
         assert_eq!(next_difficulty(&p, 3, &history(&fast)), 4);
@@ -256,7 +261,9 @@ mod tests {
         // must not drag difficulty by more than one change-limit step.
         let p = NetworkParams::mainnet();
         let t = p.target_block_time_ms;
-        let mut h: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * t).collect();
+        let mut h: Vec<u64> = (0..=WINDOW)
+            .map(|i| 100_000_000_000 - (i as u64) * t)
+            .collect();
         h[3] = 100_000_000_000 - 3 * t - 100 * t;
         // Perfect spacing everywhere except two clamped solve times that
         // cancel, so the weighted mean is still ~T and difficulty holds.
@@ -272,7 +279,9 @@ mod tests {
         let p = NetworkParams::mainnet();
         let t = p.target_block_time_ms;
         assert!(p.future_limit_ms() < t * 2);
-        let h: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * t).collect();
+        let h: Vec<u64> = (0..=WINDOW)
+            .map(|i| 100_000_000_000 - (i as u64) * t)
+            .collect();
         assert_eq!(next_difficulty(&p, 1_000, &h), 1_000);
     }
 
@@ -318,7 +327,9 @@ mod tests {
 
         // Perfect spacing holds, and a partial window behaves identically:
         // no fallback to a fixed value, no "hold genesis for an hour" hole.
-        let h2: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * t).collect();
+        let h2: Vec<u64> = (0..=WINDOW)
+            .map(|i| 100_000_000_000 - (i as u64) * t)
+            .collect();
         assert_eq!(next_difficulty(&p, 1, &history(&h2)), 1);
         let short: Vec<u64> = (0..5).map(|i| 100_000_000_000 - (i as u64) * t).collect();
         assert_eq!(next_difficulty(&p, 1, &history(&short)), 1);
@@ -501,11 +512,11 @@ mod tests {
                 json.push_str("    {\n");
                 json.push_str(&format!("      \"name\": \"{name}\",\n"));
                 json.push_str(&format!("      \"prev_difficulty\": {prev},\n"));
-                let ts: Vec<String> = hist
-                    .iter()
-                    .map(|v| format!("\"{v}\""))
-                    .collect();
-                json.push_str(&format!("      \"history_newest_first\": [{}],\n", ts.join(", ")));
+                let ts: Vec<String> = hist.iter().map(|v| format!("\"{v}\"")).collect();
+                json.push_str(&format!(
+                    "      \"history_newest_first\": [{}],\n",
+                    ts.join(", ")
+                ));
                 json.push_str(&format!("      \"expected_difficulty\": {got}\n"));
                 json.push_str(if i + 1 == cases.len() {
                     "    }\n"

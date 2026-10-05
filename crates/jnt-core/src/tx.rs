@@ -270,7 +270,7 @@ impl Transaction {
         if &addr != owner {
             return Err(Error::WrongAddress);
         }
-let msg = self.message_for_input(k);
+        let msg = self.message_for_input(k);
         let key = k256::ecdsa::VerifyingKey::from_sec1_bytes(&input.pubkey)
             .map_err(|_| Error::BadPubkey)?;
         let sig = k256::ecdsa::Signature::from_slice(&input.signature)
@@ -337,7 +337,13 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_trailing_bytes() {
-        let tx = Transaction::standard(vec![], vec![Output { value: 1, address: [0; 20] }]);
+        let tx = Transaction::standard(
+            vec![],
+            vec![Output {
+                value: 1,
+                address: [0; 20],
+            }],
+        );
         let mut bytes = tx.serialize();
         bytes.push(0);
         assert!(matches!(
@@ -371,7 +377,11 @@ mod tests {
         let mut signed = base.clone();
         signed.inputs[0].signature = [0xab; 64];
         signed.inputs[0].pubkey = sample_pubkey();
-        assert_eq!(base.sighash(), signed.sighash(), "sig must not affect sighash");
+        assert_eq!(
+            base.sighash(),
+            signed.sighash(),
+            "sig must not affect sighash"
+        );
 
         let mut retargeted = base.clone();
         retargeted.outputs[0].address = [2u8; 20];
@@ -485,8 +495,8 @@ mod tests {
             version: 1,
             tx_type: TX_STANDARD,
             lock_time: 0x11_22_33_44_55_66_77_88,
-            inputs: vec![input.clone()],
-            outputs: vec![output.clone()],
+            inputs: vec![input],
+            outputs: vec![output],
         };
 
         let entries: Vec<(&str, Vec<u8>, usize)> = vec![
@@ -500,12 +510,8 @@ mod tests {
             "  \"_comment\": \"Generated from jnt-core by serialization_vectors_are_stable. \
 Do not hand-edit.\",\n",
         );
-        json.push_str(&format!(
-            "  \"input_len\": {INPUT_SERIALIZED_LEN},\n"
-        ));
-        json.push_str(&format!(
-            "  \"output_len\": {OUTPUT_SERIALIZED_LEN},\n"
-        ));
+        json.push_str(&format!("  \"input_len\": {INPUT_SERIALIZED_LEN},\n"));
+        json.push_str(&format!("  \"output_len\": {OUTPUT_SERIALIZED_LEN},\n"));
         json.push_str("  \"items\": [\n");
         for (i, (name, bytes, declared)) in entries.iter().enumerate() {
             json.push_str("    {\n");
@@ -515,7 +521,11 @@ Do not hand-edit.\",\n",
                 json.push_str(&format!("      \"declared_len\": {declared},\n"));
             }
             json.push_str(&format!("      \"hex\": \"{}\"\n", hex::encode(bytes)));
-            json.push_str(if i + 1 == entries.len() { "    }\n" } else { "    },\n" });
+            json.push_str(if i + 1 == entries.len() {
+                "    }\n"
+            } else {
+                "    },\n"
+            });
         }
         json.push_str("  ]\n}\n");
 

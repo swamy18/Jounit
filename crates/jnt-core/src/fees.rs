@@ -24,7 +24,10 @@ pub fn next_base_fee(params: &NetworkParams, current: u64, gas_used: u64) -> u64
         cur.saturating_sub((cur * (target8 / 8 - used)) / target8)
     };
 
-    next.clamp(params.base_fee_min_sat as u128, params.base_fee_max_sat as u128) as u64
+    next.clamp(
+        params.base_fee_min_sat as u128,
+        params.base_fee_max_sat as u128,
+    ) as u64
 }
 
 /// Fee a transaction must pay: the burned portion for its own gas usage.
@@ -70,10 +73,18 @@ mod tests {
 
     fn tx(n_in: usize, n_out: usize) -> Transaction {
         let inputs: Vec<Input> = (0..n_in)
-            .map(|i| Input::unsigned(&OutPoint { txid: [i as u8; 32], index: 0 }))
+            .map(|i| {
+                Input::unsigned(&OutPoint {
+                    txid: [i as u8; 32],
+                    index: 0,
+                })
+            })
             .collect();
         let outputs: Vec<Output> = (0..n_out)
-            .map(|_| Output { value: 1, address: [0; 20] })
+            .map(|_| Output {
+                value: 1,
+                address: [0; 20],
+            })
             .collect();
         Transaction::standard(inputs, outputs)
     }
