@@ -455,4 +455,103 @@ mod tests {
         );
         assert_eq!(one.gas_used(), GAS_TX_BASE + GAS_PER_INPUT + GAS_PER_OUTPUT);
     }
+
+    /// Byte layouts pinned in `tests/vectors/ser_vectors.json`.
+    ///
+    /// Section sizes alone are already asserted above; what matters for a
+    /// second implementation is the exact byte order, so the full
+    /// serializations are recorded rather than just their lengths.
+    #[test]
+    fn serialization_vectors_are_stable() {
+        // Regenerate with: UPDATE_SER_VECTORS=1 cargo test -p jnt-core
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/vectors/ser_vectors.json");
+
+        let input = Input {
+            prev_hash: [0xABu8; 32],
+            prev_index: 0xDEAD_BEEF,
+            signature: [0xCDu8; 64],
+            pubkey: {
+                let mut p = [0xEFu8; 33];
+                p[0] = 0x02; // compressed secp256k1 prefix
+                p
+            },
+        };
+        let output = Output {
+            value: 0x0123_4567_89AB_CDEF,
+            address: [0x42u8; 20],
+        };
+        let tx = Transaction {
+            version: 1,
+            tx_type: TX_STANDARD,
+            lock_time: 0x11_22_33_44_55_66_77_88,
+            inputs: vec![input.clone()],
+            outputs: vec![output.clone()],
+        };
+
+        let entries: Vec<(&str, Vec<u8>, usize)> = vec![
+            ("input", input.to_bytes().to_vec(), INPUT_SERIALIZED_LEN),
+            ("output", output.to_bytes().to_vec(), OUTPUT_SERIALIZED_LEN),
+            ("transaction", tx.serialize(), 0),
+        ];
+
+        let mut json = String::from("{\n");
+        json.push_str(
+            "  \"_comment\": \"Generated from jnt-core by serialization_vectors_are_stable. \
+Do not hand-edit.\",\n",
+        );
+        json.push_str(&format!(
+            "  \"input_len\": {INPUT_SERIALIZED_LEN},\n"
+        ));
+        json.push_str(&format!(
+            "  \"output_len\": {OUTPUT_SERIALIZED_LEN},\n"
+        ));
+        json.push_str("  \"items\": [\n");
+        for (i, (name, bytes, declared)) in entries.iter().enumerate() {
+            json.push_str("    {\n");
+            json.push_str(&format!("      \"name\": \"{name}\",\n"));
+            json.push_str(&format!("      \"len\": {},\n", bytes.len()));
+            if *declared > 0 {
+                json.push_str(&format!("      \"declared_len\": {declared},\n"));
+            }
+            json.push_str(&format!("      \"hex\": \"{}\"\n", hex::encode(bytes)));
+            json.push_str(if i + 1 == entries.len() { "    }\n" } else { "    },\n" });
+        }
+        json.push_str("  ]\n}\n");
+
+        if std::env::var("UPDATE_SER_VECTORS").is_ok() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, json).unwrap();
+            eprintln!("wrote {}", path.display());
+            return;
+        }
+
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}\nregenerate with UPDATE_SER_VECTORS=1",
+                path.display()
+            )
+        });
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["input_len"].as_u64().unwrap(), 133, "SPEC.md 3.1");
+        assert_eq!(v["output_len"].as_u64().unwrap(), 28, "SPEC.md 3.2");
+
+        let listed = v["items"].as_array().expect("items must be an array");
+        assert_eq!(listed.len(), entries.len(), "vector file is stale");
+        for (entry, (name, bytes, _)) in listed.iter().zip(entries.iter()) {
+            assert_eq!(entry["name"], *name);
+            assert_eq!(
+                entry["len"].as_u64().unwrap() as usize,
+                bytes.len(),
+                "{name}: serialized length changed"
+            );
+            assert_eq!(
+                entry["hex"].as_str().unwrap(),
+                hex::encode(bytes),
+                "{name}: serialized bytes changed -- this is a consensus change"
+            );
+        }
+    }
 }

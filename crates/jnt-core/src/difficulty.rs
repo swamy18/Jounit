@@ -244,7 +244,6 @@ mod tests {
         // Without the +1 floor on the upper bound, a chain starting at
         // difficulty 1 could never bootstrap upwards: 1 * 1.1 floors to 1.
         let p = NetworkParams::mainnet();
-        let t = p.target_block_time_ms;
         let fast: Vec<u64> = (0..=WINDOW).map(|i| 100_000_000_000 - (i as u64) * 1).collect();
         assert_eq!(next_difficulty(&p, 1, &history(&fast)), 2);
         assert_eq!(next_difficulty(&p, 2, &history(&fast)), 3);

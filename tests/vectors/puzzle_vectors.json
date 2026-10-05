@@ -1,0 +1,69 @@
+{
+  "_comment": "Generated from jnt-core by puzzle_vectors_are_stable. Do not hand-edit.",
+  "spec": { "hash_rounds": 16, "nn_input_dim": 16, "nn_hidden_dim": 16, "nn_layers": 3, "nn_share_bps": 4000 },
+  "cases": [
+    {
+      "height": 1,
+      "nonce": 0,
+      "epoch_id": 0,
+      "header_len": 145,
+      "seed": "3c34d38b16d874fe24f96acc1dbb88b7b015bba198fb3ffd0e495516988a5df5",
+      "activation_digest": "ffc9f8376e2d4aac99867f0450d6077f384f47cd8b7e847a783eb28d895e0d5a",
+      "final_hash": "4f35b97de4275090e5211dfd0550fa48081d9c596fe8686ac194b693cb7f236a"
+    },
+    {
+      "height": 1,
+      "nonce": 1,
+      "epoch_id": 0,
+      "header_len": 145,
+      "seed": "d96273b65251594f7b95735d4f8062754d8a6081f8680d0a05f7d30d60c5f2e6",
+      "activation_digest": "24152a706eecf8ee80f68116cdb2a96a17a27945b921a910441f6a08e70b472b",
+      "final_hash": "9a32aa155acd8319d86ee43b33de0d459e1d718a3e730fcfc95a31cca57362de"
+    },
+    {
+      "height": 2,
+      "nonce": 42,
+      "epoch_id": 0,
+      "header_len": 145,
+      "seed": "5057fd03feec882bed5e870ac764ce0d4182bb3486baec59224d7eca2ba76c4a",
+      "activation_digest": "0b32c784ebf99273fba9635918da7b3b4df06c5d483075181e22c2f5f28bc9cb",
+      "final_hash": "dabcb94c5d12e1aa1558da4b941aa12283dd9b21beedcbe45891de607ea8c894"
+    },
+    {
+      "height": 100,
+      "nonce": 7,
+      "epoch_id": 1,
+      "header_len": 145,
+      "seed": "c7e6d1b713130c3bd8ca6f7af4dcce2121a491111c18cae59df961a4fdf7fbf3",
+      "activation_digest": "5b79137405a6a5d5b6f3ba52d31c5d63f0522449df29a38cf8424907d6760009",
+      "final_hash": "e8b6cfd46c0c16b1e6a7262c2b25b694706e3a9b5d2ab748bd08f4675c904fe5"
+    },
+    {
+      "height": 50000,
+      "nonce": 0,
+      "epoch_id": 1,
+      "header_len": 145,
+      "seed": "1d148185611921cb45d466fe8ea3e1a9ff13943feb84a68fabea699da8f2b1b5",
+      "activation_digest": "8ca31505dffd23375e36bba564bc0df7718ac960e4ccb5778476d7b30745109a",
+      "final_hash": "28d1295d08e7c4b8907b3333f53db07a2c98963f2e205735b026f96fa558ecc0"
+    },
+    {
+      "height": 50001,
+      "nonce": 12345,
+      "epoch_id": 2,
+      "header_len": 145,
+      "seed": "f18f35ccc8e3842ebf8837785c1838ca732746f0f18862cf20ae41cd78417daa",
+      "activation_digest": "0bfdc65129a5f90efc6b219777e5860329a48a377e6cf9330207b9a74dfa84ca",
+      "final_hash": "9dc878e8c6fa40f124d9be5e61ab748f2c5d1776efd428f969edc4d107f454aa"
+    },
+    {
+      "height": 999999,
+      "nonce": 7,
+      "epoch_id": 4294967295,
+      "header_len": 145,
+      "seed": "088a5e577a72a199c84f6dfe13147e1bc1dcb30ce9071868e25b5c7f92870a78",
+      "activation_digest": "190b4a93a24877f83855eaeaaebdf092bfe0b549c1e75efe5e65b83e7e51e410",
+      "final_hash": "596229f261345a02747b8b470c7f3ab4dfcf4df76d537716f9659b10c40af181"
+    }
+  ]
+}

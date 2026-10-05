@@ -12,9 +12,14 @@ single-node chain. A coin with one node is not a network yet.
 
 ## Verified
 
-- `cargo test -p jnt-core` — 102 tests pass. Includes an independent Python
-  reference implementation of the PoW puzzle (`sim/jounit_reference.py`) and
-  byte-level vectors in `tests/vectors/`.
+- `cargo test -p jnt-core` — 104 tests pass.
+- An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
+  written from the prose of SPEC.md rather than from the Rust source, reproduces
+  all 21 puzzle digests in `tests/vectors/puzzle_vectors.json`. This is the only
+  real evidence that SPEC.md is unambiguous rather than merely consistent with the
+  Rust code.
+- All four vector files in SPEC.md §12 exist, are generated from source, and are
+  read by tests. `sim/verify_vectors.py` regenerates and cross-checks them.
 - Node CLI end to end on the `mini` profile: init, mine 31 blocks, spend, verify
   (replays from genesis and diffs UTXO + supply), status. Fee burn reconciles
   exactly — 31 blocks issue 2356 JNT, live supply is 2355.99825 JNT, the
@@ -88,12 +93,14 @@ to separate them.
 - **`puzzle_crosscheck.py` and `verify_vectors.py`** are referenced by SPEC.md
   §12 but do not exist. `sim/jounit_reference.py` exists and is exercised, but
   nothing currently runs it automatically or diffs it against the Rust output.
-- **`difficulty_vectors.json` is consumed by the test suite;
-  `supply_vectors.json` is generated but not yet read by any test.** A test now
-  asserts the supply file is at least valid JSON, which catches a truncated
-  write but verifies nothing about its contents.
+- **`supply_vectors.json` is only weakly checked.** A test asserts it is valid
+  JSON with the right `sat_per_jnt`, which catches a truncated write but
+  verifies nothing about its contents. `sim/verify_vectors.py` does check the
+  ladder and cap invariant in detail, but nothing in `cargo test` does.
 - **No fuzzing, no property tests, no adversarial block/tx corpus.**
-- `chain.rs` carries a dead-code warning for a test helper (`fn out`).
+- Vector coverage is finite by construction. The crosscheck exercises seven
+  header/epoch combinations; it does not cover every field permutation, and a
+  Rust-only bug outside those cases would not be caught by it.
 
 ## Known rough edges
 
@@ -106,14 +113,21 @@ to separate them.
 ## Reproducing the difficulty work
 
 ```
-cargo test -p jnt-core                                  # 102 tests
+cargo test -p jnt-core                                  # 104 tests
 python sim/difficulty_attack_sim.py                     # attack containment
 python sim/difficulty_attack_sim.py --ablation \
     --start-difficulty 100000                           # which rule is load-bearing
 python sim/supply_schedule_sim.py                       # supply vectors
-UPDATE_DIFFICULTY_VECTORS=1 cargo test -p jnt-core \
-    --lib difficulty_vectors_are_stable                 # regenerate vectors
+python sim/puzzle_crosscheck.py                         # Rust vs independent Python
+python sim/verify_vectors.py --check                    # all four vector files
+
+# Regenerate vectors (puzzle/difficulty/ser digests must come from Rust;
+# supply is arithmetic and is done in Python):
+python sim/verify_vectors.py
+UPDATE_PUZZLE_VECTORS=1 cargo test -p jnt-core --lib puzzle_vectors_are_stable
+UPDATE_DIFFICULTY_VECTORS=1 cargo test -p jnt-core --lib difficulty_vectors_are_stable
+UPDATE_SER_VECTORS=1 cargo test -p jnt-core --lib serialization_vectors_are_stable
 ```
 
-A second implementation that disagrees with `difficulty_vectors.json` has a
-consensus split, not a rounding difference.
+A second implementation that disagrees with these vectors has a consensus split,
+not a rounding difference.

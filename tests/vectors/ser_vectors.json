@@ -1,0 +1,24 @@
+{
+  "_comment": "Generated from jnt-core by serialization_vectors_are_stable. Do not hand-edit.",
+  "input_len": 133,
+  "output_len": 28,
+  "items": [
+    {
+      "name": "input",
+      "len": 133,
+      "declared_len": 133,
+      "hex": "ababababababababababababababababababababababababababababababababefbeaddecdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd02efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+    },
+    {
+      "name": "output",
+      "len": 28,
+      "declared_len": 28,
+      "hex": "efcdab89674523014242424242424242424242424242424242424242"
+    },
+    {
+      "name": "transaction",
+      "len": 182,
+      "hex": "0100000000887766554433221101000000ababababababababababababababababababababababababababababababababefbeaddecdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd02efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef01000000efcdab89674523014242424242424242424242424242424242424242"
+    }
+  ]
+}

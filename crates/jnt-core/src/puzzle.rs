@@ -614,4 +614,125 @@ mod tests {
             Err(Error::InvalidDifficulty(0))
         ));
     }
+
+    /// Cases pinned in `tests/vectors/puzzle_vectors.json`.
+    ///
+    /// `sim/puzzle_crosscheck.py` recomputes every one of these with an
+    /// independent Python implementation written from SPEC.md, and the two
+    /// must agree byte for byte. That is the only real evidence that
+    /// SPEC.md is unambiguous rather than merely consistent with this code.
+    fn vector_cases() -> Vec<(u64, u64, u32, PuzzleRun, u64)> {
+        let s = spec();
+        // Spread over heights, nonces and epochs: epoch_id selects the weight
+        // derivation, so an epoch change must move the activation digest.
+        [
+            (1u64, 0u64, 0u32),
+            (1, 1, 0),
+            (2, 42, 0),
+            (100, 7, 1),
+            (50_000, 0, 1),
+            (50_001, 12_345, 2),
+            (999_999, 7, 4_294_967_295),
+        ]
+        .into_iter()
+        .map(|(height, nonce, epoch)| {
+            let h = header_at(height, nonce, epoch);
+            let run = run_puzzle(&s, &h);
+            (height, nonce, epoch, run, h.serialize().len() as u64)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn puzzle_vectors_are_stable() {
+        // Regenerate with: UPDATE_PUZZLE_VECTORS=1 cargo test -p jnt-core
+        let cases = vector_cases();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/vectors/puzzle_vectors.json");
+
+        let mut json = String::from("{\n");
+        json.push_str(
+            "  \"_comment\": \"Generated from jnt-core by puzzle_vectors_are_stable. \
+Do not hand-edit.\",\n",
+        );
+        let s = spec();
+        json.push_str(&format!(
+            "  \"spec\": {{ \"hash_rounds\": {}, \"nn_input_dim\": {}, \
+\"nn_hidden_dim\": {}, \"nn_layers\": {}, \"nn_share_bps\": {} }},\n",
+            s.hash_rounds,
+            s.nn_input_dim,
+            s.nn_hidden_dim,
+            s.nn_layers,
+            s.nn_share_bps()
+        ));
+        json.push_str("  \"cases\": [\n");
+        for (i, (height, nonce, epoch, run, header_len)) in cases.iter().enumerate() {
+            json.push_str("    {\n");
+            json.push_str(&format!("      \"height\": {height},\n"));
+            json.push_str(&format!("      \"nonce\": {nonce},\n"));
+            json.push_str(&format!("      \"epoch_id\": {epoch},\n"));
+            json.push_str(&format!("      \"header_len\": {header_len},\n"));
+            json.push_str(&format!(
+                "      \"seed\": \"{}\",\n",
+                hex::encode(run.seed)
+            ));
+            json.push_str(&format!(
+                "      \"activation_digest\": \"{}\",\n",
+                hex::encode(run.activation_digest)
+            ));
+            json.push_str(&format!(
+                "      \"final_hash\": \"{}\"\n",
+                hex::encode(run.final_hash)
+            ));
+            json.push_str(if i + 1 == cases.len() { "    }\n" } else { "    },\n" });
+        }
+        json.push_str("  ]\n}\n");
+
+        if std::env::var("UPDATE_PUZZLE_VECTORS").is_ok() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, json).unwrap();
+            eprintln!("wrote {}", path.display());
+            return;
+        }
+
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}\nregenerate with UPDATE_PUZZLE_VECTORS=1",
+                path.display()
+            )
+        });
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["spec"]["nn_share_bps"], 4_000u64, "SPEC.md 5.6 audit band");
+
+        let listed = v["cases"].as_array().expect("cases must be an array");
+        assert_eq!(
+            listed.len(),
+            cases.len(),
+            "vector file is stale: regenerate with UPDATE_PUZZLE_VECTORS=1"
+        );
+
+        for (entry, (height, nonce, epoch, run, header_len)) in
+            listed.iter().zip(cases.iter())
+        {
+            let name = format!("h{height}_n{nonce}_e{epoch}");
+            assert_eq!(entry["header_len"].as_u64().unwrap(), *header_len);
+            assert_eq!(
+                entry["seed"].as_str().unwrap(),
+                hex::encode(run.seed),
+                "vector {name}: stage 1 seed changed"
+            );
+            assert_eq!(
+                entry["activation_digest"].as_str().unwrap(),
+                hex::encode(run.activation_digest),
+                "vector {name}: stage 2 activation digest changed"
+            );
+            assert_eq!(
+                entry["final_hash"].as_str().unwrap(),
+                hex::encode(run.final_hash),
+                "vector {name}: stage 3 final hash changed"
+            );
+        }
+    }
 }

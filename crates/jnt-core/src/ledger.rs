@@ -224,10 +224,6 @@ mod tests {
     use crate::tx::{Input, TX_COINBASE};
     use crate::wallet::Wallet;
 
-    fn out(value: u64, address: crate::hash::Address) -> Output {
-        Output { value, address }
-    }
-
     fn tagged(value: u64, tag: u8) -> Output {
         Output {
             value,
