@@ -161,7 +161,7 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 | `lib.rs` | 35 | Crate root and scope statement |
 | `error.rs` | 196 | `Error` — 41 consensus-visible failure modes |
 | `params.rs` | 205 | `NetworkParams`: the mainnet and mini profiles, plus `validate()` |
-| `hash.rs` | 87 | SHA-256 helpers and the 10 frozen domain-separation tags |
+| `hash.rs` | 87 | SHA-256 helpers and the 9 frozen domain-separation tags |
 | `ser.rs` | 155 | `Reader`/`Writer` — canonical byte encoding, bounds-checked |
 | `hexserde.rs` | 58 | Serde helpers for the hex-encoded types |
 | `u256.rs` | 212 | 256-bit target arithmetic by long division. No floating point |
@@ -638,6 +638,13 @@ remote.** Cosmetic, but it is the first thing `cargo publish` would use.
 
 **Vector coverage is finite by construction.** The crosscheck exercises seven
 header/epoch combinations; a bug outside those cases would not be caught by it.
+
+**`SPEC.md` documents a domain tag the code does not implement.** The tag table
+in §0 lists ten, including `DOM_GENESIS` (`jounit/genesis/v1`). Only nine exist:
+the genesis block is hashed through the ordinary `DOM_BLOCK` path. Harmless
+today — nothing depends on genesis having its own tag — but the spec and the
+implementation disagree, and the spec is the document this project treats as
+normative.
 
 ---
 
