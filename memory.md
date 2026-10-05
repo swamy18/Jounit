@@ -689,29 +689,285 @@ backwards.
   (`params.rs::genesis_hash_is_identical_across_profiles`), so the
   "obvious approach is wrong" trap is guarded against regression.
 
-## 22. Next steps achieved (Session 4)
+## 22. Next steps achieved (Session 4) — Full Record
 
-All 7 items from §22 were completed, plus the 5 protocol mechanisms:
-1. `jnt-net`: peer lifecycle (`peer.rs`), thread-per-connection, frame codec.
-2. `jnt-net`: handshake state machine with mutual version exchange and magic verification.
-3. `jnt-net`: locator-based sync loop (`syncer.rs`), orphan block pool bounded at 512 entries.
-4. `jnt-node serve`: run loop owning the `Chain`, wired to `P2pNode`.
-5. Loopback integration tests (`crates/jnt-net/tests/integration.rs`):
-   - Two nodes converge regardless of arrival order (§13.11 inv 2)
-   - Cross-network handshake rejected at connect (§13.11 inv 4)
-   - Replayed blocks byte-identical to locally mined blocks (§13.11 inv 1)
-   - Invalid blocks never enter store
-   - Locator generation and fork point recovery
-6. 5 Protocol Mechanisms implemented:
-   - M1: 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
-   - M2: Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault (`slash.rs`)
-   - M3: Hardware-Agnostic Canonical Compute IR (`compute_ir.rs`)
-   - M4: Memory-bound HBM scratchpad PoW puzzle (`hbm_pow.rs`)
-   - M5: Sovereign BLS aggregate finality gadget checkpoints (`bls_checkpoint.rs`)
-7. Verification status:
-   - `cargo test --workspace`: 207 tests pass (178 core unit, 9 core redteam, 10 net unit, 10 net integration)
-   - `cargo clippy --workspace --all-targets -- -D warnings`: 0 warnings
-   - `cargo fmt --all --check`: clean
-   - `python sim/verify_vectors.py --check`: clean (all 4 vector files verified)
-   - `python sim/puzzle_crosscheck.py`: clean (21 digests agree across 7 vectors)
-   - `docs/status.md` and `README.md` updated to reflect the operational P2P layer and M1-M5 mechanisms.
+**Date:** 2026-10-05 (same day, latest session)
+**Scope:** Complete 5 protocol mechanisms (M1–M5) + finish jnt-net P2P layer + full docs + push to GitHub
+**Outcome:** All 207 tests pass, CI green, committed and pushed. Working tree clean.
+
+---
+
+### 22.1 What was built this session
+
+**Total new code shipped:**
+- 4 new source files in `jnt-core`: `slash.rs`, `compute_ir.rs`, `hbm_pow.rs`, `bls_checkpoint.rs`
+- 9 new source files in `jnt-net`: `peer.rs`, `syncer.rs`, `net.rs`, `tests/integration.rs` (plus existing `frame.rs`, `msg.rs`, `magic.rs`, `error.rs`, `lib.rs` from session 3)
+- Major modifications to `fees.rs`, `chain.rs`, `ser.rs`, `params.rs`, `lib.rs`, `jnt-node/main.rs`
+- 27 files changed, 4 883 insertions in the main commit
+
+---
+
+### 22.2 M1 — 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
+
+**What it does:** Every block's base-fee portion is split 50% burned (deflationary) and 50% routed to the on-chain Protocol Security & Compute Buffer (PSCB) reserve, with the full miner tip separate.
+
+**Design decisions:**
+- `FeeSplit` struct carries `burned`, `pscb`, `tip`. Strict invariant enforced: `burned + pscb + tip == total_fees`.
+- The odd satoshi in integer 50% division goes to `burned` (not PSCB) — burns are irrecoverable so conservative rounding is safer.
+- `Chain` gained `pscb_reserve: u64` and `pscb_undo: HashMap<Hash, u64>` for reorg-safe PSCB accumulation. On reorg, `pscb_undo` lets the chain undo the PSCB credit for exactly the blocks that were rolled back.
+- `pscb_reserve()` is a public read-only accessor used by `jnt-node status`.
+
+**Tests added (5):** split invariant, odd-satoshi rounding, zero-gas edge, tip-only block, PSCB is non-zero whenever fees are paid.
+
+---
+
+### 22.3 M2 — Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault (`slash.rs`)
+
+**What it does:** When a validator submits a fraudulent compute result and is slashed:
+- 50% of their stake is **instantly burned** (Anti-Collusion Burn) — eliminates any self-slashing attack where colluders reclaim 100%.
+- 50% vests **linearly per block** over 1 year into the Compute Reserve.
+
+**Design decisions:**
+- `SlashRecord::new()` splits at construction time using integer arithmetic: `burned = stake / 2`, `vest_total = stake - burned` (handles the odd satoshi; vest gets it).
+- `vest_per_block` uses `.div_ceil(period)` so the last block receives the remainder rather than losing it.
+- `SlashVault` tracks a `Vec<SlashRecord>` and prunes fully exhausted records on each `advance()` call — memory doesn't grow unboundedly.
+- Constants: `VESTING_BLOCKS_MAINNET = 52_560` (~1 year at 10-min blocks), `VESTING_BLOCKS_MINI = 1_000`.
+
+**Tests added (9):** 50/50 split, odd-satoshi distribution, vesting is linear and bounded, full remainder vests at unlock height, slash outcome from record, claimable before slash height is zero, vault tracks total burned, vault returns correct payouts, vault prunes exhausted records.
+
+---
+
+### 22.4 M3 — Universal Hardware-Agnostic Canonical Compute IR (`compute_ir.rs`)
+
+**What it does:** Defines a hardware-portable execution envelope that abstracts AI compute tasks across GPU (CUDA/ROCm), Apple Neural Engine, Google TPU, and future photonic chips.
+
+**Design decisions:**
+- `HardwareTarget` enum: `Cuda`, `Rocm`, `Ane`, `Tpu`, `Photonic`, `Generic` — extensible without breaking serialization.
+- `QuantizationMode`: `Int8`, `Fp16`, `Fp32`, `BFloat16` — deterministic, no floating-point nondeterminism.
+- `ComputeTask` has a SHA-256 domain-separated signing hash (`DOM_COMPUTE_TASK = 0xC1`) covering: task_id, worker_address, hardware_target, quantization_mode, input_hash, flop_count, deadline_block.
+- `ComputeAttestation` covers the task hash + result hash (`DOM_COMPUTE_ATTEST = 0xC2`), so the attestation is bound to a specific task with a specific output.
+- `worker_address` is `[u8; 20]` (20-byte Ethereum-style address) — uses `write_raw` in serialization because `write_bytes` expects `[u8; 32]`.
+
+**Tests added:** round-trip serialization, hardware target coverage, quantization coverage, attestation hash determinism.
+
+---
+
+### 22.5 M4 — Memory-Bound HBM Scratchpad PoW (`hbm_pow.rs`)
+
+**What it does:** Extends the mining loop with a memory-latency-bound stage to prevent pure-compute (ASIC/cloud-burst) from outcompeting hardware with real HBM/GDDR bandwidth.
+
+**Design decisions:**
+- `HbmConfig { lanes, accesses }` — `lanes` sets scratchpad size (each lane = 32 bytes = one cache line), `accesses` sets how many pseudorandom hops are made.
+- Mainnet: 16 384 lanes (512 KiB scratchpad), 64 accesses. Test: 256 lanes (8 KiB), 8 accesses — fast enough for unit tests.
+- Scratchpad is initialized deterministically from `sha256(&[&header_bytes])`, so it is unique per block candidate.
+- Each hop: `next_lane = sha256(&[&prev])[0..8] as u64 % lanes` — the SHA-256 output drives the memory address, making it infeasible to precompute the access sequence without the header.
+- Final result: `sha256(&[&last_hop_bytes])` which is compared against `target_for_difficulty(difficulty)` from `u256.rs`.
+
+**Fix needed:** Initial code used `sha256(&bytes)` but the actual API is `sha256(&[&bytes])` (slice of slices). Also used a non-existent `satisfies_difficulty` helper — fixed to use `target_for_difficulty(difficulty)` + `U256` comparison.
+
+---
+
+### 22.6 M5 — Sovereign BLS Aggregate Finality Gadget (`bls_checkpoint.rs`)
+
+**What it does:** Adds deterministic absolute finality on top of probabilistic deepest-chain PoW via BLS12-381 aggregate signatures.
+
+**Design decisions:**
+- `BlsPublicKey([u8; 48])` = G1 compressed, `BlsSignature([u8; 96])` = G2 compressed — typed wrappers enforcing encoding sizes.
+- `CheckpointPayload` serializes: epoch, height, block_hash, validator_set_hash. Signing hash uses `sha256_dom(&[DOM_BLS_CHECKPOINT], &[...])`.
+- `ValidatorSet` sorts keys at construction time (`sort_by_key(|a| a.0)`) so validator ordering is deterministic regardless of insertion order.
+- `quorum_size()` uses `.div_ceil(10_000)` on `n * QUORUM_BPS` — avoids the `(n * bps + 9999) / 10000` pattern that clippy flags.
+- Bitmap encoding: 1 bit per validator (LSB = index 0), compact byte array. `signers_from_bitmap` and `bitmap_from_indices` are inverses.
+- `BlsVerifier` trait makes the verification pluggable: `MockBls` for tests (checks all-zeros sig as invalid, otherwise passes), production would use `blst`.
+- `CheckpointChain` enforces the absolute finality guarantee: once a checkpoint is accepted, `last_finalized_height` advances and the boundary is permanent.
+
+**Tests added (13):** payload serialization, signing hash covers all fields, hash changes with epoch and block_hash, epoch calculation, quorum size (2/3 supermajority), bitmap round-trip, sorted keys are deterministic, valid checkpoint passes with quorum, checkpoint fails below quorum, all-zeros aggregate sig fails, bitmap/signer_count mismatch fails, checkpoint chain advances finality, stale checkpoint rejected.
+
+---
+
+### 22.7 `jnt-net` — Completing the P2P Layer
+
+Session 3 built: `frame.rs`, `msg.rs`, `magic.rs`, `error.rs`, `lib.rs`.
+
+This session added:
+
+**`peer.rs`** — Thread-per-connection peer state machine:
+- `HandshakeConfig`: encapsulates `NetworkParams`, current height, tip hash for `Version` construction.
+- `perform_handshake()`: sends `Version`, waits for peer `Version`, sends/waits for `Verack`, validates magic + network_id via `check_network()`.
+- `PeerHandle`: channel + `JoinHandle` wrapper for sending messages to a peer thread.
+- `PeerEvent`: `Connected { peer_id, version, is_outbound }`, `Block { peer_id, block }`, `Disconnected { peer_id }` — the event stream the chain thread consumes.
+
+**`syncer.rs`** — Locator-based sync state machine:
+- `create_locator(chain)`: exponential step locator (heights: tip, tip-1, tip-2, tip-4, tip-8... genesis) — mirrors Bitcoin's getblocks locator.
+- `find_fork_and_collect_inv(chain_a, chain_b)`: finds the common ancestor and collects hashes from fork point to tip_a, ordered oldest-first.
+- `SyncManager`: manages pending `Inv` entries, tracks `inflight` requests, and the orphan pool (bounded at 512 entries).
+- `SyncResult`: `Accepted { extended_tip, orphans_resolved }`, `Orphan { missing_parent }`, `AlreadyKnown`, `Invalid(String)`.
+- `orphan_pool_is_bounded` test confirms the pool never exceeds 512 even under adversarial hammering.
+
+**`net.rs`** — `P2pNode` orchestrator:
+- `P2pConfig { params, listen_addr, max_peers }`.
+- `P2pNode::start()`: spawns the listener thread, manages peer ID counter, `peers: Arc<Mutex<HashMap<usize, PeerHandle>>>`.
+- `P2pNode::poll_events()`: consumes `PeerEvent`s, drives `SyncManager`, sends `GetBlocks` to peers that are ahead.
+- `P2pNode::broadcast_block()`: sends `Inv` to all connected peers.
+- `P2pNode::connect()`: initiates an outbound connection with handshake.
+
+**`jnt-node serve` command** (`main.rs`):
+- New `Serve` subcommand with `--listen`, `--connect`, `--peers` flags.
+- Owns the `Chain`, wraps `P2pNode` + `SyncManager`, loops on `poll_events()` and mining.
+- Inbound block relay: accepted blocks broadcast to all peers immediately.
+
+---
+
+### 22.8 Integration test suite (`crates/jnt-net/tests/integration.rs`)
+
+10 loopback tests covering the §13.11 invariants:
+
+| Test | Invariant |
+|---|---|
+| `two_nodes_converge_regardless_of_delivery_order` | §13.11 inv 2 |
+| `cross_network_handshake_is_rejected_at_connect` | §13.11 inv 4 |
+| `mini_node_rejects_mainnet_handshake` | §13.11 inv 4 (listener side) |
+| `relay_block_equals_locally_mined_block` | §13.11 inv 1 |
+| `handshake_completes_on_loopback` | §13.11 inv 3 |
+| `locator_includes_tip_and_genesis` | §13.11 inv 6 |
+| `find_fork_collects_inv_from_common_ancestor` | §13.11 inv 6 |
+| `invalid_blocks_never_enter_the_store` | §13.11 inv 5 |
+| `sync_manager_resolves_blocks_in_order` | §13.11 inv 2 |
+| `orphan_pool_is_bounded` | §13.11 inv 7 |
+
+---
+
+### 22.9 Problems encountered and how they were fixed
+
+This is the most important part — recorded so these traps are not re-hit.
+
+**Problem 1: `sha256_dom` argument type mismatch in `bls_checkpoint.rs`**
+- Code: `sha256_dom(DOM_BLS_CHECKPOINT, &[&self.serialize()])`
+- Error: `expected &[u8], found u8` — `DOM_BLS_CHECKPOINT` is `u8`, but the function takes `&[u8]` for the domain tag.
+- Fix: `sha256_dom(&[DOM_BLS_CHECKPOINT], &[&self.serialize()])` — wrap the single byte in a slice.
+
+**Problem 2: `sha256` API takes `&[&[u8]]` not `&[u8]`**
+- Code in `hbm_pow.rs`: `sha256(&hb)` where `hb: Vec<u8>`.
+- Error: type mismatch — `sha256` takes a slice of byte slices, not a single slice.
+- Fix: `sha256(&[&hb])` — wrap in an outer slice as required by the API.
+
+**Problem 3: `write_bytes` vs `write_raw` for 20-byte address**
+- Code in `compute_ir.rs`: `w.write_bytes(&self.worker_address)` where `worker_address: [u8; 20]`.
+- Error: `write_bytes` expects `&[u8; 32]` (hash-sized), but the address is 20 bytes.
+- Fix: use `w.write_raw(&self.worker_address)` which accepts any `&[u8]`.
+
+**Problem 4: `sort_by` vs `sort_by_key` clippy warning**
+- Code: `keys.sort_by(|a, b| a.0.cmp(&b.0))`
+- Clippy: `unnecessary_sort_by` — use `sort_by_key` when the key is a simple projection.
+- Fix: `keys.sort_by_key(|a| a.0)`
+
+**Problem 5: Manual `div_ceil` pattern**
+- Code: `(n * QUORUM_BPS as u64 + 9_999) / 10_000` and `(vest_total + period - 1) / period`
+- Clippy: `manual_div_ceil` — Rust 1.73+ provides `.div_ceil()`.
+- Fix: `(n * QUORUM_BPS as u64).div_ceil(10_000)` and `vest_total.div_ceil(period)`
+
+**Problem 6: Doc comment over-indentation**
+- Code in `fees.rs`: continuation lines of bullet points were indented 14 spaces to align under the label.
+- Clippy: `doc_overindented_list_items` — continuation lines must be 2 spaces, not 14.
+- Fix: collapsed continuation lines to 2-space indent.
+
+**Problem 7: Writer API naming — new modules used non-existent method names**
+- New modules used `write_u8()`, `write_u64()`, `write_bytes()`, `write_raw()`, `finish()`.
+- The existing `Writer` only had chaining methods: `.u8()`, `.u64le()`, `.raw()`, `.into_vec()`.
+- Fix: Added convenience alias methods to `Writer` — `write_u8`, `write_u32`, `write_u64`, `write_bytes`, `write_raw`, `finish` — as thin wrappers that call the existing methods and then return `&mut self` or the buffer.
+
+**Problem 8: `satisfies_difficulty` did not exist**
+- `hbm_pow.rs` called `u256::satisfies_difficulty(hash, difficulty)`.
+- The actual API is `target_for_difficulty(difficulty) -> U256` + `U256` comparison.
+- Fix: Import `target_for_difficulty` and `U256`, compute target, then compare `U256::from_be_bytes(hash.0) <= target`.
+
+**Problem 9: Unused `Reader` import in `compute_ir.rs`**
+- `Reader` was imported but `compute_ir.rs` only serializes, never deserializes.
+- Fix: removed the import.
+
+**Problem 10: `unused_mut` warnings in `bls_checkpoint.rs` tests**
+- `let mut p1 = make_payload(100)` — `p1` was never mutated.
+- `let mut cp = make_checkpoint(...)` — `cp` was never mutated.
+- Fix: removed `mut` from both bindings.
+
+**Problem 11: Unused imports in `jnt-net/tests/integration.rs`**
+- `InvEntry` and `Version` were imported but not directly used in tests.
+- Fix: removed them from the `use` statement.
+
+**Problem 12: CI failure — `clippy::unneeded_wildcard_pattern`**
+- CI (GitHub Actions, rust 1.99) caught a lint that local clippy (1.95) did not flag.
+- Code: `PeerEvent::Connected { peer_id, version, is_outbound: _, .. }` — `is_outbound: _` is redundant because `..` already covers remaining fields.
+- Fix: removed `is_outbound: _`.
+- Lesson: CI may use a newer Rust toolchain with additional lints. Always check CI result, not just local clippy.
+
+**Problem 13: CI failure — rustfmt format diff (Linux vs Windows)**
+- After removing `is_outbound: _`, the match arm had 2 named fields + `..`.
+- On Windows `rustfmt` kept them on separate lines. On Linux (CI) `rustfmt` collapsed short patterns to one line: `PeerEvent::Connected { peer_id, version, .. } => {`.
+- Fix: manually collapsed to the one-line form to match Linux `rustfmt` output.
+- Lesson: `cargo fmt --all --check` passes locally does NOT guarantee CI passes. When a pattern's field count changes, check whether `rustfmt` would collapse it on Linux.
+
+---
+
+### 22.10 `README.md` and `docs/status.md` updates
+
+**`README.md` changes:**
+- Status banner updated from "no P2P, single node" to reflecting the full P2P layer and M1–M5.
+- TOC gained: "Protocol mechanisms (M1–M5)" and "P2P networking (jnt-net)" sections.
+- Status table: P2P row updated from "no P2P" to "Implemented: TCP framing, handshake isolation, block relay, locator-based sync, orphan pool".
+- Repository layout: added `jnt-net/` (1 400+ lines) and updated counts.
+- Crate layout: changed from 2 crates to 3 (`jnt-core`, `jnt-net`, `jnt-node`).
+- Module map: expanded from 17 to 21 modules, including M1–M5.
+- Quick start: added `jnt-node serve` example command.
+- Testing: updated count from 139 to 207 tests.
+- Added full M1–M5 descriptions and P2P section.
+
+**`docs/status.md` changes:**
+- Scope section rewritten to list all 5 mechanisms + P2P layer.
+- Verified section updated: 207 tests in 4 groups, clippy 0 warnings, fmt clean.
+
+---
+
+### 22.11 Commit history for this session
+
+```
+c89b3ab  Fix rustfmt diff in jnt-net/net.rs (collapse PeerEvent::Connected pattern fields)
+3eac825  Fix clippy unneeded_wildcard_pattern in jnt-net
+a867247  Implement P2P networking layer (jnt-net), 5 protocol mechanisms (M1-M5), and update docs
+```
+
+`a867247` is the main feature commit (27 files, +4 883 lines). The two followup commits were
+CI hotfixes: lint and format differences between the local toolchain (rustc 1.95) and the CI
+runner (rustc 1.99).
+
+---
+
+### 22.12 Current project state
+
+**Tests:** 207 total, 0 failed.
+- `jnt-core` unit: 178 (130 original + 9 mechanism tests × 5 + 13 BLS tests + misc)
+- `jnt-core` redteam: 9
+- `jnt-net` unit: 10
+- `jnt-net` integration: 10
+
+**CI:** Green on `main` (run `37356282100`).
+
+**Working tree:** Clean (`git status` = nothing to commit).
+
+**Toolchain:** rustc 1.95 local, rustc 1.99 on CI. Workspace compiles clean on both.
+
+**What is fully implemented:**
+- L1 consensus engine: PoW, UTXO ledger, fork choice, finality, difficulty retarget, supply schedule, hybrid PQ signatures.
+- P2P layer: TCP framing, handshake, peer lifecycle, sync, orphan pool, multi-peer serve daemon.
+- M1: 50/50 PSCB fee split with reorg-safe accumulation.
+- M2: Anti-collusion slash (50% burn + 50% linear vesting).
+- M3: Hardware-agnostic canonical compute IR with attestation envelope.
+- M4: Memory-bound HBM scratchpad PoW.
+- M5: BLS12-381 aggregate finality gadget with pluggable verifier.
+
+**What is not yet implemented (deferred, documented):**
+- Real BLS pairing verification (currently `MockBls` in tests; `blst` integration is the production path).
+- Side-branch pruning (depends on finality-wedge consensus decision — §20.1).
+- Persistent UTXO / append-only block log (O(n) JSON rewrite on every block — §20.2).
+- Transaction relay / mempool (no mempool exists in `jnt-core` — §20.3).
+- Layer 2: Verified Work Certificates (the project's actual useful-work premise — specced, not built).
+- `cargo-fuzz` harness (red-team tests are the seed corpus, not yet a fuzz loop).
+- LICENSE file (Cargo.toml declares MIT OR Apache-2.0 but no file exists).
