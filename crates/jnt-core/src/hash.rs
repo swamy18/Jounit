@@ -11,7 +11,7 @@ pub const DOM_BLOCK: &[u8] = b"jounit/blockhash/v1";
 pub const DOM_TX: &[u8] = b"jounit/txid/v1";
 pub const DOM_TXBODY: &[u8] = b"jounit/txbody/v1";
 pub const DOM_SIG: &[u8] = b"jounit/sig/v1";
-pub const DOM_ADDR: &[u8] = b"jounit/addr/v1";
+pub const DOM_ADDR: &[u8] = b"jounit/addr/v2";
 pub const DOM_S1: &[u8] = b"jounit/puzzle/stage1/v1";
 pub const DOM_S2: &[u8] = b"jounit/puzzle/stage2/v1";
 pub const DOM_S3: &[u8] = b"jounit/puzzle/stage3/v1";
@@ -33,12 +33,14 @@ pub fn sha256(parts: &[&[u8]]) -> Hash {
     sha256_dom(&[], parts)
 }
 
-/// `address = SHA256(DOM_ADDR || pubkey)[0..20]`
+/// Single-key address derivation, for the common case of an ECDSA-only bundle.
+///
+/// Equivalent to `Bundle::single(SCHEME_SECP256K1_ECDSA, pubkey).address()`.
+/// Kept so callers that genuinely hold one key do not have to build a bundle.
 pub fn address_from_pubkey(pubkey: &[u8; 33]) -> Address {
-    let full = sha256_dom(DOM_ADDR, &[pubkey]);
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&full[..20]);
-    addr
+    crate::sig::Bundle::single(crate::sig::SCHEME_SECP256K1_ECDSA, pubkey.to_vec())
+        .address()
+        .expect("a single ECDSA bundle is always structurally valid")
 }
 
 pub fn to_hex(bytes: &[u8]) -> String {

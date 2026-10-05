@@ -38,6 +38,11 @@ pub struct NetworkParams {
     pub puzzle_id: u64,
     pub max_tx_count: usize,
     pub max_block_bytes: usize,
+    /// Reject inputs that carry a single-scheme signature bundle, requiring a
+    /// hybrid (multi-scheme) one. Off by default so existing single-scheme
+    /// transactions stay valid; flipping it on is how a network would declare
+    /// itself post-quantum ready without a hard fork.
+    pub require_hybrid_signatures: bool,
 }
 
 impl NetworkParams {
@@ -91,6 +96,7 @@ impl NetworkParams {
             puzzle_id: 1,
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
+            require_hybrid_signatures: false,
         }
     }
 
@@ -119,6 +125,7 @@ impl NetworkParams {
             puzzle_id: 1,
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
+            require_hybrid_signatures: false,
         }
     }
 

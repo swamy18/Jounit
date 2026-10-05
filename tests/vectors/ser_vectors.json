@@ -1,13 +1,13 @@
 {
   "_comment": "Generated from jnt-core by serialization_vectors_are_stable. Do not hand-edit.",
-  "input_len": 133,
+  "input_fixed_len": 36,
   "output_len": 28,
   "items": [
     {
       "name": "input",
-      "len": 133,
-      "declared_len": 133,
-      "hex": "ababababababababababababababababababababababababababababababababefbeaddecdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd02efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+      "len": 243,
+      "declared_len": 243,
+      "hex": "ababababababababababababababababababababababababababababababababefbeadde02014000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd024000777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777770201210002efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef0220001111111111111111111111111111111111111111111111111111111111111111"
     },
     {
       "name": "output",
@@ -17,8 +17,8 @@
     },
     {
       "name": "transaction",
-      "len": 182,
-      "hex": "0100000000887766554433221101000000ababababababababababababababababababababababababababababababababefbeaddecdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd02efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef01000000efcdab89674523014242424242424242424242424242424242424242"
+      "len": 292,
+      "hex": "0100000000887766554433221101000000ababababababababababababababababababababababababababababababababefbeadde02014000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd024000777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777770201210002efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef022000111111111111111111111111111111111111111111111111111111111111111101000000efcdab89674523014242424242424242424242424242424242424242"
     }
   ]
 }

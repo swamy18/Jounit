@@ -52,9 +52,23 @@ pub enum Error {
     /// coinbase output is not yet spendable
     ImmatureCoinbase { height: u64, required: u64 },
     /// signature did not verify for the address owning the spent output
-    BadSignature,
+    BadSignature { scheme: u8 },
     /// signature scheme id not recognised by this implementation
     UnsupportedSigScheme(u8),
+    /// signature bundle declared no components
+    EmptySignatureBundle,
+    /// bundle carries more components than `MAX_BUNDLE_COMPONENTS`
+    TooManyBundleComponents { got: usize, cap: usize },
+    /// a single component's length was zero or over `MAX_COMPONENT_BYTES`
+    BadComponentLength(usize),
+    /// the same scheme appears twice in one bundle
+    DuplicateBundleScheme(u8),
+    /// signature bundle and key bundle hold different component counts
+    BundleKeyMismatch { sigs: usize, keys: usize },
+    /// a signature component has no key component of the same scheme
+    MissingKeyForScheme(u8),
+    /// the input carries a single-scheme bundle where a hybrid is required
+    HybridRequired,
     /// pubkey is not a valid compressed secp256k1 point
     BadPubkey,
     /// address derived from the input pubkey does not own the spent output
@@ -123,8 +137,36 @@ impl fmt::Display for Error {
             Error::ImmatureCoinbase { height, required } => {
                 write!(f, "coinbase at height {height} immature until {required}")
             }
-            Error::BadSignature => write!(f, "signature does not verify"),
+            Error::BadSignature { scheme } => write!(
+                f,
+                "{}-signature does not verify",
+                crate::sig::scheme_name(*scheme)
+            ),
             Error::UnsupportedSigScheme(s) => write!(f, "unsupported sig_scheme {s}"),
+            Error::EmptySignatureBundle => write!(f, "signature bundle is empty"),
+            Error::TooManyBundleComponents { got, cap } => {
+                write!(f, "signature bundle has {got} components, cap {cap}")
+            }
+            Error::BadComponentLength(n) => {
+                write!(f, "signature component length {n} outside 1..=4096")
+            }
+            Error::DuplicateBundleScheme(s) => write!(
+                f,
+                "signature scheme {} appears twice in one bundle",
+                crate::sig::scheme_name(*s)
+            ),
+            Error::BundleKeyMismatch { sigs, keys } => write!(
+                f,
+                "signature bundle has {sigs} components but key bundle has {keys}"
+            ),
+            Error::MissingKeyForScheme(s) => write!(
+                f,
+                "no {} key for a signature component",
+                crate::sig::scheme_name(*s)
+            ),
+            Error::HybridRequired => {
+                write!(f, "a hybrid signature bundle is required here")
+            }
             Error::BadPubkey => write!(f, "invalid compressed secp256k1 pubkey"),
             Error::WrongAddress => write!(f, "pubkey does not own the spent output"),
             Error::SupplyCapExceeded {

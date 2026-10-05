@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::hash::{Address, Hash};
+use crate::params::NetworkParams;
 use crate::tx::{OutPoint, Output, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,7 +192,7 @@ pub fn check_tx(
         if held.out.value == 0 {
             return Err(Error::BadFee("spending a zero-value output"));
         }
-        tx.verify_input(k, &held.out.address, tx_sig_scheme(tx))?;
+        tx.verify_input(k, &held.out.address, require_hybrid(params))?;
         value_in = value_in
             .checked_add(held.out.value)
             .ok_or(Error::ValueOverflow)?;
@@ -217,9 +218,18 @@ pub fn check_tx(
     })
 }
 
-/// Coinbase spends nothing real; the node derives its inputs instead.
-fn tx_sig_scheme(_tx: &Transaction) -> u8 {
-    crate::hash::SIG_SCHEME_SECP256K1_ECDSA
+/// Whether inputs must carry a hybrid (multi-scheme) signature bundle.
+///
+/// Driven by the network profile so a chain can require post-quantum readiness
+/// without a code change. Absent an explicit flag, single-scheme inputs are
+/// accepted: the point of agility is that a valid single-scheme transaction
+/// stays valid, and forcing hybrids on every input would invalidate history the
+/// moment the rule was added.
+///
+/// Coinbase spends nothing real; the node derives its inputs instead, so this
+/// never applies to a coinbase.
+fn require_hybrid(params: &NetworkParams) -> bool {
+    params.require_hybrid_signatures
 }
 
 #[cfg(test)]
@@ -406,10 +416,8 @@ mod tests {
         let (s, op) = funded_set(&w);
         let tx = signed_spend(&w, op, FUNDED - 100, dest);
         let gas = tx.gas_used();
-        assert!(matches!(
-            check_tx(&s, &tx, 10, &NetworkParams::mainnet(), 10_000, 10),
-            Err(Error::BadFee(_))
-        ));
+        let got = check_tx(&s, &tx, 10, &NetworkParams::mainnet(), 10_000, 10);
+        assert!(matches!(got, Err(Error::BadFee(_))), "got {got:?}");
         // Paying exactly the burned base fee works.
         let paid = signed_spend(&w, op, FUNDED - 10_000 * gas, dest);
         assert!(check_tx(&s, &paid, 10, &NetworkParams::mainnet(), 10_000, 10).is_ok());
@@ -437,7 +445,7 @@ mod tests {
         tx.outputs[0].value = 100;
         assert!(matches!(
             check_tx(&s, &tx, 10, &NetworkParams::mini(), 0, 10),
-            Err(Error::BadSignature)
+            Err(Error::BadSignature { .. })
         ));
     }
 

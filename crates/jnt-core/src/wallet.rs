@@ -53,7 +53,21 @@ impl Wallet {
             .unwrap())
     }
 
+    /// The address funds from this wallet.
+    ///
+    /// This is the **hybrid** address, matching what [`Wallet::sign`]
+    /// produces by default. A wallet that signs a hybrid bundle and is
+    /// credited at a single-scheme address would be spending against outputs it
+    /// cannot move, so the two must agree.
     pub fn address(&self) -> Result<Address> {
+        self.hybrid_address()
+    }
+
+    /// Address for a single-scheme ECDSA-only bundle.
+    ///
+    /// Only for wallets that sign with `sign_with(tx, false)`. Kept explicit
+    /// because mixing the two silently produces unspendable outputs.
+    pub fn ecdsa_address(&self) -> Result<Address> {
         Ok(address_from_pubkey(&self.pubkey()?))
     }
 
@@ -99,30 +113,129 @@ impl Wallet {
 
     /// Sign every input of `tx`. Re-signing after an output change invalidates
     /// all previous signatures, which is exactly the intended behaviour.
+    ///
+    /// Produces a **hybrid** bundle by default: an ECDSA signature and a BIP-340
+    /// Schnorr signature over the same message, from the same key, under both
+    /// scheme ids. That is what a post-quantum-ready input looks like once a
+    /// lattice scheme is added -- the bundle, the address commitment and the
+    /// verification path already exist and take another component unchanged.
+    /// Pass `hybrid = false` for a single-scheme ECDSA bundle.
     pub fn sign(&self, tx: &mut Transaction) -> Result<()> {
+        self.sign_with(tx, true)
+    }
+
+    pub fn sign_with(&self, tx: &mut Transaction, hybrid: bool) -> Result<()> {
         if tx.is_coinbase() {
             return Err(Error::BadKey("coinbase transactions are not signed"));
         }
-        let pubkey = self.pubkey()?;
+        let ecdsa_pub = self.pubkey()?;
+        let schnorr_pub = self.schnorr_pubkey()?;
         for k in 0..tx.inputs.len() {
             let msg = tx.message_for_input(k);
-            tx.inputs[k].signature = self.sign_digest(&msg)?;
-            tx.inputs[k].pubkey = pubkey;
+            let ecdsa_sig = self.sign_digest(&msg)?;
+            let schnorr_sig = self.sign_schnorr(&msg)?;
+
+            let input = &mut tx.inputs[k];
+            if hybrid {
+                input.keys = crate::sig::Bundle {
+                    components: vec![
+                        crate::sig::Component::new(
+                            crate::sig::SCHEME_SECP256K1_ECDSA,
+                            ecdsa_pub.to_vec(),
+                        ),
+                        crate::sig::Component::new(
+                            crate::sig::SCHEME_SECP256K1_SCHNORR,
+                            schnorr_pub.to_vec(),
+                        ),
+                    ],
+                };
+                input.sigs = crate::sig::Bundle {
+                    components: vec![
+                        crate::sig::Component::new(
+                            crate::sig::SCHEME_SECP256K1_ECDSA,
+                            ecdsa_sig.to_vec(),
+                        ),
+                        crate::sig::Component::new(
+                            crate::sig::SCHEME_SECP256K1_SCHNORR,
+                            schnorr_sig.to_vec(),
+                        ),
+                    ],
+                };
+            } else {
+                input.keys = crate::sig::Bundle::single(
+                    crate::sig::SCHEME_SECP256K1_ECDSA,
+                    ecdsa_pub.to_vec(),
+                );
+                input.sigs = crate::sig::Bundle::single(
+                    crate::sig::SCHEME_SECP256K1_ECDSA,
+                    ecdsa_sig.to_vec(),
+                );
+            }
         }
         Ok(())
     }
+
+    /// The address a hybrid bundle from this wallet would produce.
+    pub fn hybrid_address(&self) -> Result<Address> {
+        let ecdsa_pub = self.pubkey()?;
+        let schnorr_pub = self.schnorr_pubkey()?;
+        crate::sig::Bundle {
+            components: vec![
+                crate::sig::Component::new(crate::sig::SCHEME_SECP256K1_ECDSA, ecdsa_pub.to_vec()),
+                crate::sig::Component::new(
+                    crate::sig::SCHEME_SECP256K1_SCHNORR,
+                    schnorr_pub.to_vec(),
+                ),
+            ],
+        }
+        .address()
+    }
+
+    /// BIP-340 Schnorr signing key over the same 32-byte scalar.
+    pub fn schnorr_signing_key(&self) -> Result<k256::schnorr::SigningKey> {
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&self.private_key);
+        k256::schnorr::SigningKey::from_bytes(&raw)
+            .map_err(|_| Error::BadKey("scalar out of range"))
+    }
+
+    /// BIP-340 x-only public key, 32 bytes.
+    pub fn schnorr_pubkey(&self) -> Result<[u8; 32]> {
+        Ok(self
+            .schnorr_signing_key()?
+            .verifying_key()
+            .to_bytes()
+            .into())
+    }
+
+    /// BIP-340 Schnorr signature over a 32-byte digest.
+    pub fn sign_schnorr(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
+        use k256::schnorr::signature::hazmat::PrehashSigner;
+        let sk = self.schnorr_signing_key()?;
+        let sig: k256::schnorr::Signature = sk
+            .sign_prehash(digest)
+            .map_err(|_| Error::BadKey("schnorr signing failed"))?;
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&sig.to_bytes());
+        Ok(out)
+    }
 }
 
+/// Verify a single-scheme ECDSA signature against a digest.
+///
+/// Kept for callers holding a bare key rather than an input bundle. Anything
+/// checking a transaction must go through `Transaction::verify_input`, which
+/// handles bundles and the address commitment.
 pub fn verify_digest(pubkey: &[u8; 33], digest: &[u8; 32], sig: &[u8; 64]) -> Result<()> {
     use k256::ecdsa::signature::hazmat::PrehashVerifier;
     let key = VerifyingKey::from_sec1_bytes(pubkey).map_err(|_| Error::BadPubkey)?;
-    let s = Signature::from_slice(sig).map_err(|_| Error::BadSignature)?;
+    let s = Signature::from_slice(sig).map_err(|_| Error::BadSignature { scheme: 1 })?;
     // Some(.) means the signature is high-s and therefore malleable.
     if s.normalize_s().is_some() {
-        return Err(Error::BadSignature);
+        return Err(Error::BadSignature { scheme: 1 });
     }
     key.verify_prehash(digest, &s)
-        .map_err(|_| Error::BadSignature)
+        .map_err(|_| Error::BadSignature { scheme: 1 })
 }
 
 #[cfg(test)]
@@ -134,11 +247,20 @@ mod tests {
     }
 
     #[test]
-    fn addresses_are_20_bytes_and_derived_from_the_key() {
+    fn the_credited_address_matches_what_signing_produces() {
+        // The address a wallet is credited at must be the address its
+        // signatures spend from, or funds become unspendable. Hybrid signing
+        // commits to both schemes, so `address()` is the hybrid address and
+        // differs from the ECDSA-only one.
         let w = wallet();
         let a = w.address().unwrap();
         assert_eq!(a.len(), 20);
-        assert_eq!(a, address_from_pubkey(&w.pubkey().unwrap()));
+        assert_eq!(a, w.hybrid_address().unwrap());
+        assert_ne!(
+            a,
+            w.ecdsa_address().unwrap(),
+            "the hybrid address must not equal the single-scheme one"
+        );
         assert_ne!(a, wallet().address().unwrap());
     }
 
@@ -177,8 +299,7 @@ mod tests {
             }],
         );
         w.sign(&mut tx).unwrap();
-        tx.verify_input(0, &addr, crate::hash::SIG_SCHEME_SECP256K1_ECDSA)
-            .unwrap();
+        tx.verify_input_any(0, &addr).unwrap();
     }
 
     #[test]
@@ -199,8 +320,8 @@ mod tests {
         w.sign(&mut tx).unwrap();
         tx.outputs[0].value = 1;
         assert!(matches!(
-            tx.verify_input(0, &addr, crate::hash::SIG_SCHEME_SECP256K1_ECDSA),
-            Err(Error::BadSignature)
+            tx.verify_input_any(0, &addr),
+            Err(Error::BadSignature { .. })
         ));
     }
 

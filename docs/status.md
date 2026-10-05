@@ -12,7 +12,7 @@ single-node chain. A coin with one node is not a network yet.
 
 ## Verified
 
-- `cargo test --workspace` — 114 tests pass, `cargo clippy --all-targets` clean
+- `cargo test --workspace` — 130 tests pass, `cargo clippy --all-targets` clean
   under `-D warnings`, `cargo fmt --check` clean. CI (`.github/workflows/ci.yml`)
   runs all of it plus the vector cross-checks on every push.
 - An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
@@ -152,7 +152,7 @@ to separate them.
 ## Reproducing the difficulty work
 
 ```
-cargo test --workspace                                 # 114 tests
+cargo test --workspace                                 # 130 tests
 cargo clippy --workspace --all-targets -- -D warnings # clean
 cargo fmt --all --check                               # clean
 python sim/difficulty_attack_sim.py                     # attack containment

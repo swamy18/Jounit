@@ -84,14 +84,20 @@ Construction: pair leaves left-to-right; if the level has an odd node count, **d
 
 All lengths are implied by the field list. Integers marked `LE` are little-endian.
 
-### 3.1 `Input` — 133 bytes
+### 3.1 `Input` — variable
 
 | Field | Size |
 |---|---|
 | `prevout_hash` | 32 raw |
 | `prevout_index` | 4 LE |
-| `signature` | 64 raw |
-| `pubkey` | 33 raw |
+| `sigs` | signature bundle (§3.5) |
+| `keys` | public-key bundle (§3.5) |
+
+Fixed prefix is 36 bytes. The two bundles are length-prefixed, so the input is
+variable-length. This is deliberate: a post-quantum signature is ~2.4 KB
+(ML-DSA-44) to 3.3 KB (ML-DSA-65), and no fixed field sized to today's 64-byte
+ECDSA could ever hold one. A cap that admits a real post-quantum signature would
+have to be at least 4096 bytes per component regardless.
 
 ### 3.2 `Output` — 28 bytes
 
@@ -108,9 +114,51 @@ All lengths are implied by the field list. Integers marked `LE` are little-endia
 | `tx_type` | 1 (`0` = standard, `1` = coinbase) |
 | `lock_time` | 8 LE |
 | `input_count` | 4 LE |
-| `inputs` | `input_count × 133` |
+| `inputs` | `input_count × (variable)` |
 | `output_count` | 4 LE |
 | `outputs` | `output_count × 28` |
+
+### 3.5 Signature and key bundles
+
+A bundle is an ordered, canonical list of components:
+
+```
+count          1        (0 permitted only for an unsigned or coinbase input)
+per component: scheme   1
+                len     2 LE
+                bytes   len
+```
+
+Rules, all enforced:
+
+- `1 ≤ count ≤ 4` for an input that claims to spend.
+- `1 ≤ len ≤ 4096` per component. Checked against the *declared* length before
+  any allocation, since the prefix is attacker-controlled.
+- Total serialized size ≤ `2 × 4 × 4096 + 512`.
+- Every `scheme` must be one this implementation can verify.
+- A scheme may not repeat within one bundle — a duplicate adds bytes without
+  adding independence, so it is not a hybrid.
+
+An unsigned input and a coinbase input both carry two empty bundles
+(`count = 0`), which is why `count = 0` parses. Non-emptiness is enforced by
+validation, which only runs for inputs that actually claim to spend.
+
+**Hybrid verification.** `sigs` and `keys` are parallel: `sigs[i]` is verified
+by the key in `keys` declaring the same `scheme` id — matched by id, not by
+position. **Every** component must verify. A one-of-N rule would not be a
+hybrid: an adversary who breaks one primitive would forge that component and
+strip the rest.
+
+**Addresses commit to the whole key set.**
+`address = SHA256(DOM_ADDR || serialize(keys))[0..20]`, with `DOM_ADDR` at
+`/v2` because the preimage changed from a bare 33-byte pubkey to a serialized
+bundle. An ECDSA-only key set and a hybrid one therefore cannot share an
+address, and a hybrid key set cannot be quietly reduced.
+
+**Schemes.** `1` = secp256k1 ECDSA (low-`s`, canonical). `2` = secp256k1
+BIP-340 Schnorr. Scheme 2 exercises the multi-scheme path end to end; it is not
+post-quantum and adds no quantum resistance on its own. A lattice scheme (3)
+would slot in without changing any encoding, since the bundle is generic.
 
 ```
 txid = SHA256( DOM_TX ‖ serialize(tx) )

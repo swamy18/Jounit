@@ -25,6 +25,7 @@ pub mod ledger;
 pub mod params;
 pub mod puzzle;
 pub mod ser;
+pub mod sig;
 pub mod supply;
 pub mod tx;
 pub mod u256;

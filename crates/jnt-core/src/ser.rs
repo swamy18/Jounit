@@ -110,6 +110,11 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
 
+    pub fn u16le(&mut self) -> Result<u16> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+
     pub fn u64le(&mut self) -> Result<u64> {
         let s = self.take(8)?;
         let mut b = [0u8; 8];
@@ -129,6 +134,15 @@ impl<'a> Reader<'a> {
         let mut out = [0u8; N];
         out.copy_from_slice(s);
         Ok(out)
+    }
+
+    /// Borrow `n` bytes without copying into a fixed-size array.
+    ///
+    /// Used by the signature-bundle reader, where the length is a `u16` from
+    /// the wire rather than a compile-time constant. Callers must have already
+    /// checked `n` against their own cap; `take` enforces the buffer bound.
+    pub fn fixed_slice(&mut self, n: usize) -> Result<&'a [u8]> {
+        self.take(n)
     }
 
     pub fn expect_end(&self) -> Result<()> {

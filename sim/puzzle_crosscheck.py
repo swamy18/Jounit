@@ -65,8 +65,11 @@ def reference_header(height: int, nonce: int, epoch_id: int):
         + u32le(1)  # input_count
         + (b"\x00" * 32)  # prevout_hash
         + (0).to_bytes(4, "little")  # prevout_index
-        + (b"\x00" * 64)  # signature
-        + (b"\x00" * 33)  # pubkey
+        # SPEC.md 3.5: signature and key bundles. A coinbase spends
+        # nothing, so both are empty -- two zero counts. These replaced
+        # the old fixed 64-byte signature + 33-byte pubkey.
+        + bytes([0])
+        + bytes([0])
         + u32le(1)  # output_count
         + u64le(0)  # value
         + (b"\x00" * 20)  # address

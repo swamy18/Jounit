@@ -39,3 +39,20 @@ hex_mod!(h20, 20);
 hex_mod!(h32, 32);
 hex_mod!(h33, 33);
 hex_mod!(h64, 64);
+
+/// Variable-length byte vectors, serialized as hex strings.
+///
+/// Needed by the signature bundles: a post-quantum component is ~2.4 KB, which
+/// no fixed-size adapter covers, and hex keeps the node's JSON export readable.
+pub mod var_bytes {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let raw = String::deserialize(d)?;
+        hex::decode(raw.trim()).map_err(de::Error::custom)
+    }
+}

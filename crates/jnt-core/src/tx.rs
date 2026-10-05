@@ -8,16 +8,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::hash::{
-    sha256_dom, Address, Hash, DOM_SIG, DOM_TX, DOM_TXBODY, SIG_SCHEME_SECP256K1_ECDSA,
-};
+use crate::hash::{sha256_dom, Address, Hash, DOM_SIG, DOM_TX, DOM_TXBODY};
 use crate::hexserde;
 use crate::ser::{Reader, Writer};
 
 pub const TX_STANDARD: u8 = 0;
 pub const TX_COINBASE: u8 = 1;
 
-pub const INPUT_SERIALIZED_LEN: usize = 133;
+/// Fixed part of a serialized input: `prev_hash(32) + prev_index(4)`. The
+/// signature and key bundles that follow are variable-length (SPEC.md §3.2),
+/// because a post-quantum signature is ~2.4 KB and no fixed field sized to
+/// today's ECDSA could ever hold one.
+pub const INPUT_FIXED_LEN: usize = 36;
+
+/// `value(8) + address(20)`
 pub const OUTPUT_SERIALIZED_LEN: usize = 28;
 
 /// Gas model (SPEC.md §8). No scripts, so cost is linear in size.
@@ -43,15 +47,19 @@ impl OutPoint {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// One spent outpoint plus a hybrid signature bundle over it.
+///
+/// `sigs` and `keys` are parallel bundles of equal length: `sigs[i]` is signed by
+/// `keys[i]`, and **all** components must verify. A bundle of one is an ordinary
+/// single-scheme signature; a bundle of several is a hybrid that survives one
+/// primitive being broken. See `sig.rs` for why "all must verify" is the rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Input {
     #[serde(with = "hexserde::h32")]
     pub prev_hash: Hash,
     pub prev_index: u32,
-    #[serde(with = "hexserde::h64")]
-    pub signature: [u8; 64],
-    #[serde(with = "hexserde::h33")]
-    pub pubkey: [u8; 33],
+    pub sigs: crate::sig::Bundle,
+    pub keys: crate::sig::Bundle,
 }
 
 impl Input {
@@ -66,29 +74,40 @@ impl Input {
         Input {
             prev_hash: prev.txid,
             prev_index: prev.index,
-            signature: [0u8; 64],
-            pubkey: [0u8; 33],
+            sigs: crate::sig::Bundle::default(),
+            keys: crate::sig::Bundle::default(),
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; INPUT_SERIALIZED_LEN] {
-        let mut w = Writer::with_capacity(INPUT_SERIALIZED_LEN);
-        w.fixed(&self.prev_hash)
-            .u32le(self.prev_index)
-            .fixed(&self.signature)
-            .fixed(&self.pubkey);
-        let v = w.into_vec();
-        let mut out = [0u8; INPUT_SERIALIZED_LEN];
-        out.copy_from_slice(&v);
-        out
+    /// Attach a single ECDSA signature, the common case.
+    pub fn with_ecdsa(mut self, pubkey: [u8; 33], sig: [u8; 64]) -> Self {
+        self.keys = crate::sig::Bundle::single(crate::sig::SCHEME_SECP256K1_ECDSA, pubkey.to_vec());
+        self.sigs = crate::sig::Bundle::single(crate::sig::SCHEME_SECP256K1_ECDSA, sig.to_vec());
+        self
+    }
+
+    /// Serialized length, known without serializing.
+    pub fn serialized_len(&self) -> usize {
+        INPUT_FIXED_LEN + self.sigs.serialized_len() + self.keys.serialized_len()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(self.serialized_len());
+        w.fixed(&self.prev_hash).u32le(self.prev_index);
+        w.raw(&self.sigs.to_bytes()).raw(&self.keys.to_bytes());
+        w.into_vec()
     }
 
     pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let prev_hash: Hash = r.fixed()?;
+        let prev_index = r.u32le()?;
+        let sigs = crate::sig::Bundle::from_reader(r)?;
+        let keys = crate::sig::Bundle::from_reader(r)?;
         Ok(Input {
-            prev_hash: r.fixed()?,
-            prev_index: r.u32le()?,
-            signature: r.fixed()?,
-            pubkey: r.fixed()?,
+            prev_hash,
+            prev_index,
+            sigs,
+            keys,
         })
     }
 }
@@ -143,12 +162,10 @@ impl Transaction {
             version: 1,
             tx_type: TX_COINBASE,
             lock_time: 0,
-            inputs: vec![Input {
-                prev_hash,
-                prev_index: height as u32,
-                signature: [0u8; 64],
-                pubkey: [0u8; 33],
-            }],
+            inputs: vec![Input::unsigned(&OutPoint {
+                txid: prev_hash,
+                index: height as u32,
+            })],
             outputs: vec![output],
         }
     }
@@ -158,7 +175,7 @@ impl Transaction {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(64 + self.inputs.len() * INPUT_SERIALIZED_LEN);
+        let mut w = Writer::with_capacity(64 + self.inputs.len() * INPUT_FIXED_LEN);
         w.u32le(self.version)
             .u8(self.tx_type)
             .u64le(self.lock_time)
@@ -221,8 +238,8 @@ impl Transaction {
     pub fn sighash(&self) -> Hash {
         let mut blanked = self.clone();
         for i in blanked.inputs.iter_mut() {
-            i.signature = [0u8; 64];
-            i.pubkey = [0u8; 33];
+            i.sigs = crate::sig::Bundle::default();
+            i.keys = crate::sig::Bundle::default();
         }
         sha256_dom(DOM_TXBODY, &[&blanked.serialize()])
     }
@@ -284,35 +301,41 @@ impl Transaction {
     }
 
     /// Verify input `k` against the address that owns the spent output.
-    pub fn verify_input(&self, k: usize, owner: &Address, sig_scheme: u8) -> Result<()> {
-        if sig_scheme != SIG_SCHEME_SECP256K1_ECDSA {
-            return Err(Error::UnsupportedSigScheme(sig_scheme));
-        }
+    ///
+    /// The scheme is no longer passed in: each input carries its own bundles
+    /// and names its schemes, which is what makes agility real rather than a
+    /// byte that only ever has one legal value. `require_hybrid` is kept for
+    /// callers that want to reject single-scheme inputs, and is what a network
+    /// would switch on to require post-quantum readiness.
+    pub fn verify_input(&self, k: usize, owner: &Address, require_hybrid: bool) -> Result<()> {
         let input = &self.inputs[k];
-        let addr = crate::hash::address_from_pubkey(&input.pubkey);
+
+        input.sigs.validate()?;
+        input.keys.validate()?;
+        if require_hybrid && input.sigs.components.len() < 2 {
+            return Err(Error::HybridRequired);
+        }
+
+        // The address commits to the whole key bundle, so a hybrid key set
+        // cannot be swapped for a smaller one that omits a component.
+        let addr = input.keys.address()?;
         if &addr != owner {
             return Err(Error::WrongAddress);
         }
+
         let msg = self.message_for_input(k);
-        let key = k256::ecdsa::VerifyingKey::from_sec1_bytes(&input.pubkey)
-            .map_err(|_| Error::BadPubkey)?;
-        let sig = k256::ecdsa::Signature::from_slice(&input.signature)
-            .map_err(|_| Error::BadSignature)?;
-        // `normalize_s` returns Some only when the signature is *high*-s, i.e.
-        // malleable. Reject those so txids stay canonical.
-        if sig.normalize_s().is_some() {
-            return Err(Error::BadSignature);
-        }
-        use k256::ecdsa::signature::hazmat::PrehashVerifier;
-        key.verify_prehash(&msg, &sig)
-            .map_err(|_| Error::BadSignature)
+        crate::sig::verify_bundle(&input.sigs, &input.keys, &msg)
+    }
+
+    /// Convenience wrapper for the common single-scheme-allowed case.
+    pub fn verify_input_any(&self, k: usize, owner: &Address) -> Result<()> {
+        self.verify_input(k, owner, false)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::address_from_pubkey;
 
     fn sample_pubkey() -> [u8; 33] {
         // x = 1 generator point, a well-known valid compressed key.
@@ -323,12 +346,15 @@ mod tests {
     }
 
     #[test]
-    fn input_and_output_have_fixed_lengths() {
+    fn an_unsigned_input_is_the_fixed_prefix_plus_two_empty_bundles() {
+        // The signature and key bundles are length-prefixed, so an unsigned
+        // input is `prev_hash(32) + prev_index(4) + count(0) + count(0)`.
         let i = Input::unsigned(&OutPoint {
             txid: [7u8; 32],
             index: 3,
         });
-        assert_eq!(i.to_bytes().len(), INPUT_SERIALIZED_LEN);
+        assert_eq!(i.to_bytes().len(), INPUT_FIXED_LEN + 2);
+        assert_eq!(i.serialized_len(), INPUT_FIXED_LEN + 2);
         assert_eq!(
             Output {
                 value: 1,
@@ -398,8 +424,9 @@ mod tests {
             }],
         );
         let mut signed = base.clone();
-        signed.inputs[0].signature = [0xab; 64];
-        signed.inputs[0].pubkey = sample_pubkey();
+        signed.inputs[0] = signed.inputs[0]
+            .clone()
+            .with_ecdsa(sample_pubkey(), [0xab; 64]);
         assert_eq!(
             base.sighash(),
             signed.sighash(),
@@ -458,18 +485,26 @@ mod tests {
                 address: [0; 20],
             }],
         );
-        tx.inputs[0].pubkey = sample_pubkey();
-        let real = address_from_pubkey(&tx.inputs[0].pubkey);
+        // The address now commits to the whole key bundle, so derive it the
+        // same way rather than reaching for a bare-pubkey helper.
+        tx.inputs[0] = tx.inputs[0].clone().with_ecdsa(sample_pubkey(), [0xab; 64]);
+        let real = tx.inputs[0].keys.address().unwrap();
+        assert!(
+            matches!(
+                tx.verify_input_any(0, &real),
+                Err(Error::BadSignature { .. })
+            ),
+            "a bogus signature must not verify"
+        );
         assert!(matches!(
-            tx.verify_input(0, &real, SIG_SCHEME_SECP256K1_ECDSA),
-            Err(Error::BadSignature)
-        ));
-        assert!(matches!(
-            tx.verify_input(0, &[0u8; 20], SIG_SCHEME_SECP256K1_ECDSA),
+            tx.verify_input_any(0, &[0u8; 20]),
             Err(Error::WrongAddress)
         ));
+
+        // A scheme this build cannot verify is refused at the bundle level.
+        tx.inputs[0].sigs.components[0].scheme = 99;
         assert!(matches!(
-            tx.verify_input(0, &real, 99),
+            tx.verify_input_any(0, &real),
             Err(Error::UnsupportedSigScheme(99))
         ));
     }
@@ -545,16 +580,37 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/vectors/ser_vectors.json");
 
+        // A hybrid input: two schemes over one outpoint, which is the shape
+        // the variable-length encoding exists for.
+        let mut ecdsa_pub = [0xEFu8; 33];
+        ecdsa_pub[0] = 0x02; // compressed secp256k1 prefix
+        let schnorr_pub = [0x11u8; 32];
         let input = Input {
             prev_hash: [0xABu8; 32],
             prev_index: 0xDEAD_BEEF,
-            signature: [0xCDu8; 64],
-            pubkey: {
-                let mut p = [0xEFu8; 33];
-                p[0] = 0x02; // compressed secp256k1 prefix
-                p
+            keys: crate::sig::Bundle {
+                components: vec![
+                    crate::sig::Component::new(
+                        crate::sig::SCHEME_SECP256K1_ECDSA,
+                        ecdsa_pub.to_vec(),
+                    ),
+                    crate::sig::Component::new(
+                        crate::sig::SCHEME_SECP256K1_SCHNORR,
+                        schnorr_pub.to_vec(),
+                    ),
+                ],
+            },
+            sigs: crate::sig::Bundle {
+                components: vec![
+                    crate::sig::Component::new(crate::sig::SCHEME_SECP256K1_ECDSA, vec![0xCD; 64]),
+                    crate::sig::Component::new(
+                        crate::sig::SCHEME_SECP256K1_SCHNORR,
+                        vec![0x77; 64],
+                    ),
+                ],
             },
         };
+        let input_len = input.serialized_len();
         let output = Output {
             value: 0x0123_4567_89AB_CDEF,
             address: [0x42u8; 20],
@@ -563,12 +619,12 @@ mod tests {
             version: 1,
             tx_type: TX_STANDARD,
             lock_time: 0x11_22_33_44_55_66_77_88,
-            inputs: vec![input],
+            inputs: vec![input.clone()],
             outputs: vec![output],
         };
 
         let entries: Vec<(&str, Vec<u8>, usize)> = vec![
-            ("input", input.to_bytes().to_vec(), INPUT_SERIALIZED_LEN),
+            ("input", input.to_bytes(), input_len),
             ("output", output.to_bytes().to_vec(), OUTPUT_SERIALIZED_LEN),
             ("transaction", tx.serialize(), 0),
         ];
@@ -578,7 +634,7 @@ mod tests {
             "  \"_comment\": \"Generated from jnt-core by serialization_vectors_are_stable. \
 Do not hand-edit.\",\n",
         );
-        json.push_str(&format!("  \"input_len\": {INPUT_SERIALIZED_LEN},\n"));
+        json.push_str(&format!("  \"input_fixed_len\": {INPUT_FIXED_LEN},\n"));
         json.push_str(&format!("  \"output_len\": {OUTPUT_SERIALIZED_LEN},\n"));
         json.push_str("  \"items\": [\n");
         for (i, (name, bytes, declared)) in entries.iter().enumerate() {
@@ -613,8 +669,8 @@ Do not hand-edit.\",\n",
             )
         });
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["input_len"].as_u64().unwrap(), 133, "SPEC.md 3.1");
-        assert_eq!(v["output_len"].as_u64().unwrap(), 28, "SPEC.md 3.2");
+        assert_eq!(v["input_fixed_len"].as_u64().unwrap(), 36, "SPEC.md 3.2");
+        assert_eq!(v["output_len"].as_u64().unwrap(), 28, "SPEC.md 3.3");
 
         let listed = v["items"].as_array().expect("items must be an array");
         assert_eq!(listed.len(), entries.len(), "vector file is stale");
