@@ -460,4 +460,111 @@ mod tests {
         assert_eq!(s.outputs_for_address(&dest).len(), 1);
         assert_eq!(s.total_value(), FUNDED - 100);
     }
+
+    // --- Properties -------------------------------------------------------
+
+    #[test]
+    fn undo_is_an_exact_inverse_over_a_random_spend_sequence() {
+        // Roll a long mixed sequence of spends forward, then all the way back,
+        // and compare the whole set entry for entry. `apply_tx`/`undo_tx` are
+        // the basis of reorg handling, so a lossy undo means a node that
+        // silently invents or destroys coins after a reorg.
+        let w = Wallet::new_random("prop");
+        let dest = [3u8; 20];
+        let (mut s, first) = funded_set(&w);
+
+        let snapshot = s.clone();
+        let mut undo_log: Vec<(Transaction, Undo)> = Vec::new();
+        let mut next = first;
+        let mut tag = 0u8;
+
+        for step in 0..64u64 {
+            if !s.contains(&next) {
+                break;
+            }
+            tag = tag.wrapping_add(1);
+            // Vary the payment so outputs differ, and keep it non-zero and
+            // below the held value so every step is a valid spend.
+            let pay = 1_000 + (step % 7) * 111;
+            let tx = signed_spend(&w, next, pay, dest);
+            let undo = s.apply_tx(&tx, 100 + step).unwrap();
+            next = OutPoint {
+                txid: tx.txid(),
+                index: 0,
+            };
+            undo_log.push((tx, undo));
+        }
+
+        assert!(!undo_log.is_empty(), "no spends were applied");
+        assert_ne!(s.total_value(), snapshot.total_value());
+
+        for (tx, undo) in undo_log.iter().rev() {
+            s.undo_tx(tx, undo);
+        }
+
+        assert_eq!(s.len(), snapshot.len(), "set size changed after undo");
+        assert_eq!(s.total_value(), snapshot.total_value(), "value leaked");
+        for (op, u) in snapshot.iter() {
+            assert_eq!(
+                s.get(&op),
+                Some(u),
+                "output {}:{} differs after undo",
+                hex::encode(op.txid),
+                op.index
+            );
+        }
+    }
+
+    #[test]
+    fn total_value_never_exceeds_the_cap_and_never_wraps() {
+        // `total_value` sums the whole set. Build entries whose values would
+        // overflow a u64 and confirm the sum saturates rather than wrapping to
+        // a small number, which would let a cap check pass on a set that
+        // actually holds more.
+        let mut s = UtxoSet::new();
+        for i in 0..4u8 {
+            s.insert(
+                OutPoint {
+                    txid: [i; 32],
+                    index: 0,
+                },
+                Utxo {
+                    out: tagged(u64::MAX / 2, i),
+                    height: 0,
+                },
+            );
+        }
+        assert_eq!(
+            s.total_value(),
+            u64::MAX,
+            "an overflowing total must saturate, not wrap"
+        );
+    }
+
+    #[test]
+    fn a_transaction_can_never_create_more_value_than_it_spends() {
+        // The core conservation property, checked over a spread of shapes
+        // rather than a single happy path: whatever the fee and split, the
+        // output total must not exceed the resolved input total.
+        let w = Wallet::new_random("prop");
+        let p = NetworkParams::mini();
+        // `funded_set` always funds FUNDED, so the first tuple element is
+        // documentation of the funding side rather than a varying input.
+        for pay in [1u64, FUNDED - 1, FUNDED, 9] {
+            let (mut s, op) = funded_set(&w);
+            let tx = signed_spend(&w, op, pay, [5u8; 20]);
+            let delta = match check_tx(&s, &tx, 10, &p, 0, 0) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            assert!(
+                delta.value_out <= delta.value_in,
+                "created {} from {}",
+                delta.value_out,
+                delta.value_in
+            );
+            s.apply_tx(&tx, 10).unwrap();
+            assert!(s.total_value() <= FUNDED, "set grew beyond the funding");
+        }
+    }
 }

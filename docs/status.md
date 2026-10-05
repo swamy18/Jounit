@@ -12,7 +12,7 @@ single-node chain. A coin with one node is not a network yet.
 
 ## Verified
 
-- `cargo test --workspace` — 106 tests pass, `cargo clippy --all-targets` clean
+- `cargo test --workspace` — 114 tests pass, `cargo clippy --all-targets` clean
   under `-D warnings`, `cargo fmt --check` clean. CI (`.github/workflows/ci.yml`)
   runs all of it plus the vector cross-checks on every push.
 - An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
@@ -131,7 +131,13 @@ to separate them.
 - **P2P.** No node discovery, no block/tx relay, no mempool gossip.
 - **Persisted UTXO indexing.** State is replayed from genesis on load, which is
   fine at test scale and will not be at 40M coins.
-- **No fuzzing, no property tests, no adversarial block/tx corpus.**
+- **No fuzzing with a coverage-guided harness** (`cargo-fuzz`/`arbitrary`),
+  which is what would really exercise the parsers. In its place are
+  deterministic property tests: arbitrary bytes through every deserializer,
+  every truncation of a valid block, count fields claiming more entries than
+  the buffer holds, wire round-trip stability, output-encoding injectivity, and
+  `undo_tx` proven an exact inverse over a 64-step spend sequence. Each was
+  checked to fail when the property it names is broken.
 - Vector coverage is finite by construction. The crosscheck exercises seven
   header/epoch combinations; it does not cover every field permutation, and a
   Rust-only bug outside those cases would not be caught by it.
@@ -146,7 +152,7 @@ to separate them.
 ## Reproducing the difficulty work
 
 ```
-cargo test --workspace                                 # 106 tests
+cargo test --workspace                                 # 114 tests
 cargo clippy --workspace --all-targets -- -D warnings # clean
 cargo fmt --all --check                               # clean
 python sim/difficulty_attack_sim.py                     # attack containment

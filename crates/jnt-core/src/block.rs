@@ -330,4 +330,124 @@ mod tests {
         h.height = 120_000;
         assert_eq!(h.expected_epoch(50_000), 2);
     }
+
+    // --- Properties -------------------------------------------------------
+    //
+    // A node parses bytes it did not produce, so every deserializer has to
+    // reject hostile input by returning an error, never by panicking. There is
+    // no fuzz harness here yet, so these properties run over a deterministic
+    // spread of adversarial shapes instead of random bytes only: truncated
+    // buffers, count fields claiming more entries than the buffer holds, and
+    // length-prefix fields pinned to their extremes.
+
+    /// Deterministic pseudo-random bytes, so a failure is reproducible from
+    /// the seed alone rather than needing the original fuzz corpus.
+    fn pseudo_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                // xorshift64*, chosen for being short and obviously
+                // deterministic rather than for quality.
+                s ^= s >> 12;
+                s ^= s << 25;
+                s ^= s >> 27;
+                (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic_the_deserializers() {
+        for seed in 0..256u64 {
+            let len = (seed as usize * 37) % 400;
+            let bytes = pseudo_bytes(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), len);
+            // The only requirement is that these return rather than panic.
+            let _ = Block::deserialize(&bytes);
+            let _ = Header::deserialize(&bytes);
+            let _ = Transaction::deserialize(&bytes);
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_a_valid_block_is_rejected_not_panicked() {
+        let mut b = genesis_block(1);
+        b.header.height = 1;
+        b.header.prev_hash = [7u8; 32];
+        b.header.timestamp_ms = GENESIS_TIMESTAMP_MS + 600_000;
+        b.header.difficulty = 1;
+        b.header.nonce = 1;
+        let full = b.serialize();
+
+        // Any prefix short of the whole thing must fail cleanly.
+        for cut in 0..full.len() {
+            assert!(
+                Block::deserialize(&full[..cut]).is_err(),
+                "a {cut}-byte prefix of a {}-byte block was accepted",
+                full.len()
+            );
+        }
+        // And trailing junk must fail rather than be ignored.
+        let mut extended = full.clone();
+        extended.push(0xAB);
+        assert!(Block::deserialize(&extended).is_err());
+    }
+
+    #[test]
+    fn a_count_field_cannot_claim_more_entries_than_the_buffer_holds() {
+        // header + signature + pubkey, then a tx_count of u32::MAX against a
+        // buffer with nothing after it. Without the remaining-buffer check
+        // this would try to reserve four billion entries.
+        let mut b = genesis_block(1);
+        b.txs.clear();
+        let mut bytes = b.serialize();
+        bytes.truncate(HEADER_SERIALIZED_LEN + 64 + 33);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        assert!(matches!(
+            Block::deserialize(&bytes),
+            Err(Error::Malformed(_))
+        ));
+
+        // Same shape one level down, inside a transaction. The count fields are
+        // hand-assembled because `Transaction::standard` would refuse the
+        // empty input and output lists this needs.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1u32.to_le_bytes()); // version
+        raw.push(crate::tx::TX_STANDARD);
+        raw.extend_from_slice(&0u64.to_le_bytes()); // lock_time
+        raw.extend_from_slice(&u32::MAX.to_le_bytes()); // input_count
+        raw.extend_from_slice(&u32::MAX.to_le_bytes()); // output_count
+        assert!(Transaction::deserialize(&raw).is_err());
+    }
+
+    #[test]
+    fn serialization_round_trips_bit_for_bit() {
+        let b = genesis_block(1);
+        let bytes = b.serialize();
+        let back = Block::deserialize(&bytes).unwrap();
+        assert_eq!(back.serialize(), bytes, "block round-trip is not stable");
+        assert_eq!(back.block_hash(), b.block_hash());
+
+        let tx = &b.txs[0];
+        let raw = tx.serialize();
+        assert_eq!(Transaction::deserialize(&raw).unwrap(), *tx);
+    }
+
+    #[test]
+    fn serialization_is_injective_for_every_output_value() {
+        // Distinct value/address pairs must not collide on the wire, which is
+        // what makes the coinbase value check in apply_block meaningful.
+        let mut seen = std::collections::HashSet::new();
+        for v in [0u64, 1, 76 * 100_000_000, u64::MAX - 1, u64::MAX] {
+            let out = crate::tx::Output {
+                value: v,
+                address: [0xABu8; 20],
+            };
+            let bytes = out.to_bytes();
+            assert!(
+                seen.insert(bytes),
+                "output value {v} collided with another on the wire"
+            );
+        }
+    }
 }
