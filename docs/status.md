@@ -44,10 +44,16 @@ expression and watching the new test fail with the overflow panic. `value_out`
 now saturates and a new `value_out_overflows` check runs in `check_tx` before
 the comparison is trusted.
 
-The rest of the arithmetic audit came back clean: `ser.rs` bounds-checks every
-read, both `tx` and `block` deserializers reject attacker-controlled counts
-larger than the remaining buffer before allocating, `value_in` already used
-`checked_add`, and `fees.rs` uses saturating operations throughout.
+The rest of the arithmetic audit came back largely clean: `ser.rs`
+bounds-checks every read, both `tx` and `block` deserializers reject
+attacker-controlled counts larger than the remaining buffer before allocating,
+`value_in` already used `checked_add`, `fees.rs` uses saturating operations
+throughout, `apply_tx` records undo data that makes rollback an exact inverse,
+and `apply_block` does verify the coinbase against `reward + tip` (chain.rs)
+before the supply-cap check — so the inflation path is closed there. The one gap
+it did turn up was block-level fee accumulation using `+=`, which panics in
+debug and wraps in release, feeding a wrong total into the burn/tip split. Now
+`checked_add`.
 
 **The puzzle overflow guard could not fire.** `PuzzleSpec::validate` computed
 its accumulator bound as `(nn_input_dim as i64) * 128 * 128 + 62` and compared

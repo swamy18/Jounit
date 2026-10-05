@@ -310,8 +310,16 @@ impl Chain {
             let undo = self.utxo.apply_tx(tx, height)?;
             body_undo.spent.extend(undo.spent);
             body_undo.created.extend(undo.created);
-            total_gas += delta.gas_used;
-            total_fees += delta.fee_total;
+            // Accumulated across the block, so use checked arithmetic: `+=`
+            // panics in debug and wraps in release, and a wrapped total feeds
+            // straight into the burn/tip split below, where wrapping could
+            // understate the burned portion or invent a miner tip.
+            total_gas = total_gas
+                .checked_add(delta.gas_used)
+                .ok_or(Error::ValueOverflow)?;
+            total_fees = total_fees
+                .checked_add(delta.fee_total)
+                .ok_or(Error::ValueOverflow)?;
         }
         // Genesis-adjacent blocks pay no base fee on their first transaction;
         // the schedule above already starts at `base_fee_initial_sat`.
