@@ -2046,3 +2046,24 @@ CI gained a fuzz-smoke job: nightly + cargo-fuzz, each target 20s per push.
 Committed: 99061e5 (invariants + 2 bug fixes), a43d799 (fuzz harness 7
 targets). Workspace tests: 360 (was 347). fmt/clippy -D warnings/release
 clean; five sims green.
+
+## Session 11 (cont.) — pending decisions recorded + gap audit
+
+The two blocking decisions are now recorded in docs/decisions.md as standing
+design-only decisions (no runtime change, no activation):
+
+1. D3 L2 fees = option 3: the five flat FEE_TX_* fees are the L2 schedule;
+   the flat fee itself becomes full_base in split_fees (M1 50/50 burn/PSCB
+   invariant holds unchanged); L1 gas floor untouched; no exemption, no second
+   fee market. Task payments (payment_jnt) are a market price, not fees.
+2. §14.6 economics: min stake 5000 JNT bonded (unbond after finality_depth),
+   TopN=21 (fixed genesis committee bootstrap on testnet), NO validator
+   rewards, equivocation = burn entire bond via slash.rs evidence path,
+   activation strictly at end of Phase 6 (non-binding committee first, binding
+   finality is its own reviewable change).
+
+Gap audit vs the 6-phase roadmap (same file): Phase 1 DONE (mempool, store,
+relay, real BLS, fuzzing); Phases 2-5 NOT STARTED (jnt-l2 and jnt-worker
+crates do not exist; dependencies ComputeTask/SlashVault/PSCB/hbm_pow all
+ready); Phase 6 PREPARED but gated on 2-5. Next: Phase 2 — jnt-l2 skeleton,
+TaskContract state machine, five L2 tx types with D3 fee routing.
