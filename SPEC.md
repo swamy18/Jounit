@@ -902,9 +902,12 @@ a quadratic amplifier — the cheapest possible way to burn a node's CPU.
    The incremental undo primitives already exist (`ledger.rs`), so a reorg should
    unwind block by block. Not a DoS vector on its own: a reorg crossing
    `finality_depth` is refused outright (§9.3), which bounds how often this runs.
-4. **SHOULD:** persist blocks append-only rather than rewriting the whole chain
-   file per block. `Store::save_chain` currently rewrites every block on every
-   mined block, which is O(n) per block and O(n²) over a sync.
+4. ~~**SHOULD:** persist blocks append-only rather than rewriting the whole chain
+   file per block.~~ **Resolved (v0.3).** `crates/jnt-store` is an append-only,
+   checksummed record log with atomically-replaced metadata; the node appends
+   O(new blocks) per mined block and rebuilds its index by scanning at open.
+   See the crate documentation for the crash semantics (torn tails are
+   truncated and reported; damage to committed data refuses to open).
 
 ### 13.11 Invariants a node MUST preserve
 

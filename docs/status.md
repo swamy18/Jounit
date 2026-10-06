@@ -17,7 +17,7 @@ whether a node accepts a block:
 | M2 | Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault | No — no rule creates a slash record yet | `slash.rs` |
 | M3 | Universal Hardware-Agnostic Canonical Compute IR | No — envelopes only | `compute_ir.rs` |
 | M4 | Memory-bound HBM scratchpad PoW puzzle | No — not a registered `puzzle_id` | `hbm_pow.rs` |
-| M5 | Sovereign BLS aggregate finality gadget checkpoints | No — `BlsVerifier` is a mock | `bls_checkpoint.rs` |
+| M5 | Sovereign BLS aggregate finality gadget checkpoints | No — pairing core is real (`blst`), the gadget is unwired; §14.6 validator-set semantics are design-only | `bls_checkpoint.rs`, `bls.rs` |
 
 SPEC.md §14 carries the same table and says why each of M2–M5 is inactive: each
 needs a rule this repository has not specified (what proves a compute result
@@ -27,15 +27,32 @@ consensus, so guessing those rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — 242 tests pass:
-  - 191 unit tests in `jnt-core` (including M1–M5 test suites, the 10-case
-    mempool attack suite and the 2 pinned L2 fee-schedule tests)
+- `cargo test --workspace` — **341 tests pass (current count; older sections of
+  this file quote counts as of their own dates — 242, then 263, then 293 —
+  kept as history):**
+  - 206 unit tests in `jnt-core` (M1–M5 suites, the 30-test real-BLS suite in
+    `bls.rs`, the 10-case mempool attack suite, the 2 pinned L2 fee-schedule
+    tests, and the rest)
+  - 18 adversarial checkpoint tests against the real BLS verifier
+    (`tests/bls_checkpoint_attack.rs`)
   - 10 mempool↔chain integration tests in `crates/jnt-core/tests/mempool_l1.rs`
   - 11 red-team integration tests in `crates/jnt-core/tests/redteam.rs`
-  - 15 unit tests in `jnt-net` (framing, codecs, sync continuation, bounds)
-  - 12 integration tests in `crates/jnt-net/tests/integration.rs`, including a
-    real-socket end-to-end sync between two `P2pNode`s
+  - 30 persistent-storage tests in `crates/jnt-store` (torn tails, corruption
+    refusal, reorg+restart, migration)
+  - unit + integration tests in `jnt-net` (framing, codecs, sync, bounds,
+    tx-relay socket tests), including a real-socket end-to-end sync between
+    two `P2pNode`s
   - 2 wire-vector tests in `crates/jnt-net/tests/net_vectors.rs`
+- **Persistent storage is implemented** (`crates/jnt-store`, appendix below):
+  append-only checksummed block log, atomic metadata, crash-safe reopen;
+  replaces the old whole-chain JSON rewrite.
+- **P2P transaction relay is implemented** (SPEC.md §13.14): wallet → mempool →
+  peer relay → remote pool → mining → confirmation was verified end to end
+  with three real processes.
+- **Real BLS cryptography is implemented** (`bls.rs` over `blst`): derive,
+  sign, aggregate, one-pairing aggregate-verify, deterministic fixtures.
+  `verify_checkpoint` with `RealBls` rejects forgeries `MockBls` accepts. This
+  does NOT make finality consensus-active.
 - `cargo clippy --workspace --all-targets` clean under `-D warnings`.
 - `cargo fmt --check` clean across all crates.
 - Two real `jnt-node serve` processes on the `mini` profile completed a full

@@ -1987,3 +1987,12 @@ migration).
 uncommitted ~516-line change and is never touched; tests never weakened to
 pass; no consensus/economic decisions taken silently; no push beyond what was
 asked for.
+
+## Session 11 — doc reconciliation pass
+
+User asked for a fresh reconcile before continuing Phase 3. status.md now
+states: 341 tests (older counts kept as dated history), M5 table row says the
+pairing core is real but the gadget is unwired, and the relay/store/BLS
+milestones are listed under Verified. SPEC.md §13.10 item 4 marked resolved
+(jnt-store). docs/roadmap.md (other author's ~584-line in-flight diff) still
+untouched.
