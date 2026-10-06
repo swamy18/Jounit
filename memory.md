@@ -2012,3 +2012,37 @@ chain.rs/block.rs/main.rs never reference it — shipped inert. One test bug
 caught my own wrong expectation about the cache grace slot (it holds the
 epoch before current, it is not cleared on every rotation). 21 attack tests
 green. 347 workspace tests total, all checks clean, pushed.
+
+## Session 11 (cont.) — Phase 4: fuzzing complete
+
+Windows nightly has no clang_rt.asan_dynamic dll, so local libFuzzer execution
+was blocked on this machine (exe builds but STATUS_DLL_NOT_FOUND; -s none does
+not help — libFuzzer's sancov runtime is missing from the MSVC toolchain).
+Instead of burning more time on that: installed Rust nightly + cargo-fuzz +
+build-essential/clang inside the WSL Ubuntu distro and ran the campaign there
+(Linux toolchains ship ASan). Copied the tree to ~/jounit (native FS — /mnt/c
+builds are 100x slower). All 7 targets executed with ASan, zero crashes:
+tx_decode 3.49M runs/61s, six more targets each ~60s (numbers in status.md).
+
+Before fuzzing even ran, the deterministic fuzz-invariant tests found two real
+bugs; both fixed with regression tests:
+1. jnt-net Message::Unknown re-framed its already-verbatim payload as
+   ty+len+raw on encode → unknown messages grew 5 bytes per decode→encode
+   cycle. Encode is now the exact inverse of decode (was a wire correctness
+   bug, not consensus-critical since unknowns are not relayed).
+2. jnt-store MetaFile::load leaked raw InvalidData IO on non-UTF-8 meta.json
+   (crash/disk damage) instead of the named BadMeta error class. Now: bytes
+   read + from_utf8 mapped to BadMeta.
+
+Added three deterministic invariant suites (jnt-core, jnt-net, jnt-store
+tests/fuzz_invariants.rs, 10 tests) enforcing the same properties the fuzz
+targets search for on stable/CI: decode-never-panics over adversarial bytes,
+all-truncations/all-bitflips of valid tx/block, round-trip stability,
+mempool byte cap under hostile admission, all checkpoint clauses under
+forged/replayed/lying-count/oversized-bitmap inputs, torn-tail recovery
+across every cut, garbage/truncated meta.json handling.
+
+CI gained a fuzz-smoke job: nightly + cargo-fuzz, each target 20s per push.
+Committed: 99061e5 (invariants + 2 bug fixes), a43d799 (fuzz harness 7
+targets). Workspace tests: 360 (was 347). fmt/clippy -D warnings/release
+clean; five sims green.

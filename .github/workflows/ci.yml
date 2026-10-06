@@ -69,3 +69,35 @@ jobs:
 
       - name: Supply cross-check against design doc
         run: python sim/supply_schedule_sim.py
+
+  fuzz-smoke:
+    name: fuzz smoke (nightly + ASan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Nightly with llvm-tools/clang runtime is what cargo-fuzz builds with;
+      # on Linux the ASan runtime ships with the toolchain, so no extra setup.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+
+      - name: Smoke-run each target
+        # Short budget per target: CI proves the harness builds, runs, and
+        # survives a seedless start plus the committed corpus without finding
+        # a crash. Long campaigns run locally (see docs/status.md) and any
+        # minimized crash lands here as a regression test.
+        run: |
+          for t in tx_decode block_decode wire_msg_decode mempool_admit storage_recover checkpoint_validate meta_parse; do
+            cargo fuzz run "$t" -- -max_total_time=20 -rss_limit_mb=4096
+          done
+        working-directory: fuzz
