@@ -2067,3 +2067,161 @@ relay, real BLS, fuzzing); Phases 2-5 NOT STARTED (jnt-l2 and jnt-worker
 crates do not exist; dependencies ComputeTask/SlashVault/PSCB/hbm_pow all
 ready); Phase 6 PREPARED but gated on 2-5. Next: Phase 2 — jnt-l2 skeleton,
 TaskContract state machine, five L2 tx types with D3 fee routing.
+---
+
+# MASTER STATUS LEDGER (the "everything" document)
+
+Written 2026-10-06, at commit `43bf4c3`. This is the one section to read to
+know the exact state of the Jounit project: what exists, what is left, what is
+on hold, and what each remaining piece needs. Sections above it (Sessions 1-11)
+are the chronological build log this ledger summarizes.
+
+## A. Where the mission stands, in one paragraph
+
+Jounit is a spec-first L1 blockchain (hybrid PoW + LWMA difficulty, EIP-1559-
+shaped 50/50 burn/PSCB fees, 40M JNT hard cap, NN puzzle mining, real blst BLS
+checkpoint machinery shipped inert) that is production-ready at L1 and one
+reviewable change away from a public testnet. Phase 1 of the L2 roadmap is
+complete (mempool, persistent crash-safe storage, P2P tx relay, real BLS,
+fuzzing). Phases 2-5 (L2: TaskContract, disputes, VWC, worker SDK) are not
+started but every primitive they need already exists. Both blocking protocol
+decisions (L2 fee path, validator economics) are now recorded in
+docs/decisions.md, so nothing is blocked on the owner anymore. Next work item:
+Phase 2 - jnt-l2 crate + TaskContract state machine + five L2 tx types with
+D3 fee routing.
+
+## B. Work DONE (shipped, tested, on main)
+
+L1 core (jnt-core):
+- Spec-first chain: blocks, UTXO ledger, hybrid ECDSA+DDH sig bundles,
+  mining puzzle (M3 NN + M4 HBM), LWMA difficulty with attack sims,
+  supply schedule pinned to vectors, 40M cap enforced everywhere.
+- EIP-1559-shaped fees: required_fee, split_fees (50% burn / 50% PSCB),
+  per-block PSCB undo maps for reorg correctness.
+- Mempool: byte-bounded, fee-rate ordered, conflict-checked, integrated with
+  Chain (mine_from_pool, reorg re-admission, disconnect handling).
+- Real BLS (blst, min_pk, IETF keygen): derive/sign/verify/aggregate,
+  domain-separated DST, validator_set_hash.
+- Checkpoint envelope (SPEC 14.4) + validator-set machinery (14.6) as a pure
+  inert library: validators.rs - deterministic TopN sets, epoch-bound set
+  hash, six-clause checkpoint validation, epoch cache with grace,
+  equivocation evidence. Chain::submit never consults it (grep-verified).
+- SlashVault (M2): vested SlashRecords, exhaustion, claim timing.
+
+Networking (jnt-net):
+- Framed P2P with pre-allocation DoS bounds, handshake with nonces,
+  ban scoring + keepalives, message set incl. Tx relay (13.14),
+  peer read loops isolated so decode faults score, not crash.
+
+Storage (jnt-store):
+- Append-only record log, crash recovery with reported torn tails,
+  canonical height index rebuilt from the tip, UTXO snapshots,
+  network-bound metadata with atomic rename, adversarial-tail hardening.
+
+Node (jnt-node):
+- CLI (jnt-node serve --listen ...), wallet/balance/transfer paths,
+  P2P serve + relay wiring, storage integration.
+
+Quality infrastructure:
+- 360 workspace tests, 0 failures. fmt + clippy -D warnings + release +
+  5 Python sims all green (verify_vectors, puzzle_crosscheck,
+  supply_schedule_sim, difficulty_attack_sim, net_reference).
+- 7 cargo-fuzz targets (fuzz/, standalone crate) over tx/block/wire/mempool/
+  storage/checkpoint/meta boundaries; campaign executed in WSL nightly+ASan:
+  13.4M execs, 0 crashes, 0 leaks.
+- 3 deterministic fuzz-invariant suites on stable (found 2 real bugs, both
+  fixed with regression tests: Unknown-msg 5-byte-per-cycle growth;
+  MetaFile::load leaking raw IO on non-UTF-8).
+- CI (GitHub Actions): fmt, clippy, tests, release build, vector cross-checks,
+  difficulty-attack sim, supply check, AND a fuzz-smoke job (7 targets x 20s,
+  nightly+ASan on every push).
+
+Documentation:
+- SPEC.md complete through 14.6 (incl. tx relay 13.14, checkpoint envelope
+  14.4, real-BLS semantics 14.5, validator machinery 14.6 DESIGN ONLY).
+- docs/status.md: per-step build log with test counts.
+- docs/decisions.md: the two owner decisions (below) + 6-phase gap audit.
+- memory.md: this ledger + full session log.
+
+## C. Work REMAINING (phased, in dependency order)
+
+Phase 2 - TaskContract + L2 tx types (NEXT, unblocked):
+- New crate crates/jnt-l2/: TaskContract + ContractState machine
+  (Open -> InProgress -> ResultSubmitted -> Disputed -> Settled/Expired),
+  7 methods per roadmap Step 3, happy-path + attack tests.
+- 5 L2 tx types in jnt-core (TxPostTask, TxClaimTask, TxSubmitResult,
+  TxDispute, TxSettle): Writer/Reader serialization, domain-separated
+  signing hashes (new DOM_ constants), validation rules, round-trip tests.
+- D3 fee routing: l2_fee_for(tx_type), flat fee as full_base in
+  split_fees; replace the tripwire test with positive fee tests.
+
+Phase 3 - Dispute engine (needs 2):
+- DisputeChallenge/Verdict/Engine, M2 SlashVault + PSCB wiring,
+  whistleblower bonus from PSCB. Prereq: small spec note on M3 CPU-reference
+  re-execution (roadmap section 11, open question 2).
+
+Phase 4 - VWC issuance (needs 3):
+- VerifiedWorkCertificate: signing_hash over all fields, canonical
+  serialization, quorum-gated verify, lookup by task/worker.
+
+Phase 5 - Worker SDK (needs 2+4):
+- New crate crates/jnt-worker/: node connection, task scan/claim/execute/
+  submit loop, M4 HBM proof, earnings; CLI + WorkerClient SDK.
+
+Phase 6 - Public testnet (needs 2-5):
+- End-to-end wiring in jnt-node (L2 tx handling, dispute flow, checkpoint
+  relay message - 13.5 additive type, vector-stable decision needed).
+- Multi-node tooling (compose/systemd, seeds), chaos testing (dispute storms,
+  partitions), bug-bounty program.
+- 14.6 activation at the END: fixed genesis committee signs non-binding
+  first; binding finality = separate reviewable change after chaos testing.
+
+## D. Work ON HOLD (deliberately, with the reason)
+
+- BLS/M5 consensus activation - owner boundary: separate deliberate protocol
+  phase; machinery shipped inert, decisions recorded, nothing wired.
+- Validator economics IMPLEMENTATION (stake accounting, slashing wiring) -
+  decided in docs/decisions.md but built only with Phase 6, not before.
+- Agent integration layer (roadmap section 12: REST API, MCP server, ElizaOS
+  plugin, LangChain tool) - independent of Phases 2-5, none started.
+- L2 fee-market option 4 (second congestion controller) - explicitly rejected
+  for now; can be added later without breaking the D3 decision.
+- Stake-weighted sampling (vs TopN) - rejected for now in Decision 2.
+- Longer fuzz campaigns (hours per target, seeded corpora) - env now works in
+  WSL (~/jounit/fuzz); run opportunistically, not blocking anything.
+- Windows-native libFuzzer - permanently blocked (MSVC nightly lacks ASan
+  runtime); WSL is the fuzzing environment, CI runs it on every push.
+
+## E. Decisions already taken (docs/decisions.md - no longer blocking)
+
+1. D3 L2 fees = option 3: five flat FEE_TX_* fees are the L2 schedule; the
+   flat fee itself is full_base in split_fees (M1 50/50 burn/PSCB holds);
+   L1 gas floor untouched; no exemptions; task payments are market prices.
+2. 14.6 economics: min stake 5000 JNT bonded (unbond after finality_depth),
+   TopN=21 with fixed genesis-committee bootstrap, NO validator rewards,
+   equivocation burns the entire bond, activation strictly end-of-Phase-6.
+
+## F. Numbers (verified, not claimed)
+
+- Tests: 360 workspace, 0 failed (fmt/clippy -D warnings/release/sims green).
+- Fuzz: 7 targets, 13,403,223 total execs, 0 crashes/leaks/OOMs.
+  Per target: tx_decode 4,829,687; wire_msg_decode 2,960,697; mempool_admit
+  2,460,827; block_decode 2,291,347; meta_parse 539,534; storage_recover
+  248,534; checkpoint_validate 72,997.
+- Bugs found by invariants this session: 2 (both fixed + regression-tested).
+- Repo: 38 commits; latest pushed 43bf4c3.
+
+## G. Environment notes (so future sessions don't re-learn)
+
+- Dev box: Windows, MSVC toolchain. cargo-fuzz CANNOT execute natively
+  (no clang_rt.asan_dynamic dll in nightly-MSVC; -s none also fails -
+  sancov runtime missing).
+- WSL Ubuntu 26.04 has rustup nightly + cargo-fuzz + build-essential/clang;
+  the tree is copied to ~/jounit (native FS - /mnt/c builds are ~100x
+  slower). Fuzz recipe: cd ~/jounit/fuzz && ~/.cargo/bin/cargo fuzz run <t>
+- GitHub Actions results are not fetchable from this machine (API 404);
+  check the Actions tab in a browser.
+- docs/roadmap.md carries another author's uncommitted ~584-line diff -
+  never stage, commit, or revert it.
+- CI must keep running the fuzz-smoke job; the invariant suites keep the
+  same guarantees on stable cargo test.
