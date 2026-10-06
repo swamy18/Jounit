@@ -27,8 +27,10 @@ consensus, so guessing those rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — 219 tests pass:
-  - 179 unit tests in `jnt-core` (including M1–M5 test suites)
+- `cargo test --workspace` — 242 tests pass:
+  - 191 unit tests in `jnt-core` (including M1–M5 test suites, the 10-case
+    mempool attack suite and the 2 pinned L2 fee-schedule tests)
+  - 10 mempool↔chain integration tests in `crates/jnt-core/tests/mempool_l1.rs`
   - 11 red-team integration tests in `crates/jnt-core/tests/redteam.rs`
   - 15 unit tests in `jnt-net` (framing, codecs, sync continuation, bounds)
   - 12 integration tests in `crates/jnt-net/tests/integration.rs`, including a
@@ -50,8 +52,13 @@ consensus, so guessing those rules in code would have been the wrong order.
   Each consuming test was checked to actually fail when the value it pins is
   perturbed, so none of them pass vacuously. `net_vectors.json` (§13.12) is the
   wire-format set — frame envelope, every `msg_type`, `VERSION` for both
-  profiles, locator construction. It has no independent implementation yet, the
-  way `sim/jounit_reference.py` re-derives §5; that check is still owed.
+  profiles, locator construction. It now has the independent implementation the
+  puzzle set has: `sim/net_reference.py` re-derives §13.2 framing and §13.5
+  messages from the prose alone and is run by `verify_vectors.py --check`. It
+  found a real bug on its first run (ADDR field order, below). Five of the 28
+  pinned values are chain-derived — a mined block and locator entries from a
+  200-block chain — so the script reports them as **skipped** by name rather than
+  passing over them silently.
 - Node CLI end to end on the `mini` profile: init, mine 31 blocks, spend, verify
   (replays from genesis and diffs UTXO + supply), status. Fee burn reconciles
   exactly — 31 blocks issue 2356 JNT, live supply is 2355.99825 JNT, the
@@ -59,6 +66,43 @@ consensus, so guessing those rules in code would have been the wrong order.
 - Supply schedule matches design doc §16, including that only 298 000 of the
   304 000 JNT mini cap is reachable and the remainder is permanently
   unmintable rather than merely reserved.
+- The mempool (`jnt-core/src/mempool.rs`) has a 10-case attack suite. Each case
+  names the rule it enforces and the attack it stops: double spending one output
+  twice, spending a nonexistent output, a byte-cap flood, overshooting the gas
+  cap, ordering by fee *rate* rather than fee total, selection determinism
+  between two nodes holding the same pool, eviction of confirmed transactions,
+  transitive eviction two generations deep, re-admission after eviction, and
+  leaving unrelated siblings alone. Two of those cases failed against the code
+  as first written (below), and the fee-order case did not fail until the test
+  itself was rebuilt — see the note below.
+
+**The mempool is now wired into L1 (Step 1A).** `Chain` gained three things, all
+of them in `jnt-core` — no networking or storage concern leaked into consensus:
+
+- `mine_from_pool` selects from the pool at the next block's height and base fee
+  and evicts exactly what the block contains. Evicting the whole *selection*
+  would drop transactions the gas or byte cap left behind, and those are still
+  the best candidates for the next block.
+- `confirmed_above(from_height)` returns the transactions canonical blocks have
+  confirmed since the caller's cursor, so a block that arrives over the wire
+  evicts from the pool the same way a locally mined one does.
+- `reconcile_mempool(pool, from_height)` is the whole operation: evict what the
+  chain confirms, re-admit what a reorg un-confirmed, report what moved.
+
+Ten integration tests in `crates/jnt-core/tests/mempool_l1.rs` attack the seam
+rather than the pool: local tx → pool → block, eviction by a peer's block,
+double spend, malformed and forged transactions, a full pool, a degenerate byte
+cap, fee-rate ordering reaching the block, and two reorg cases (a disconnected
+transaction coming back, and one whose input the winning branch consumed being
+refused instead of re-pooled).
+
+**Restart behaviour is defined, not accidental.** The pool is in-memory only and
+does not survive a restart, so a node restarts with an empty pool and reconciles
+from the tip: there is nothing to recover and nothing stale to distrust. The
+cursor is therefore only needed within a run. This is honest rather than
+complete — a production node would persist the pool — and it is recorded here so
+nobody mistakes it for an oversight. Persisting it belongs with Step 2
+(`jnt-store`), not before.
 
 ## Known bugs found and fixed
 
@@ -82,6 +126,34 @@ before the supply-cap check — so the inflation path is closed there. The one g
 it did turn up was block-level fee accumulation using `+=`, which panics in
 debug and wraps in release, feeding a wrong total into the burn/tip split. Now
 `checked_add`.
+
+**The mempool's eviction cascade did not cascade.** `evict_confirmed` decided
+what to drop by asking the `spends` reverse index who spends a given outpoint.
+That index answers "who spends this outpoint", not "which transaction *created*
+it", and its entries are keyed by the outpoint being spent — so for a dependent
+transaction the index pointed straight back at the dependent itself, which is
+never what the check needed to know. Nothing downstream of a confirmed
+transaction was removed: not the direct child, and not a grandchild two hops from
+the block. The pool kept entries that could never be mined and relayed them to
+every peer forever. The rule is now stated as what it means: a transaction is
+doomed if it spends an outpoint the block consumed, or an outpoint created by a
+transaction the cascade has already removed — tracked in a `gone` set that grows
+each pass. Confirmed by temporarily restoring the index-based predicate and
+watching both cascade tests fail (`a tx spending a confirmed-away output stayed
+pooled`, `the cascade stopped before the second generation: 2 entries left`);
+with the fix in place both pass.
+
+**A second reorg destroyed the first reorg's disconnected transactions.**
+`disconnected_txs` was cleared at the top of `reselect` and assigned (rather than
+extended) when a reorg committed. A syncing node submits blocks in a burst, so
+two reorgs landing before the caller reconciled was ordinary behaviour, not an
+edge case: the second reorg's assignment wiped the first's pending transactions,
+and the pool re-admitted nothing. No error, no log — the transactions simply
+did not come back. The set is now only ever *added* to, and only after a reorg has
+committed; nothing clears it except the caller draining it. Confirmed by
+re-instating the `clear()` and watching all three reorg tests fail
+(`exactly the orphaned payment`, `the payment was not re-admitted`, `the
+payment's input is gone…`).
 
 **The puzzle overflow guard could not fire.** `PuzzleSpec::validate` computed
 its accumulator bound as `(nn_input_dim as i64) * 128 * 128 + 62` and compared
@@ -312,9 +384,11 @@ socket found all of the following.
 
 - **Layer 2 / Verified Work Certificates.** The core of the project's premise.
 - **P2P gaps.** Block relay works (verified end to end over real sockets, and
-  between two `serve` processes). Still missing: peer discovery (§13.6 by
-  design — address book only), transaction relay and any mempool (§13.13),
-  headers-first sync, compact blocks. Real `blst` BLS verification (M5).
+  between two `serve` processes). A bounded, attack-tested mempool now exists,
+  but nothing feeds it and nothing reads it: pulling it when building a block and
+  relaying transactions over the wire (§13.13) are both still missing, as are
+  peer discovery (§13.6 by design — address book only), headers-first sync and
+  compact blocks. Real `blst` BLS verification (M5).
 - **Persisted UTXO indexing.** State is replayed from genesis on load, which is
   fine at test scale and will not be at 40M coins. `serve` also rewrites
   `blocks.json` in full whenever the chain changes (SPEC.md §13.10 item 4).
@@ -363,3 +437,89 @@ UPDATE_SER_VECTORS=1 cargo test -p jnt-core --lib serialization_vectors_are_stab
 
 A second implementation that disagrees with these vectors has a consensus split,
 not a rounding difference.
+
+## Resolved design decisions
+
+These four were open questions blocking L2. They are now decided, so they are
+recorded here rather than left as a list of things nobody has answered.
+
+**D1 / D4 — Who are the validators?** The M5 BLS validator set **is** the L2
+dispute-arbitrator set. One set, one epoch, one governance system; designing a
+second would have been the more expensive mistake. Validator entry is
+permissionless by staking a minimum JNT amount, and the active set is the top 21
+stakers per epoch. Genesis is bootstrapped by founder nodes, since there is no
+stake to rank before any exists.
+
+**D2 — How does M3 re-execution work during a dispute?** A CPU-only reference
+execution path for the ComputeIR. It must be bit-identical to the GPU path for
+the same input, which is tractable precisely because M3 already forbids floating
+point: the IR is integer-only, so "GPU" and "CPU" are two readers of the same
+bytes. Validators run the CPU path during arbitration and therefore need no GPU.
+
+**D3 — Gas schedule for L2 transactions.** Flat per type, not per-byte, so a
+worker's cost is knowable in advance:
+
+| Transaction | Fee (sat) |
+|---|---:|
+| `TxPostTask` | 5 000 |
+| `TxClaimTask` | 2 000 |
+| `TxSubmitResult` | 2 000 |
+| `TxDispute` | 10 000 |
+| `TxSettle` | 20 000 |
+
+Recorded in `params.rs` as `FEE_TX_POST_TASK_SAT`, `FEE_TX_CLAIM_TASK_SAT`,
+`FEE_TX_SUBMIT_RESULT_SAT`, `FEE_TX_DISPUTE_SAT` and `FEE_TX_SETTLE_SAT`, with
+`L2_FEE_SCHEDULE` holding the exact set so a test can pin it.
+
+**Open interaction, deliberately left visible.** Nothing consumes these yet — the
+L2 transaction types do not exist — and they do not clear the fee floor the node
+actually enforces. The only fee rule today is `base_fee * gas_used`, and even the
+smallest transaction burns `GAS_TX_BASE` (16 000) gas, so the cheapest possible
+floor for a *single* L2 transaction is orders of magnitude above a 20 000 sat
+settle fee. Wiring these in as-is would have `check_tx` reject every one of them
+as underpaid. L2 therefore needs either its own fee path or an explicit exemption
+from the gas floor; the test `l2_flat_fees_sit_below_the_gas_floor` fails the day
+that is settled, so the question cannot be forgotten.
+
+## The L2 fee path — analysis, not yet a decision
+
+D3's flat fees are orders of magnitude below the floor the node enforces today
+(`base_fee * gas_used`, and even the smallest transaction burns `GAS_TX_BASE` =
+16 000 gas). Wiring them in as-is would have `check_tx` reject every L2
+transaction as underpaid. The inspector's finding is confirmed against the code,
+and the options are these:
+
+1. **Raise the flat fees above the floor.** Simplest and wrong: it makes an L2
+   task post cost more than a JNT transfer, which contradicts the reason D3 chose
+   flat fees at all.
+2. **Exempt the five L2 types from the gas floor.** Rejected as stated: an
+   exemption is a second fee rule, and one written as an exception is the easiest
+   kind to widen later by accident.
+3. **Give the L2 types their own fee schedule, and split the flat fee the same
+   way the base fee is split.** `split_fees` currently derives `full_base` from
+   `base_fee * total_gas`; for an L2 transaction `full_base` would be the flat fee
+   itself, so the M1 50/50 burn/PSCB invariant holds unchanged and no rule is
+   weakened — the transaction simply has a different price. **This is the
+   recommended option**: it reuses the existing split rather than bypassing it,
+   keeps one invariant for both fee kinds, and leaves the L1 floor untouched.
+4. **A separate L2 fee market with its own base fee.** Rejected for now:
+   two congestion controllers is a large amount of new mechanism for five
+   transaction types, and it can be introduced later without breaking option 3.
+
+**Not decided, and deliberately not implemented.** This needs writing into
+SPEC.md before any L2 transaction type is coded, and it needs the user's sign-off
+because it changes what a JNT price *means* for L2 work. The test
+`l2_flat_fees_sit_below_the_gas_floor` fails the moment the gap closes, so the
+question cannot be silently settled by a later commit.
+
+## Build order
+
+1. Mempool (`jnt-core/src/mempool.rs`) — **done**, and wired into L1 (Step 1A)
+2. Transaction relay over P2P (`jnt-net`)
+3. Persistent storage (`jnt-store/`)
+4. Real BLS pairing — replace `MockBls` with `blst`
+5. `cargo-fuzz` harness
+6. L2 (`jnt-l2/`) — only after 1–4
+
+Each step uses the red-team discipline from session 1: write the attack, confirm
+it fails against the current code, then fix the cause.

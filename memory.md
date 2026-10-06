@@ -1432,3 +1432,383 @@ before.
   against, the way `sim/jounit_reference.py` does for §5.
 - `cargo-fuzz`. The red-team suite and the net vectors are the seed corpus.
 - LICENSE file. `Cargo.toml` declares MIT OR Apache-2.0; no file exists.
+---
+
+# Working memory — session 6: D1–D4 decided, Phase 0.5 + 0.7 closed
+
+**Date:** 2026-10-06
+**Scope:** the user resolved the four open design questions that had been
+blocking L2 since `docs/roadmap.md` §11, and set the build order.
+**Outcome:** decisions recorded; P0.7 (LICENSE) and P0.5 (wire-format
+crosscheck) shipped. The crosscheck found a real interop bug on its first run.
+
+---
+
+## 30. D1–D4, as decided
+
+**D1 / D4 — Validators.** The M5 BLS validator set *is* the L2 dispute
+arbitrator set. One set, one epoch, one governance system. Entry is
+permissionless by staking a minimum JNT amount; the active set is the **top 21
+stakers per epoch**. Genesis is bootstrapped by founder nodes — there is no stake
+to rank before any exists, which is a bootstrapping problem the spec should state
+explicitly rather than assume away.
+
+**D2 — M3 re-execution in disputes.** A CPU-only reference execution path for
+the ComputeIR, bit-identical to the GPU path. This is tractable *because* M3
+already forbids floating point: the IR is integer-only, so GPU and CPU are two
+readers of the same bytes rather than two floating-point pipelines that can
+diverge. Validators run the CPU path during arbitration and need no GPU.
+
+**D3 — L2 gas schedule.** Flat per transaction type, not per-byte, so a worker's
+cost is knowable before they commit:
+
+| Transaction | Fee (sat) |
+|---|---:|
+| `TxPostTask` | 5 000 |
+| `TxClaimTask` | 2 000 |
+| `TxSubmitResult` | 2 000 |
+| `TxDispute` | 10 000 |
+| `TxSettle` | 20 000 |
+
+Recorded as constants in `params.rs` in session 7 (`FEE_TX_*_SAT` plus
+`L2_FEE_SCHEDULE`). They are **not** consistent with the gas floor the node
+enforces today — see §36 below. That is an open question, not a settled one.
+
+**Build order:** mempool → tx relay → `jnt-store` → real BLS (`blst`) →
+`cargo-fuzz` → L2 only after those four.
+
+## 31. What shipped in this session
+
+### 31.1 LICENSE (P0.7)
+
+`Cargo.toml` has declared `license = "MIT OR Apache-2.0"` since the first commit
+with no license file present. Now `LICENSE-MIT` + `LICENSE-APACHE`.
+
+### 31.2 Wire-format crosscheck (P0.5) — and the bug it found
+
+`sim/net_reference.py`: a second implementation of the §13 wire format, written
+from the spec prose the way `sim/jounit_reference.py` is written from §5.
+
+**It disagreed on the first run.** SPEC.md §13.5 defines `ADDR` as
+`count(2 LE) ‖ count × (port(2 LE) ‖ ip(16))` — port first. The crate encoded
+`ip ‖ port`.
+
+Why no existing test could have caught it, which is the point worth keeping:
+
+- **Round-trip tests cannot.** The encoder and decoder were wrong in the *same*
+  way, so they agreed with each other perfectly.
+- **The vector file could not.** `net_vectors.json` is generated *from* the Rust,
+  so it only ever confirmed the Rust agreed with itself.
+- **No length assertion could.** The entry is 18 bytes in either order.
+
+The consequence is the severe one: two nodes running this code would interoperate
+perfectly with each other, and neither would connect to any implementation that
+followed the spec. A silent, total interop failure on a wire format whose entire
+purpose is that independent implementations interoperate.
+
+Fixed, vectors regenerated, and `addr_entry_is_port_then_ip` added as a
+literal-bytes assertion so the order cannot drift back. The crosscheck is now
+part of `verify_vectors.py --check`.
+
+**Honest limit:** 5 of the 28 pinned values are chain-derived (a mined block,
+locator entries from a 200-block chain). A second encoder cannot produce those
+without a node, so the script reports them as **skipped** by name rather than
+passing over them silently.
+
+## 32. Process notes worth keeping
+
+- **Two independent audits, two different blind spots.** Session 5's came from
+  never running `P2pNode`; this one's came from never having a second encoder.
+  Both times the gap was in how things were *verified*, not in what the code was
+  supposed to do. The general lesson: for any format two parties must agree on,
+  a round-trip test is not evidence — it is evidence that one implementation is
+  self-consistent.
+- **`docs/roadmap.md` has uncommitted changes I did not make** (516 insertions
+  when last seen). Left untouched, unstaged and uncommitted. Whoever owns it
+  should reconcile it, and it may conflict with `docs/status.md`, which I did
+  edit.
+- **GitHub Actions has not been run.** Local checks mirror CI, but CI uses rustc
+  1.99 against local 1.95, and session 4 saw both a lint and a rustfmt
+  difference that only CI caught. A follow-up hotfix commit is a realistic
+  possibility.
+- **`STATUS.md` test counts will drift.** Every roadmap step adds tests; the
+  numbers in the "Verified" section are only true as of the commit that wrote
+  them.
+
+---
+
+# Working memory — session 7: mempool (build order step 1)
+
+**Date:** 2026-10-06
+**Scope:** step 1 of the build order — `crates/jnt-core/src/mempool.rs` — plus the
+D3 fee constants in `params.rs` and two stale claims corrected in
+`docs/status.md`.
+**Outcome:** mempool implemented and attack-tested. 232 workspace tests pass.
+
+---
+
+## 33. What the pool is, and what it deliberately is not
+
+Bounded pool of transactions valid against the state the **next** block will be
+built on. `add` takes the next height and that block's base fee, because getting
+either wrong admits transactions the node itself will reject when it builds —
+wasting every peer that relayed them.
+
+- **Not consensus.** `check_tx` remains the only authority on validity. A pooled
+  transaction has no more standing than one that arrived inside a block; a pool
+  that disagrees with the chain loses. That is why eviction is driven by actual
+  confirmed transactions rather than assumed.
+- **Ordered by fee *rate*, not fee total.** A block has a gas budget, not a byte
+  budget. Ordering by the total inverts the incentive: a large transaction
+  outranks a small one paying several times as much per unit of work.
+- **Total, deterministic order.** Ties break on `accepted_at`, then txid. Two
+  nodes holding the same pool must select the same transactions in the same
+  order, or they build different blocks from the same state — the same class of
+  defect as the arrival-order fork choice session 1 removed.
+- **Conflict check before the size check**, so a double spend is reported as a
+  double spend and never as "pool full". A pool that reports the wrong reason
+  cannot be debugged by its operator.
+- **`continue`, not `break`, when a candidate does not fit the gas left.** A
+  lower-fee transaction may still fit what remains; stopping at the first
+  oversized one wastes the rest of the block.
+- **Never lowers a fee to make something fit.** Fees are the user's decision.
+
+## 34. The bug the attack suite found
+
+`evict_confirmed` decided what to drop by asking the `spends` reverse index *who
+spends this outpoint*. That is the wrong question. A dependent transaction is one
+that spends an output **created by** a removed transaction — a property of the
+input's outpoint, not of who currently spends it. Worse, `spends` is keyed by the
+outpoint being spent, so for the dependent itself the lookup returned the
+dependent, never the parent that created the output.
+
+Result: **nothing downstream of a confirmed transaction was removed** — not the
+direct child, not a grandchild two hops from the block. The pool kept entries
+that could never be mined and advertised them to every peer forever.
+
+Fixed by tracking a `gone` set of removed txids that grows on each pass and
+testing `gone.contains(&op.txid)`.
+
+**Red-team discipline, honestly applied.** The predicate was temporarily
+reverted to the index-based form and both cascade tests were re-run: both failed
+(`a tx spending a confirmed-away output stayed pooled`; `the cascade stopped
+before the second generation: 2 entries left`). Then the fix was restored and
+both pass. The recorded evidence is the failing run, not the passing one.
+
+## 35. Two test-harness traps, both worth remembering
+
+**Trap 1 — a test that fails for the wrong reason looks exactly like a test that
+found a bug.** Eight of the nine mempool tests then present failed on first run
+for a reason unrelated to the mempool: `check_tx` applies `coinbase_maturity` to
+*every* output, not only to coinbase outputs (`held.height + coinbase_maturity >
+height`). `funded()` creates UTXOs at height 0 and the tests spent at height 1,
+so every admission was refused with `ImmatureCoinbase`. The blanket maturity is
+pre-existing consensus behaviour with its own passing tests, so the fix belonged
+in the harness — a named `H: u64 = 100` constant with a comment saying why.
+The ninth test passed because it checked a *nonexistent* outpoint, which
+`check_tx` rejects before maturity is ever consulted.
+
+**Trap 2 — a vacuous test.** The fee-ordering test as first written built two
+identical 1-in-1-out transactions. Gas was therefore equal, so "order by rate"
+and "order by total" produce the same sequence and the test could not fail.
+Rebuilt with a 4-in-1-out "wide" transaction (higher gas, larger total, lower
+rate) against a 1-in-1-out "narrow" one (lower total, higher rate). The rebuilt
+test also asserts `wide.gas_used() * narrow_fee > narrow.gas_used() * wide_fee`
+so the *setup* is checked, not just the outcome — otherwise a future change to
+gas constants could silently make it vacuous again.
+
+## 36. D3 constants, and an interaction nobody had noticed
+
+The five fees are now `FEE_TX_POST_TASK_SAT`, `FEE_TX_CLAIM_TASK_SAT`,
+`FEE_TX_SUBMIT_RESULT_SAT`, `FEE_TX_DISPUTE_SAT`, `FEE_TX_SETTLE_SAT`, with
+`L2_FEE_SCHEDULE` holding the exact set so one test pins all five literally — a
+self-referential assertion would happily agree with a typo.
+
+**They do not clear the fee floor, and that is now written down rather than
+discovered later.** The only fee rule the node enforces is
+`base_fee * gas_used`. Even the smallest transaction burns `GAS_TX_BASE` = 16 000
+gas, so at the *cheapest* base fee either profile can reach, the floor is still
+orders of magnitude above a 20 000 sat settle fee. Wiring D3 in as-is would have
+`check_tx` reject every one of them as underpaid. L2 therefore needs either its
+own fee path or an explicit exemption from the gas floor. The test
+`l2_flat_fees_sit_below_the_gas_floor` asserts the gap and fails the day it is
+closed, so the question cannot be quietly forgotten.
+
+This is the same shape as the M2–M5 finding: a decided value that is correct as a
+decision and inconsistent with the code that would have to enforce it.
+
+## 37. Other fixes in this session
+
+- The `add` signature had lost its closing `)` during a botched edit
+  (`base_fee: u64, -> Result<...>`); repaired by reading the real delimiters
+  rather than by another blind line-index edit.
+- Clippy `manual_checked_ops` on the fee-rate division. Fixed with
+  `checked_div(...).unwrap_or(u64::MAX)` rather than an `#[allow]`: a
+  peer-supplied transaction with zero gas would otherwise be a panic, and a panic
+  driven by peer data is a denial of service. `GAS_TX_BASE` alone is 16 000, so
+  the branch is unreachable today — the point is that it stops being a crash if
+  that ever changes.
+- `docs/status.md` still claimed `net_vectors.json` "has no independent
+  implementation yet … that check is still owed". Session 6 delivered it
+  (`sim/net_reference.py`); the sentence was simply never updated. Corrected.
+
+## 38. State at the end of this session
+
+- `cargo test --workspace` — **232 pass, 0 fail** (was 219): 191 core unit, 11
+  red-team, 16 net unit, 12 net integration, 2 wire-vector.
+- `cargo fmt --all --check`, `RUSTFLAGS="-D warnings" cargo clippy --workspace
+  --all-targets`, `cargo build --workspace --release` — all exit 0.
+- All five Python sims exit 0. **Note:** `difficulty_attack_sim.py` and
+  `net_reference.py` take no `--check` flag — passing it makes argparse exit 2.
+  Run them bare. And when looping over the sims, capture the *python* exit status,
+  not `tail`'s: a pipeline silently reported every script as passing on the first
+  attempt of this session.
+- **The mempool is not wired to anything.** `lib.rs` exports it; nothing imports
+  it. No miner builds from it, no peer feeds it. Deliberate — the same
+  module-first pattern M2–M5 landed with. Step 2 is what makes it live.
+- Two stale `jnt-node serve` processes from an earlier session (srv_a/srv_b, the
+  two-node P2P experiment, still listening on 127.0.0.1:23347) held a lock on
+  `target/release/jnt-node.exe`, so the release build failed with
+  `failed to remove file … Access is denied`. Killed them; the build then
+  succeeded in 25 s. If a release build fails that way again, check `tasklist`
+  before suspecting the code.
+- `docs/roadmap.md` still carries uncommitted changes I did not make. Untouched,
+  unstaged, uncommitted.
+- **Nothing is committed.** Session 7 exists only in the working tree.
+---
+
+# Working memory — session 8: mempool integrated into L1 (Step 1A)
+
+**Date:** 2026-10-06
+**Scope:** Step 1A — wire the mempool into L1 — plus the required inspection of the
+fee model before any L2 work.
+**Outcome:** mempool is live in the chain. 242 tests pass. **No commit.**
+
+---
+
+## 39. What "integrated" means, and what was deliberately kept out
+
+Three methods on `Chain`, all inside `jnt-core`, none of them aware of sockets or
+files:
+
+- **`mine_from_pool(pool, miner, now)`** — selects at the next block's height and
+  base fee, mines, then evicts *exactly what the block contains*. Evicting the
+  whole selection would drop transactions the gas or byte cap left out, and those
+  are the best candidates for the next block. A rejection by `build_block` still
+  removes the entry: the pool is a snapshot of what the next block was expected to
+  build on, and a rejection means that expectation was wrong.
+- **`confirmed_above(from_height)`** — transactions canonical blocks confirmed
+  since the caller's cursor. This is the path a *peer's* block takes to evict from
+  the pool; without it, relayed blocks would confirm transactions that stayed
+  pooled forever.
+- **`reconcile_mempool(pool, from_height)`** — the whole operation: evict what the
+  chain confirms, re-admit what a reorg un-confirmed, return a report.
+
+Re-admission goes through `add`, and therefore through the *new* base fee and the
+new UTXO set. A disconnected transaction whose input the winning branch consumed
+is therefore **refused**, and that is counted and asserted rather than treated as
+an error: a reorg is allowed to invalidate a transaction. Re-admitting directly
+into the entries map would have re-pooled something no block can ever include.
+
+## 40. The bug: a second reorg destroyed the first reorg's transactions
+
+`disconnected_txs` was cleared at the top of `reselect` and **assigned** when a
+reorg committed. A syncing node submits blocks in a burst, so two reorgs landing
+before the caller reconciled is ordinary behaviour, not an edge case:
+
+1. reorg A rolls back block N → `disconnected_txs = [payment]`
+2. reorg B (the next block arrives) → `clear()` wipes `[payment]`, then
+   `disconnected_txs = []` because B's own rollback disconnected nothing
+3. the pool re-admits nothing
+
+No error, no log. The user's payment was valid, mined and broadcast, and it simply
+did not come back.
+
+Fixed by making published sets **append-only**: nothing clears the set except the
+caller draining it, and a reorg only ever *adds* to it, and only after the reorg
+has committed — a reorg that fails is restored wholesale, so publishing its list
+would put back transactions the canonical chain still contains.
+
+**Red-team proof.** The `clear()` was re-instated and all three reorg tests failed
+(`exactly the orphaned payment`, `the payment was not re-admitted`, `the payment's
+input is gone — re-admitting it would relay something no block can include`).
+Restored, all three pass.
+
+## 41. Two traps, one of them in the new code
+
+**Trap A — plumbing two methods that both consume the same resource.** The
+reorg test drained with `take_disconnected()` and *then* called
+`reconcile_mempool`, which drains internally. The second drain saw nothing, so
+re-admission was a silent no-op reporting `readmitted: 0` with no error. It looked
+exactly like a library bug and cost three debugging rounds. Two fixes, both
+applied:
+
+- the drain and the reconcile are now tested in **separate** tests, so each
+  contract is pinned on its own; and
+- the test that uses `reconcile_mempool` no longer drains first, with a comment
+  saying why.
+
+The generalisable lesson, and the third time in this project it has appeared: an
+API where two methods both consume the same thing will be misused, and the
+misuse will be silent. A caller with one job — reconcile the pool — should have
+one method.
+
+**Trap B — the maturity rule again, now through the miner.** The full-pool test
+spent coinbases from heights 1..=40 while validating against height 41. Every
+output in this ledger is subject to `coinbase_maturity`, so heights 32+ were
+legitimately immature and the test reported `unexpected refusal at height 32:
+coinbase at height 32 immature until 42`. Same trap as session 7's `H = 100`;
+this time the fix was to bound the loop at 31 with a comment explaining the
+arithmetic.
+
+## 42. The fee model, inspected as instructed
+
+Confirmed against the code, not the docs:
+
+- the only fee rule is `fees::required_fee(base_fee, gas_used) = base_fee *
+  gas_used` (`fees.rs`);
+- `GAS_TX_BASE` = 16 000 (`tx.rs`), so the *floor* for even the smallest
+  transaction is `base_fee_min_sat * 16 000` — 1 600 000 sat on mainnet;
+- D3's largest fee is `TxSettle` at 20 000 sat, about 80x below that floor.
+
+So wiring D3 in as-is has `check_tx` reject every L2 transaction as underpaid.
+Four options are written up in `docs/status.md`. The recommended one is option 3:
+give the five L2 types their own fee schedule and route the flat fee through the
+existing `split_fees` 50/50 burn/PSCB split, so `full_base` is the flat fee
+itself. That preserves the M1 invariant exactly, creates no exemption, and leaves
+the L1 floor alone. Rejected: raising the fees (defeats the point of flat fees),
+a bare exemption (a second rule written as an exception is the easiest kind to
+widen by accident), and a separate L2 fee market (large new mechanism for five
+transaction types, and reversible later).
+
+**Deliberately not implemented and not put into SPEC.md.** It changes what a JNT
+price means for L2 work and needs the user's sign-off first. The canary test
+`l2_flat_fees_sit_below_the_gas_floor` fails the moment the gap closes, so this
+cannot be settled by accident in a later commit.
+
+## 43. Restart behaviour, stated rather than left implicit
+
+The pool is in-memory only. A node restarts with an empty pool and reconciles from
+the tip: nothing to recover, nothing stale to distrust, so the cursor only has to
+be held within a run. This is honest rather than complete — a production node
+would persist the pool — and it is written into `docs/status.md` so it is not
+mistaken for an oversight. Persisting it belongs with `jnt-store` (step 3), not
+before.
+
+## 44. State at the end of this session
+
+- `cargo test --workspace` — **242 pass, 0 fail** (was 232): 191 core unit, 10
+  mempool↔chain integration, 11 red-team, 16 net unit, 12 net integration, 2
+  wire-vector.
+- `cargo fmt --all --check`, `RUSTFLAGS="-D warnings" cargo clippy --workspace
+  --all-targets`, `cargo build --workspace --release` — all exit 0.
+- All five Python sims exit 0.
+- `docs/roadmap.md`: **appended** a `## 19. L1 implementation status` section.
+  Nothing above it was edited, because the file carries 516 uncommitted
+  insertions from another author and rewriting would have mixed two changes. The
+  diff confirms this: insertions went 516 → 567, deletions stayed at 15.
+- **Not started:** step 2 (tx relay over P2P), step 3 (`jnt-store`), step 4
+  (`blst`), step 5 (`cargo-fuzz`), step 6 (L2). The dependency order is
+  unchanged, and the mempool is now positioned to be fed by step 2.
+- **No commit.** The user asked for the work to be finished and verified first,
+  then for a summary and a proposed commit message.

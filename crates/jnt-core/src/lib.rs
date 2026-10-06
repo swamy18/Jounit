@@ -28,6 +28,7 @@ pub mod hash;
 pub mod hbm_pow;
 pub mod hexserde;
 pub mod ledger;
+pub mod mempool;
 pub mod params;
 pub mod puzzle;
 pub mod ser;

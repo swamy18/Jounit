@@ -8,6 +8,37 @@ use crate::error::{Error, Result};
 
 pub const SAT_PER_JNT: u64 = 100_000_000;
 
+/// Flat fee per L2 transaction type, in satoshis (decision D3).
+///
+/// Flat **per type, not per byte.** A worker deciding whether to post a task has
+/// to know the price before it builds the transaction, and a size-metered fee
+/// makes the price of the same logical operation depend on how the payload
+/// serializer happens to encode it.
+///
+/// **These are not yet consensus, and they do not currently clear the fee
+/// floor.** The only fee rule in the node today is `base_fee * gas_used`
+/// (`fees::required_fee`), and even the smallest transaction uses
+/// `GAS_TX_BASE` gas, so the floor is orders of magnitude above every number
+/// below. Nothing consumes these constants yet — the L2 transaction types do not
+/// exist — and wiring them in will need either an L2 fee path of its own or an
+/// explicit exemption from the gas floor. `l2_flat_fees_sit_below_the_gas_floor`
+/// pins that open question so it cannot be forgotten.
+pub const FEE_TX_POST_TASK_SAT: u64 = 5_000;
+pub const FEE_TX_CLAIM_TASK_SAT: u64 = 2_000;
+pub const FEE_TX_SUBMIT_RESULT_SAT: u64 = 2_000;
+pub const FEE_TX_DISPUTE_SAT: u64 = 10_000;
+pub const FEE_TX_SETTLE_SAT: u64 = 20_000;
+
+/// The D3 schedule as one table, so the exact set is asserted in one place and a
+/// future change has a single spot to be checked against the decision record.
+pub const L2_FEE_SCHEDULE: &[(&str, u64)] = &[
+    ("TxPostTask", FEE_TX_POST_TASK_SAT),
+    ("TxClaimTask", FEE_TX_CLAIM_TASK_SAT),
+    ("TxSubmitResult", FEE_TX_SUBMIT_RESULT_SAT),
+    ("TxDispute", FEE_TX_DISPUTE_SAT),
+    ("TxSettle", FEE_TX_SETTLE_SAT),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkParams {
     pub name: String,
@@ -246,5 +277,44 @@ mod tests {
         let g = crate::block::genesis_block(NetworkParams::mainnet().genesis_difficulty);
         let h = crate::block::genesis_block(NetworkParams::mini().genesis_difficulty);
         assert_eq!(g.block_hash(), h.block_hash());
+    }
+
+    #[test]
+    fn l2_fee_schedule_is_the_decided_d3_set() {
+        // Written out literally rather than derived from the constants: these are
+        // a decision, and a typo in a constant is exactly the mistake a
+        // self-referential assertion would agree with.
+        assert_eq!(
+            L2_FEE_SCHEDULE,
+            &[
+                ("TxPostTask", 5_000u64),
+                ("TxClaimTask", 2_000),
+                ("TxSubmitResult", 2_000),
+                ("TxDispute", 10_000),
+                ("TxSettle", 20_000),
+            ]
+        );
+    }
+
+    /// A canary, not a requirement. Fails the day someone makes these fees
+    /// spendable without deciding what happens to the gas floor — at which point
+    /// the doc comment on `FEE_TX_POST_TASK_SAT` stops being true too.
+    #[test]
+    fn l2_flat_fees_sit_below_the_gas_floor() {
+        // `base_fee_min_sat` is the cheapest base fee either profile can reach,
+        // so this is the most favourable possible floor: if the flat fees are
+        // under *this*, they are under every fee the node would ever charge.
+        for profile in [NetworkParams::mainnet(), NetworkParams::mini()] {
+            let floor = profile.base_fee_min_sat * crate::tx::GAS_TX_BASE;
+            for (name, fee) in L2_FEE_SCHEDULE {
+                assert!(
+                    *fee < floor,
+                    "{name} at {fee} sat now clears the {floor} sat gas floor on {} \
+                     — the open fee-path question in params.rs has been answered, \
+                     so update the comment and delete this test",
+                    profile.name
+                );
+            }
+        }
     }
 }

@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::fees::{next_base_fee, split_fees, FeeSplit};
 use crate::hash::{Hash, DOM_BLOCK};
 use crate::ledger::{check_tx, Undo, Utxo, UtxoSet};
+use crate::mempool::{Mempool, ReconcileReport};
 use crate::params::NetworkParams;
 use crate::puzzle::{PuzzleRegistry, PuzzleSolver, PuzzleSpec};
 use crate::supply::{block_reward_sat, max_issuance_sat};
@@ -58,6 +59,16 @@ pub struct Chain {
     /// correctness: when a canonical block is rolled back, its PSCB contribution
     /// must be subtracted from the running total.
     pscb_undo: HashMap<Hash, u64>,
+    /// Non-coinbase transactions the most recent successful reorg rolled back,
+    /// oldest block first. Drained by the caller so the mempool can re-admit
+    /// them.
+    ///
+    /// Held on `Chain` rather than returned from `submit_at` because a reorg that
+    /// fails is restored wholesale: a list published from a reorg that did not
+    /// happen would put transactions back into the pool that the canonical chain
+    /// still contains, and the pool would then relay an unmineable duplicate of
+    /// a confirmed transaction.
+    disconnected_txs: Vec<Transaction>,
 }
 
 impl Chain {
@@ -84,6 +95,7 @@ impl Chain {
             undo: HashMap::new(),
             pscb_reserve: 0,
             pscb_undo: HashMap::new(),
+            disconnected_txs: Vec::new(),
         };
         chain.blocks.insert(hash, genesis.clone());
         chain.work.insert(hash, genesis.header.difficulty);
@@ -641,6 +653,14 @@ impl Chain {
 
     /// Run fork choice over the stored blocks and apply whatever wins.
     fn reselect(&mut self, submitted: Hash) -> Result<()> {
+        // Nothing is cleared here, and that is deliberate. Transactions
+        // disconnected by an earlier reorg are still disconnected, and they stay
+        // pending until the caller drains them — a reorg landing before the
+        // caller gets a chance to reconcile must not wipe them. An earlier
+        // version cleared this set on entry, so two reorgs in quick succession
+        // (exactly what a syncing node sees) silently destroyed the first
+        // reorg's transactions. Published sets are only ever *added* to, and only
+        // after the reorg has committed.
         let target = self.best_candidate();
         if target != self.tip_hash() {
             return self.adopt(target);
@@ -684,6 +704,16 @@ impl Chain {
             });
         }
 
+        // Collect what the reorg takes off the chain, oldest block first, so the
+        // mempool can re-admit it. Recorded locally and published only once the
+        // rival branch has applied cleanly — see `disconnected_txs`.
+        let mut disconnected: Vec<Transaction> = Vec::new();
+        for i in common..self.canon.len() {
+            if let Some(block) = self.blocks.get(&self.canon[i]) {
+                disconnected.extend(block.txs.iter().skip(1).cloned());
+            }
+        }
+
         for i in (common..self.canon.len()).rev() {
             let hash = self.canon[i];
             self.rollback_block(&hash);
@@ -701,6 +731,11 @@ impl Chain {
             }
             self.canon.push(*hash);
         }
+        // The rival branch applied cleanly, so the reorg actually happened and
+        // those transactions are now genuinely unconfirmed. Extend rather than
+        // assign: an earlier reorg's transactions may not have been drained yet,
+        // and they are still unconfirmed.
+        self.disconnected_txs.extend(disconnected);
         Ok(())
     }
 
@@ -846,6 +881,82 @@ impl Chain {
             difficulty_override,
             max_attempts,
         )
+    }
+
+    /// Mine the next block out of `pool` instead of from a caller-supplied body.
+    ///
+    /// Selection happens against the *next* block's height and base fee, which
+    /// are the same numbers `build_block` will re-check each transaction against,
+    /// so a selection that `check_tx` would reject cannot be produced here. What
+    /// `build_block` rejects still leaves the pool, though: the pool is a
+    /// snapshot of the state the next block was expected to build on, and a
+    /// rejection means that expectation was wrong.
+    pub fn mine_from_pool(
+        &mut self,
+        pool: &mut Mempool,
+        miner_address: crate::hash::Address,
+        now_ms: u64,
+    ) -> Result<Block> {
+        let height = self.height() + 1;
+        let base_fee = self.expected_base_fee_for_next_block();
+        let body = pool.select_for_block(self.params.gas_cap, self.params.max_block_bytes);
+        let block = self.build_block(miner_address, body, now_ms, None, DEFAULT_MAX_ATTEMPTS)?;
+        // Only evict what this block actually contains. Evicting the whole
+        // selection would drop transactions the cap left behind, and they are
+        // still perfectly good candidates for the next block.
+        let confirmed: Vec<Transaction> = block.txs.iter().skip(1).cloned().collect();
+        pool.reconcile(self.utxo(), height, &self.params, base_fee, &confirmed, &[]);
+        Ok(block)
+    }
+
+    /// Transactions of canonical blocks in `(from_height, tip]`, oldest first.
+    ///
+    /// `from_height` is the caller's cursor — the height it last reconciled the
+    /// pool against. At or above the tip this returns nothing, which is the
+    /// common case and costs a bounds check.
+    pub fn confirmed_above(&self, from_height: u64) -> Vec<Transaction> {
+        let mut out = Vec::new();
+        for height in from_height.saturating_add(1)..self.canon.len() as u64 {
+            if let Some(block) = self.block_at(height) {
+                out.extend(block.txs.iter().skip(1).cloned());
+            }
+        }
+        out
+    }
+
+    /// Take the transactions the most recent reorg disconnected.
+    ///
+    /// Draining rather than reading, because re-admission must happen exactly
+    /// once per reorg: a transaction re-admitted twice is at best redundant, and
+    /// after the pool has changed it is a conflict against itself.
+    pub fn take_disconnected(&mut self) -> Vec<Transaction> {
+        std::mem::take(&mut self.disconnected_txs)
+    }
+
+    /// Keep `pool` in step with this chain: evict what the canonical chain now
+    /// confirms, re-admit what a reorg un-confirmed.
+    ///
+    /// Returns the height the pool is now reconciled to, plus what moved. Holding
+    /// that cursor is the caller's job, and it is the only state this needs:
+    /// after a restart the pool is empty too, so reconciling from the tip is both
+    /// correct and free.
+    pub fn reconcile_mempool(
+        &mut self,
+        pool: &mut Mempool,
+        from_height: u64,
+    ) -> (u64, ReconcileReport) {
+        let tip_height = self.height();
+        let confirmed = self.confirmed_above(from_height);
+        let disconnected = self.take_disconnected();
+        let report = pool.reconcile(
+            self.utxo(),
+            tip_height + 1,
+            &self.params,
+            self.expected_base_fee_for_next_block(),
+            &confirmed,
+            &disconnected,
+        );
+        (tip_height, report)
     }
 
     /// Cumulative difficulty of the canonical chain. This is what fork choice
