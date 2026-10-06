@@ -27,7 +27,7 @@ consensus, so guessing those rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — **352 tests pass (current count; older sections of
+- `cargo test --workspace` — **347 tests pass (current count; older sections of
   this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):**
   - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite,, the 30-test real-BLS suite in
@@ -759,5 +759,5 @@ verifies each epoch's checkpoints against that epoch's own derivation; cache
 grace-period behavior; equivocation evidence exposed as data (punishment is
 an open economics item).
 
-352 workspace tests (was 341). fmt/clippy -D warnings/release clean; five
+347 workspace tests (was 341). fmt/clippy -D warnings/release clean; five
 sims green.

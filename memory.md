@@ -2011,4 +2011,4 @@ Implemented as a pure library (validators.rs); grep-verified that
 chain.rs/block.rs/main.rs never reference it — shipped inert. One test bug
 caught my own wrong expectation about the cache grace slot (it holds the
 epoch before current, it is not cleared on every rotation). 21 attack tests
-green. 352 workspace tests total, all checks clean, pushed.
+green. 347 workspace tests total, all checks clean, pushed.
