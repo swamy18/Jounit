@@ -43,6 +43,7 @@ MSG_GETDATA = 6
 MSG_BLOCK = 7
 MSG_GETBLOCKS = 8
 MSG_ADDR = 9
+MSG_TX = 10
 
 # --- SPEC.md section 13.3: per-profile identity ---------------------------
 # A new profile MUST pick a magic no existing profile uses.
@@ -65,10 +66,24 @@ MAX_INBOUND = 32
 HANDSHAKE_TIMEOUT_S = 20
 BAN_SCORE_THRESHOLD = 100
 ORPHAN_POOL_MAX = 64
+# section 13.14, all from the section 13.8 table.
+MAX_RELAY_IN_FLIGHT = 128
+MAX_RELAY_PENDING = 1_024
+MAX_RELAY_KNOWN = 4_096
+MAX_TX_INV_BATCH = 64
+TX_RELAY_PER_PEER_PER_MIN = 600
+TX_REQUEST_TIMEOUT_MS = 30_000
 
-# section 13.5: kind 1 = block in v0.2; 0 reserved for transactions.
+# section 13.5: kind 1 = block; kind 0 = transaction (section 13.14).
+# 0 was reserved for transactions before they existed, so that announcement could
+# be added without changing the shape of INV/GETDATA.
 INV_TYPE_BLOCK = 1
+INV_TYPE_TX = 0
 PROTOCOL_VERSION = 1
+
+# section 3.5: 1 <= len <= 4096 per bundle component, and at most 4 components.
+BUNDLE_MAX_COMPONENTS = 4
+BUNDLE_COMPONENT_MAX = 4096
 
 
 # --- encoders, written from the field tables in section 13 ----------------
@@ -165,6 +180,54 @@ def ipv4_mapped(a: str, b: str, c: str, d: str) -> bytes:
     return bytes(10) + bytes([0xFF, 0xFF]) + bytes([a, b, c, d])
 
 
+def bundle(components: list[tuple[int, bytes]]) -> bytes:
+    """Signature / key bundle -- SPEC.md section 3.5.
+
+    count(1) | count x (scheme(1) | len(2 LE) | bytes)
+
+    ``count = 0`` is legal and is what an unsigned or coinbase input carries.
+    """
+    if len(components) > BUNDLE_MAX_COMPONENTS and components:
+        raise ValueError(f"bundle has {len(components)} components (max 4)")
+    out = bytes([len(components)])
+    seen: set[int] = set()
+    for scheme, blob in components:
+        if not 1 <= len(blob) <= BUNDLE_COMPONENT_MAX:
+            raise ValueError(f"component length {len(blob)} outside 1..4096")
+        if scheme in seen:
+            raise ValueError(f"scheme {scheme} repeats within one bundle")
+        seen.add(scheme)
+        out += bytes([scheme]) + u16le(len(blob)) + blob
+    return out
+
+
+def tx_payload(
+    inputs: list[tuple[bytes, int, list[tuple[int, bytes]], list[tuple[int, bytes]]]],
+    outputs: list[tuple[int, bytes]],
+    version: int = 1,
+    tx_type: int = 0,
+    lock_time: int = 0,
+) -> bytes:
+    """Transaction -- SPEC.md section 3.3.
+
+    version(4 LE) | tx_type(1) | lock_time(8 LE) |
+    input_count(4 LE)  | inputs  (32 | index(4 LE) | sigs | keys)
+    output_count(4 LE) | outputs (value(8 LE) | address(20))
+    """
+    out = u32le(version) + bytes([tx_type]) + u64le(lock_time)
+    out += u32le(len(inputs))
+    for prev_hash, prev_index, sigs, keys in inputs:
+        if len(prev_hash) != 32:
+            raise ValueError("prevout hash must be 32 bytes")
+        out += prev_hash + u32le(prev_index) + bundle(sigs) + bundle(keys)
+    out += u32le(len(outputs))
+    for value, address in outputs:
+        if len(address) != 20:
+            raise ValueError("address must be 20 bytes")
+        out += u64le(value) + address
+    return out
+
+
 # --- the values net_vectors.json pins -------------------------------------
 
 TIP = bytes([0x5A]) * 32
@@ -187,6 +250,13 @@ def derived_items() -> dict[str, str]:
         [bytes([0x44]) * 32, bytes([0x55]) * 32], bytes([0x66]) * 32
     ).hex()
     items["msg_addr"] = addr_payload([(ipv4_mapped(127, 0, 0, 1), 8333)]).hex()
+    # section 13.14: an unsigned transaction, so the payload follows from section
+    # 3 prose alone -- both bundles are `count = 0` and no key material is needed.
+    items["msg_inv_tx"] = inv_payload([(INV_TYPE_TX, bytes([0x99]) * 32)]).hex()
+    items["msg_tx"] = tx_payload(
+        inputs=[(bytes([0x77]) * 32, 1, [], [])],
+        outputs=[(12_345, bytes([0x88]) * 20)],
+    ).hex()
     return items
 
 
@@ -206,10 +276,20 @@ def derived_facts() -> dict[str, int]:
             getblocks_payload([bytes([0x44]) * 32, bytes([0x55]) * 32], bytes([0x66]) * 32)
         ),
         "addr_len": len(addr_payload([(ipv4_mapped(127, 0, 0, 1), 8333)])),
+        "inv_tx_len": len(inv_payload([(INV_TYPE_TX, bytes([0x99]) * 32)])),
+        "tx_len": len(
+            tx_payload(inputs=[(bytes([0x77]) * 32, 1, [], [])], outputs=[(12_345, bytes([0x88]) * 20)])
+        ),
         "max_frame_payload": MAX_FRAME_BYTES,
         "max_inv_per_msg": MAX_INV_PER_MSG,
         "max_addr_per_msg": MAX_ADDR_PER_MSG,
         "max_locator_len": MAX_LOCATOR_LEN,
+        "max_relay_in_flight": MAX_RELAY_IN_FLIGHT,
+        "max_relay_pending": MAX_RELAY_PENDING,
+        "max_relay_known": MAX_RELAY_KNOWN,
+        "max_tx_inv_batch": MAX_TX_INV_BATCH,
+        "tx_relay_per_peer_per_min": TX_RELAY_PER_PEER_PER_MIN,
+        "tx_request_timeout_ms": TX_REQUEST_TIMEOUT_MS,
     }
 
 

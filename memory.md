@@ -1812,3 +1812,91 @@ before.
   unchanged, and the mempool is now positioned to be fed by step 2.
 - **No commit.** The user asked for the work to be finished and verified first,
   then for a summary and a proposed commit message.
+# Working memory — session 9
+
+## Milestone 1 of the remaining roadmap: P2P transaction relay
+
+Continues from `cbd194f` (mempool + L1 integration). Step 2 of the build order:
+connect the pool to the network without letting the network near consensus.
+
+**Consensus: unchanged.** SPEC.md §13.14 was written first and is normative for
+relay; §13.5 gained `msg_type = 10` (`TX`, additive under the existing freeze
+rule so a v0.2 node ignores it rather than disconnecting) and §13.8 gained one
+bound. Nothing in the relay path can reach `Chain::submit`.
+
+### What was built
+
+- `jnt-net/src/msg.rs`: `MessageType::Tx = 10`, `INV_TYPE_TX = 0`,
+  `Message::Tx`, with the same bounded-decode discipline as the other payloads.
+- `jnt-net/src/relay.rs` (new): request set, advertised-but-unrequested queue,
+  loop-suppression set, per-peer rate window, request expiry, and both response
+  budgets (one block's worth of bytes, `max_tx_inv_batch` transactions).
+- `jnt-net/src/net.rs`, `peer.rs`: announce / request / serve / admit, ban scoring
+  on invalid transactions, connect-time pool announcement, peer registration
+  moved into `spawn_peer`, `PeerTable`, stopped-peer release.
+- `jnt-node/src/main.rs`: mines from the pool, reconciles unconditionally (a reorg
+  can land at the same height), prints relay counters, `send --relay <addr>` and
+  `serve --no-mine`.
+- `jnt-net/tests/tx_relay.rs` (new, 10 tests) and 11 unit tests in `relay.rs`.
+- `tests/vectors/net_vectors.json` regenerated; `sim/net_reference.py` extended
+  and now re-derives 32 wire values from the §13 prose.
+
+### Bugs found
+
+Three, two of them proven by a failing test first.
+
+1. **A banned peer stayed in the live set.** `stop()` shuts the socket down but
+   the reader thread parked in a blocking read does not reliably wake — on Windows
+   it did not, for the whole of a test that polled for over a second. The peer
+   kept its slot, kept receiving broadcasts, and kept holding relay and sync
+   state. Fixed by releasing stopped peers from `poll_events` instead of waiting
+   for the reader. Red step: with the sweep neutralised, exactly one test fails.
+
+2. **A one-shot submitter's transaction was discarded.** The sweep introduced in
+   (1) keyed off the `stopped` flag, which the reader thread also sets when a
+   stream simply ends. A cleanly closing peer therefore looked banned, and its
+   queued transaction was released before it was read: `accepted 0 refused 0`,
+   nothing observable anywhere. This is the path `send --relay` takes. Fixed by
+   giving the reader its own flag and requiring the sweep to see a peer that is
+   stopped *and* still being read from. Red step: with the guard removed, the
+   test fails with that exact symptom.
+
+   Worth recording *how* this was found: an end-to-end run with two real node
+   processes showed a transaction that never appeared in any chain and no log line
+   explaining why. Instrumenting the relay reader proved the frame was being read
+   (`ty=10 len=292`) while the pool counted nothing, which located the defect in
+   the release ordering rather than in the wire format. A library-only test would
+   have hidden it, because the CLI path is the only one that closes immediately.
+
+3. **A peer could stall relay permanently by announcing and not delivering.**
+   The request set was global and had no deadline, so `max_relay_in_flight`
+   unfulfilled announcements left no room for any other request — from any peer —
+   and the hoarded txids were marked as already requested, so a peer that did hold
+   them was ignored too. Thirty-two bytes per announcement bought a node-wide
+   stall. Fixed with `tx_request_timeout` and a retry against whoever announces
+   next; the txid is never blacklisted.
+
+### Verification
+
+- `cargo fmt --all --check`, `RUSTFLAGS="-D warnings" cargo clippy --workspace
+  --all-targets`, `cargo test --workspace`, `cargo build --workspace --release` —
+  all exit 0. Workspace tests: 262 (was 242).
+- All five Python sims exit 0, including the wire-format crosscheck (32 values).
+- **Two real processes**: `serve` on A with a listener, `serve --connect --no-mine`
+  on B, and a third process running `send --relay`. A logged
+  `relay accepted 1 refused 0 (pool holds 1)`; block 75 on B's chain holds the
+  transaction (outputs 1 000 000 000 and 6 599 824 000); B reports the 10 JNT
+  output as spendable at height 75. Exactly one block contains it.
+
+### Honest limits
+
+- A `TX` has no acknowledgement, so a sender learns only that a node took the
+  frame. `send --relay` prints that distinction rather than implying acceptance.
+- The pool is still in-memory; a restart drops what it held and never
+  re-requests it. This is why step 3 (persistent storage) comes next.
+- Announce-on-connect is capped at `max_inv_per_msg`, so a pool larger than 500
+  entries is not fully announced to a new peer.
+- CI was not run (no GitHub Actions locally); past sessions saw CI-only lint and
+  rustfmt differences, so a hotfix commit remains a possibility.
+- No commit of `docs/roadmap.md`: the file carries another author's uncommitted
+  work, and my append is contiguous with it, so it cannot be staged separately.

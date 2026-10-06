@@ -731,9 +731,16 @@ without disconnecting, so a later version can add messages safely.
 | `7` | `BLOCK` | `serialize(block)` (§3.5) |
 | `8` | `GETBLOCKS` | `count(2 LE) ‖ locator(count × 32) ‖ stop_hash(32)` |
 | `9` | `ADDR` | `count(2 LE) ‖ count × (port(2 LE) ‖ ip(16))` |
+| `10` | `TX` | `serialize(transaction)` (§3.6) |
 
-`kind` is `1` = block in v0.2; `0` is reserved so transaction announcements can
-reuse the message without a wire change.
+`kind` is `1` = block and `0` = transaction (§13.14). Transactions were reserved
+here before they existed, precisely so the *announcement* could be added without
+changing `INV`/`GETDATA`'s shape; only delivery needed a new message type.
+
+`msg_type = 10` was added in v0.3. It is additive by construction: the freeze rule
+above already requires an unknown type to be ignored without disconnecting, so a
+v0.2 node drops `TX` and stays connected. Such a node does not relay transactions,
+which is a peer's choice and not a protocol violation.
 
 Every `count` field MUST be bounded by the smallest entry that could follow,
 checked before allocating — `INV` entries are 33 bytes, `ADDR` entries 18,
@@ -814,6 +821,12 @@ remotely triggerable failure, so these are requirements, not tuning.
 | `handshake_timeout` | `20 s` | half-open connection exhaustion |
 | `ban_score_threshold` | `100` | misbehaviour (below) |
 | `orphan_pool_max` | `64` | memory from parentless blocks |
+| `max_relay_in_flight` | `128` | outstanding transaction requests (§13.14) |
+| `max_relay_pending` | `1 024` | advertised-but-unrequested txids (32 KB) |
+| `max_relay_known` | `4 096` | relay-loop suppression set (128 KB) |
+| `max_tx_inv_batch` | `64` | txids requested per `GETDATA` |
+| `tx_relay_per_peer_per_min` | `600` | transaction flood from one peer |
+| `tx_request_timeout` | `30 s` | an unanswered transaction request is forgotten (§13.14) |
 
 `max_frame_bytes` is `max_block_bytes + 100 000`, so a maximum-size block is
 relayable with room for its envelope. `max_inbound < max_peers` because inbound
@@ -840,6 +853,7 @@ Reaching `100` bans the address. Scores decay by `1` per hour.
 | `BLOCK` whose parent is unknown, repeated | `+5` |
 | Unresponsive to `PING` (60 s) | `+10` |
 | `ADDR` ignored in v0.2, still sent | `+10` |
+| `TX` failing deserialisation or `check_tx` | `+10` |
 
 **A block failing validation is +10, not a ban.** Difficulty and PoW failures are
 normal on a chain under hashrate churn, and an honest peer relaying a block during
@@ -937,13 +951,86 @@ Listed so these are decisions rather than oversights:
 
 - **Peer identity.** No node keys. Reputation is per-connection (§13.4).
 - **Discovery.** Address book only (§13.6). Sybil resistance unaddressed.
-- **Transaction relay.** Needs a mempool: conflict sets, RBF, fee estimation, and
-  re-validation after reorg. Unspecced — better specified from a real
-  implementation than guessed at now.
+- ~~**Transaction relay.**~~ **Resolved in §13.14 (v0.3).** It was left unspecced
+  on purpose — "better specified from a real implementation than guessed at now" —
+  and the implementation is what settled the shape: the `kind = 0` reservation in
+  §13.5 turned out to be sufficient for the announcement, so only delivery needed
+  a new message type. Conflict sets, re-validation after reorg and fee ordering
+  came from the mempool, not from the wire.
 - **Headers-first sync.** Deferred with justification (§13.7).
 - **Compact blocks / BIP-152.** Later; the 500-hash `INV` path is adequate first.
 - **Genesis network discrimination.** Needs a consensus-breaking genesis change
   (§13.3); `network_magic` is the v0.2 workaround.
+
+### 13.14 Transaction relay
+
+**Transaction relay does not change consensus, and no rule here can.** A
+transaction arriving over the wire is admitted by the same `check_tx` against the
+same state as one built locally — §13.11 invariant 1 extended from blocks to
+transactions. Nothing in this section may reach `Chain::submit`: a relayed
+transaction becomes consensus-relevant only if a block containing it is mined or
+received, and that block is validated exactly as §13.7 requires. The mempool is
+not consensus state, so a peer cannot use this section to make an invalid
+transaction valid.
+
+**Announcement and request reuse the existing messages.** `INV` and `GETDATA`
+carry `kind = 0` entries naming transaction ids, with the payload shape unchanged.
+Delivery uses `TX` (§13.5).
+
+**Flow.**
+
+1. On a locally accepted transaction, announce its txid to every peer except the
+   one it arrived from.
+2. On `INV` with `kind = 0`, request the txids not already held or already
+   requested, batched into `GETDATA` at `max_tx_inv_batch` per message.
+3. On `GETDATA` with `kind = 0`, answer with the transactions the node's own pool
+   holds, and answer nothing for the rest. A node is not obliged to serve a
+   transaction it does not have, and serving one from anywhere but the pool would
+   mean relaying something the node never validated.
+4. On `TX`, deserialise, validate, admit to the pool; if admission succeeded and
+   the transaction was not already known, announce it onward to the other peers.
+
+**A peer may not make the node do unbounded work.**
+
+- The relay request set is capped at `max_relay_in_flight`; the
+  advertised-but-unrequested queue at `max_relay_pending` (§13.8).
+- **An unanswered request is forgotten after `tx_request_timeout`.** A cap alone is
+  not enough, because the request set is global rather than per-peer and the cap
+  bounds how many requests can be held, not how long. Without a deadline a peer
+  could announce `max_relay_in_flight` transactions, deliver none, and stop the
+  node requesting transactions from *every* peer for as long as it stayed
+  connected — and the withheld txids would be marked as already requested, so a
+  peer that did hold them would be ignored too. Thirty-two bytes per announcement
+  would buy a permanent, node-wide relay stall. Expiry bounds the worst case to a
+  delay, and a request that expires is retried against whoever announces the txid
+  next; the txid is never blacklisted.
+- The set of txids remembered for relay-loop suppression is capped at
+  `max_relay_known`, evicting oldest-first. **Eviction weakens suppression rather
+  than breaking it:** a re-announced old transaction is requested at most once
+  more, and every path that makes a node *do* work is separately bounded, so the
+  worst case is a bounded amount of repeated work rather than growth.
+- Per-peer transaction throughput is limited to `tx_relay_per_peer_per_min`.
+  Exceeding it scores the peer, and the §13.8 rule applies: exceeding an inbound
+  bound bans rather than merely disconnecting.
+- A `TX` payload over `max_frame_bytes` is rejected by the frame layer before any
+  allocation (§13.2 item 1), so no separate transaction size limit exists. There
+  deliberately is not one: a relay cap tighter than `max_block_bytes` could make a
+  transaction that consensus accepts permanently unrelayable, which is
+  censorship. A transaction larger than a whole block is refused by the pool
+  instead, where the reason is checkable against `max_block_bytes`.
+- A transaction already present in the pool or already announced is not requested
+  and not relayed again.
+
+**Invalid transactions are misbehaviour, not noise.** A `TX` that fails
+deserialisation or `check_tx` is charged `+10` (§13.9) and is never relayed
+onward. **A node MUST NOT relay a transaction it did not itself admit** — that is
+what stops a peer from using a node as an amplifier for data the node knows to be
+invalid.
+
+**Reorg re-admission is local.** A transaction the canonical chain un-confirmed is
+re-admitted to the pool (§13.10) and, once re-admitted, announced like any other.
+There is no wire message for un-confirmation: a peer that applied the same reorg
+draws the same conclusion from the same blocks.
 
 ---
 

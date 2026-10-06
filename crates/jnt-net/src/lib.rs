@@ -19,4 +19,5 @@ pub mod magic;
 pub mod msg;
 pub mod net;
 pub mod peer;
+pub mod relay;
 pub mod syncer;

@@ -515,7 +515,7 @@ question cannot be silently settled by a later commit.
 ## Build order
 
 1. Mempool (`jnt-core/src/mempool.rs`) — **done**, and wired into L1 (Step 1A)
-2. Transaction relay over P2P (`jnt-net`)
+2. Transaction relay over P2P (`jnt-net`) — **done**
 3. Persistent storage (`jnt-store/`)
 4. Real BLS pairing — replace `MockBls` with `blst`
 5. `cargo-fuzz` harness
@@ -523,3 +523,106 @@ question cannot be silently settled by a later commit.
 
 Each step uses the red-team discipline from session 1: write the attack, confirm
 it fails against the current code, then fix the cause.
+
+---
+
+## Step 2 — transaction relay: implemented
+
+Turns the mempool from a module nothing feeds into one that is fed by the network.
+**No consensus rule changed.** A transaction arriving over the wire is admitted by
+the same `check_tx` against the same state as one built locally, and nothing in
+relay can reach `Chain::submit`: a relayed transaction becomes consensus-relevant
+only inside a block, which is validated exactly as before.
+
+SPEC.md §13.14 is new and normative; §13.5 gained `msg_type = 10` (`TX`, additive
+under the existing freeze rule) and `kind = 0` in `INV`/`GETDATA` stopped being
+reserved and started being used. §13.8 gained `tx_request_timeout`.
+
+| Piece | Where |
+|---|---|
+| `MessageType::Tx = 10`, `INV_TYPE_TX = 0`, bounded `Message::Tx` | `jnt-net/src/msg.rs` |
+| Relay bookkeeping: requests, pending, known set, rate window, expiry | `jnt-net/src/relay.rs` |
+| Announce / request / serve / admit / ban, peer registration | `jnt-net/src/net.rs`, `peer.rs` |
+| Mine from the pool, unconditional reconcile, relay counters | `jnt-node/src/main.rs` |
+| Wallet → node: `send --relay <addr>` | `jnt-node/src/main.rs` |
+| Follower node: `serve --no-mine` | `jnt-node/src/main.rs` |
+
+### Bugs found and fixed
+
+Two real defects, each proven by re-running the test against the old code.
+
+1. **A banned peer was never released from the live set.** `stop()` shuts the
+   socket down, but the reader thread parked in a blocking read does not reliably
+   wake for that — on Windows it demonstrably did not: a peer banned for ten
+   invalid transactions stayed in the peer table for over a second of polling and
+   its reader only returned at teardown. Until then the node believed it had a
+   peer it had already banned: the slot counted against `max_peers`, broadcasts
+   still queued for it, and nothing released the sync or relay state it owed.
+   Fixed by releasing stopped peers in `poll_events` rather than waiting for the
+   reader. **Red step:** with the sweep neutralised, only
+   `repeated_invalid_transactions_get_the_peer_banned` fails.
+2. **The submission path silently lost a transaction.** The first fix swept for
+   stopped peers using the `stopped` flag — but the reader thread set that same
+   flag whenever a stream ended, so a peer closing cleanly looked identical to a
+   peer being banned and the sweep discarded its last messages. A wallet that
+   connects, submits one transaction and hangs up (which is what
+   `send --relay` does) had its transaction read, decoded, queued and then
+   dropped, with `accepted 0 refused 0` — nothing observable anywhere. Fixed by
+   giving the reader its own flag and making the release rule "stopped **and** the
+   reader has not reported yet". **Red step:** with the guard removed,
+   `a_one_shot_submitter_is_served_and_then_let_go` fails with that exact symptom.
+
+A third defect was closed by design rather than by a failing test: the in-flight
+request set was global and unbounded in time, so a peer could announce
+`max_relay_in_flight` transactions, deliver none, and stop the node requesting
+from *every* peer for as long as it stayed connected. Requests now expire after
+`tx_request_timeout`, and a request that expires is retried against whoever
+announces the txid next.
+
+### Tests
+
+- `crates/jnt-net/tests/tx_relay.rs` — 10 real-socket tests against a hand-rolled
+  peer, not our own client: the whole path (pool → `INV` → `GETDATA` → `TX` →
+  peer pool → mined → block back → eviction on both nodes); announce/request/serve
+  round trip; forbidden signature; repeated invalid transactions reaching the ban
+  threshold; duplicate announcement pooled once and not punished; conflicting
+  spend refused without a ban; oversized transaction refused by the pool;
+  repeated announcement drawing one request; unanswered request expiring;
+  one-shot submitter served and released.
+- `crates/jnt-net/src/relay.rs` — 11 unit tests for the bookkeeping, including the
+  stall scenario and both response budgets.
+- `tests/vectors/net_vectors.json` regenerated with `TX` and `kind = 0` bytes, plus
+  the five new §13.14 bounds; `sim/net_reference.py` re-derives all of them from
+  the §13 prose and now agrees on 32 values. **It caught an arithmetic error in
+  the vector generator** (`inv_tx_len` typed as `4 + 1 + 32` when `INV`'s count is
+  `u16`) — the kind of mistake a self-consistent encoder cannot find.
+
+### Verified end-to-end with two real processes
+
+`serve --listen` on node A (mining), `serve --connect ... --no-mine` on node B,
+then `send --relay` from a third process:
+
+```
+relay          accepted 1 refused 0 (pool holds 1)
+B chain: block 75 holds 2 txs, outputs [1000000000, 6599824000]
+B balance: 8d0e399eaf9cb1f3:0  10.00000000 JNT  height 75  spendable
+```
+
+The wallet's signed transaction crossed a real handshake and a real TCP link into
+A's pool, was mined at height 75, reached B by block relay, and B reports the
+output as spendable. Exactly one block on B's chain contains it.
+
+### Limitations
+
+- **No acknowledgement.** A `TX` is silent: the sender learns that a node *took*
+  the frame, not that the pool accepted it. `send --relay` says so instead of
+  implying success, and the receiving node's `relay accepted/refused` line is the
+  actual evidence.
+- The pool is still in-memory only, so a node that restarts drops everything it
+  held and never re-requests it. That is step 3's problem, and it is why the
+  ordering is storage before relay hardening rather than the reverse.
+- Relay is not part of the §13.11 invariant list yet; the next revision should add
+  "a relayed transaction is validated exactly as a local one" explicitly.
+- `INV` announcements are sent only for the first `max_inv_per_msg` pool entries
+  on connect, so a pool larger than 500 entries is not fully announced to a new
+  peer. Bounded and honest, but incomplete.

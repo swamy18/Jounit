@@ -12,11 +12,13 @@ use std::time::Duration;
 use jnt_core::block::genesis_block;
 use jnt_core::chain::Chain;
 use jnt_core::hash::Hash;
+use jnt_core::mempool::Mempool;
 use jnt_core::params::NetworkParams;
 use jnt_net::magic::check_network;
 use jnt_net::msg::{INV_TYPE_BLOCK, PROTOCOL_VERSION};
-use jnt_net::net::{P2pConfig, P2pNode};
+use jnt_net::net::{NodeState, P2pConfig, P2pNode};
 use jnt_net::peer::{perform_handshake, HandshakeConfig};
+use jnt_net::relay::RelayManager;
 use jnt_net::syncer::{create_locator, find_fork_and_collect_inv, SyncManager, SyncResult};
 
 // ---------------------------------------------------------------------------
@@ -148,9 +150,24 @@ fn invalid_blocks_never_enter_the_store() {
 /// Drive `poll_events` until `done` or the deadline expires. Both nodes in the
 /// tests below are single-threaded from the caller's point of view, so polling
 /// in a loop is exactly what `jnt-node serve` does.
-fn pump(node: &P2pNode, chain: &mut Chain, syncer: &mut SyncManager, deadline: std::time::Instant) {
+fn pump(
+    node: &P2pNode,
+    chain: &mut Chain,
+    pool: &mut Mempool,
+    syncer: &mut SyncManager,
+    relay: &mut RelayManager,
+    deadline: std::time::Instant,
+) {
     while std::time::Instant::now() < deadline {
-        node.poll_events(chain, syncer, None);
+        node.poll_events(
+            NodeState {
+                chain,
+                pool,
+                syncer,
+                relay,
+            },
+            None,
+        );
         if syncer.orphan_count() == 0 {
             thread::sleep(Duration::from_millis(10));
         } else {
@@ -198,10 +215,14 @@ fn a_node_syncs_a_peer_over_real_sockets() {
     // Serves GETBLOCKS / GETDATA while the client syncs.
     let mut server_syncer = SyncManager::new();
     let server_thread = thread::spawn(move || {
+        let mut server_pool = Mempool::default();
+        let mut server_relay = RelayManager::new();
         pump(
             &server,
             &mut server_chain,
+            &mut server_pool,
             &mut server_syncer,
+            &mut server_relay,
             std::time::Instant::now() + Duration::from_secs(6),
         );
         server_chain.tip_hash()
@@ -223,11 +244,21 @@ fn a_node_syncs_a_peer_over_real_sockets() {
     )
     .unwrap();
     let mut client_syncer = SyncManager::new();
+    let mut client_pool = Mempool::default();
+    let mut client_relay = RelayManager::new();
     client.connect(addr, &client_chain).unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
     while std::time::Instant::now() < deadline && client_chain.height() < 5 {
-        client.poll_events(&mut client_chain, &mut client_syncer, None);
+        client.poll_events(
+            NodeState {
+                chain: &mut client_chain,
+                pool: &mut client_pool,
+                syncer: &mut client_syncer,
+                relay: &mut client_relay,
+            },
+            None,
+        );
         thread::sleep(Duration::from_millis(10));
     }
 

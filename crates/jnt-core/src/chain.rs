@@ -883,29 +883,43 @@ impl Chain {
         )
     }
 
-    /// Mine the next block out of `pool` instead of from a caller-supplied body.
+    /// Mine the next block out of `pool`, submit it, and evict what it confirmed.
     ///
-    /// Selection happens against the *next* block's height and base fee, which
-    /// are the same numbers `build_block` will re-check each transaction against,
-    /// so a selection that `check_tx` would reject cannot be produced here. What
-    /// `build_block` rejects still leaves the pool, though: the pool is a
-    /// snapshot of the state the next block was expected to build on, and a
-    /// rejection means that expectation was wrong.
+    /// Selection happens against the *next* block's height and base fee, which are
+    /// the same numbers `build_block` re-checks every transaction against, so a
+    /// selection `check_tx` would reject cannot be produced here.
+    ///
+    /// **The three steps are one function deliberately.** Mining, submitting and
+    /// evicting were briefly separate, and the split is wrong in a way that is easy
+    /// to miss: a mined block is not a confirmed transaction until it wins fork
+    /// choice. A peer's heavier block arriving at the same height leaves ours as a
+    /// side branch, and evicting on "mined" rather than on "canonical" would then
+    /// silently drop transactions the chain never confirmed. Submitting inside
+    /// means the eviction decision is made against what actually became canonical.
     pub fn mine_from_pool(
         &mut self,
         pool: &mut Mempool,
         miner_address: crate::hash::Address,
         now_ms: u64,
     ) -> Result<Block> {
-        let height = self.height() + 1;
-        let base_fee = self.expected_base_fee_for_next_block();
+        let cursor = self.height();
         let body = pool.select_for_block(self.params.gas_cap, self.params.max_block_bytes);
         let block = self.build_block(miner_address, body, now_ms, None, DEFAULT_MAX_ATTEMPTS)?;
-        // Only evict what this block actually contains. Evicting the whole
-        // selection would drop transactions the cap left behind, and they are
-        // still perfectly good candidates for the next block.
-        let confirmed: Vec<Transaction> = block.txs.iter().skip(1).cloned().collect();
-        pool.reconcile(self.utxo(), height, &self.params, base_fee, &confirmed, &[]);
+        self.submit_at(block.clone(), Some(now_ms))?;
+        // Eviction is derived from the **canonical chain**, never from the fact
+        // that we mined something. `reconcile_mempool` evicts what canonical
+        // blocks above the cursor confirm, so a mined block that lost fork choice
+        // evicts nothing with no special case, and a competing block that won
+        // evicts its own transactions instead. An earlier version evicted the
+        // block we had just built, guarded by a `tip_hash() == hash` check; that
+        // guard is unreachable on today's single-threaded chain loop, which makes
+        // it untestable rather than wrong — and an eviction rule that cannot be
+        // exercised is one nobody will notice breaking.
+        //
+        // Only what the chain confirms is evicted, never the whole selection: a
+        // transaction the gas or byte cap left out is still the best candidate
+        // for the next block.
+        let _ = self.reconcile_mempool(pool, cursor);
         Ok(block)
     }
 

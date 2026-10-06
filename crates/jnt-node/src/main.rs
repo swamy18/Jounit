@@ -29,11 +29,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
 use jnt_core::hash::{address_from_hex, address_to_hex, hash_to_hex};
+use jnt_core::mempool::Mempool;
 use jnt_core::params::{NetworkParams, SAT_PER_JNT};
 use jnt_core::supply::{block_reward_sat, cumulative_supply_sat, halvings, max_issuance_sat};
-use jnt_core::tx::{OutPoint, Output};
+use jnt_core::tx::{OutPoint, Output, Transaction};
 use jnt_core::wallet::Wallet;
-use jnt_net::net::{P2pConfig, P2pNode};
+use jnt_net::frame::write_frame;
+use jnt_net::msg::{Message, MessageType};
+use jnt_net::net::{NodeState, P2pConfig, P2pNode};
+use jnt_net::peer::{perform_handshake, HandshakeConfig};
+use jnt_net::relay::RelayManager;
 use jnt_net::syncer::SyncManager;
 
 const USAGE: &str = "\
@@ -45,7 +50,7 @@ USAGE:
 COMMANDS:
   init      Create a chain directory, a miner wallet and the genesis block
   mine      Mine blocks and extend the chain
-  send      Spend from a wallet address into a new block
+  send      Spend from a wallet address, local or over P2P
   status    Print chain tip, difficulty, supply and wallet balance
   verify    Replay the chain from genesis and diff it against stored state
   show-block  Print one block
@@ -54,6 +59,14 @@ COMMANDS:
   export    Write the canonical chain to JSON
   serve     Run a P2P node (block relay, multi-peer sync)
   help      This text
+
+SEND OPTIONS:
+  --to <address>             Recipient (required)
+  --amount <sat>             Amount to send (required)
+  --relay <host:port>        Hand the signed transaction to a running node
+                             instead of mining it here; the node's mempool
+                             holds it and relays it to its peers
+  --fee <sat>                Override the computed fee
 
 COMMON OPTIONS:
   --network <mainnet|mini>   Default: mini
@@ -64,6 +77,7 @@ SERVE OPTIONS:
   --connect <host:port>      Dial an outbound peer (repeatable via CSV)
   --peers <n>                Max total peers (default: 125)
   --interval <ms>            Serve loop period (default: 250)
+  --no-mine                  Relay and validate only, never mine
 ";
 
 fn main() -> ExitCode {
@@ -124,6 +138,7 @@ impl Args {
                         | "listen"
                         | "connect"
                         | "peers"
+                        | "relay"
                 );
                 if takes_value {
                     let value = raw
@@ -483,6 +498,30 @@ fn cmd_send(args: &Args) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let txid = jnt_core::hash::hash_to_hex(&tx.txid());
 
+    // `--relay <addr>` hands the signed transaction to a running node over the
+    // real P2P protocol instead of mining it here (SPEC.md §13.14). Without it
+    // there was no way to get a locally built transaction into a node's pool at
+    // all: this command mined it straight into a block, so the wallet path was
+    // "build a transaction, then be your own miner", and the relay path was only
+    // reachable from another node. A transaction that never enters the pool
+    // cannot be relayed, cannot be replaced by a better fee, and cannot be seen
+    // by any peer before it is already confirmed.
+    //
+    // Mining in place is kept as the default for the ordinary case of a single
+    // node with no peers, where there is nothing to relay to and no mempool for
+    // anything else to fill.
+    if let Some(relay_addr) = args.str("relay") {
+        let relay_addr: std::net::SocketAddr = relay_addr
+            .parse()
+            .map_err(|e| format!("--relay `{relay_addr}`: {e}"))?;
+        relay_transaction(relay_addr, &chain, &tx)?;
+        println!("txid    {txid}");
+        println!("relayed to {relay_addr} (not mined here; the node's mempool holds it)");
+        println!("amount  {} JNT", jnt(amount));
+        println!("fee     {} JNT", jnt(fee));
+        return Ok(());
+    }
+
     let block = chain
         .mine_block(from, vec![tx], now_ms())
         .map_err(|e| e.to_string())?;
@@ -497,6 +536,49 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     println!("amount  {} JNT", jnt(amount));
     println!("fee     {} JNT", jnt(fee));
     println!("burned  {} JNT (base fee, destroyed)", jnt(burned));
+    Ok(())
+}
+
+/// Hand a signed transaction to a running node.
+///
+/// Deliberately the smallest client that can do this: connect, complete the
+/// §13.4 handshake, send `TX`, keep the connection open long enough for the node
+/// to read the frame, close. No `INV` first — the node admits a `TX` whether or
+/// not it asked for it, which is what lets a wallet that was never in the
+/// announcement path contribute one.
+///
+/// It does **not** read a reply, because the protocol has no `TX` acknowledgement
+/// to read: admission is silent, and the node announces the txid to *its* peers
+/// rather than back to the sender. That is honest about what this can promise —
+/// the transaction reached a node, not that the node accepted it. `status` on
+/// that node is the check, and the sender still owns the outputs until a block
+/// spends them.
+fn relay_transaction(
+    addr: std::net::SocketAddr,
+    chain: &Chain,
+    tx: &Transaction,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let params = chain.params().clone();
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))
+            .map_err(|e| format!("relay connect {addr}: {e}"))?;
+    let cfg = HandshakeConfig::new(params.clone(), chain.height(), chain.tip_hash());
+    perform_handshake(&mut stream, &cfg, true).map_err(|e| format!("relay handshake: {e}"))?;
+
+    let payload = Message::Tx(Box::new(tx.clone())).encode();
+    write_frame(&mut stream, &params, MessageType::Tx as u8, &payload)
+        .map_err(|e| format!("relay send: {e}"))?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    // Closing immediately after a write is normally safe — TCP delivers what was
+    // written before the FIN — but the node's side of this is a thread that may
+    // not have been scheduled yet, and a connection that lands in the backlog and
+    // is then reset is a transaction the sender believes it sent. One short pause
+    // turns "probably delivered" into "delivered".
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
 
@@ -717,6 +799,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         .unwrap_or_default();
 
     let max_peers = args.num("peers", 125)? as usize;
+    // A relay-only node: it validates, relays and syncs, but does not mine. This
+    // is what a follower, a seed or a wallet's server looks like, and it is also
+    // the only way to observe relay without a second miner racing it for every
+    // block.
+    let no_mine = args.has("no-mine");
     let mut config = P2pConfig::new(store.params.clone(), listen_addr);
     config.max_peers = max_peers;
     // Loop period. Without one the loop mined as fast as the CPU allowed and
@@ -729,6 +816,13 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         P2pNode::start(config, chain.height(), chain.tip_hash()).map_err(|e| e.to_string())?;
 
     let mut syncer = SyncManager::new();
+    // The mempool is in-memory only, so a restart begins with an empty pool and a
+    // cursor at the tip. There is nothing to recover and nothing stale to
+    // distrust; see `docs/status.md`.
+    let mut pool = Mempool::default();
+    let mut relay = RelayManager::new();
+    let mut pool_cursor = chain.height();
+    let mut relay_seen = (0u64, 0u64);
 
     println!("network        {}", store.params.name);
     println!("height         {}", chain.height());
@@ -745,8 +839,13 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         }
     }
 
-    // Pick miner address if a wallet exists
-    let miner_addr = wallets.first().and_then(|w| w.address().ok());
+    // Pick miner address if a wallet exists. `--no-mine` keeps the wallet — it is
+    // still the address the node reports balances for — and only stops it mining.
+    let miner_addr = if no_mine {
+        None
+    } else {
+        wallets.first().and_then(|w| w.address().ok())
+    };
 
     println!("press Ctrl-C to stop");
 
@@ -754,21 +853,62 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     loop {
         // Mine one block if we have a miner wallet
         if let Some(addr) = miner_addr {
-            if let Ok(block) = chain.mine_block(addr, vec![], now_ms()) {
+            // Mine from the pool rather than from an empty body. A node that only
+            // ever mines empty blocks never confirms a relayed transaction, which
+            // is the entire point of having a pool (§13.14). `mine_from_pool`
+            // submits the block itself and then evicts what the *canonical* chain
+            // confirms, so nothing here has to remember to do either.
+            if let Ok(block) = chain.mine_from_pool(&mut pool, addr, now_ms()) {
                 let hash = block.block_hash();
                 let height = block.header.height;
-                if chain.submit(block).is_ok() {
-                    store.save_chain(&chain).ok();
-                    store.write_meta(&chain).ok();
-                    println!("mined height {height}  {}", &hash_to_hex(&hash)[..16]);
-                    node.broadcast_block(hash, None);
-                }
+                store.save_chain(&chain).ok();
+                store.write_meta(&chain).ok();
+                println!("mined height {height}  {}", &hash_to_hex(&hash)[..16]);
+                node.broadcast_block(hash, None);
             }
         }
 
         // Drain inbound P2P events and apply to chain.
         let before = chain.height();
-        node.poll_events(&mut chain, &mut syncer, Some(now_ms()));
+        node.poll_events(
+            NodeState {
+                chain: &mut chain,
+                pool: &mut pool,
+                syncer: &mut syncer,
+                relay: &mut relay,
+            },
+            Some(now_ms()),
+        );
+
+        // Reconciliation is unconditional, deliberately not gated on the height
+        // having changed. A reorg can land at the *same* height, and gating on
+        // height would skip exactly the case where the pool most needs updating:
+        // re-admitting the transactions the reorg un-confirmed. When nothing has
+        // changed this is a bounds check over an empty range.
+        let (cursor, report) = chain.reconcile_mempool(&mut pool, pool_cursor);
+        pool_cursor = cursor;
+        if report.evicted > 0 || report.readmitted > 0 || report.refused > 0 {
+            println!(
+                "mempool        evicted {} re-admitted {} refused {}",
+                report.evicted, report.readmitted, report.refused
+            );
+        }
+
+        // Relay outcomes, printed on change. A transaction refused from a peer is
+        // otherwise silent — it is not relayed, there is no acknowledgement, and
+        // the sender sees only that nothing happened. Without this, "the network
+        // is dropping my payments" and "a peer is sending junk" are the same
+        // observation.
+        let (accepted, refused) = (relay.accepted_count(), relay.refused_count());
+        if accepted != relay_seen.0 || refused != relay_seen.1 {
+            if accepted > relay_seen.0 || refused > relay_seen.1 {
+                println!(
+                    "relay          accepted {accepted} refused {refused} (pool holds {})",
+                    pool.len()
+                );
+            }
+            relay_seen = (accepted, refused);
+        }
 
         // Blocks that arrived *from peers* have to be persisted too. Saving
         // only on the mining path meant a node that synchronised 500 blocks

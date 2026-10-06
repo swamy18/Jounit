@@ -17,10 +17,15 @@
 use jnt_core::chain::Chain;
 use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
+use jnt_core::tx::{Input, OutPoint, Output, Transaction};
 use jnt_net::frame::{read_frame, write_frame, MAX_FRAME_PAYLOAD};
 use jnt_net::msg::{
-    InvEntry, Message, MessageType, SocketAddr as WireAddr, Version, INV_TYPE_BLOCK,
+    InvEntry, Message, MessageType, SocketAddr as WireAddr, Version, INV_TYPE_BLOCK, INV_TYPE_TX,
     MAX_ADDR_PER_MSG, MAX_INV_PER_MSG, MAX_LOCATOR_ENTRIES, PROTOCOL_VERSION,
+};
+use jnt_net::relay::{
+    MAX_RELAY_IN_FLIGHT, MAX_RELAY_KNOWN, MAX_RELAY_PENDING, MAX_TX_INV_BATCH,
+    TX_RELAY_PER_PEER_PER_MIN, TX_REQUEST_TIMEOUT_MS,
 };
 use jnt_net::syncer::{create_locator, find_fork_and_collect_inv};
 
@@ -127,6 +132,47 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
             }]),
         ),
     ];
+
+    // --- TX (§13.14) ----------------------------------------------------
+    // An unsigned transaction, so the payload is reproducible from §3 prose
+    // alone: both bundles are `count = 0`, and nothing here depends on a key.
+    let wire_tx = Transaction::standard(
+        vec![Input::unsigned(&OutPoint {
+            txid: [0x77u8; 32],
+            index: 1,
+        })],
+        vec![Output {
+            value: 12_345,
+            address: [0x88u8; 20],
+        }],
+    );
+    // Announcement reuses `INV` with `kind = 0` (§13.5). Pinned separately from
+    // the block-kind entry above, because `kind` is the field that decides
+    // whether a peer treats an entry as a block or a transaction.
+    items.push((
+        "msg_inv_tx".into(),
+        hex_of(
+            &Message::Inv(vec![InvEntry {
+                kind: INV_TYPE_TX,
+                hash: [0x99u8; 32],
+            }])
+            .encode(),
+        ),
+    ));
+    // count(2 LE) + one entry(33). The count is 2 bytes, not 4 — see the
+    // independent check in `sim/net_reference.py`, which caught 4 + 1 + 32 here.
+    facts.push(("inv_tx_len".into(), 2 + 1 + 32));
+
+    let tx_enc = Message::Tx(Box::new(wire_tx.clone())).encode();
+    facts.push(("tx_len".into(), tx_enc.len() as u64));
+    items.push(("msg_tx".into(), hex_of(&tx_enc)));
+
+    // Decode must return the identical transaction, not merely a transaction:
+    // a field that round-trips through the wrong offset would still parse.
+    match Message::decode(MessageType::Tx as u8, &tx_enc).unwrap() {
+        Message::Tx(decoded) => assert_eq!(*decoded, wire_tx),
+        other => panic!("expected Tx, got {other:?}"),
+    }
     for (name, msg) in &msgs {
         let enc = msg.encode();
         facts.push((format!("{name}_len"), enc.len() as u64));
@@ -178,6 +224,18 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
     facts.push(("max_inv_per_msg".into(), MAX_INV_PER_MSG as u64));
     facts.push(("max_addr_per_msg".into(), MAX_ADDR_PER_MSG as u64));
     facts.push(("max_locator_len".into(), MAX_LOCATOR_ENTRIES as u64));
+    // §13.14 relay bounds. Pinned here rather than only stated in prose, because
+    // a bound that drifts between two implementations is a peer that either
+    // refuses honest traffic or accepts a flood.
+    facts.push(("max_relay_in_flight".into(), MAX_RELAY_IN_FLIGHT as u64));
+    facts.push(("max_relay_pending".into(), MAX_RELAY_PENDING as u64));
+    facts.push(("max_relay_known".into(), MAX_RELAY_KNOWN as u64));
+    facts.push(("max_tx_inv_batch".into(), MAX_TX_INV_BATCH as u64));
+    facts.push((
+        "tx_relay_per_peer_per_min".into(),
+        TX_RELAY_PER_PEER_PER_MIN as u64,
+    ));
+    facts.push(("tx_request_timeout_ms".into(), TX_REQUEST_TIMEOUT_MS));
 
     (items, facts)
 }
@@ -287,6 +345,34 @@ fn net_vectors_are_stable() {
     assert_eq!(fact("max_inv_per_msg"), 500, "13.8");
     assert_eq!(fact("max_addr_per_msg"), 100, "13.8");
     assert_eq!(fact("max_frame_payload"), 4_100_000, "13.8");
+
+    // §13.14. Restated from the field tables rather than read back from the
+    // encoder: a transaction is version(4) + tx_type(1) + lock_time(8) +
+    // input_count(4) + one fixed-width unsigned input (32 + 4 + 1 + 1) +
+    // output_count(4) + one output (28). An unsigned input carries two empty
+    // bundles, one byte each — and that is the part most likely to drift, since
+    // adding a length prefix to a bundle would not change any round trip.
+    assert_eq!(
+        fact("tx_len"),
+        4 + 1 + 8 + 4 + (32 + 4 + 1 + 1) + 4 + 28,
+        "TX payload layout (13.5, 3.1-3.3)"
+    );
+    assert_eq!(
+        fact("inv_tx_len"),
+        2 + 33,
+        "an INV payload is count(2 LE) + kind(1) + hash(32)"
+    );
+    // `kind = 0` for transactions is the field a v0.2 node uses to decide whether
+    // an INV entry is a block or a transaction; changing it would make the two
+    // versions disagree about what they were just told.
+    let inv_tx = listed
+        .iter()
+        .find(|e| e["name"] == "msg_inv_tx")
+        .expect("msg_inv_tx vector is missing")["hex"]
+        .as_str()
+        .unwrap();
+    assert_eq!(&inv_tx[..4], "0100", "INV count is u16 LE");
+    assert_eq!(&inv_tx[4..6], "00", "kind 0 must mean `transaction` (13.5)");
     assert!(
         fact("inv_from_genesis_len") <= MAX_INV_PER_MSG as u64,
         "a GETBLOCKS response must never exceed max_inv_per_msg"

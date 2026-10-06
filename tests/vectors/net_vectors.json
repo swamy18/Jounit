@@ -9,6 +9,14 @@
       "value": 89
     },
     {
+      "name": "inv_tx_len",
+      "value": 35
+    },
+    {
+      "name": "tx_len",
+      "value": 87
+    },
+    {
       "name": "verack_len",
       "value": 8
     },
@@ -63,6 +71,30 @@
     {
       "name": "max_locator_len",
       "value": 500
+    },
+    {
+      "name": "max_relay_in_flight",
+      "value": 128
+    },
+    {
+      "name": "max_relay_pending",
+      "value": 1024
+    },
+    {
+      "name": "max_relay_known",
+      "value": 4096
+    },
+    {
+      "name": "max_tx_inv_batch",
+      "value": 64
+    },
+    {
+      "name": "tx_relay_per_peer_per_min",
+      "value": 600
+    },
+    {
+      "name": "tx_request_timeout_ms",
+      "value": 30000
     }
   ],
   "items": [
@@ -77,6 +109,14 @@
     {
       "hex": "6a4e54020b6a6f756e69742f6d696e690100000001000000000000002a000000000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0c2f6a6e742d6e65743a302e32efcdab8967452301",
       "name": "version_mini"
+    },
+    {
+      "hex": "0100009999999999999999999999999999999999999999999999999999999999999999",
+      "name": "msg_inv_tx"
+    },
+    {
+      "hex": "010000000000000000000000000100000077777777777777777777777777777777777777777777777777777777777777770100000000000100000039300000000000008888888888888888888888888888888888888888",
+      "name": "msg_tx"
     },
     {
       "hex": "adde000000000000",

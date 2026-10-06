@@ -41,6 +41,11 @@ pub enum MempoolError {
     },
     Invalid(String),
     Full,
+    /// Larger than a whole block, so no block can ever include it.
+    Oversized {
+        size: usize,
+        limit: usize,
+    },
     Underpaid {
         required: u64,
         offered: u64,
@@ -59,6 +64,10 @@ impl std::fmt::Display for MempoolError {
             ),
             MempoolError::Invalid(why) => write!(f, "invalid: {why}"),
             MempoolError::Full => write!(f, "mempool is full"),
+            MempoolError::Oversized { size, limit } => write!(
+                f,
+                "transaction of {size} bytes exceeds the {limit} byte block limit"
+            ),
             MempoolError::Underpaid { required, offered } => {
                 write!(f, "fee {offered} below required {required}")
             }
@@ -150,6 +159,17 @@ impl Mempool {
         self.entries.contains_key(txid)
     }
 
+    /// Every pooled txid, in ascending order.
+    ///
+    /// Ascending, not insertion order: a node announcing its pool to a new peer
+    /// must announce the same *prefix* of it as any other node holding the same
+    /// entries, or which transactions get announced when the pool is larger than
+    /// one `INV` becomes a function of local history. Ordering by txid is a
+    /// property of the entries alone.
+    pub fn txids(&self) -> Vec<Hash> {
+        self.entries.keys().copied().collect()
+    }
+
     pub fn get(&self, txid: &Hash) -> Option<&MempoolEntry> {
         self.entries.get(txid)
     }
@@ -219,6 +239,19 @@ impl Mempool {
         };
 
         let size = entry.size_bytes();
+        // A transaction larger than a whole block can never be included by any
+        // block, so pooling it wastes the bandwidth of every peer that relays it
+        // and it can never be mined by anyone. Not a new consensus rule: it is
+        // what `max_block_bytes` already implies. Enforced here rather than at
+        // the wire because the wire has no correct answer — a relay-time size cap
+        // tighter than `max_block_bytes` would make a transaction that consensus
+        // accepts permanently unrelayable, which is censorship (SPEC.md §13.14).
+        if size > params.max_block_bytes {
+            return Err(MempoolError::Oversized {
+                size,
+                limit: params.max_block_bytes,
+            });
+        }
         if self.bytes + size > self.max_bytes {
             return Err(MempoolError::Full);
         }

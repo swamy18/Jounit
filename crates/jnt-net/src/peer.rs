@@ -1,9 +1,10 @@
 //! Peer connection lifecycle and handshake state machine. SPEC.md §13.4, §13.9.
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,6 +79,42 @@ pub struct PeerHandle {
     /// up to the 60 s read timeout, still consuming a thread and still able to
     /// deliver events for a peer the node believed it had dropped.
     socket: Arc<TcpStream>,
+    /// Set by the reader thread when its loop ends, immediately before it reports
+    /// the disconnect.
+    ///
+    /// Deliberately **not** `stopped`. Two different situations were sharing one
+    /// flag: `stop()` means "we ended this peer", while the reader leaving its
+    /// loop means "this peer's stream ended". On a normal close the reader may
+    /// still have events queued — including a transaction it has already read and
+    /// handed over — and treating the second as the first discarded a peer's last
+    /// message as it was being delivered.
+    reader_done: Arc<AtomicBool>,
+}
+
+/// The node's live peer table and inbound counter, as one thing.
+///
+/// Given to `spawn_peer` so a new peer can register itself *before* its reader
+/// thread starts. Keeping the two together is deliberate: a peer that is
+/// registered but not counted, or counted but not registered, is a slot that
+/// either leaks or is invisible to `max_peers` (§13.8).
+#[derive(Clone)]
+pub struct PeerTable {
+    live: Arc<Mutex<HashMap<usize, PeerHandle>>>,
+    inbound: Arc<AtomicUsize>,
+}
+
+impl PeerTable {
+    pub fn new(live: Arc<Mutex<HashMap<usize, PeerHandle>>>, inbound: Arc<AtomicUsize>) -> Self {
+        Self { live, inbound }
+    }
+
+    /// Add a peer, counting an inbound slot for it if applicable.
+    pub fn register(&self, handle: PeerHandle) {
+        if !handle.is_outbound {
+            self.inbound.fetch_add(1, Ordering::Relaxed);
+        }
+        self.live.lock().unwrap().insert(handle.id, handle);
+    }
 }
 
 impl PeerHandle {
@@ -94,6 +131,30 @@ impl PeerHandle {
     /// Current misbehaviour ban score.
     pub fn ban_score(&self) -> u32 {
         self.ban_score.load(Ordering::Relaxed)
+    }
+
+    /// Whether this peer has been stopped.
+    ///
+    /// `stop()` is the only thing that sets this, and it sets it *before* it
+    /// touches the socket, so this flag is the first and most reliable signal
+    /// that a connection has been ended. Everything downstream is slower than
+    /// it: the reader thread has to notice the closed socket and the event loop
+    /// has to process the resulting `Disconnected`, neither of which is
+    /// guaranteed to happen promptly — or, on Windows, at all before the read
+    /// timeout expires.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Whether this peer's reader thread has finished.
+    ///
+    /// When it has, the `Disconnected` event is already on its way — the reader
+    /// sends it immediately after setting this — so everything that peer said is
+    /// ahead of that event in the queue and will be processed in order. A peer
+    /// that is stopped *and* still being read from is the case that cannot wait:
+    /// it has been ended, and its reader may not wake for a minute.
+    pub fn has_reader_exited(&self) -> bool {
+        self.reader_done.load(Ordering::Relaxed)
     }
 
     /// Add to the peer's ban score. If threshold is reached, disconnects.
@@ -294,6 +355,23 @@ fn generate_nonce() -> u64 {
 }
 
 /// Spawn peer read and write loops on an established TCP stream.
+///
+/// `live` is the node's peer table and this function registers the peer in it
+/// **before** the reader thread starts, rather than the caller doing it after
+/// this returns. Two things depend on that ordering and both are silent when it
+/// is wrong:
+///
+/// - A frame can be sitting in the socket buffer the moment the handshake
+///   finishes, so the reader thread can decode and queue a `Message` in the
+///   instant between `spawn_peer` returning and the caller's insert. The event
+///   loop could then see a message from a peer it does not know about.
+/// - The `Connected` event announces whatever the pool already holds. That runs
+///   on the event loop, so if the peer is registered a moment late the
+///   announcement is dropped and transactions pooled before the connection
+///   existed are never relayed to it — the exact case it was added for.
+///
+/// `inbound` is only incremented once the peer is actually registered, so a
+/// failed registration cannot leak an inbound slot (§13.8).
 pub fn spawn_peer(
     peer_id: usize,
     mut stream: TcpStream,
@@ -301,11 +379,13 @@ pub fn spawn_peer(
     is_outbound: bool,
     params: NetworkParams,
     event_tx: Sender<PeerEvent>,
+    table: PeerTable,
 ) -> NetResult<PeerHandle> {
     let remote_addr = stream.peer_addr()?;
     let (outbound_tx, outbound_rx): (Sender<Message>, Receiver<Message>) = channel();
     let ban_score = Arc::new(AtomicU32::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
+    let reader_done = Arc::new(AtomicBool::new(false));
     let socket = Arc::new(stream.try_clone()?);
 
     let handle = PeerHandle {
@@ -317,7 +397,12 @@ pub fn spawn_peer(
         ban_score: Arc::clone(&ban_score),
         stopped: Arc::clone(&stopped),
         socket: Arc::clone(&socket),
+        reader_done: Arc::clone(&reader_done),
     };
+
+    // Registered before either thread starts, so no event this peer produces can
+    // be observed by the event loop before the peer itself is known.
+    table.register(handle.clone());
 
     // Notify connected
     let _ = event_tx.send(PeerEvent::Connected {
@@ -347,6 +432,7 @@ pub fn spawn_peer(
                 Message::Block(_) => MessageType::Block as u8,
                 Message::GetBlocks { .. } => MessageType::GetBlocks as u8,
                 Message::Addr(_) => MessageType::Addr as u8,
+                Message::Tx(_) => MessageType::Tx as u8,
                 Message::Unknown { ty, .. } => *ty,
             };
             let payload = msg.encode();
@@ -359,6 +445,7 @@ pub fn spawn_peer(
 
     // Reader thread
     let read_stopped = Arc::clone(&stopped);
+    let read_done = Arc::clone(&reader_done);
     let read_ban = Arc::clone(&ban_score);
     let read_event_tx = event_tx;
     let auto_pong_tx = outbound_tx;
@@ -444,6 +531,10 @@ pub fn spawn_peer(
         }
 
         read_stopped.store(true, Ordering::Relaxed);
+        // Set before the event, so the event loop can distinguish "this reader is
+        // finished and its report is queued" from "this peer was ended and its
+        // reader is still parked".
+        read_done.store(true, Ordering::Relaxed);
         let _ = read_event_tx.send(PeerEvent::Disconnected {
             peer_id,
             reason: exit_reason,

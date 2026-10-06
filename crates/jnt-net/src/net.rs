@@ -14,13 +14,16 @@ use std::time::Duration;
 
 use jnt_core::chain::Chain;
 use jnt_core::hash::Hash;
+use jnt_core::mempool::{Mempool, MempoolError};
 use jnt_core::params::NetworkParams;
 
 use crate::error::{NetError, NetResult};
-use crate::msg::{InvEntry, Message, INV_TYPE_BLOCK};
+use crate::msg::{InvEntry, Message, INV_TYPE_BLOCK, INV_TYPE_TX, MAX_INV_PER_MSG};
 use crate::peer::{
-    perform_handshake, spawn_peer, HandshakeConfig, PeerEvent, PeerHandle, BAN_SCORE_THRESHOLD,
+    perform_handshake, spawn_peer, HandshakeConfig, PeerEvent, PeerHandle, PeerTable,
+    BAN_SCORE_THRESHOLD,
 };
+use crate::relay::RelayManager;
 use crate::syncer::{create_locator, find_fork_and_collect_inv, SyncManager, SyncResult};
 
 /// Score added to an address each time it exceeds an inbound bound.
@@ -110,6 +113,39 @@ impl P2pConfig {
     }
 }
 
+/// Everything a poll may mutate, as one borrow.
+///
+/// These four always travel together: every message handler needs the chain to
+/// validate against, the pool to admit into, the sync manager for blocks and the
+/// relay manager for transactions. Passing them as four separate arguments is
+/// what made `handle_message` an eight-parameter function whose signature had to
+/// be suppressed rather than fixed.
+///
+/// Grouping them also states the invariant the node depends on: all four are
+/// mutated by a single thread, so the pool can never be validated against a chain
+/// that another thread is moving underneath it.
+pub struct NodeState<'a> {
+    pub chain: &'a mut Chain,
+    pub pool: &'a mut Mempool,
+    pub syncer: &'a mut SyncManager,
+    pub relay: &'a mut RelayManager,
+}
+
+impl<'a> NodeState<'a> {
+    /// Reborrow for one call, so the caller keeps ownership of the state.
+    ///
+    /// Needed because the event loop hands the state to a handler inside a loop:
+    /// moving the fields out would compile exactly once.
+    pub fn reborrow(&mut self) -> NodeState<'_> {
+        NodeState {
+            chain: self.chain,
+            pool: self.pool,
+            syncer: self.syncer,
+            relay: self.relay,
+        }
+    }
+}
+
 /// The P2P network controller.
 pub struct P2pNode {
     config: P2pConfig,
@@ -141,6 +177,7 @@ impl P2pNode {
 
             let l_peers = Arc::clone(&peers);
             let l_inbound = Arc::clone(&inbound_count);
+            let l_table = PeerTable::new(Arc::clone(&peers), Arc::clone(&inbound_count));
             let l_running = Arc::clone(&running);
             let l_event_tx = event_tx.clone();
             let l_bans = Arc::clone(&ban_scores);
@@ -189,25 +226,21 @@ impl P2pNode {
 
                             peer_id_counter += 1;
                             let pid = peer_id_counter;
-                            let p_peers = Arc::clone(&l_peers);
-                            let p_inbound = Arc::clone(&l_inbound);
+                            let p_table = l_table.clone();
                             let p_event_tx = l_event_tx.clone();
                             let p_params = l_config.params.clone();
 
                             thread::spawn(move || {
                                 match perform_handshake(&mut stream, &hs_config, false) {
                                     Ok(ver) => {
-                                        // Only count the connection as inbound
-                                        // once the peer thread exists. Counting
-                                        // before `spawn_peer` leaked a slot
-                                        // whenever spawning failed, and inbound
-                                        // slots are the scarce resource (§13.8).
-                                        if let Ok(handle) = spawn_peer(
-                                            pid, stream, ver, false, p_params, p_event_tx,
-                                        ) {
-                                            p_inbound.fetch_add(1, Ordering::Relaxed);
-                                            p_peers.lock().unwrap().insert(pid, handle);
-                                        }
+                                        // `spawn_peer` registers the peer and
+                                        // counts the inbound slot itself, and it
+                                        // does both before starting the reader
+                                        // thread. Its comment explains why the
+                                        // ordering matters.
+                                        let _ = spawn_peer(
+                                            pid, stream, ver, false, p_params, p_event_tx, p_table,
+                                        );
                                     }
                                     Err(_) => {
                                         // Handshake failed or rejected
@@ -269,6 +302,7 @@ impl P2pNode {
             true,
             self.config.params.clone(),
             self.event_tx.clone(),
+            PeerTable::new(Arc::clone(&self.peers), Arc::clone(&self.inbound_count)),
         )?;
 
         // Send initial GETBLOCKS locator to sync with the new peer
@@ -278,7 +312,7 @@ impl P2pNode {
             stop: Hash::default(),
         });
 
-        self.peers.lock().unwrap().insert(peer_id, handle);
+        // `spawn_peer` already registered it, before its reader thread started.
         Ok(peer_id)
     }
 
@@ -304,15 +338,46 @@ impl P2pNode {
         );
     }
 
-    /// Process all pending network events against the chain and sync manager.
-    /// Returns the number of events processed.
-    pub fn poll_events(
-        &self,
-        chain: &mut Chain,
-        syncer: &mut SyncManager,
-        now_ms: Option<u64>,
-    ) -> usize {
+    /// Announce transaction ids to all peers except `exclude_peer` (§13.14).
+    ///
+    /// The caller is expected to have admitted these to its own pool first.
+    /// Announcing something the node did not accept would make it an amplifier
+    /// for data it knows to be invalid, which §13.14 forbids — so this function
+    /// deliberately takes txids rather than transactions: the only way to have a
+    /// txid is to have the transaction, and the only way to have a transaction
+    /// the node will relay is to have pooled it.
+    pub fn broadcast_tx(&self, txids: &[Hash], exclude_peer: Option<usize>) {
+        if txids.is_empty() {
+            return;
+        }
+        self.broadcast_inv(
+            txids
+                .iter()
+                .map(|h| InvEntry {
+                    kind: INV_TYPE_TX,
+                    hash: *h,
+                })
+                .collect(),
+            exclude_peer,
+        );
+    }
+
+    /// Process all pending network events against the chain, mempool and sync
+    /// manager. Returns the number of events processed.
+    ///
+    /// The mutable state is borrowed rather than owned by `P2pNode` for the same
+    /// reason `Chain` is: the mempool is validated against chain state, so all of
+    /// it has to be in the same hands to be consistent, and only the chain thread
+    /// mutates any of it. See [`NodeState`].
+    pub fn poll_events(&self, mut state: NodeState<'_>, now_ms: Option<u64>) -> usize {
         let mut count = 0;
+
+        // Peers stopped since the last call are released here rather than waiting
+        // for their reader thread to report the disconnect itself. See
+        // `swept_stopped_peers` for why that wait is not something to depend on.
+        for peer_id in self.swept_stopped_peers() {
+            self.release_peer(peer_id, state.syncer, state.relay);
+        }
 
         while let Ok(event) = self.event_rx.try_recv() {
             count += 1;
@@ -321,8 +386,8 @@ impl P2pNode {
                     peer_id, version, ..
                 } => {
                     // If the peer is ahead, ask for blocks
-                    if version.height > chain.height() {
-                        let locator = create_locator(chain);
+                    if version.height > state.chain.height() {
+                        let locator = create_locator(state.chain);
                         if let Some(peer) = self.peers.lock().unwrap().get(&peer_id) {
                             let _ = peer.send(Message::GetBlocks {
                                 locator,
@@ -330,36 +395,134 @@ impl P2pNode {
                             });
                         }
                     }
+                    // Announce what this node already holds. Without this, a
+                    // transaction pooled *before* this connection existed is
+                    // never relayed to it: `broadcast_tx` reaches the peers
+                    // connected at the time, and there were none. That is the
+                    // ordinary case for a node that has been running a while and
+                    // then gains a peer, so the pool would only ever propagate
+                    // transactions that happened to arrive after the last
+                    // connection.
+                    //
+                    // Bounded by `max_inv_per_msg` and by the pool's own size,
+                    // and the pool is already bounded by bytes.
+                    let entries: Vec<InvEntry> = state
+                        .pool
+                        .txids()
+                        .into_iter()
+                        .take(MAX_INV_PER_MSG)
+                        .map(|hash| InvEntry {
+                            kind: INV_TYPE_TX,
+                            hash,
+                        })
+                        .collect();
+                    if !entries.is_empty() {
+                        if let Some(peer) = self.peers.lock().unwrap().get(&peer_id) {
+                            let _ = peer.send(Message::Inv(entries));
+                        }
+                    }
                 }
                 PeerEvent::Disconnected { peer_id, .. } => {
                     // Release everything queued for / owed by that peer before
                     // dropping the handle, so its hashes can be served by
                     // another connection instead of stalling sync (§13.7).
-                    syncer.peer_disconnected(peer_id);
-                    let mut peers = self.peers.lock().unwrap();
-                    if let Some(p) = peers.remove(&peer_id) {
-                        if !p.is_outbound {
-                            self.inbound_count.fetch_sub(1, Ordering::Relaxed);
-                        }
-                    }
+                    self.release_peer(peer_id, state.syncer, state.relay);
                 }
                 PeerEvent::Message { peer_id, msg } => {
-                    self.handle_message(peer_id, msg, chain, syncer, now_ms);
+                    // A message from a peer the node no longer tracks is dropped:
+                    // it is work owed by a connection that no longer exists. This
+                    // is what stops a banned peer's already-queued frames from
+                    // still reaching the pool, the relay bookkeeping and the
+                    // chain, and it is the reason the sweep can release a stopped
+                    // peer without waiting for its reader.
+                    //
+                    // The test is membership, deliberately *not* the stop flag.
+                    // The flag is also set by the reader thread when a stream
+                    // simply ends, and a peer that closed cleanly can have
+                    // messages queued ahead of its disconnect report — including
+                    // a transaction it had already delivered. Rejecting those
+                    // would discard a valid transaction from an honest peer at
+                    // the moment it hung up. Membership has no such ambiguity: a
+                    // peer is registered before its reader thread starts (see
+                    // `spawn_peer`) and released only once the node has decided
+                    // the connection is over.
+                    if !self.peers.lock().unwrap().contains_key(&peer_id) {
+                        continue;
+                    }
+                    self.handle_message(peer_id, msg, state.reborrow(), now_ms);
                 }
             }
         }
 
+        // A peer can also be stopped by the messages just processed — that is
+        // what a ban is — and the caller should see the effect of one call, not
+        // have to make another.
+        for peer_id in self.swept_stopped_peers() {
+            self.release_peer(peer_id, state.syncer, state.relay);
+        }
+
         count
+    }
+
+    /// Release everything a peer owned and drop it from the live set.
+    ///
+    /// Shared by the reader thread's `Disconnected` event and the sweep for
+    /// stopped peers, so the two paths cannot drift apart. Idempotent: releasing
+    /// a peer that is already gone does nothing.
+    fn release_peer(&self, peer_id: usize, syncer: &mut SyncManager, relay: &mut RelayManager) {
+        syncer.peer_disconnected(peer_id);
+        relay.peer_disconnected(peer_id);
+        if let Some(p) = self.peers.lock().unwrap().remove(&peer_id) {
+            if !p.is_outbound {
+                self.inbound_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Peers that have been stopped but are still in the live set.
+    ///
+    /// `PeerHandle::stop()` shuts the socket down, but a reader thread parked in
+    /// a blocking read with a 60 s timeout does not reliably wake for that. On
+    /// Windows it demonstrably does not: a peer banned for ten invalid
+    /// transactions stayed in the peer table for the whole of a test that polled
+    /// for over a second, and its reader thread only returned at teardown. The
+    /// node is then left believing it has a peer it has already banned — the slot
+    /// counts against `max_peers`, broadcasts still queue for it, and nothing
+    /// releases the sync or relay state it owes. The sweep makes the removal
+    /// independent of a thread that may be asleep for a minute.
+    ///
+    /// The flag is the authority because `stop()` is the only thing that sets it,
+    /// and it is set before the socket is touched.
+    fn swept_stopped_peers(&self) -> Vec<usize> {
+        let peers = self.peers.lock().unwrap();
+        peers
+            .iter()
+            // Only peers that have been ended *and* whose reader has not reported
+            // it yet. Once the reader has finished, the `Disconnected` event is
+            // already queued behind everything else that peer sent, and releasing
+            // it here would jump that queue and drop its last messages.
+            .filter(|(_, p)| p.is_stopped() && !p.has_reader_exited())
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     fn handle_message(
         &self,
         peer_id: usize,
         msg: Message,
-        chain: &mut Chain,
-        syncer: &mut SyncManager,
+        state: NodeState<'_>,
         now_ms: Option<u64>,
     ) {
+        // Destructured rather than reached through `state.` at every use: the
+        // handlers below read the way they did before the state was grouped, and
+        // a reborrow of four fields is not worth rewriting two hundred lines of
+        // message handling to spell out.
+        let NodeState {
+            chain,
+            pool,
+            syncer,
+            relay,
+        } = state;
         match msg {
             Message::GetBlocks { locator, stop } => {
                 let inv = find_fork_and_collect_inv(chain, &locator, &stop);
@@ -371,15 +534,103 @@ impl P2pNode {
                 }
             }
             Message::Inv(entries) => {
-                let to_request = syncer.handle_inv(peer_id, &entries, chain);
+                // Blocks and transactions share `INV`, separated by `kind`
+                // (§13.5). Splitting here rather than teaching the sync manager
+                // about transactions keeps the two mechanisms independent: a
+                // change to relay policy cannot alter block sync.
+                let (block_entries, tx_entries): (Vec<InvEntry>, Vec<InvEntry>) =
+                    entries.into_iter().partition(|e| e.kind == INV_TYPE_BLOCK);
+                let to_request = syncer.handle_inv(peer_id, &block_entries, chain);
                 self.send_get_data(peer_id, to_request);
+                let tx_request = relay.handle_inv_tx(
+                    peer_id,
+                    &tx_entries,
+                    pool,
+                    now_ms.unwrap_or_else(crate::net::now_ms),
+                );
+                self.send_get_data(peer_id, tx_request);
             }
             Message::GetData(entries) => {
-                let blocks = syncer.handle_get_data(&entries, chain);
+                let (block_entries, tx_entries): (Vec<InvEntry>, Vec<InvEntry>) =
+                    entries.into_iter().partition(|e| e.kind == INV_TYPE_BLOCK);
+                let blocks = syncer.handle_get_data(&block_entries, chain);
+                // Bounded to one block's worth of transaction data: the request
+                // is capped by `max_inv_per_msg`, but without this the response
+                // would not be, and a peer could ask for 500 transactions and
+                // receive gigabytes (§13.14).
+                let txs =
+                    relay.handle_get_data_tx(&tx_entries, pool, self.config.params.max_block_bytes);
                 let peers = self.peers.lock().unwrap();
                 if let Some(peer) = peers.get(&peer_id) {
                     for b in blocks {
                         let _ = peer.send(Message::Block(Box::new(b)));
+                    }
+                    for t in txs {
+                        let _ = peer.send(Message::Tx(Box::new(t)));
+                    }
+                }
+            }
+            Message::Tx(tx) => {
+                // Rate limit before validating. Decoding already happened, but
+                // `check_tx` touches the whole UTXO set per input, so the
+                // expensive work is behind this gate.
+                let clock = now_ms.unwrap_or_else(crate::net::now_ms);
+                if !relay.allow_from(peer_id, clock) {
+                    // An inbound bound was exceeded, and §13.8 requires that this
+                    // *bans* rather than merely dropping: dropping alone leaves
+                    // the node doing the decoding work for every message.
+                    let peers = self.peers.lock().unwrap();
+                    if let Some(peer) = peers.get(&peer_id) {
+                        peer.add_ban_score(INBOUND_VIOLATION_SCORE);
+                    }
+                    return;
+                }
+
+                let tx = *tx;
+                let txid = tx.txid();
+                // Whether or not we accept it, the request slot is finished.
+                // Holding it would let a peer stall relay indefinitely by
+                // answering with junk.
+                relay.release(&txid);
+
+                let outcome = pool.add(
+                    tx,
+                    chain.utxo(),
+                    chain.height() + 1,
+                    chain.params(),
+                    chain.expected_base_fee_for_next_block(),
+                );
+                match outcome {
+                    Ok(_) => {
+                        relay.mark_known(txid);
+                        relay.note_accepted();
+                        self.broadcast_tx(&[txid], Some(peer_id));
+                    }
+                    // Normal, not misbehaviour: two peers relaying the same
+                    // transaction is what a network looks like.
+                    Err(MempoolError::AlreadyKnown) => relay.mark_known(txid),
+                    // Valid on its own terms; we disagree about price, or we
+                    // already hold the conflicting spend. §13.9 makes exactly
+                    // this argument about a block that fails validation: a peer
+                    // racing us to a fee update is honest, and banning it would
+                    // disconnect honest peers exactly when the network is busy.
+                    Err(MempoolError::Underpaid { .. })
+                    | Err(MempoolError::Conflict { .. })
+                    | Err(MempoolError::Full) => {
+                        relay.mark_known(txid);
+                        relay.note_refused();
+                    }
+                    // Fails `check_tx`, or cannot fit a block. +10, so repeated
+                    // abuse bans and a single honest race does not. Note this is
+                    // not a ban: a node that is behind on sync will legitimately
+                    // see spends of outputs it has not received yet.
+                    Err(MempoolError::Invalid(_)) | Err(MempoolError::Oversized { .. }) => {
+                        relay.mark_known(txid);
+                        relay.note_refused();
+                        let peers = self.peers.lock().unwrap();
+                        if let Some(peer) = peers.get(&peer_id) {
+                            peer.add_ban_score(10);
+                        }
                     }
                 }
             }

@@ -150,7 +150,6 @@ fn a_local_transaction_is_pooled_then_mined_and_evicted() {
     assert!(pool.is_empty(), "the pool kept a transaction it just mined");
     assert_eq!(pool.size_bytes(), 0, "byte accounting leaked");
 
-    chain.submit(block).unwrap();
     assert!(chain.utxo().get(&op).is_none(), "the spent input survived");
 }
 
@@ -277,7 +276,6 @@ fn a_malformed_transaction_cannot_stop_the_chain() {
     assert!(pool.is_empty(), "garbage reached the pool");
     let block = chain.mine_from_pool(&mut pool, addr(1), ts(13)).unwrap();
     assert_eq!(block.header.height, 13);
-    chain.submit(block).unwrap();
 }
 
 /// **The rule:** a full pool refuses new transactions instead of growing, and
@@ -327,7 +325,6 @@ fn a_full_pool_refuses_new_transactions_and_the_chain_still_mines() {
     let block = chain.mine_from_pool(&mut pool, addr(1), ts(41)).unwrap();
     assert_eq!(block.header.height, 41);
     assert!(block.txs.len() > 1, "the block should carry pooled work");
-    chain.submit(block).unwrap();
 }
 
 /// The degenerate case an operator sees after misconfiguring the cap: a pool too
@@ -349,7 +346,6 @@ fn a_degenerate_byte_cap_yields_empty_blocks_not_a_stall() {
 
     let block = chain.mine_from_pool(&mut pool, addr(1), ts(13)).unwrap();
     assert_eq!(block.txs.len(), 1, "coinbase only");
-    chain.submit(block).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +414,6 @@ fn a_reorg_returns_disconnected_transactions_to_the_pool() {
     admit(&chain, &mut pool, payment.clone()).unwrap();
     let main_block = chain.mine_from_pool(&mut pool, addr(1), ts(13)).unwrap();
     assert_eq!(main_block.header.height, 13);
-    chain.submit(main_block).unwrap();
     assert!(pool.is_empty(), "mine_from_pool must evict what it mined");
 
     // Rival branch: three empty blocks instead. Identical blocks to a peer's.
@@ -479,8 +474,9 @@ fn a_reorg_exposes_exactly_the_disconnected_transactions_once() {
     let mut pool = Mempool::default();
     let payment = signed_spend(&miner, op, value - FEE, addr(9));
     admit(&chain, &mut pool, payment.clone()).unwrap();
-    let main_block = chain.mine_from_pool(&mut pool, addr(1), ts(13)).unwrap();
-    chain.submit(main_block).unwrap();
+    // The block is submitted inside `mine_from_pool`; only the pool's response
+    // is under test here.
+    let _mined = chain.mine_from_pool(&mut pool, addr(1), ts(13)).unwrap();
 
     // Nothing is pending before a reorg, and an empty drain is empty rather
     // than a stale set from an earlier reorg.
@@ -523,8 +519,9 @@ fn a_reorg_that_consumed_the_input_refuses_the_readmission() {
     let mut pool = Mempool::default();
     let payment = signed_spend(&miner, op, value - FEE, addr(9));
     admit(&chain, &mut pool, payment.clone()).unwrap();
-    let main_block = chain.mine_from_pool(&mut pool, addr(1), ts(13)).unwrap();
-    chain.submit(main_block).unwrap();
+    // The block is submitted inside `mine_from_pool`; only the pool's response
+    // is under test here.
+    let _mined = chain.mine_from_pool(&mut pool, addr(1), ts(13)).unwrap();
 
     // Rival branch: its block 13 spends the *same* coinbase first.
     let rival_spend = signed_spend(&miner, op, value - FEE - 1, addr(7));

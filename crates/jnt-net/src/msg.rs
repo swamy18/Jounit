@@ -8,6 +8,7 @@
 use jnt_core::block::Block;
 use jnt_core::hash::Hash;
 use jnt_core::ser::{Reader, Writer};
+use jnt_core::tx::Transaction;
 
 use crate::error::{NetError, NetResult};
 
@@ -23,9 +24,13 @@ pub const MAX_HANDSHAKE_STR_LEN: usize = 64;
 pub const MAX_INV_PER_MSG: usize = 500;
 pub const MAX_LOCATOR_ENTRIES: usize = 500;
 
-/// `kind` values for inventory entries (§13.5). `0` reserved so transaction
-/// announcements can reuse `INV` later.
+/// `kind` values for inventory entries (§13.5).
+///
+/// `0` was reserved for transactions from the start (v0.2) precisely so that the
+/// announcement would need no wire change once a mempool existed. Transaction
+/// relay (§13.14) is the change that reservation was for.
 pub const INV_TYPE_BLOCK: u8 = 1;
+pub const INV_TYPE_TX: u8 = 0;
 
 /// Message type numbers. Frozen: unknown numbers are ignored, not rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +45,9 @@ pub enum MessageType {
     Block = 7,
     GetBlocks = 8,
     Addr = 9,
+    /// Added in v0.3 (§13.14). Additive: the freeze rule means a node built
+    /// before this existed ignores it rather than disconnecting.
+    Tx = 10,
 }
 
 impl MessageType {
@@ -54,6 +62,7 @@ impl MessageType {
             7 => MessageType::Block,
             8 => MessageType::GetBlocks,
             9 => MessageType::Addr,
+            10 => MessageType::Tx,
             _ => return None,
         })
     }
@@ -81,6 +90,9 @@ pub enum Message {
         stop: Hash,
     },
     Addr(Vec<SocketAddr>),
+    /// A relayed transaction (§13.14). Boxed because a transaction is by far the
+    /// largest variant and every `Message` is cloned once per peer on broadcast.
+    Tx(Box<Transaction>),
     /// An unknown type number — ignored, per the freeze rule. Retained only so
     /// tests can assert that unknown types are dropped without disconnect.
     Unknown {
@@ -179,6 +191,13 @@ impl Message {
                     w.u16le(a.port).fixed(&a.ip);
                 }
             }
+            Message::Tx(tx) => {
+                // No size check here: the frame layer bounded the payload at
+                // `MAX_FRAME_PAYLOAD` before this was ever parsed, and
+                // `Transaction::from_reader` bounds each count field before
+                // reserving for it.
+                w.raw(&tx.serialize());
+            }
             Message::Unknown { ty, raw } => {
                 w.u8(*ty)
                     .u32le(u32::try_from(raw.len()).unwrap_or(0))
@@ -206,6 +225,10 @@ impl Message {
                 stop: r.fixed()?,
             },
             Some(MessageType::Addr) => Message::Addr(decode_addr(&mut r)?),
+            Some(MessageType::Tx) => Message::Tx(Box::new(
+                Transaction::deserialize(payload)
+                    .map_err(|e| NetError::Decode(format!("tx deserialize: {e}")))?,
+            )),
             None => {
                 // Unknown: preserve the raw payload so callers can log it, but
                 // do not act on it. §13.5 freeze rule.
