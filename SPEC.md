@@ -1,10 +1,10 @@
 # JOUNIT PROTOCOL SPECIFICATION
 
 **Version:** 0.2 (foundation + P2P transport)
-**Status:** Draft — §0–§12 normative for `jnt-core` v0.1.x; §13 normative for `jnt-net` v0.2.x (**not yet implemented**)
+**Status:** Draft — §0–§12 normative for `jnt-core` v0.1.x; §13 normative for `jnt-net` v0.2.x; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today
 **Scope:** Layer 1 only (base layer). Layer 2 (useful work / Verified Work Certificates) is specced in `docs/roadmap.md`, not implemented here. §13 covers block relay between nodes; transaction relay is deferred (§13.13).
 
-This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. The four vector files covering §0–§12 exist today; `net_vectors.json` (§13.12) does not yet, because §13 is specified ahead of its implementation.
+This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
 
 ---
 
@@ -36,6 +36,15 @@ This document is the **normative reference**. Any implementation in any language
 | `DOM_W` | `jounit/puzzle/weights/v1` |
 | `DOM_GENESIS` | `jounit/genesis/v1` |
 | `DOM_NET_HANDSHAKE` | `jounit/net/handshake/v1` |
+
+Single-byte tags for the M3/M5 envelopes (§14). They are one byte rather than an
+ASCII string because they tag a fixed-shape payload, not a message family:
+
+| Tag | Value | Covers |
+|---|---|---|
+| `DOM_COMPUTE_TASK` | `0xC0` | §14.2 compute task |
+| `DOM_COMPUTE_ATTEST` | `0xC1` | §14.2 compute attestation |
+| `DOM_BLS_CHECKPOINT` | `0xB1` | §14.4 BLS checkpoint payload |
 
 ---
 
@@ -401,9 +410,9 @@ If a block reward would cross the cap, the coinbase collects the tips only and t
 
 ---
 
-## 8. Fees and burn
+## 8. Fees, burn and the PSCB split
 
-Per Sections 28.1 / 24.3: EIP-1559-shaped base fee that is **burned**; only the tip is paid to the miner. No new supply is minted from fees, so the cap can never be exceeded by usage.
+Per Sections 28.1 / 24.3: EIP-1559-shaped base fee. No new supply is minted from fees, so the cap can never be exceeded by usage.
 
 ```
 fee_total(block)   = Σ fee(tx)
@@ -412,7 +421,26 @@ tip_total          = fee_total − base_fee_total
 coinbase.value     = block_reward(height) + tip_total
 ```
 
-`base_fee_total` is burned (removed from the UTXO set, never reissued).
+**The base-fee portion is split 50/50 (M1, §14).** Half is burned — removed
+from the UTXO set and never reissued — and half accrues to the on-chain
+Protocol Security & Compute Buffer reserve:
+
+```
+pscb_credit(block) = base_fee_total / 2        // floor
+burned(block)      = base_fee_total − pscb     // == ceil(base_fee_total / 2)
+coinbase.value     = block_reward(height) + tip_total
+```
+
+The odd satoshi goes to `burned`, not to the reserve: a burn is irrecoverable,
+so conservative rounding on that side is the safe direction. Only the tip is
+paid to the miner, as before.
+
+`pscb_credit` is **reorg-correct**: it is credited per canonical block and
+subtracted again when that block is rolled back, so the reserve always equals
+the sum over the canonical chain. It does **not** count toward `supply_cap` —
+those satoshis are already destroyed for cap purposes; the reserve is a
+protocol-owned accounting claim on them, not new issuance. `verify_canonical_chain`
+re-derives it by replay and fails if it diverges.
 
 ```
 gas_per_tx  = 16 000 + 1 000 × input_count + 250 × output_count
@@ -524,6 +552,7 @@ The genesis block is **not** a premine: it contains zero value and no spendable 
 | `ser_vectors.json` | input / output / tx / header byte layouts | `UPDATE_SER_VECTORS=1 cargo test -p jnt-core` | `serialization_vectors_are_stable` |
 | `supply_vectors.json` | reward ladder, cumulative supply, cap invariant | `sim/supply_schedule_sim.py` | `a_supply_vector_file_exists_to_show_the_pattern`, `sim/verify_vectors.py` |
 | `difficulty_vectors.json` | LWMA next-difficulty, timestamp clamp behaviour | `UPDATE_DIFFICULTY_VECTORS=1 cargo test -p jnt-core` | `difficulty_vectors_are_stable` |
+| `net_vectors.json` | frame envelope, every `msg_type` payload, `VERSION` layout, locator construction (§13.12) | `UPDATE_NET_VECTORS=1 cargo test -p jnt-net` | `net_vectors_are_stable` |
 
 `sim/puzzle_crosscheck.py` is the important one: it re-derives every puzzle digest with `sim/jounit_reference.py`, a second implementation written from the prose of this document rather than from the Rust source. If the two disagree, the disagreement is in the spec, not in either implementation.
 
@@ -533,10 +562,12 @@ Regenerate and verify everything with `python sim/verify_vectors.py` (`--check` 
 
 ## 13. Peer-to-peer layer (v0.2)
 
-**Status: Draft. Not implemented.** This section is normative for the network layer
-and describes what `jnt-net` MUST do. It is written before the code, per the same
-discipline as §5: where the wire format is ambiguous, every implementation will
-disagree and the disagreement will look like a consensus split.
+**Status: implemented in `jnt-net`, with the two §13.10 MUSTs (incremental
+cumulative work, side-branch pruning) and the §13.8 resource bounds in place.**
+This section is normative for the network layer and describes what `jnt-net`
+MUST do. It was written before the code, per the same discipline as §5: where
+the wire format is ambiguous, every implementation will disagree and the
+disagreement will look like a consensus split.
 
 ### 13.0 What this section is, and is not
 
@@ -834,13 +865,25 @@ block** (`chain.rs`). One `submit` is therefore O(stored²), and side branches a
 retained forever, so the cost only grows. A peer submitting blocks turns this into
 a quadratic amplifier — the cheapest possible way to burn a node's CPU.
 
-1. **MUST (blocking):** maintain cumulative work incrementally per stored block,
-   computed once at insert as `parent_work + difficulty`. Fork choice becomes
-   O(stored) to scan and O(1) per block to score. This changes no consensus
-   outcome: the value is identical, since it is a sum along the same path.
-2. **MUST (blocking):** prune side branches. Retain blocks within
-   `finality_depth` of the tip plus a bounded orphan pool; drop the rest. Without
-   this, `stored` grows without bound regardless of item 1.
+1. **MUST (blocking), implemented:** maintain cumulative work incrementally per
+   stored block, computed once at insert as `parent_work + difficulty`. Fork
+   choice becomes O(stored) to scan and O(1) per block to score. This changes no
+   consensus outcome: the value is identical, since it is a sum along the same
+   path.
+2. **MUST (blocking), implemented:** prune side branches. Canonical history is
+   retained in full — undo records, `verify_canonical_chain` and persistence all
+   replay from genesis. Every **non-canonical** block at or below
+   `tip − finality_depth` is dropped, together with any stored descendant of a
+   dropped block (a block whose parent is gone cannot be walked to). Pruning runs
+   when the store exceeds `canon_len + 4 × finality_depth`.
+
+   This also settles a behaviour the rule was previously ambiguous about: a valid
+   branch that forks *below* the finality point used to be retained with its work
+   counted, so fork choice kept selecting it and the node refused honest blocks
+   until honest work caught up. Such a branch is now forgotten, and honest blocks
+   are accepted again. **§9.3 is unchanged** — a reorg whose fork point is at or
+   below the finality height is still refused with `ReorgWouldCrossFinality`. What
+   changes is only how long the node keeps a branch it was never going to follow.
 3. **SHOULD:** `adopt()` snapshots the whole UTXO set per reorg — O(chain length).
    The incremental undo primitives already exist (`ledger.rs`), so a reorg should
    unwind block by block. Not a DoS vector on its own: a reorg crossing
@@ -901,3 +944,90 @@ Listed so these are decisions rather than oversights:
 - **Compact blocks / BIP-152.** Later; the 500-hash `INV` path is adequate first.
 - **Genesis network discrimination.** Needs a consensus-breaking genesis change
   (§13.3); `network_magic` is the v0.2 workaround.
+
+---
+
+## 14. Protocol mechanisms (M1–M5)
+
+These are the mechanisms the design calls for by name. The table below is the
+authoritative statement of which are **consensus-active today** — meaning a
+node's validation or state machine depends on them — and which are defined
+data structures with no effect on consensus yet. The distinction is stated here
+because the alternative, a document that lists all five as shipped, hides the
+most important fact about them: **only M1 can change what a node accepts.**
+
+| # | Mechanism | Module | Consensus-active | § |
+|---|---|---|---|---|
+| M1 | 50/50 PSCB base-fee split | `fees.rs`, `chain.rs` | **Yes** — changes the UTXO set and therefore supply accounting | §8 |
+| M2 | Anti-collusion slash vault (50% burn + 50% linear vesting) | `slash.rs` | No — defined and tested, nothing creates a slash record yet | this section |
+| M3 | Hardware-agnostic compute IR + attestation envelope | `compute_ir.rs` | No — serialization and signing hashes only | this section |
+| M4 | Memory-bound HBM scratchpad PoW | `hbm_pow.rs` | No — an alternative puzzle body, not registered in the §5.1 registry | this section |
+| M5 | BLS12-381 aggregate finality gadget | `bls_checkpoint.rs` | No — `BlsVerifier` is a trait; only a mock implementation exists | this section |
+
+**Why M2–M5 are not wired in.** Each needs a rule that no spec currently
+states: what evidence proves a compute result fraudulent (M2), who is allowed to
+submit a compute task and how a result enters a block (M3), whether the HBM
+puzzle replaces or composes with the §5 puzzle and how difficulty maps onto it
+(M4), and who the validator set is and how a checkpoint is relayed (M5). M2 and
+M4 in particular would change consensus: a slash moves coins and an HBM stage
+changes what counts as valid work. Guessing those rules in code rather than in
+this document would have been the wrong order, so the modules exist, are tested
+against their stated invariants, and are documented as inactive.
+
+### 14.1 M2 — Anti-collusion slash vault
+
+On a proven-fraudulent compute result, a validator's stake splits:
+
+```
+burned     = stake / 2                        // destroyed, never reissued
+vest_total = stake − burned                   // == ceil(stake / 2)
+unlock     = slash_height + vesting_period
+```
+
+`vest_total` pays back to the *original* validator, `ceil(vest_total /
+vesting_period)` per block. Two properties are enforced: the split is exact
+(`burned + vest_total == stake`, no satoshi created or lost), and the final block
+releases the remainder, so total vested over the period equals `vest_total`
+exactly. Exhausted records are pruned, so the vault is bounded.
+
+Mainnet `vesting_period` = 52 560 blocks (365 days at 10-minute blocks); the
+mini profile uses 2 000.
+
+The burn is the part that carries the security argument: a colluding validator
+who slashes *themselves* recovers only the vesting half, and only by continuing
+honest work for a year.
+
+### 14.2 M3 — Compute IR and attestation
+
+A `ComputeTask` commits, under domain tag `0xC0`, to `task_id`, `worker_address`,
+`hardware_target`, `quantization_mode`, `input_hash`, `flop_count` and
+`deadline_block`. A `ComputeAttestation` commits under `0xC1` to that task hash
+plus a `result_hash`. Hardware targets (`Cuda`, `Rocm`, `Ane`, `Tpu`,
+`Photonic`, `Generic`) and quantization modes (`Int8`, `Fp16`, `Fp32`,
+`BFloat16`) are enumerated with explicit discriminants, so a future target is a
+new variant rather than a change to an existing encoding.
+
+### 14.3 M4 — Memory-bound HBM scratchpad PoW
+
+A proof of work stage whose cost is memory *latency* rather than arithmetic: a
+scratchpad of `lanes` cache lines (32 bytes each), seeded from the header hash,
+followed by `accesses` pseudorandom hops where the next lane index is derived
+from a SHA-256 output. Mainnet is 16 384 lanes (512 KiB) and 64 accesses.
+
+The security claim is that the access sequence cannot be precomputed without the
+header, so an ASIC cannot parallelise it and a cloud burst cannot amortise it.
+It is **not** registered as a `puzzle_id` in §5.1, so it validates nothing today.
+
+### 14.4 M5 — BLS aggregate finality
+
+`BlsPublicKey` (48-byte compressed G1) and `BlsSignature` (96-byte compressed
+G2) are typed wrappers, so a wrong-size key cannot be constructed. A
+`CheckpointPayload` commits under domain tag `0xB1` to epoch, height, block hash
+and validator-set hash. `ValidatorSet` sorts keys at construction, so its hash
+does not depend on insertion order. Quorum is `ceil(n × 2/3)`, and a signer set
+is carried as a bitmap of `n` bits. `BlsVerifier` is a trait so the pairing check
+can be swapped for a real implementation (`blst`) without touching the chain.
+
+**It is a mock today.** `MockBls` accepts any non-zero signature, so no code path
+in this repository performs a pairing, and no absolute-finality guarantee is in
+force. Treat §14.4 as a specification of an envelope, not of a working gadget.

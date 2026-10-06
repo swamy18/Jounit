@@ -971,3 +971,464 @@ runner (rustc 1.99).
 - Layer 2: Verified Work Certificates (the project's actual useful-work premise — specced, not built).
 - `cargo-fuzz` harness (red-team tests are the seed corpus, not yet a fuzz loop).
 - LICENSE file (Cargo.toml declares MIT OR Apache-2.0 but no file exists).
+---
+
+# Working memory — session 5: full integration audit
+
+**Date:** 2026-10-06
+**Branch:** `main`, clean at start (5 commits from session 4).
+**Scope:** the user asked for an autonomous review of everything shipped in
+sessions 1–4 — "is it complete, connected, working?" — then fix, verify, record,
+commit and push.
+**Outcome:** 15 real defects found and fixed, 3 of them serious. 219 tests pass
+(was 207). Committed and pushed.
+
+---
+
+## 23. The headline finding
+
+**Sessions 1–4 tested `SyncManager` directly. Nothing ever ran `P2pNode`.**
+
+Every `jnt-net` test constructed a `SyncManager` and called `handle_block` /
+`handle_inv` by hand. The event loop, the peer threads, the framing on a live
+socket, and the continuation between sync batches were never executed by a test.
+So when I wrote the first end-to-end test — two real `P2pNode`s, a real
+listener, a real connection — it failed immediately, and fixing it uncovered a
+chain of further defects.
+
+This is the same lesson as session 1's `first_seen` fork-choice bug and session 2's
+genesis collision: **the untested path is where the bugs are.** The difference is
+that this time the gap was in my own test strategy rather than in a rule the
+specification had already stated. §13.7 says the requester `GETDATA`s "in
+batches of 16, submits each, **and repeats**". The code did not repeat. The spec
+was right, the code was wrong, and no test could see it because the test never
+crossed the boundary where the repetition is supposed to happen.
+
+## 24. Defects fixed, ordered by severity
+
+### 24.1 Sync stopped after one batch — `syncer.rs`
+
+`handle_inv` returned the first `SYNC_BATCH_SIZE` (16) entries of an `INV` and
+**discarded the rest**. Worse, it had already inserted all of them into the
+`requested` set, so the discarded entries were also marked as in-flight: lost
+*and* poisoned. Nothing ever asked for the next batch. A node more than 16
+blocks behind could never finish syncing — the `serve` command was decorative.
+
+Fix: every advertised hash goes into a bounded `pending` queue; each applied
+block frees a request slot and `take_batch` refills it. `net.rs` calls
+`take_batch` after every `BLOCK`.
+
+### 24.2 A disconnecting peer could stall sync forever
+
+`requested` was a `HashSet<Hash>` with no owner and no release path. A peer that
+advertised 500 hashes and hung up left all 500 marked as requested, so no later
+peer advertising the same blocks was ever asked for them. Silent, permanent, and
+free to trigger.
+
+Fix: `requested: HashMap<Hash, peer_id>`, plus `peer_disconnected(peer_id)`,
+called from `poll_events`. Tests: `a_disconnect_releases_the_disconnected_peers_requests`.
+
+### 24.3 The `requested` set grew without bound
+
+§13.11 invariant 6 — "MUST NOT grow any bounded structure past §13.8" — was
+violated by the simplest possible attack: advertise hashes, never deliver them.
+Now capped at `MAX_IN_FLIGHT` (64), with `MAX_PENDING_INV` (2000) queued.
+Test: `a_peer_that_never_delivers_cannot_grow_state_without_bound` (200 max-size
+`INV`s, nothing delivered).
+
+### 24.4 Every inbound connection failed on Windows
+
+The listener is non-blocking so `accept` can poll. On Windows an accepted socket
+**inherits** `WSA_FLAG_NON_BLOCKED`, so the blocking, timeout-based handshake
+immediately returned `WouldBlock` and the peer was dropped with
+`ConnectionAborted`. `jnt-node serve` could not accept a single connection on
+Windows — the platform this repo is developed on.
+
+Every prior test used a plain blocking `TcpListener` and passed. Only a test that
+went through `P2pNode::start` with a listener could see it.
+
+Fix: `stream.set_nonblocking(false)` immediately after `accept`.
+
+### 24.5 `stop()` did not disconnect
+
+`PeerHandle::stop` set a flag. The reader thread stayed blocked in `read_frame`
+for up to 60 s, still holding a thread and still able to emit events for a peer
+the node believed it had dropped — including a peer just banned for a framing
+violation. Fix: the handle keeps an `Arc<TcpStream>` and calls
+`shutdown(Both)`.
+
+### 24.6 `max_peers` was never enforced
+
+§13.8 bounds it as the cap on thread and descriptor count. Only `max_inbound` was
+checked, and only on the accept path. A node could dial as many outbound peers as
+it had addresses. Now enforced on `connect` (new `NetError::Resource`) and on
+accept, alongside `max_inbound`.
+
+### 24.7 Exceeding an inbound bound disconnected instead of banned
+
+§13.8 says it bans. There was no ban list at all — v0.2 has no address book
+(§13.6), so nothing remembered an address. Added a bounded, address-keyed score
+table with §13.9's 1-per-hour decay, `+20` per violation, refusing banned
+addresses at accept.
+
+### 24.8 The handshake nonce was the wall clock
+
+`generate_nonce` was `SystemTime::now() ^ constant`. §13.4 calls the nonce
+"proof of possession of the socket", and a nonce a peer can estimate from block
+timestamps is not a challenge — it makes the replay the nonce exists to defeat
+easier, not harder. Now mixes an OS-seeded `RandomState` key with a counter.
+This is the weakest possible substitute for a node key, and §13.4 already says
+so; the point was only that it should not be *predictable*.
+
+### 24.9 `mine_block_with`'s attempt cap guarded nothing
+
+`max_attempts` was applied by a **second** mining loop in `mine_block_with` that
+only ran after `build_block`'s own unbounded loop had finished. Asking for 3
+attempts at difficulty 2^64 did not fail fast — it ran effectively forever. The
+doc comment claimed "a mis-set difficulty or a hostile retarget cannot hang a node
+forever", which was false.
+
+Fix: the budget is enforced in the loop that does the work; `mine_block_with` now
+just forwards it. The regression test does not fail on the old code, it *hangs*,
+which is the defect.
+
+### 24.10 Side branches were never pruned — §13.10 item 2
+
+The last unimplemented MUST in the spec, and the cause of the "finality wedge"
+that sessions 1, 3 and 4 all recorded as an open design question. A valid branch
+forking below `finality_depth` was retained with its work counted, so fork choice
+kept selecting it and honest blocks were refused until honest work caught up. A
+peer could stall a node's progress at no cost to itself.
+
+Fix: prune every **non-canonical** block at or below `tip − finality_depth`,
+plus any stored descendant of a dropped block (a block whose parent is gone
+cannot be walked to by `path_to`). Canonical history is retained in full —
+`undo`, `verify_canonical_chain` and persistence all replay from genesis.
+
+**This is the decision I flagged rather than made silently.** §9.3 is unchanged:
+a reorg whose fork point is at or below the finality height is still refused, and
+both finality regression tests still pass. What changed is only how long the node
+remembers a branch it was never going to follow. SPEC.md §13.10 item 2 now says so
+explicitly, and `docs/status.md` records the supersession.
+
+### 24.11 `jnt-node serve` threw away everything it synced
+
+It persisted only on its own mining path. Blocks that arrived from peers were
+applied in memory and never written — a node that synchronised 500 blocks saved
+none of them, and a restart replayed genesis and discarded the whole sync. It
+also looped with no delay at all: mining as fast as the CPU allowed, rewriting
+the entire `blocks.json` each time (O(n) per block), with almost nothing left for
+`poll_events`. Now saves whenever `poll_events` changed the height, and paces the
+loop with `--interval` (default 250 ms).
+
+### 24.12 `verify` could not see an M1 bug
+
+`verify_canonical_chain` compared canon, UTXO length and UTXO value. M1 added
+`pscb_reserve` and `pscb_undo`, which are live state and are rewound on reorg —
+and which the node's own verifier could not see. Now both are re-derived by replay.
+Test: `the_pscb_reserve_is_rewound_exactly_on_reorg`.
+
+### 24.13 Smaller
+
+- The locator could return 501 entries: genesis was appended on top of an
+  already-full locator. §13.8's `max_locator_len` is now reserved for.
+- Orphan eviction picked an arbitrary hash-map key, so which orphans survived
+  depended on iteration order. Now oldest-first, tracked in a `VecDeque`.
+- An invalid inbound block is a framing violation
+---
+
+# Working memory — session 5: full integration audit
+
+**Date:** 2026-10-06
+**Branch:** `main`, clean at start (5 commits from session 4).
+**Scope:** the user asked for an autonomous review of everything shipped in
+sessions 1–4 — "is it complete, connected, working?" — then fix, verify, record,
+commit and push.
+**Outcome:** 15 real defects found and fixed, 3 of them serious. 219 tests pass
+(was 207). Committed and pushed.
+
+---
+
+## 23. The headline finding
+
+**Sessions 1–4 tested `SyncManager` directly. Nothing ever ran `P2pNode`.**
+
+Every `jnt-net` test constructed a `SyncManager` and called `handle_block` /
+`handle_inv` by hand. The event loop, the peer threads, the framing on a live
+socket, and the continuation between sync batches were never executed by a test.
+So when I wrote the first end-to-end test — two real `P2pNode`s, a real
+listener, a real connection — it failed immediately, and fixing it uncovered a
+chain of further defects.
+
+This is the same lesson as session 1's `first_seen` fork-choice bug and session
+2's genesis collision: **the untested path is where the bugs are.** The
+difference is that this time the gap was in the test strategy rather than in a
+rule the specification had already stated. §13.7 says the requester `GETDATA`s
+"in batches of 16, submits each, **and repeats**". The code did not repeat. The
+spec was right, the code was wrong, and no test could see it because the test
+never crossed the boundary where the repetition is supposed to happen.
+
+## 24. Defects fixed, ordered by severity
+
+### 24.1 Sync stopped after one batch — `syncer.rs`
+
+`handle_inv` returned the first `SYNC_BATCH_SIZE` (16) entries of an `INV` and
+**discarded the rest**. Worse, it had already inserted all of them into the
+`requested` set, so the discarded entries were also marked as in-flight: lost
+*and* poisoned. Nothing ever asked for the next batch. A node more than 16
+blocks behind could never finish syncing — the `serve` command was decorative.
+
+Fix: every advertised hash goes into a bounded `pending` queue; each applied
+block frees a request slot and `take_batch` refills it. `net.rs` calls
+`take_batch` after every `BLOCK`.
+
+### 24.2 A disconnecting peer could stall sync forever
+
+`requested` was a `HashSet<Hash>` with no owner and no release path. A peer that
+advertised 500 hashes and hung up left all 500 marked as requested, so no later
+peer advertising the same blocks was ever asked for them. Silent, permanent, and
+free to trigger.
+
+Fix: `requested: HashMap<Hash, peer_id>`, plus `peer_disconnected(peer_id)`,
+called from `poll_events`. Test:
+`a_disconnect_releases_the_disconnected_peers_requests`.
+
+### 24.3 The `requested` set grew without bound
+
+§13.11 invariant 6 — "MUST NOT grow any bounded structure past §13.8" — was
+violated by the simplest possible attack: advertise hashes, never deliver them.
+Now capped at `MAX_IN_FLIGHT` (64), with `MAX_PENDING_INV` (2000) queued.
+Test: `a_peer_that_never_delivers_cannot_grow_state_without_bound` (200
+max-size `INV`s, nothing delivered).
+
+### 24.4 Every inbound connection failed on Windows
+
+The listener is non-blocking so `accept` can poll. On Windows an accepted socket
+**inherits** `WSA_FLAG_NON_BLOCKED`, so the blocking, timeout-based handshake
+immediately returned `WouldBlock` and the peer was dropped with
+`ConnectionAborted`. `jnt-node serve` could not accept a single connection on
+Windows — the platform this repo is developed on.
+
+Every prior test used a plain blocking `TcpListener` and passed. Only a test that
+went through `P2pNode::start` with a listener could see it.
+
+Fix: `stream.set_nonblocking(false)` immediately after `accept`.
+
+### 24.5 `stop()` did not disconnect
+
+`PeerHandle::stop` set a flag. The reader thread stayed blocked in `read_frame`
+for up to 60 s, still holding a thread and still able to emit events for a peer
+the node believed it had dropped — including a peer just banned for a framing
+violation. Fix: the handle keeps an `Arc<TcpStream>` and calls `shutdown(Both)`.
+
+### 24.6 `max_peers` was never enforced
+
+§13.8 bounds it as the cap on thread and descriptor count. Only `max_inbound` was
+checked, and only on the accept path. A node could dial as many outbound peers as
+it had addresses. Now enforced on `connect` (new `NetError::Resource`) and on
+accept, alongside `max_inbound`.
+
+### 24.7 Exceeding an inbound bound disconnected instead of banned
+
+§13.8 says it bans. There was no ban list at all — v0.2 has no address book
+(§13.6), so nothing remembered an address. Added a bounded, address-keyed score
+table with §13.9's 1-per-hour decay, `+20` per violation, refusing banned
+addresses at accept.
+
+### 24.8 The handshake nonce was the wall clock
+
+`generate_nonce` was `SystemTime::now() ^ constant`. §13.4 calls the nonce
+"proof of possession of the socket", and a nonce a peer can estimate from block
+timestamps is not a challenge — it makes the replay the nonce exists to defeat
+easier, not harder. Now mixes an OS-seeded `RandomState` key with a counter.
+This is the weakest possible substitute for a node key, and §13.4 already says
+so; the point was only that it should not be *predictable*.
+
+### 24.9 `mine_block_with`'s attempt cap guarded nothing
+
+`max_attempts` was applied by a **second** mining loop in `mine_block_with` that
+only ran after `build_block`'s own unbounded loop had finished. Asking for 3
+attempts at difficulty 2^64 did not fail fast — it ran effectively forever. The
+doc comment claimed "a mis-set difficulty or a hostile retarget cannot hang a
+node forever", which was false.
+
+Fix: the budget is enforced in the loop that does the work; `mine_block_with` now
+just forwards it. The regression test does not fail on the old code, it *hangs*,
+which is the defect.
+
+### 24.10 Side branches were never pruned — §13.10 item 2
+
+The last unimplemented MUST in the spec, and the cause of the "finality wedge"
+that sessions 1, 3 and 4 all recorded as an open design question. A valid branch
+forking below `finality_depth` was retained with its work counted, so fork choice
+kept selecting it and honest blocks were refused until honest work caught up. A
+peer could stall a node's progress at no cost to itself.
+
+Fix: prune every **non-canonical** block at or below `tip − finality_depth`,
+plus any stored descendant of a dropped block (a block whose parent is gone
+cannot be walked to by `path_to`). Canonical history is retained in full —
+`undo`, `verify_canonical_chain` and persistence all replay from genesis.
+
+**This is the decision I flagged rather than made silently.** §9.3 is unchanged:
+a reorg whose fork point is at or below the finality height is still refused, and
+both finality regression tests still pass. What changed is only how long the node
+remembers a branch it was never going to follow. SPEC.md §13.10 item 2 now says so
+explicitly, and `docs/status.md` records the supersession.
+
+### 24.11 `jnt-node serve` threw away everything it synced
+
+It persisted only on its own mining path. Blocks that arrived from peers were
+applied in memory and never written — a node that synchronised 500 blocks saved
+none of them, and a restart replayed genesis and discarded the whole sync. It
+also looped with no delay at all: mining as fast as the CPU allowed, rewriting
+the entire `blocks.json` each time (O(n) per block), with almost nothing left for
+`poll_events`. Now saves whenever `poll_events` changed the height, and paces the
+loop with `--interval` (default 250 ms).
+
+### 24.12 `verify` could not see an M1 bug
+
+`verify_canonical_chain` compared canon, UTXO length and UTXO value. M1 added
+`pscb_reserve` and `pscb_undo`, which are live state and are rewound on reorg —
+and which the node's own verifier could not see. Now both are re-derived by
+replay. Test: `the_pscb_reserve_is_rewound_exactly_on_reorg`.
+
+### 24.13 Smaller
+
+- The locator could return 501 entries: genesis was appended on top of an
+  already-full locator. §13.8's `max_locator_len` is now reserved for.
+- Orphan eviction picked an arbitrary hash-map key, so which orphans survived
+  depended on iteration order. Now oldest-first, tracked in a `VecDeque`.
+- An oversized frame or post-handshake bad magic is scored `+100` per §13.9 and
+  was only a disconnect: a peer could probe the framing bounds for free and
+  reconnect.
+- No `PING` keepalive, so a half-open TCP connection held a thread forever and
+  §13.9's "unresponsive to PING" row was unimplemented. The reader now pings on
+  the first 60 s timeout and scores `+10` on the second.
+- `inbound_count` was incremented before `spawn_peer` could fail, leaking the
+  scarce inbound slot.
+- `chain.rs`'s module doc still described the fork-choice tie-break as
+  "first-seen order" — the arrival-counter bug session 1 fixed. Two sessions
+  recorded it as "noticed but not touched". It is a comment that misdescribes a
+  consensus rule, which is worse than no comment, so it is fixed.
+
+## 25. Documentation that was wrong, not merely stale
+
+- **SPEC.md §8 contradicted the code.** It said the base fee is burned in full;
+  M1 had been splitting it 50/50 to the PSCB since session 4. This is the most
+  consequential doc defect in the repository: the normative spec did not describe
+  the consensus rule. §8 now states the split, the odd-satoshi rounding, and the
+  reorg-correctness requirement.
+- **SPEC.md's header said §13 was "not yet implemented"** and
+  `net_vectors.json` did not exist. §13 is implemented, both blocking MUSTs are
+  in, and the vectors now exist.
+- **README listed all five mechanisms as shipped.** M2–M5 are complete, tested,
+  self-consistent modules with **no effect on consensus**. `lib.rs` pointed at
+  "SPEC.md §M1–§M5" — sections that did not exist. New §14 gives each mechanism a
+  spec section and a status, and states why M2–M5 are inactive: each needs a rule
+  this repo has not specified (what proves a compute result fraudulent, how a
+  task enters a block, whether HBM replaces or composes with the §5 puzzle, who
+  the validator set is). M2 and M4 would change consensus. I did not invent those
+  rules.
+- **`main.rs`'s module doc said "There is no P2P layer yet"** — directly above a
+  `serve` command that runs it.
+- README claimed `VESTING_BLOCKS_MINI` was 1 000. It is 2 000.
+
+## 26. What I added
+
+- **`tests/vectors/net_vectors.json`** + `crates/jnt-net/tests/net_vectors.rs`:
+  the §13.12 wire-format vectors, which §12 said did not exist because §13 was
+  specced ahead of its implementation. Round-trip tests only prove a codec agrees
+  with itself; a field-order change would pass every one of them and break every
+  deployed peer. The file pins the bytes, and the test restates the §13.5 layout
+  as independent scalars so a file regenerated from wrong code cannot pass.
+  *Honest limitation:* there is no second implementation for the wire format, the
+  way `sim/jounit_reference.py` re-derives §5. That check is still owed, and the
+  vector file says so in its own `note` field.
+- **`a_node_syncs_a_peer_over_real_sockets`** — the test whose absence hid §24.1
+  through §24.4.
+- Two red-team tests (`side_branches_beyond_the_finality_window_are_pruned`,
+  `a_mining_attempt_cap_cannot_be_bypassed`), one chain test
+  (`the_pscb_reserve_is_rewound_exactly_on_reorg`), four syncer tests, one
+  peer-limit test, and `invalid_blocks_never_enter_the_store` strengthened — it
+  previously checked only the height, while §13.11 invariant 5 names the block
+  store *and* cumulative work, so it passed against code that retained the block
+  and banked its difficulty.
+
+## 27. Mistakes I made this session
+
+- **I nearly "fixed" a test instead of reading the failure.** My first
+  `the_pscb_reserve_is_rewound_exactly_on_reorg` asserted `pscb == fee / 2`. It
+  failed (207 000 vs 600 500) and I checked whether the code was wrong. The code
+  was right: PSCB is 50% of the *base-fee portion*, not of the whole fee — the
+  tip belongs to the miner. My assertion was wrong.
+- **Two index-based assertions in the vector test.** `v["facts"][2]` was
+  `verack_len`, not the `VERSION` length, and I then miscounted
+  `"jounit/mainnet"` as 13 characters instead of 14. Both were caught because I
+  asserted against literals rather than a computed layout. I replaced them with
+  a computed `FIXED` constant so the next field-count change breaks loudly
+  instead of silently.
+- **A clumsy double `P2pNode::start`** in the first draft of the socket test,
+  left in the file for one iteration. Cosmetic, but it read as a misunderstanding
+  of the type.
+- **I nearly shipped the pruning decision silently.** It closes a question three
+  earlier sessions deliberately left open. It is specced as a blocking MUST, so
+  implementing it is following the spec rather than making a consensus call — but
+  "the spec said so" is exactly the reasoning that hides a decision, so it is
+  written down in three places (SPEC.md §13.10 item 2, `docs/status.md`, and here)
+  with the before/after behaviour spelled out.
+
+## 28. Verification
+
+Exit status preserved on every check, not inferred from a filter:
+
+```
+cargo fmt --all --check                                       exit 0
+RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets  exit 0
+cargo test --workspace                                        exit 0   219 tests
+  jnt-core lib          179
+  jnt-core redteam       11
+  jnt-net lib            15
+  jnt-net integration    12
+  jnt-net vectors         2
+cargo build --workspace --release                             exit 0
+python sim/verify_vectors.py --check                          exit 0
+python sim/puzzle_crosscheck.py                               exit 0
+python sim/supply_schedule_sim.py                            exit 0
+python sim/difficulty_attack_sim.py                           exit 0
+```
+
+**`tests/vectors/` and `sim/` are unchanged** — `git status` shows only the new
+`net_vectors.json`. Nothing I touched affects hashing, the PoW puzzle, the
+retarget or serialization layout, and both independent Python implementations
+still agree byte-for-byte with Rust. That is the evidence these were
+state/transport-layer fixes rather than consensus-breaking ones.
+
+**CLI end to end**, release build, `mini` profile: `init → mine 20 → status →
+verify (21 blocks replayed, UTXO + supply + PSCB match) → export → show-block`,
+all exit 0.
+
+**Two real `serve` processes**: node A mined 6 blocks and listened; node B
+dialed, handshook, mined 3 blocks of its own, then adopted A's heavier branch
+(reorg 3 → 15) and kept relaying — both reaching ~83 blocks. Both data
+directories then passed `verify` against a from-genesis replay, which also
+confirms §24.11: B's relayed blocks were on disk, which they would not have been
+before.
+
+## 29. Current state
+
+219 tests, CI-equivalent checks green, committed and pushed.
+
+**Still open, and none of it is a bug:**
+
+- Real BLS pairing verification (`blst`). `MockBls` accepts any non-zero
+  signature, so no absolute-finality guarantee is in force.
+- M2–M5 wired into consensus. Each needs a specification, and two of them are
+  consensus changes.
+- Persistence: `blocks.json` is still rewritten in full whenever the chain
+  changes (§13.10 item 4), and state is still replayed from genesis on load.
+  `serve` is a block relay, not a database.
+- Mempool and transaction relay (§13.13), headers-first sync, compact blocks.
+- A second implementation of the wire format to cross-check `net_vectors.json`
+  against, the way `sim/jounit_reference.py` does for §5.
+- `cargo-fuzz`. The red-team suite and the net vectors are the seed corpus.
+- LICENSE file. `Cargo.toml` declares MIT OR Apache-2.0; no file exists.

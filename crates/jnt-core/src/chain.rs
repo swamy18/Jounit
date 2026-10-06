@@ -2,8 +2,11 @@
 //! SPEC.md §9.
 //!
 //! Fork choice is heaviest cumulative difficulty. Selection is deterministic:
-//! ties break on lower height, then on first-seen order, so two nodes holding the
-//! same set of valid blocks always agree on the tip.
+//! ties break on lower height, then on the lowest block hash, so two nodes
+//! holding the same set of valid blocks always agree on the tip. (An earlier
+//! version of this comment claimed a first-seen tie-break; that was the arrival
+//! counter bug, since fixed — the comment outlived the code and misdescribed a
+//! consensus rule, which is worse than no comment at all.)
 
 use std::collections::HashMap;
 
@@ -146,6 +149,14 @@ impl Chain {
     /// Height below which history is immutable.
     pub fn finalized_height(&self) -> u64 {
         self.height().saturating_sub(self.params.finality_depth)
+    }
+
+    /// Store size above which side-branch pruning runs. Sized off the finality
+    /// window so a healthy chain never trips it, and off the canonical length
+    /// so a node with real history still has room for a live fork.
+    fn prune_threshold(&self) -> usize {
+        let window = (self.params.finality_depth as usize).saturating_mul(4);
+        (self.canon.len() + window).max(64)
     }
 
     /// `timestamps` of the previous `n` blocks, newest first (index 0 = tip).
@@ -619,6 +630,12 @@ impl Chain {
                 self.work.remove(&hash);
             }
         }
+        // Side branches outside the finality window are useless to us and
+        // unbounded in supply (SPEC.md §13.10 item 2). Prune on a threshold so
+        // the cost is amortised rather than paid per block.
+        if self.blocks.len() > self.prune_threshold() {
+            self.prune_side_branches();
+        }
         outcome
     }
 
@@ -697,6 +714,7 @@ impl Chain {
         body: Vec<Transaction>,
         now_ms: u64,
         difficulty_override: Option<u128>,
+        max_attempts: u64,
     ) -> Result<Block> {
         let parent = self.tip().clone();
         let parent_hash = parent.block_hash();
@@ -771,7 +789,12 @@ impl Chain {
         };
 
         let mut nonce = 0u64;
-        loop {
+        // The attempt budget is enforced here, in the loop that actually does
+        // the work. It used to be applied only by the second loop in
+        // `mine_block_with`, which is unreachable until this one has already
+        // finished: a hostile retarget or a mis-set difficulty therefore hung
+        // the node regardless of the cap its caller had asked for.
+        for _ in 0..max_attempts {
             header.nonce = nonce;
             if self.solver.satisfies(&header)? {
                 return Ok(Block {
@@ -783,6 +806,16 @@ impl Chain {
             }
             nonce = nonce.wrapping_add(1);
         }
+        let unmined = Block {
+            header,
+            signature: [0u8; 64],
+            signer_pubkey: [0u8; 33],
+            txs,
+        };
+        Err(Error::PowInvalid {
+            hash: crate::hash::hash_to_hex(&unmined.block_hash()),
+            difficulty: unmined.header.difficulty,
+        })
     }
 
     /// Mine the next block on top of the tip.
@@ -806,28 +839,96 @@ impl Chain {
         difficulty_override: Option<u128>,
         max_attempts: u64,
     ) -> Result<Block> {
-        let block = self.build_block(miner_address, body, now_ms, difficulty_override)?;
-        let mut header = block.header.clone();
-        let mut nonce = header.nonce;
-        for _ in 0..max_attempts {
-            header.nonce = nonce;
-            if self.solver.satisfies(&header)? {
-                let mut mined = block.clone();
-                mined.header = header;
-                return Ok(mined);
-            }
-            nonce = nonce.wrapping_add(1);
-        }
-        Err(Error::PowInvalid {
-            hash: crate::hash::hash_to_hex(&block.block_hash()),
-            difficulty: block.header.difficulty,
-        })
+        self.build_block(
+            miner_address,
+            body,
+            now_ms,
+            difficulty_override,
+            max_attempts,
+        )
     }
 
     /// Cumulative difficulty of the canonical chain. This is what fork choice
     /// compares, so it is also the honest measure of "heavier".
     pub fn total_work(&self) -> u128 {
         self.cumulative_work(&self.tip_hash())
+    }
+
+    /// Number of blocks in the store, canonical and side branch alike.
+    pub fn stored_block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Drop side branches the node can no longer act on. SPEC.md §13.10 item 2.
+    ///
+    /// Canonical history is kept in full: undo records, `verify_canonical_chain`
+    /// and the persistence layer all replay from genesis, and history below the
+    /// tip is the node's own, not a peer's. What is dropped is every
+    /// **non-canonical** block at or below `tip − finality_depth`, plus any
+    /// stored descendant of a dropped block, since a block whose parent is gone
+    /// cannot be applied or walked to (`path_to` would fail).
+    ///
+    /// This closes the growth vector §13.10 item 2 exists for: a peer could
+    /// submit an unbounded number of valid side blocks, each retained forever,
+    /// with no work of its own. It also resolves a long-standing behaviour
+    /// question — see `docs/status.md`: a branch that forked *below* the
+    /// finality point used to be retained with its work counted, so fork choice
+    /// kept selecting it and honest blocks were refused until honest work caught
+    /// up. Once forgotten, the node accepts honest blocks again. The §9.3
+    /// finality rule is unchanged: a reorg across it is still refused.
+    fn prune_side_branches(&mut self) -> usize {
+        let tip_height = self.height();
+        let cutoff = tip_height.saturating_sub(self.params.finality_depth);
+
+        let mut canonical: HashMap<Hash, ()> = HashMap::with_capacity(self.canon.len());
+        for hash in &self.canon {
+            canonical.insert(*hash, ());
+        }
+
+        // Decide by ascending height so a block is only dropped after its parent
+        // has been decided; a survivor therefore always has a surviving parent.
+        let mut by_height: Vec<(u64, Hash)> = self
+            .blocks
+            .iter()
+            .map(|(h, b)| (b.header.height, *h))
+            .collect();
+        by_height.sort_unstable();
+
+        let mut keep: HashMap<Hash, ()> =
+            HashMap::with_capacity(self.canon.len() + by_height.len());
+        for hash in &self.canon {
+            keep.insert(*hash, ());
+        }
+
+        let mut dropped = Vec::new();
+        for (height, hash) in by_height {
+            if canonical.contains_key(&hash) {
+                continue;
+            }
+            if height > cutoff {
+                // Above the window: keep only if it chains to something kept.
+                let parent_kept = self
+                    .blocks
+                    .get(&hash)
+                    .map(|b| keep.contains_key(&b.header.prev_hash))
+                    .unwrap_or(false);
+                if parent_kept {
+                    keep.insert(hash, ());
+                } else {
+                    dropped.push(hash);
+                }
+            } else {
+                dropped.push(hash);
+            }
+        }
+
+        for hash in &dropped {
+            self.blocks.remove(hash);
+            self.work.remove(hash);
+            self.undo.remove(hash);
+            self.pscb_undo.remove(hash);
+        }
+        dropped.len()
     }
 
     /// Base fee the next block must carry. A wallet building a transaction has
@@ -880,6 +981,15 @@ impl Chain {
         }
         if probe.utxo.total_value() != self.utxo.total_value() {
             return Err(Error::Malformed("utxo value diverged on replay"));
+        }
+        // M1's PSCB reserve is part of live state and is rewound on reorg, so a
+        // wrong undo there would silently accumulate or lose funds. It was not
+        // checked at all, which made `verify` blind to the one thing M1 added.
+        if probe.pscb_reserve != self.pscb_reserve {
+            return Err(Error::Malformed("pscb reserve diverged on replay"));
+        }
+        if probe.pscb_undo != self.pscb_undo {
+            return Err(Error::Malformed("pscb undo records diverged on replay"));
         }
         Ok(())
     }
@@ -1358,5 +1468,88 @@ mod tests {
             supply_before + reward - burned,
             "base fee must be destroyed, not redistributed"
         );
+    }
+
+    /// M1's PSCB reserve must survive a reorganization intact: credited per
+    /// canonical block, rewound per rolled-back block, and equal to the sum a
+    /// clean replay produces. Before the M1 checks were added to
+    /// `verify_canonical_chain`, `jnt-node verify` could not see a PSCB bug at
+    /// all — it compared the UTXO set only.
+    #[test]
+    fn the_pscb_reserve_is_rewound_exactly_on_reorg() {
+        let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+        let miner = Wallet::new_random("miner");
+        let alice = Wallet::new_random("alice");
+        let miner_addr = miner.address().unwrap();
+        let alice_addr = alice.address().unwrap();
+
+        for h in 1..=12u64 {
+            let b = chain.mine_block(miner_addr, vec![], ts(h)).unwrap();
+            chain.submit(b).unwrap();
+        }
+
+        // A block that pays a fee, so a non-zero PSCB credit exists.
+        let op = OutPoint {
+            txid: chain.block_at(1).unwrap().txs[0].txid(),
+            index: 0,
+        };
+        let spendable = chain.utxo().get(&op).unwrap().out.value;
+        let fee = chain.expected_base_fee_for_next_block() * 50_000 + 1_000;
+        let tx = miner
+            .build_tx(
+                &[op],
+                vec![Output {
+                    value: spendable / 2,
+                    address: alice_addr,
+                }],
+                fee,
+            )
+            .unwrap();
+        let gas_used = tx.gas_used();
+        let paid = chain.mine_block(miner_addr, vec![tx], ts(13)).unwrap();
+        // PSCB is 50% of the base-fee portion, not of the whole fee: the tip
+        // above it belongs to the miner (§8, M1).
+        let base_portion = paid.header.base_fee_sat * gas_used;
+        chain.submit(paid).unwrap();
+
+        let reserve_with_fee = chain.pscb_reserve();
+        assert!(reserve_with_fee > 0, "no PSCB was credited for the fee");
+        assert_eq!(
+            reserve_with_fee,
+            base_portion / 2,
+            "PSCB is 50% of the base-fee portion"
+        );
+
+        // Reorg inside the finality window: fork at 11 and rebuild 12..=15.
+        let mut rival = Chain::new(NetworkParams::mini()).unwrap();
+        for h in 1..=10u64 {
+            let blk = rival.mine_block(miner_addr, vec![], ts(h)).unwrap();
+            rival.submit(blk).unwrap();
+        }
+        assert_eq!(
+            rival.tip_hash(),
+            chain.block_hash_at(10).unwrap(),
+            "the rival must share the prefix"
+        );
+        let mut rival_blocks = Vec::new();
+        for h in 11..=15u64 {
+            let blk = rival.mine_block(addr(9), vec![], ts(h)).unwrap();
+            rival.submit(blk.clone()).unwrap();
+            rival_blocks.push(blk);
+        }
+        assert!(rival.total_work() > chain.total_work());
+        for blk in rival_blocks {
+            chain.submit(blk).unwrap();
+        }
+
+        assert_eq!(chain.height(), 15);
+        assert_eq!(
+            chain.pscb_reserve(),
+            0,
+            "the paying block was rolled back, so its PSCB credit must be rewound"
+        );
+        chain
+            .verify_canonical_chain()
+            .expect("pscb state diverged from a clean replay");
     }
 }

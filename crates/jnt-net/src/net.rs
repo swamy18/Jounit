@@ -4,7 +4,7 @@
 //! to the chain thread.
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -16,10 +16,71 @@ use jnt_core::chain::Chain;
 use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
 
-use crate::error::NetResult;
+use crate::error::{NetError, NetResult};
 use crate::msg::{InvEntry, Message, INV_TYPE_BLOCK};
-use crate::peer::{perform_handshake, spawn_peer, HandshakeConfig, PeerEvent, PeerHandle};
+use crate::peer::{
+    perform_handshake, spawn_peer, HandshakeConfig, PeerEvent, PeerHandle, BAN_SCORE_THRESHOLD,
+};
 use crate::syncer::{create_locator, find_fork_and_collect_inv, SyncManager, SyncResult};
+
+/// Score added to an address each time it exceeds an inbound bound.
+/// SPEC.md §13.8: exceeding an inbound bound bans rather than merely
+/// disconnecting. Five strikes reaches `ban_score_threshold`.
+pub const INBOUND_VIOLATION_SCORE: u32 = 20;
+
+/// Maximum addresses tracked for inbound-bound scoring. Keeps the ban table
+/// bounded against a flood of distinct source addresses (§13.11 invariant 6).
+const MAX_BAN_TRACKED: usize = 1024;
+
+/// Per-address score with the wall-clock hour it was last updated, so the
+/// 1-per-hour decay of §13.9 can be applied without a background timer.
+#[derive(Debug, Clone, Copy)]
+struct BanState {
+    score: u32,
+    updated_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Apply §13.9's 1-per-hour decay and report whether the address is banned.
+fn is_banned(bans: &Arc<Mutex<HashMap<IpAddr, BanState>>>, ip: IpAddr) -> bool {
+    let mut map = bans.lock().unwrap();
+    let now = now_ms();
+    let Some(state) = map.get_mut(&ip) else {
+        return false;
+    };
+    let hours = now.saturating_sub(state.updated_ms) / 3_600_000;
+    if hours > 0 {
+        state.score = state.score.saturating_sub(hours as u32);
+        state.updated_ms = now;
+    }
+    state.score >= BAN_SCORE_THRESHOLD
+}
+
+/// Record an inbound-bound violation and prune the table if it grew too large.
+fn score_violation(bans: &Arc<Mutex<HashMap<IpAddr, BanState>>>, ip: IpAddr) {
+    let mut map = bans.lock().unwrap();
+    let now = now_ms();
+    let state = map.entry(ip).or_insert(BanState {
+        score: 0,
+        updated_ms: now,
+    });
+    let hours = now.saturating_sub(state.updated_ms) / 3_600_000;
+    if hours > 0 {
+        state.score = state.score.saturating_sub(hours as u32);
+        state.updated_ms = now;
+    }
+    state.score = state.score.saturating_add(INBOUND_VIOLATION_SCORE);
+    if map.len() > MAX_BAN_TRACKED {
+        let threshold = BAN_SCORE_THRESHOLD;
+        map.retain(|_, s| s.score >= threshold);
+    }
+}
 
 /// Maximum total connected peers. SPEC.md §13.8.
 pub const MAX_PEERS: usize = 125;
@@ -58,6 +119,10 @@ pub struct P2pNode {
     event_tx: Sender<PeerEvent>,
     event_rx: Receiver<PeerEvent>,
     running: Arc<AtomicBool>,
+    /// Ban scores by address, for inbound-bound violations (SPEC.md §13.8/§13.9).
+    /// v0.2 has no address book (§13.6), so this map is the only place an
+    /// address can be remembered, and it is deliberately the only one.
+    ban_scores: Arc<Mutex<HashMap<IpAddr, BanState>>>,
     listener_thread: Option<JoinHandle<()>>,
 }
 
@@ -67,6 +132,7 @@ impl P2pNode {
         let (event_tx, event_rx) = channel();
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let inbound_count = Arc::new(AtomicUsize::new(0));
+        let ban_scores = Arc::new(Mutex::new(HashMap::new()));
         let running = Arc::new(AtomicBool::new(true));
 
         let listener_thread = if let Some(addr) = config.listen_addr {
@@ -77,6 +143,7 @@ impl P2pNode {
             let l_inbound = Arc::clone(&inbound_count);
             let l_running = Arc::clone(&running);
             let l_event_tx = event_tx.clone();
+            let l_bans = Arc::clone(&ban_scores);
             let l_config = config.clone();
 
             Some(thread::spawn(move || {
@@ -84,9 +151,32 @@ impl P2pNode {
 
                 while l_running.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            if l_inbound.load(Ordering::Relaxed) >= l_config.max_inbound {
-                                // Exceeding max inbound limit: drop connection
+                        Ok((mut stream, peer_addr)) => {
+                            // The listener is non-blocking so `accept` can poll.
+                            // On Windows an accepted socket *inherits*
+                            // WSA_FLAG_NON_BLOCKED, which makes the blocking,
+                            // timeout-based handshake underneath fail
+                            // immediately with `WouldBlock` — every inbound
+                            // connection was refused on that platform. Clear
+                            // the flag explicitly rather than relying on the
+                            // platform default.
+                            if let Err(_e) = stream.set_nonblocking(false) {
+                                drop(stream);
+                                continue;
+                            }
+                            // Inbound bounds first, and they *ban* rather than
+                            // merely close (§13.8). `max_peers` is checked as
+                            // well as `max_inbound`: it caps the total thread and
+                            // descriptor count, which `max_inbound` alone does
+                            // not once a node makes its own outbound connections.
+                            if is_banned(&l_bans, peer_addr.ip()) {
+                                drop(stream);
+                                continue;
+                            }
+                            if l_inbound.load(Ordering::Relaxed) >= l_config.max_inbound
+                                || l_peers.lock().unwrap().len() >= l_config.max_peers
+                            {
+                                score_violation(&l_bans, peer_addr.ip());
                                 drop(stream);
                                 continue;
                             }
@@ -107,10 +197,15 @@ impl P2pNode {
                             thread::spawn(move || {
                                 match perform_handshake(&mut stream, &hs_config, false) {
                                     Ok(ver) => {
-                                        p_inbound.fetch_add(1, Ordering::Relaxed);
+                                        // Only count the connection as inbound
+                                        // once the peer thread exists. Counting
+                                        // before `spawn_peer` leaked a slot
+                                        // whenever spawning failed, and inbound
+                                        // slots are the scarce resource (§13.8).
                                         if let Ok(handle) = spawn_peer(
                                             pid, stream, ver, false, p_params, p_event_tx,
                                         ) {
+                                            p_inbound.fetch_add(1, Ordering::Relaxed);
                                             p_peers.lock().unwrap().insert(pid, handle);
                                         }
                                     }
@@ -142,12 +237,24 @@ impl P2pNode {
             event_tx,
             event_rx,
             running,
+            ban_scores,
             listener_thread,
         })
     }
 
     /// Connect to a remote peer address as an initiator.
     pub fn connect(&self, addr: SocketAddr, chain: &Chain) -> NetResult<usize> {
+        // SPEC.md §13.8 bounds `max_peers` as the cap on thread and descriptor
+        // count. It was never enforced here, so a node could open as many
+        // outbound connections as it had addresses and blow past the bound the
+        // rest of the design assumes.
+        if self.peer_count() >= self.config.max_peers {
+            return Err(NetError::Resource(format!(
+                "peer limit reached ({} configured, {} connected)",
+                self.config.max_peers,
+                self.peer_count()
+            )));
+        }
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
         let hs_config =
             HandshakeConfig::new(self.config.params.clone(), chain.height(), chain.tip_hash());
@@ -225,6 +332,10 @@ impl P2pNode {
                     }
                 }
                 PeerEvent::Disconnected { peer_id, .. } => {
+                    // Release everything queued for / owed by that peer before
+                    // dropping the handle, so its hashes can be served by
+                    // another connection instead of stalling sync (§13.7).
+                    syncer.peer_disconnected(peer_id);
                     let mut peers = self.peers.lock().unwrap();
                     if let Some(p) = peers.remove(&peer_id) {
                         if !p.is_outbound {
@@ -260,13 +371,8 @@ impl P2pNode {
                 }
             }
             Message::Inv(entries) => {
-                let to_request = syncer.handle_inv(&entries, chain);
-                if !to_request.is_empty() {
-                    let peers = self.peers.lock().unwrap();
-                    if let Some(peer) = peers.get(&peer_id) {
-                        let _ = peer.send(Message::GetData(to_request));
-                    }
-                }
+                let to_request = syncer.handle_inv(peer_id, &entries, chain);
+                self.send_get_data(peer_id, to_request);
             }
             Message::GetData(entries) => {
                 let blocks = syncer.handle_get_data(&entries, chain);
@@ -296,13 +402,13 @@ impl P2pNode {
                     }
                     SyncResult::Orphan { missing_parent } => {
                         // Request missing parent block from this peer
-                        let peers = self.peers.lock().unwrap();
-                        if let Some(peer) = peers.get(&peer_id) {
-                            let _ = peer.send(Message::GetData(vec![InvEntry {
+                        self.send_get_data(
+                            peer_id,
+                            vec![InvEntry {
                                 kind: INV_TYPE_BLOCK,
                                 hash: missing_parent,
-                            }]));
-                        }
+                            }],
+                        );
                     }
                     SyncResult::AlreadyKnown => {}
                     SyncResult::Invalid(_) => {
@@ -313,6 +419,12 @@ impl P2pNode {
                         }
                     }
                 }
+                // Keep the window moving: one block applied frees one request
+                // slot, so ask for the next batch. Without this the requester
+                // stops after the first batch and never finishes syncing
+                // (§13.7 "and repeats").
+                let next = syncer.take_batch(peer_id);
+                self.send_get_data(peer_id, next);
             }
             Message::Addr(_) | Message::Unknown { .. } | Message::Pong { .. } => {
                 // Ignored per spec
@@ -326,6 +438,42 @@ impl P2pNode {
     /// Number of active connected peers.
     pub fn peer_count(&self) -> usize {
         self.peers.lock().unwrap().len()
+    }
+
+    /// Whether an address is currently banned for inbound-bound violations.
+    /// Also applies the §13.9 decay, so this is the authoritative answer rather
+    /// than a raw table read.
+    pub fn is_banned(&self, addr: IpAddr) -> bool {
+        is_banned(&self.ban_scores, addr)
+    }
+
+    /// Addresses currently at or over the ban threshold.
+    pub fn banned_count(&self) -> usize {
+        let mut map = self.ban_scores.lock().unwrap();
+        let now = now_ms();
+        let mut count = 0;
+        for state in map.values_mut() {
+            let hours = now.saturating_sub(state.updated_ms) / 3_600_000;
+            if hours > 0 {
+                state.score = state.score.saturating_sub(hours as u32);
+                state.updated_ms = now;
+            }
+            if state.score >= BAN_SCORE_THRESHOLD {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Send a `GETDATA` to one peer, if it is still connected.
+    fn send_get_data(&self, peer_id: usize, entries: Vec<InvEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let peers = self.peers.lock().unwrap();
+        if let Some(peer) = peers.get(&peer_id) {
+            let _ = peer.send(Message::GetData(entries));
+        }
     }
 
     /// Stop the network listener and all peer threads.

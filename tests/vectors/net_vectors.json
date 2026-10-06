@@ -1,0 +1,152 @@
+{
+  "facts": [
+    {
+      "name": "version_mainnet_len",
+      "value": 92
+    },
+    {
+      "name": "version_mini_len",
+      "value": 89
+    },
+    {
+      "name": "verack_len",
+      "value": 8
+    },
+    {
+      "name": "ping_len",
+      "value": 8
+    },
+    {
+      "name": "pong_len",
+      "value": 8
+    },
+    {
+      "name": "inv_len",
+      "value": 68
+    },
+    {
+      "name": "getdata_len",
+      "value": 35
+    },
+    {
+      "name": "getblocks_len",
+      "value": 98
+    },
+    {
+      "name": "addr_len",
+      "value": 20
+    },
+    {
+      "name": "block1_len",
+      "value": 333
+    },
+    {
+      "name": "locator_len_200",
+      "value": 18
+    },
+    {
+      "name": "inv_from_genesis_len",
+      "value": 200
+    },
+    {
+      "name": "max_frame_payload",
+      "value": 4100000
+    },
+    {
+      "name": "max_inv_per_msg",
+      "value": 500
+    },
+    {
+      "name": "max_addr_per_msg",
+      "value": 100
+    },
+    {
+      "name": "max_locator_len",
+      "value": 500
+    }
+  ],
+  "items": [
+    {
+      "hex": "6a4e540207030000006a6e74",
+      "name": "frame_inv_type7_len3"
+    },
+    {
+      "hex": "6a4e54010e6a6f756e69742f6d61696e6e65740100000001000000000000002a000000000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0c2f6a6e742d6e65743a302e32efcdab8967452301",
+      "name": "version_mainnet"
+    },
+    {
+      "hex": "6a4e54020b6a6f756e69742f6d696e690100000001000000000000002a000000000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0c2f6a6e742d6e65743a302e32efcdab8967452301",
+      "name": "version_mini"
+    },
+    {
+      "hex": "adde000000000000",
+      "name": "msg_verack"
+    },
+    {
+      "hex": "efbe000000000000",
+      "name": "msg_ping"
+    },
+    {
+      "hex": "edfe000000000000",
+      "name": "msg_pong"
+    },
+    {
+      "hex": "0200011111111111111111111111111111111111111111111111111111111111111111012222222222222222222222222222222222222222222222222222222222222222",
+      "name": "msg_inv"
+    },
+    {
+      "hex": "0100013333333333333333333333333333333333333333333333333333333333333333",
+      "name": "msg_getdata"
+    },
+    {
+      "hex": "0200444444444444444444444444444444444444444444444444444444444444444455555555555555555555555555555555555555555555555555555555555555556666666666666666666666666666666666666666666666666666666666666666",
+      "name": "msg_getblocks"
+    },
+    {
+      "hex": "010000000000000000000000ffff7f0000018d20",
+      "name": "msg_addr"
+    },
+    {
+      "hex": "0100000001000000000000002317ec84903140e2cd72be6f3c9dfd2ff36d9f8642293a5152279b4ad7a5196b2557db9116f827dc08821478b46519f8b42a9346e4cf90ae95e2548fe340d7a0e8abda769b01000064000000000000000100000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000001000000010000000000000000010000002317ec84903140e2cd72be6f3c9dfd2ff36d9f8642293a5152279b4ad7a5196b0100000000000100000000ccfec4010000000707070707070707070707070707070707070707",
+      "name": "block1"
+    },
+    {
+      "hex": "048e11ffc97519e54c52eb6a9a8d1fdfa3550a7d587a4cf5d5dbe460dd684729",
+      "name": "locator_0"
+    },
+    {
+      "hex": "d1fa654ceac2f28fe978a9cf858c2e00111a87192d557d340fbdbd8a568f8a96",
+      "name": "locator_1"
+    },
+    {
+      "hex": "02a3246093af64f17a36b2907545986ee7d22de259a9564c80ebc233b9f43706",
+      "name": "locator_2"
+    },
+    {
+      "hex": "2ed891dfb4f4c535522b11f8f20dfa20a72c452eb908f2379c88d711de4e1f9f",
+      "name": "locator_3"
+    },
+    {
+      "hex": "9aab60490e1a3010496c06bd82e3fa18fd5e6b86c12ff28d419f5c5ce716294f",
+      "name": "locator_4"
+    },
+    {
+      "hex": "6b9b35ea3a2b41b0debb73a9945133be328ec4c8d544afeb13b418b709790e94",
+      "name": "locator_5"
+    },
+    {
+      "hex": "a9dc9edeb7fcc546221dd782851cb390018ca733c97986f26e105c9d5df310d4",
+      "name": "locator_6"
+    },
+    {
+      "hex": "f9150f114be5c8a7311acdcb93f4cd835f524de4c6429645a6403509ceab6ab2",
+      "name": "locator_7"
+    },
+    {
+      "hex": "057dfcf5938436de73a3582b77c894129a9b559fd38d5ac3b641f9020bb1fffe",
+      "name": "inv_from_genesis_first"
+    }
+  ],
+  "note": "Wire-format vectors. Regenerate with UPDATE_NET_VECTORS=1 cargo test -p jnt-net. No independent implementation exists yet, unlike sim/jounit_reference.py for §5.",
+  "spec_section": "13.12"
+}

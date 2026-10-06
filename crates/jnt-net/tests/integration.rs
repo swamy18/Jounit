@@ -15,6 +15,7 @@ use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
 use jnt_net::magic::check_network;
 use jnt_net::msg::{INV_TYPE_BLOCK, PROTOCOL_VERSION};
+use jnt_net::net::{P2pConfig, P2pNode};
 use jnt_net::peer::{perform_handshake, HandshakeConfig};
 use jnt_net::syncer::{create_locator, find_fork_and_collect_inv, SyncManager, SyncResult};
 
@@ -93,8 +94,11 @@ fn invalid_blocks_never_enter_the_store() {
     // merkle check in validate_standalone fires before PoW).
     let mut bad_block = chain.block_at(1).unwrap().clone();
     bad_block.header.merkle_root[0] ^= 0xFF;
+    let bad_hash = bad_block.block_hash();
 
     let before_height = chain.height();
+    let before_work = chain.total_work();
+    let before_stored = chain.stored_block_count();
     let result = syncer.handle_block(bad_block, &mut chain, None);
 
     assert!(
@@ -105,6 +109,23 @@ fn invalid_blocks_never_enter_the_store() {
         chain.height(),
         before_height,
         "invalid block must not advance the chain"
+    );
+    // §13.11 invariant 5 names both the block store and cumulative_work. The
+    // original version of this test checked neither, so it passed against code
+    // that could have retained the block and banked its difficulty.
+    assert!(
+        chain.block_by_hash(&bad_hash).is_none(),
+        "an invalid block entered the block store"
+    );
+    assert_eq!(
+        chain.total_work(),
+        before_work,
+        "an invalid block contributed to cumulative work"
+    );
+    assert_eq!(
+        chain.stored_block_count(),
+        before_stored,
+        "an invalid block grew the block store"
     );
 
     // Chain must still accept a valid next block afterwards
@@ -118,6 +139,131 @@ fn invalid_blocks_never_enter_the_store() {
         !matches!(result2, SyncResult::Accepted { .. }),
         "a block from a different chain cannot extend our canonical chain"
     );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: the whole P2P path over real sockets
+// ---------------------------------------------------------------------------
+
+/// Drive `poll_events` until `done` or the deadline expires. Both nodes in the
+/// tests below are single-threaded from the caller's point of view, so polling
+/// in a loop is exactly what `jnt-node serve` does.
+fn pump(node: &P2pNode, chain: &mut Chain, syncer: &mut SyncManager, deadline: std::time::Instant) {
+    while std::time::Instant::now() < deadline {
+        node.poll_events(chain, syncer, None);
+        if syncer.orphan_count() == 0 {
+            thread::sleep(Duration::from_millis(10));
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// The one test that exercises `P2pNode` end to end: a real listener, a real
+/// outbound connection, a real handshake, `GETBLOCKS` → `INV` → `GETDATA` →
+/// `BLOCK`, and fork choice on the receiving node.
+///
+/// Nothing tested this path before. Every other `jnt-net` test drove `SyncManager`
+/// directly, which meant the event loop, the peer threads and the sync
+/// continuation between batches were all untested — and the sync path did not
+/// work: the requester took one batch of 16 and stopped, so a node more than 16
+/// blocks behind could never catch up.
+#[test]
+fn a_node_syncs_a_peer_over_real_sockets() {
+    let params = mini();
+    let gh = genesis_hash(&params);
+
+    // Responder: 5 blocks ahead, listening.
+    let mut server_chain = fresh_chain();
+    mine_n(&mut server_chain, 5);
+    let server_tip = server_chain.tip_hash();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener); // free the port for P2pNode::start to bind
+
+    let server = P2pNode::start(
+        P2pConfig {
+            params: params.clone(),
+            listen_addr: Some(addr),
+            max_peers: 8,
+            max_inbound: 8,
+            user_agent: "server/0.1".into(),
+        },
+        server_chain.height(),
+        server_chain.tip_hash(),
+    )
+    .unwrap();
+
+    // Serves GETBLOCKS / GETDATA while the client syncs.
+    let mut server_syncer = SyncManager::new();
+    let server_thread = thread::spawn(move || {
+        pump(
+            &server,
+            &mut server_chain,
+            &mut server_syncer,
+            std::time::Instant::now() + Duration::from_secs(6),
+        );
+        server_chain.tip_hash()
+    });
+
+    // Requester: connects, and must end up at the server's tip.
+    let mut client_chain = Chain::new(params.clone()).unwrap();
+    assert_eq!(client_chain.tip_hash(), gh);
+    let client = P2pNode::start(
+        P2pConfig {
+            params: params.clone(),
+            listen_addr: None,
+            max_peers: 8,
+            max_inbound: 8,
+            user_agent: "client/0.1".into(),
+        },
+        0,
+        gh,
+    )
+    .unwrap();
+    let mut client_syncer = SyncManager::new();
+    client.connect(addr, &client_chain).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while std::time::Instant::now() < deadline && client_chain.height() < 5 {
+        client.poll_events(&mut client_chain, &mut client_syncer, None);
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        client_chain.height(),
+        5,
+        "a node behind its peer did not finish syncing (got height {})",
+        client_chain.height()
+    );
+    assert_eq!(client_chain.tip_hash(), server_tip);
+    client_chain.verify_canonical_chain().unwrap();
+
+    let _ = server_thread.join();
+}
+
+/// §13.8: `max_peers` bounds the total peer count. It was never enforced, so a
+/// node could open outbound connections past the bound the design assumes.
+#[test]
+fn the_peer_limit_refuses_new_outbound_connections() {
+    let params = mini();
+    let gh = genesis_hash(&params);
+    let node = P2pNode::start(
+        P2pConfig {
+            params: params.clone(),
+            listen_addr: None,
+            max_peers: 0,
+            max_inbound: 0,
+            user_agent: "lonely/0.1".into(),
+        },
+        0,
+        gh,
+    )
+    .unwrap();
+    let chain = fresh_chain();
+    let res = node.connect("127.0.0.1:1".parse().unwrap(), &chain);
+    assert!(res.is_err(), "a node at its peer limit must refuse to dial");
 }
 
 // ---------------------------------------------------------------------------

@@ -42,7 +42,7 @@ without weakening the security a hash chain depends on.
 
 **Built:** a complete, tested, specification-first L1 core and P2P networking layer:
 - **L1 Core (`jnt-core`)**: Hybrid hash + neural proof of work, UTXO ledger with undo, LWMA difficulty adjustment, EIP-1559 base fee with 50/50 PSCB split, fixed-cap halving supply schedule, and deepest-chain fork choice.
-- **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and sovereign BLS aggregate finality gadget checkpoints (M5).
+- **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a sovereign BLS aggregate finality gadget (M5). See the status table above for what each one does and does not yet affect.
 - **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
 - **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
 
@@ -128,7 +128,8 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-core/` | 9 800+ | Protocol implementation across 21 modules. All consensus logic. |
 | `crates/jnt-core/tests/redteam.rs` | 637 | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
 | `crates/jnt-net/` | 1 400+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
-| `crates/jnt-net/tests/integration.rs` | 336 | P2P loopback integration tests: multi-node convergence, fork handling. |
+| `crates/jnt-net/tests/integration.rs` | 500+ | P2P integration tests, including a real-socket end-to-end sync. |
+| `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
 | `crates/jnt-node/` | 760+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
 | `sim/` | 1 201 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
@@ -220,7 +221,22 @@ bytes ──▶ Reader (bounds-checked) ──▶ Block/Transaction
 
 ## Protocol mechanisms (M1–M5)
 
-Jounit incorporates five protocol-level mechanisms to align economic incentives with long-term AI compute infrastructure:
+Jounit defines five protocol-level mechanisms to align economic incentives with
+long-term AI compute infrastructure. **Only M1 is consensus-active today** —
+that is, only M1 can change whether a node accepts a block. M2–M5 are fully
+implemented, unit-tested modules with no effect on chain state yet: each needs a
+rule this repository has not specified (what proves a compute result fraudulent,
+how a task enters a block, whether the HBM puzzle replaces or composes with §5,
+who the validator set is). SPEC.md §14 records that status per mechanism, and
+this list is repeated in `docs/status.md`.
+
+| # | Mechanism | Consensus-active | Module |
+|---|---|---|---|
+| M1 | 50/50 PSCB base-fee split | **Yes** — changes the UTXO set | `fees.rs`, `chain.rs` |
+| M2 | Anti-collusion slash vault | No | `slash.rs` |
+| M3 | Hardware-agnostic compute IR | No | `compute_ir.rs` |
+| M4 | Memory-bound HBM scratchpad PoW | No | `hbm_pow.rs` |
+| M5 | BLS aggregate finality | No — verifier is a mock | `bls_checkpoint.rs` |
 
 ### M1 — 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
 Base fees collected in each block are split equally:
@@ -228,11 +244,12 @@ Base fees collected in each block are split equally:
 - **50% Protocol Security & Compute Buffer (PSCB):** Accumulated on-chain in the `pscb_reserve`. Provides protocol-level liquidity and backing for useful-work validator stakes.
 - **Miner Tip:** 100% of user priority tips go directly to the miner.
 - **Invariant:** `burned + pscb + tip == total_fees`.
+- **Reorg-correct:** the credit is rewound per rolled-back block, and `verify_canonical_chain` re-derives it by replay.
 
 ### M2 — Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault (`slash.rs`)
 Protects against malicious or fabricated compute results submitted to the network:
 - **50% Instant Burn (Anti-Collusion):** Eliminates self-slashing arbitrage where colluding parties reclaim 100% of slashed funds.
-- **50% Time-Locked Vesting (Compute Reserve):** Slashed stake vests linearly per block over 1 year (52,560 blocks on mainnet, 1,000 on mini) into the community compute reserve.
+- **50% Time-Locked Vesting (Compute Reserve):** Slashed stake vests linearly per block over 1 year (52,560 blocks on mainnet, 2,000 on mini) into the community compute reserve.
 - Supports validator-level penalty tracking and vault pruning.
 
 ### M3 — Universal Hardware-Agnostic Canonical Compute IR (`compute_ir.rs`)
@@ -245,13 +262,15 @@ Prevents vendor lock-in by abstracting computation across heterogeneous hardware
 Hardens mining against ASIC centralization and pure-compute bypasses:
 - **HBM / High-Bandwidth Memory Latency:** Miners traverse a deterministic pseudorandom scratchpad using cache-line-aligned (32-byte) memory hops.
 - Guarantees that mining performance is bound to actual hardware memory bus bandwidth (HBM3/GDDR6) rather than pure ALU arithmetic.
+- **Not registered as a `puzzle_id`**, so it validates nothing today.
 
 ### M5 — Sovereign BLS Aggregate Finality Gadget (`bls_checkpoint.rs`)
-Adds deterministic finality on top of probabilistic deepest-chain PoW:
-- **Checkpoints:** Triggered every `CHECKPOINT_INTERVAL` (100 blocks on mainnet, 10 on mini).
-- **BLS12-381 Aggregate Signatures:** Compact 96-byte aggregate signatures over 48-byte validator public keys.
-- **2/3 Supermajority Quorum:** Enforces >= 66.67% (`QUORUM_BPS = 6667`) validator agreement with compact bitmask signers.
-- **Absolute Immutability:** Once a checkpoint is verified by `CheckpointChain`, reorgs past the checkpoint boundary are rejected outright.
+Describes deterministic finality on top of probabilistic deepest-chain PoW:
+- **Checkpoints:** every `CHECKPOINT_INTERVAL` (100 blocks on mainnet, 10 on mini).
+- **BLS12-381 Aggregate Signatures:** 96-byte aggregate signatures over 48-byte validator public keys.
+- **2/3 Supermajority Quorum:** `ceil(n × 2/3)` validator agreement with compact bitmask signers.
+- **Absolute Immutability:** once a checkpoint is accepted by `CheckpointChain`, the boundary is permanent.
+- **`BlsVerifier` is a trait and only a mock implements it** — no pairing is performed anywhere in this repository, so the finality guarantee is *not* in force. `blst` is the production path.
 
 ---
 
@@ -509,7 +528,7 @@ Per-command options: `--blocks`, `--interval`, `--wallet`, `--amount`, `--to`,
 ## Testing and verification
 
 ```sh
-cargo test --workspace                                   # 207 tests (187 core + 20 net)
+cargo test --workspace                                   # 219 tests (190 core + 29 net)
 cargo clippy --workspace --all-targets -- -D warnings    # 0 warnings
 cargo fmt --all --check
 ```

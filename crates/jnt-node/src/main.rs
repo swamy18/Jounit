@@ -13,10 +13,12 @@
 //!                                                   (--amount is in satoshis)
 //! jnt-node wallet   --new --label miner
 //! jnt-node export   --out chain.json
+//! jnt-node serve     --listen 0.0.0.0:8333         relay blocks to and from peers
 //! ```
 //!
-//! There is no P2P layer yet: this is a single-node chain. See
-//! `docs/roadmap.md` for what a real node still needs.
+//! A `serve` subcommand runs the P2P node (`jnt-net`); everything else operates
+//! on a local chain directory. See `docs/roadmap.md` for what a real node still
+//! needs.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -61,6 +63,7 @@ SERVE OPTIONS:
   --listen <host:port>       TCP address to accept inbound peers (optional)
   --connect <host:port>      Dial an outbound peer (repeatable via CSV)
   --peers <n>                Max total peers (default: 125)
+  --interval <ms>            Serve loop period (default: 250)
 ";
 
 fn main() -> ExitCode {
@@ -716,6 +719,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let max_peers = args.num("peers", 125)? as usize;
     let mut config = P2pConfig::new(store.params.clone(), listen_addr);
     config.max_peers = max_peers;
+    // Loop period. Without one the loop mined as fast as the CPU allowed and
+    // rewrote the whole chain file each time: a `serve` node pegged a core,
+    // spent its time on O(n) JSON writes (SPEC.md §13.10 item 4), and had
+    // almost no budget left to drain inbound peer events.
+    let interval_ms = args.num("interval", 250)?;
 
     let node =
         P2pNode::start(config, chain.height(), chain.tip_hash()).map_err(|e| e.to_string())?;
@@ -758,7 +766,23 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             }
         }
 
-        // Drain inbound P2P events and apply to chain
+        // Drain inbound P2P events and apply to chain.
+        let before = chain.height();
         node.poll_events(&mut chain, &mut syncer, Some(now_ms()));
+
+        // Blocks that arrived *from peers* have to be persisted too. Saving
+        // only on the mining path meant a node that synchronised 500 blocks
+        // wrote none of them: a restart replayed genesis and threw the whole
+        // sync away. `save_chain` is O(n) per call (§13.10 item 4), so this is
+        // deliberately once per batch that changed the chain, not once per
+        // event.
+        if chain.height() != before {
+            store.save_chain(&chain).ok();
+            store.write_meta(&chain).ok();
+        }
+
+        if interval_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        }
     }
 }

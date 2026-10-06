@@ -73,6 +73,11 @@ pub struct PeerHandle {
     tx: Sender<Message>,
     ban_score: Arc<AtomicU32>,
     stopped: Arc<AtomicBool>,
+    /// A handle on the socket, so `stop()` can actually close the connection.
+    /// Setting a flag alone left the reader thread parked in `read_frame` for
+    /// up to the 60 s read timeout, still consuming a thread and still able to
+    /// deliver events for a peer the node believed it had dropped.
+    socket: Arc<TcpStream>,
 }
 
 impl PeerHandle {
@@ -101,6 +106,8 @@ impl PeerHandle {
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
+        // Unblock the reader immediately rather than waiting for a timeout.
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -265,12 +272,25 @@ fn validate_peer_version(
     Ok(())
 }
 
+/// A per-process random 64-bit nonce, used for the handshake challenge (§13.4).
+///
+/// `RandomState`'s keys are seeded by the OS, so hashing a counter through it
+/// yields values that are unpredictable to a remote peer. The previous
+/// implementation was derived purely from the wall clock, which a peer can
+/// estimate from block timestamps — it made the "proof of socket possession"
+/// nonce guessable, and a guessable nonce is not a challenge.
 fn generate_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    (now as u64) ^ 0x5a5a_a5a5_3c3c_c3c3
+        .as_nanos() as u64;
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(now);
+    h.write_u64(seq);
+    h.finish()
 }
 
 /// Spawn peer read and write loops on an established TCP stream.
@@ -286,6 +306,7 @@ pub fn spawn_peer(
     let (outbound_tx, outbound_rx): (Sender<Message>, Receiver<Message>) = channel();
     let ban_score = Arc::new(AtomicU32::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
+    let socket = Arc::new(stream.try_clone()?);
 
     let handle = PeerHandle {
         id: peer_id,
@@ -295,6 +316,7 @@ pub fn spawn_peer(
         tx: outbound_tx.clone(),
         ban_score: Arc::clone(&ban_score),
         stopped: Arc::clone(&stopped),
+        socket: Arc::clone(&socket),
     };
 
     // Notify connected
@@ -343,18 +365,26 @@ pub fn spawn_peer(
 
     thread::spawn(move || {
         let mut exit_reason = "connection closed".to_string();
+        // Keepalive state: a read timeout means "nothing heard for 60 s". We
+        // ping once, and a second timeout means the peer is unresponsive to
+        // PING, which SPEC.md §13.9 scores at +10.
+        let mut ping_sent = false;
+        let mut ping_nonce = 0u64;
 
         while !read_stopped.load(Ordering::Relaxed) {
             match read_frame(&mut stream, &params) {
                 Ok((ty, payload)) => {
+                    ping_sent = false;
                     match Message::decode(ty, &payload) {
                         Ok(msg) => match msg {
                             Message::Ping { nonce } => {
                                 // Auto respond with PONG
                                 let _ = auto_pong_tx.send(Message::Pong { nonce });
                             }
-                            Message::Pong { .. } => {
-                                // Keepalive response acknowledged
+                            Message::Pong { nonce } => {
+                                if ping_sent && nonce == ping_nonce {
+                                    ping_sent = false;
+                                }
                             }
                             other => {
                                 if read_event_tx
@@ -382,8 +412,29 @@ pub fn spawn_peer(
                     if e.kind() == std::io::ErrorKind::TimedOut
                         || e.kind() == std::io::ErrorKind::WouldBlock =>
                 {
-                    // Read timeout — idle connection keepalive check
+                    if ping_sent {
+                        // §13.9: unresponsive to PING (60 s) scores +10.
+                        let curr = read_ban.fetch_add(10, Ordering::SeqCst);
+                        if curr + 10 >= BAN_SCORE_THRESHOLD {
+                            exit_reason = "banned: unresponsive to PING".into();
+                            break;
+                        }
+                        ping_sent = false;
+                    } else {
+                        ping_nonce = generate_nonce();
+                        let _ = auto_pong_tx.send(Message::Ping { nonce: ping_nonce });
+                        ping_sent = true;
+                    }
                     continue;
+                }
+                Err(NetError::InvalidMagic { .. } | NetError::OversizedFrame { .. }) => {
+                    // §13.9: a frame over `max_frame_bytes`, or a bad magic after
+                    // a good handshake, is an immediate +100 ban. Without this
+                    // they were just a disconnect, so a peer could probe the
+                    // framing bounds for free and reconnect.
+                    read_ban.store(BAN_SCORE_THRESHOLD, Ordering::SeqCst);
+                    exit_reason = "banned: framing violation".into();
+                    break;
                 }
                 Err(e) => {
                     exit_reason = e.to_string();

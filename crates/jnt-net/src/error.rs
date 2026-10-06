@@ -32,6 +32,8 @@ pub enum NetError {
     Banned(String),
     /// An inner `BLOCK`/`GETBLOCKS` payload failed to decode.
     Decode(String),
+    /// A §13.8 resource bound refused an operation, e.g. `max_peers` reached.
+    Resource(String),
     /// Underlying socket failure.
     Io(io::Error),
 }
@@ -53,6 +55,7 @@ impl fmt::Display for NetError {
             NetError::Peer(s) => write!(f, "peer behaviour: {s}"),
             NetError::Banned(s) => write!(f, "peer banned: {s}"),
             NetError::Decode(s) => write!(f, "decoding payload: {s}"),
+            NetError::Resource(s) => write!(f, "resource bound: {s}"),
             NetError::Io(e) => write!(f, "io: {e}"),
         }
     }

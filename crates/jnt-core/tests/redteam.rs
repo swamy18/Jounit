@@ -635,3 +635,90 @@ fn an_unknown_header_sig_scheme_is_rejected() {
         "an unknown sig_scheme was accepted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 10. A peer must not be able to wedge the node with side branches
+// ---------------------------------------------------------------------------
+
+/// **The rule:** SPEC.md §13.10 item 2 — side branches beyond the finality
+/// window are pruned, so the block store cannot grow without bound.
+///
+/// **The attack:** nothing, in the sense that no expensive work is needed. A
+/// peer submits many *valid* side blocks forking from genesis. Each is stored
+/// and each stays forever, because `submit_at` only removed a block when it
+/// could not be applied — and these can all be applied. `stored` therefore grew
+/// with every message, and `best_candidate` rescanned all of it.
+///
+/// The second half of the rule is the part that mattered: those blocks carried
+/// fork-choice weight. A branch that forked *below* the finality point stayed
+/// in the store with its work counted, so fork choice kept selecting it and the
+/// node refused honest blocks until honest work caught up — a peer could stop a
+/// node making progress, at no cost to itself. Pruning (§13.10 item 2) forgets
+/// those blocks, so the node accepts honest blocks again. The §9.3 finality
+/// rule itself is unchanged.
+#[test]
+fn side_branches_beyond_the_finality_window_are_pruned() {
+    let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+    extend(&mut chain, 25, ts);
+    let honest_tip = chain.tip_hash();
+    let canon = chain.stored_block_count();
+
+    // 120 valid rivals forking at genesis, each mined on its own throwaway
+    // chain so it is a real block rather than a hand-forged header. The `^ 0x80`
+    // tag keeps them distinct from the canonical chain's own block 1.
+    for i in 0..120u8 {
+        let mut fork = Chain::new(NetworkParams::mini()).unwrap();
+        let rival = fork.mine_block(addr(i ^ 0x80), vec![], ts(1)).unwrap();
+        chain
+            .submit(rival)
+            .expect("a valid side block must be accepted into the store");
+    }
+
+    assert!(
+        chain.stored_block_count() < canon + 120,
+        "side branches were retained without bound: {} blocks stored",
+        chain.stored_block_count()
+    );
+    assert_eq!(
+        chain.tip_hash(),
+        honest_tip,
+        "pruning must not disturb the canonical tip"
+    );
+
+    // The consequence that actually matters: an honest block is still accepted,
+    // and the chain still agrees with a from-genesis replay.
+    let honest = chain.mine_block(addr(1), vec![], ts(26)).unwrap();
+    chain
+        .submit(honest)
+        .expect("side branches from a peer stopped the node accepting honest blocks");
+    assert_eq!(chain.height(), 26);
+    chain.verify_canonical_chain().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 11. A mining attempt cap must actually be a cap
+// ---------------------------------------------------------------------------
+
+/// **The rule:** `mine_block_with` documents an attempt cap as the thing that
+/// stops a mis-set difficulty or a hostile retarget from hanging a node.
+///
+/// **The attack:** the cap was applied by a *second* mining loop that only ran
+/// after `build_block` had already finished mining — and `build_block` looped
+/// without a bound. So the cap guarded nothing: asking for 3 attempts at
+/// difficulty 2^64 did not fail fast, it ran for the age of the universe. This
+/// test does not fail on the original code; it hangs, which is the defect.
+#[test]
+fn a_mining_attempt_cap_cannot_be_bypassed() {
+    let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+    let started = std::time::Instant::now();
+    let res = chain.mine_block_with(addr(1), vec![], ts(1), Some(1u128 << 64), 3);
+    assert!(
+        matches!(res, Err(Error::PowInvalid { .. })),
+        "an unsatisfiable difficulty must report PowInvalid rather than succeed"
+    );
+    assert!(
+        started.elapsed().as_secs() < 30,
+        "the attempt cap was not enforced: mining ran for {:?}",
+        started.elapsed()
+    );
+}

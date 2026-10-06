@@ -2,10 +2,13 @@
 //!
 //! Relays and synchronizes canonical blocks between peers:
 //! - Locator construction and fork-point discovery (§13.7).
-//! - Inventory announcement and batch GETDATA fetching.
-//! - Bounded orphan pool (§13.8 `orphan_pool_max = 64`) for handling out-of-order blocks.
+//! - Inventory announcement and batched GETDATA fetching.
+//! - Bounded orphan pool (§13.8 `orphan_pool_max = 64`) for out-of-order blocks.
+//!
+//! Every structure here is bounded, because every one of them is fed by a peer
+//! that may never send what it advertised (§13.11 invariant 6).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
@@ -20,14 +23,29 @@ pub const ORPHAN_POOL_MAX: usize = 64;
 /// Batch size for GETDATA requests during block-first sync. SPEC.md §13.7.
 pub const SYNC_BATCH_SIZE: usize = 16;
 
+/// Maximum `GETDATA` requests outstanding across all peers. SPEC.md §13.7
+/// ("the requester MUST NOT trust the responder's height"): a peer that
+/// advertises a million hashes must not be able to make us queue a million
+/// requests. Four batches deep is enough to keep the pipe full.
+pub const MAX_IN_FLIGHT: usize = 4 * SYNC_BATCH_SIZE;
+
+/// Maximum advertised-but-not-yet-requested hashes held per node. An `INV` is
+/// capped at 500 entries, so this is a few messages of slack — enough for a
+/// peer to send its next `INV` before the previous batch is applied.
+pub const MAX_PENDING_INV: usize = 4 * MAX_INV_PER_MSG;
+
 /// Build a locator list starting from the chain tip with exponential backoff.
 /// SPEC.md §13.7.
 ///
 /// ```text
 /// locator[0] = tip_hash
 /// locator[i] = block_hash_at(height - 10^i)
-/// locator capped at 500 entries; append genesis hash if absent
+/// locator capped at max_locator_len entries; append genesis hash if absent
 /// ```
+///
+/// The genesis entry is reserved inside the cap: the spec bounds the locator at
+/// `max_locator_len`, so appending genesis on top of a full locator would send
+/// one more entry than the bound allows.
 pub fn create_locator(chain: &Chain) -> Vec<Hash> {
     let mut locator = Vec::new();
     let tip_height = chain.height();
@@ -36,7 +54,8 @@ pub fn create_locator(chain: &Chain) -> Vec<Hash> {
     let mut step: u64 = 1;
     let mut h = tip_height;
 
-    while h > 0 && locator.len() < MAX_LOCATOR_ENTRIES {
+    // Leave one slot for the genesis hash appended below.
+    while h > 0 && locator.len() + 1 < MAX_LOCATOR_ENTRIES {
         if h >= step {
             h -= step;
         } else {
@@ -124,29 +143,50 @@ pub enum SyncResult {
 }
 
 /// Manages synchronization state, orphan blocks, and in-flight requests.
+///
+/// Requests are tracked per peer so a disconnect releases exactly that peer's
+/// outstanding work. Without that, a peer that disconnects mid-sync leaves its
+/// hashes marked as "requested" forever and the node silently stops syncing
+/// those blocks — a peer could stall a node's sync just by hanging up.
 pub struct SyncManager {
     /// Blocks indexed by missing parent hash: parent_hash -> Vec<Block>
     orphans_by_parent: HashMap<Hash, Vec<Block>>,
+    /// Insertion order of `orphans_by_parent` keys, so eviction is oldest-first
+    /// and deterministic rather than dependent on hash-map iteration order.
+    orphan_order: VecDeque<Hash>,
     /// Total count of orphan blocks stored
     orphan_count: usize,
-    /// In-flight block requests to avoid redundant GETDATA
-    requested: HashSet<Hash>,
+    /// Outstanding `GETDATA` requests: block hash -> peer we asked.
+    requested: HashMap<Hash, usize>,
+    /// Advertised hashes not yet requested, with the peer that advertised them.
+    pending: VecDeque<(usize, InvEntry)>,
 }
 
 impl SyncManager {
     pub fn new() -> Self {
         Self {
             orphans_by_parent: HashMap::new(),
+            orphan_order: VecDeque::new(),
             orphan_count: 0,
-            requested: HashSet::new(),
+            requested: HashMap::new(),
+            pending: VecDeque::new(),
         }
     }
 
-    /// Process an inbound INV message: filter out blocks already present in the chain
-    /// or orphan pool, and return up to `SYNC_BATCH_SIZE` entries to request via GETDATA.
-    pub fn handle_inv(&mut self, entries: &[InvEntry], chain: &Chain) -> Vec<InvEntry> {
-        let mut to_request = Vec::new();
-
+    /// Record an inbound `INV`: queue the hashes we do not have and return the
+    /// next batch to request from this peer.
+    ///
+    /// Everything in the `INV` is queued, not just the first `SYNC_BATCH_SIZE`.
+    /// An earlier version returned the first 16 and discarded the rest, which
+    /// ended sync after one batch: SPEC.md §13.7 requires the requester to
+    /// `GETDATA` "in batches of 16, submit each, **and repeats**", and a chain
+    /// more than 16 blocks long could then never be synchronised.
+    pub fn handle_inv(
+        &mut self,
+        peer_id: usize,
+        entries: &[InvEntry],
+        chain: &Chain,
+    ) -> Vec<InvEntry> {
         for e in entries {
             if e.kind != INV_TYPE_BLOCK {
                 continue;
@@ -154,17 +194,72 @@ impl SyncManager {
             if chain.block_by_hash(&e.hash).is_some() {
                 continue;
             }
-            if self.requested.contains(&e.hash) {
+            if self.requested.contains_key(&e.hash) {
                 continue;
             }
-            self.requested.insert(e.hash);
-            to_request.push(e.clone());
-            if to_request.len() >= SYNC_BATCH_SIZE {
-                break;
+            if self.pending.iter().any(|(_, q)| q.hash == e.hash) {
+                continue;
             }
+            // A peer can keep advertising new hashes forever; the queue is
+            // bounded and the excess is dropped rather than accumulated.
+            if self.pending.len() >= MAX_PENDING_INV {
+                continue;
+            }
+            self.pending.push_back((peer_id, e.clone()));
         }
 
-        to_request
+        self.take_batch(peer_id)
+    }
+
+    /// Take up to `SYNC_BATCH_SIZE` queued hashes for `peer_id`, subject to the
+    /// global in-flight cap. Call this after every applied block to keep the
+    /// window moving, and not only when an `INV` arrives.
+    pub fn take_batch(&mut self, peer_id: usize) -> Vec<InvEntry> {
+        if self.requested.len() >= MAX_IN_FLIGHT {
+            return Vec::new();
+        }
+        let room = MAX_IN_FLIGHT - self.requested.len();
+        let want = SYNC_BATCH_SIZE.min(room);
+        if want == 0 {
+            return Vec::new();
+        }
+
+        let mut taken: Vec<InvEntry> = Vec::with_capacity(want);
+        let mut taken_hashes: HashSet<Hash> = HashSet::with_capacity(want);
+        for (pid, e) in self.pending.iter() {
+            if taken.len() >= want {
+                break;
+            }
+            if *pid == peer_id && taken_hashes.insert(e.hash) {
+                taken.push(e.clone());
+            }
+        }
+        if taken.is_empty() {
+            return taken;
+        }
+        self.pending
+            .retain(|(_, e)| !taken_hashes.contains(&e.hash));
+        for e in &taken {
+            self.requested.insert(e.hash, peer_id);
+        }
+        taken
+    }
+
+    /// Number of outstanding `GETDATA` requests.
+    pub fn in_flight_count(&self) -> usize {
+        self.requested.len()
+    }
+
+    /// Number of advertised hashes waiting for a request slot.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Release everything owed to / queued from a peer that has disconnected, so
+    /// another peer can serve those hashes instead.
+    pub fn peer_disconnected(&mut self, peer_id: usize) {
+        self.requested.retain(|_, pid| *pid != peer_id);
+        self.pending.retain(|(pid, _)| *pid != peer_id);
     }
 
     /// Process an inbound GETDATA message: fetch requested blocks from the chain.
@@ -188,6 +283,9 @@ impl SyncManager {
         now_ms: Option<u64>,
     ) -> SyncResult {
         let block_hash = block.block_hash();
+        // Free the request slot on every path, including a rejected block:
+        // otherwise a peer could fill the in-flight table with blocks that never
+        // validate and stall sync without bound.
         self.requested.remove(&block_hash);
 
         let prev_tip = chain.tip_hash();
@@ -220,13 +318,22 @@ impl SyncManager {
     }
 
     fn add_orphan(&mut self, parent: Hash, block: Block) {
-        if self.orphan_count >= ORPHAN_POOL_MAX {
-            // Evict an arbitrary parent queue if capacity reached
-            if let Some(k) = self.orphans_by_parent.keys().next().copied() {
-                if let Some(evicted) = self.orphans_by_parent.remove(&k) {
-                    self.orphan_count = self.orphan_count.saturating_sub(evicted.len());
-                }
+        while self.orphan_count >= ORPHAN_POOL_MAX {
+            // Evict the oldest parent queue. Evicting an arbitrary hash-map key
+            // made which orphans survived depend on iteration order, so a node's
+            // orphan pool could differ between runs on identical input.
+            let Some(k) = self.orphan_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.orphans_by_parent.remove(&k) {
+                self.orphan_count = self.orphan_count.saturating_sub(evicted.len());
             }
+        }
+        if self.orphan_count >= ORPHAN_POOL_MAX {
+            return;
+        }
+        if !self.orphans_by_parent.contains_key(&parent) {
+            self.orphan_order.push_back(parent);
         }
         self.orphans_by_parent
             .entry(parent)
@@ -256,5 +363,152 @@ impl SyncManager {
 impl Default for SyncManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jnt_core::params::NetworkParams;
+
+    fn chain_at(n: u64) -> Chain {
+        let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+        let addr = [1u8; 20];
+        let mut ts = jnt_core::block::GENESIS_TIMESTAMP_MS + 1;
+        for _ in 0..n {
+            let b = chain.mine_block(addr, vec![], ts).unwrap();
+            chain.submit(b).unwrap();
+            ts += 60_000;
+        }
+        chain
+    }
+
+    fn inv_for(chain: &Chain) -> Vec<InvEntry> {
+        (1..=chain.height())
+            .map(|h| InvEntry {
+                kind: INV_TYPE_BLOCK,
+                hash: chain.block_hash_at(h).unwrap(),
+            })
+            .collect()
+    }
+
+    /// The §13.7 requirement that a requester keeps going after each batch.
+    /// Before the fix `handle_inv` returned the first 16 entries and dropped the
+    /// rest, so a 40-block chain could never be synced.
+    #[test]
+    fn sync_continues_across_every_inv_batch() {
+        let source = chain_at(40);
+        let mut sink = Chain::new(NetworkParams::mini()).unwrap();
+        let mut syncer = SyncManager::new();
+
+        let entries = inv_for(&source);
+        assert_eq!(entries.len(), 40);
+        let mut first = syncer.handle_inv(7, &entries, &sink);
+        assert_eq!(first.len(), SYNC_BATCH_SIZE);
+
+        // Serve each batch until the sink reaches the source tip.
+        for _ in 0..20 {
+            for e in &first {
+                let block = source.block_by_hash(&e.hash).unwrap().clone();
+                syncer.handle_block(block, &mut sink, None);
+            }
+            if sink.tip_hash() == source.tip_hash() {
+                break;
+            }
+            let next = syncer.take_batch(7);
+            assert!(!next.is_empty(), "sync stalled before reaching the tip");
+            first = next;
+        }
+        assert_eq!(
+            sink.tip_hash(),
+            source.tip_hash(),
+            "every advertised block must eventually be applied"
+        );
+    }
+
+    /// §13.11 invariant 6: a peer advertising hashes it never delivers must not
+    /// be able to grow a bounded structure past its cap.
+    #[test]
+    fn a_peer_that_never_delivers_cannot_grow_state_without_bound() {
+        let sink = Chain::new(NetworkParams::mini()).unwrap();
+        let mut syncer = SyncManager::new();
+
+        for round in 0..200u8 {
+            let entries: Vec<InvEntry> = (0..MAX_INV_PER_MSG)
+                .map(|i| InvEntry {
+                    kind: INV_TYPE_BLOCK,
+                    hash: [round.wrapping_mul(31).wrapping_add(i as u8); 32],
+                })
+                .collect();
+            syncer.handle_inv(1, &entries, &sink);
+        }
+
+        assert!(
+            syncer.in_flight_count() <= MAX_IN_FLIGHT,
+            "in-flight requests grew to {} (cap {MAX_IN_FLIGHT})",
+            syncer.in_flight_count()
+        );
+        assert!(
+            syncer.pending_count() <= MAX_PENDING_INV,
+            "pending queue grew to {} (cap {MAX_PENDING_INV})",
+            syncer.pending_count()
+        );
+    }
+
+    /// A peer that disconnects mid-sync must not strand its hashes: another
+    /// peer advertising the same blocks has to be able to serve them.
+    #[test]
+    fn a_disconnect_releases_the_disconnected_peers_requests() {
+        let source = chain_at(20);
+        let sink = Chain::new(NetworkParams::mini()).unwrap();
+        let mut syncer = SyncManager::new();
+
+        let batch = syncer.handle_inv(1, &inv_for(&source), &sink);
+        assert!(!batch.is_empty());
+        assert!(syncer.in_flight_count() > 0);
+
+        syncer.peer_disconnected(1);
+        assert_eq!(syncer.in_flight_count(), 0, "requests must be released");
+        assert_eq!(syncer.pending_count(), 0, "queued hashes must be released");
+
+        // A second peer re-advertises: the hashes are requestable again.
+        let mut syncer2 = SyncManager::new();
+        let again = syncer2.handle_inv(2, &inv_for(&source), &sink);
+        assert_eq!(
+            again.len(),
+            SYNC_BATCH_SIZE,
+            "a replacement peer must be able to serve the stranded hashes"
+        );
+    }
+
+    #[test]
+    fn a_locator_never_exceeds_the_spec_cap() {
+        let chain = chain_at(600);
+        let locator = create_locator(&chain);
+        assert!(
+            locator.len() <= MAX_LOCATOR_ENTRIES,
+            "locator of {} entries exceeds max_locator_len {MAX_LOCATOR_ENTRIES}",
+            locator.len()
+        );
+        assert!(locator.contains(&chain.block_hash_at(0).unwrap()));
+    }
+
+    #[test]
+    fn orphan_eviction_is_oldest_first_and_bounded() {
+        let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+        let mut foreign = Chain::new(NetworkParams::mini()).unwrap();
+        let addr = [2u8; 20];
+        let mut ts = jnt_core::block::GENESIS_TIMESTAMP_MS + 1;
+        for _ in 0..(ORPHAN_POOL_MAX as u64 + 10) {
+            let b = foreign.mine_block(addr, vec![], ts).unwrap();
+            foreign.submit(b).unwrap();
+            ts += 60_000;
+        }
+        let mut syncer = SyncManager::new();
+        for h in 1..=foreign.height() {
+            let block = foreign.block_at(h).unwrap().clone();
+            syncer.handle_block(block, &mut chain, None);
+        }
+        assert!(syncer.orphan_count() <= ORPHAN_POOL_MAX);
     }
 }

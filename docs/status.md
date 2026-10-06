@@ -6,32 +6,52 @@ relying on anything here.
 ## Scope
 
 Layer 1 (base layer) implementation per SPEC.md. Includes the P2P networking layer
-(`jnt-net`) supporting multi-peer block relay, locator-based sync, and handshake
-isolation. Also includes the five core protocol mechanisms:
-- M1: 50/50 PSCB (Protocol Security & Compute Buffer) fee split
-- M2: Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault
-- M3: Universal Hardware-Agnostic Canonical Compute IR
-- M4: Memory-bound HBM scratchpad PoW puzzle
-- M5: Sovereign BLS aggregate finality gadget checkpoints
+(`jnt-net`) supporting multi-peer block relay, locator-based sync, handshake
+isolation, ban scoring and side-branch pruning. Also defines the five core
+protocol mechanisms — **only M1 is consensus-active**, i.e. only M1 can change
+whether a node accepts a block:
+
+| # | Mechanism | Consensus-active | Module |
+|---|---|---|---|
+| M1 | 50/50 PSCB (Protocol Security & Compute Buffer) fee split | **Yes** — SPEC.md §8 | `fees.rs`, `chain.rs` |
+| M2 | Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault | No — no rule creates a slash record yet | `slash.rs` |
+| M3 | Universal Hardware-Agnostic Canonical Compute IR | No — envelopes only | `compute_ir.rs` |
+| M4 | Memory-bound HBM scratchpad PoW puzzle | No — not a registered `puzzle_id` | `hbm_pow.rs` |
+| M5 | Sovereign BLS aggregate finality gadget checkpoints | No — `BlsVerifier` is a mock | `bls_checkpoint.rs` |
+
+SPEC.md §14 carries the same table and says why each of M2–M5 is inactive: each
+needs a rule this repository has not specified (what proves a compute result
+fraudulent, how a task enters a block, whether the HBM puzzle replaces or
+composes with the §5 puzzle, who the validator set is). M2 and M4 would change
+consensus, so guessing those rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — 207 tests pass:
-  - 178 unit tests in `jnt-core` (including M1-M5 test suites)
-  - 9 red-team integration tests in `crates/jnt-core/tests/redteam.rs`
-  - 10 unit tests in `jnt-net`
-  - 10 integration tests in `crates/jnt-net/tests/integration.rs`
+- `cargo test --workspace` — 219 tests pass:
+  - 179 unit tests in `jnt-core` (including M1–M5 test suites)
+  - 11 red-team integration tests in `crates/jnt-core/tests/redteam.rs`
+  - 15 unit tests in `jnt-net` (framing, codecs, sync continuation, bounds)
+  - 12 integration tests in `crates/jnt-net/tests/integration.rs`, including a
+    real-socket end-to-end sync between two `P2pNode`s
+  - 2 wire-vector tests in `crates/jnt-net/tests/net_vectors.rs`
 - `cargo clippy --workspace --all-targets` clean under `-D warnings`.
 - `cargo fmt --check` clean across all crates.
+- Two real `jnt-node serve` processes on the `mini` profile completed a full
+  handshake, synced, reorged onto the heavier branch and kept relaying; both
+  data directories then passed `jnt-node verify` (replay from genesis, UTXO +
+  supply + PSCB match).
 - An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
   written from the prose of SPEC.md rather than from the Rust source, reproduces
   all 21 puzzle digests in `tests/vectors/puzzle_vectors.json`. This is the only
   real evidence that SPEC.md is unambiguous rather than merely consistent with the
   Rust code.
-- All four vector files in SPEC.md §12 exist, are generated from source, and are
+- All five vector files in SPEC.md §12 exist, are generated from source, and are
   read by tests. `sim/verify_vectors.py` regenerates and cross-checks them.
   Each consuming test was checked to actually fail when the value it pins is
-  perturbed, so none of them pass vacuously.
+  perturbed, so none of them pass vacuously. `net_vectors.json` (§13.12) is the
+  wire-format set — frame envelope, every `msg_type`, `VERSION` for both
+  profiles, locator construction. It has no independent implementation yet, the
+  way `sim/jounit_reference.py` re-derives §5; that check is still owed.
 - Node CLI end to end on the `mini` profile: init, mine 31 blocks, spend, verify
   (replays from genesis and diffs UTXO + supply), status. Fee burn reconciles
   exactly — 31 blocks issue 2356 JNT, live supply is 2355.99825 JNT, the
@@ -191,13 +211,24 @@ Smaller items from the same pass:
   Clamped instead. `apply_block` also now refuses heights past `u32::MAX`, where
   the coinbase's `u32` height index stops being injective.
 
-One design limitation is called out rather than changed: a valid branch that
-forked below the finality point and is heavier than the tip is *retained* and
-its work *is* counted, so the node declines to reorganize and cannot accept
-honest blocks until the situation changes. That follows directly from treating
-`finality_depth` as a hard rule. Whether the node should instead follow the
-heavier chain, or how long to remember a branch it will not take, is a consensus
-design question and not a bug fix.
+**A branch that forked below the finality point no longer wedges the node.**
+Earlier sessions recorded this as an open design question rather than a bug: a
+valid branch heavier than the tip but forking below `finality_depth` was
+retained, its work was counted, fork choice kept selecting it, and the node
+refused honest blocks until honest work caught up. A peer could therefore stall a
+node's progress at no cost to itself.
+
+SPEC.md §13.10 item 2 settles it, and side-branch pruning is now implemented:
+every non-canonical block at or below `tip − finality_depth` is dropped, along
+with any stored descendant of a dropped block. Forgetting such a branch is what
+lets the node accept honest blocks again. **§9.3 is unchanged** — a reorg whose
+fork point is at or below the finality height is still refused with
+`ReorgWouldCrossFinality`; `reorg_cannot_rewrite_finalized_history` and
+`a_longer_branch_cannot_rewrite_finalized_history` both still pass. What changed
+is only how long the node remembers a branch it was never going to follow.
+
+Canonical history is still retained in full, because undo records,
+`verify_canonical_chain` and the persistence layer all replay from genesis.
 
 ## A claim that did not survive measurement
 
@@ -225,12 +256,69 @@ never recovers ends up pinned on the difficulty floor, so rows matching the
 full-spec row may be there for that trivial reason. Raise `--start-difficulty`
 to separate them.
 
+## P2P defects found and fixed
+
+Every other `jnt-net` test drove `SyncManager` directly, so the event loop, the
+peer threads and the sync continuation were untested. Driving them from a real
+socket found all of the following.
+
+- **Sync stopped after one batch.** §13.7 requires the requester to `GETDATA`
+  "in batches of 16, submit each, **and repeats**". `handle_inv` returned the
+  first 16 entries of an `INV` and discarded the rest — and worse, marked them
+  all as requested, so they were poisoned as well as lost. A node more than 16
+  blocks behind could never finish syncing. Now every advertised hash is queued
+  (bounded), and each applied block frees a slot for the next batch.
+- **A peer could stall sync by disconnecting.** Requested hashes were tracked in
+  a set with no owner and no release path, so a peer that hung up mid-sync left
+  its hashes marked as requested forever. Requests are now tracked per peer and
+  released on disconnect.
+- **The `requested` set grew without bound.** §13.11 invariant 6 says no
+  structure may grow past its §13.8 bound; a peer advertising hashes it never
+  delivered grew this set forever. It is now capped, and a bounded pending queue
+  holds what is advertised-but-not-yet-requested.
+- **`max_peers` was never enforced.** §13.8 bounds it as the cap on thread and
+  descriptor count, and only `max_inbound` was checked, on the accept path only.
+  Outbound dials are now refused at the limit, and the total is checked on accept
+  too.
+- **Every inbound connection failed on Windows.** An accepted socket inherits
+  the listener's non-blocking flag on Windows, so the blocking, timeout-based
+  handshake returned `WouldBlock` immediately and the peer was dropped. The flag
+  is now cleared explicitly on accept. This is why the end-to-end test is worth
+  having: every prior test used a plain blocking listener and passed.
+- **`stop()` did not disconnect.** It set a flag; the reader thread stayed parked
+  in `read_frame` for up to 60 s, still holding a thread and still able to emit
+  events for a peer the node believed it had dropped — including a peer banned for
+  a framing violation. The socket is now shut down, and an oversized frame or
+  post-handshake bad magic scores the immediate `+100` that §13.9 already promised.
+- **The handshake nonce was the wall clock.** Deriving it from
+  `SystemTime::now()` made the "proof of socket possession" challenge guessable
+  from block timestamps. It now mixes a `RandomState` key (OS-seeded) with a
+  counter.
+- **Exceeding an inbound bound disconnected instead of banning**, contrary to
+  §13.8. There is now a bounded, address-keyed score table with the §13.9
+  one-per-hour decay.
+- **The locator could exceed `max_locator_len`.** Genesis was appended on top of
+  an already-full locator, making 501 entries. The slot is now reserved.
+- **`jnt-node serve` lost everything it synced.** It persisted only on its own
+  mining path, so blocks that arrived from peers were never written and a restart
+  replayed genesis and discarded the entire sync. It also looped with no delay,
+  pegging a core on mining and O(n) JSON writes. Both fixed; `--interval`
+  controls the loop period.
+- **`verify` could not see M1 bugs.** `verify_canonical_chain` compared the UTXO
+  set only, so a wrong PSCB unwind was invisible to the node's own checker. It now
+  re-derives the reserve and its undo records by replay.
+
 ## Not done
 
 - **Layer 2 / Verified Work Certificates.** The core of the project's premise.
-- **P2P.** No node discovery, no block/tx relay, no mempool gossip.
+- **P2P gaps.** Block relay works (verified end to end over real sockets, and
+  between two `serve` processes). Still missing: peer discovery (§13.6 by
+  design — address book only), transaction relay and any mempool (§13.13),
+  headers-first sync, compact blocks. Real `blst` BLS verification (M5).
 - **Persisted UTXO indexing.** State is replayed from genesis on load, which is
-  fine at test scale and will not be at 40M coins.
+  fine at test scale and will not be at 40M coins. `serve` also rewrites
+  `blocks.json` in full whenever the chain changes (SPEC.md §13.10 item 4).
+- **M2–M5 are not wired into consensus.** See the table above and SPEC.md §14.
 - **No fuzzing with a coverage-guided harness** (`cargo-fuzz`/`arbitrary`),
   which is what would really exercise the parsers. In its place are
   deterministic property tests: arbitrary bytes through every deserializer,
