@@ -761,3 +761,59 @@ an open economics item).
 
 347 workspace tests (was 341). fmt/clippy -D warnings/release clean; five
 sims green.
+
+## Phase 4 — Fuzzing: harness shipped, campaign executed, invariants enforced
+
+`fuzz/` is a standalone cargo-fuzz crate (kept out of the workspace) with seven
+targets over the highest-risk boundaries: `tx_decode`, `block_decode`,
+`wire_msg_decode`, `mempool_admit`, `storage_recover`, `checkpoint_validate`,
+`meta_parse`. Each asserts round-trip and capability invariants — decode →
+encode → decode identity, mempool byte cap under hostile admission, store
+reopen after an adversarial tail, accepted checkpoint ⇒ honest count + quorum
++ real signature — not merely panic-freedom.
+
+Execution environment note: Windows' nightly MSVC toolchain does not ship the
+ASan runtime (`clang_rt.asan_dynamic-x86_64.dll`), so the campaign ran in WSL
+Ubuntu (nightly + cargo-fuzz + ASan). One-time env setup is recorded in
+memory.md. Results, one 60-second ASan campaign per target, all exit 0, no
+crashes, no leaks, no OOMs:
+
+| target              | execs     |
+|---------------------|-----------|
+| tx_decode           | 4,829,687 |
+| wire_msg_decode     | 2,960,697 |
+| mempool_admit       | 2,460,827 |
+| block_decode        | 2,291,347 |
+| meta_parse          |   539,534 |
+| storage_recover     |   248,534 |
+| checkpoint_validate |    72,997 |
+| **total**           | **13.4M** |
+
+(checkpoint_validate is BLS-bound: every iteration does real blst pairings;
+storage_recover is fsync-bound. Both are capability-bound, which is the point.)
+
+The deterministic counterparts run on every `cargo test`: three
+`fuzz_invariants.rs` suites (jnt-core, jnt-net, jnt-store) feed hand-built
+adversarial inputs — every truncation and bitflip of a valid tx/block, hostile
+length fields, binary garbage metadata, forged/replayed/lying-count
+checkpoints — through the same invariants. They found two real bugs before the
+fuzzer ran, both fixed with regression tests:
+
+1. **jnt-net `Message::Unknown` grew 5 bytes per decode→encode cycle.** Decode
+   stores the payload verbatim (§13.5 freeze rule); encode re-framed it as
+   `ty + len + raw`. Encode is now the exact inverse of decode. Wire
+   correctness only — unknowns are never relayed — but the asymmetry would
+   have bitten the first non-Rust peer implementation.
+2. **jnt-store `MetaFile::load` leaked a raw `InvalidData` IO error on
+   non-UTF-8 meta.json** (a crash or disk-damage outcome, exactly what
+   `BadMeta` exists to name). Now reads bytes and maps the utf-8 failure to
+   `BadMeta`.
+
+CI gained a `fuzz-smoke` job: nightly + cargo-fuzz, 20 s per target per push,
+so the harness is executed — not just compiled — on every change. Longer
+campaigns run locally; any minimized crash lands in the invariant suites as a
+regression test.
+
+360 workspace tests (was 347). fmt/clippy -D warnings/release clean; five sims
+green. No consensus rule touched: `Chain::submit` still never references
+validators.rs, supply/mining/rewards unchanged.
