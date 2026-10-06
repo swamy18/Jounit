@@ -1943,3 +1943,47 @@ a fixture test caught a hand-guessed key hash (real value committed). 18
 adversarial checkpoint tests green. 341 workspace tests total, all checks
 clean. M5 still NOT consensus-active — the honest boundary is §14.6 validator
 economics, a user decision, not mine.
+
+## Session 10 status snapshot — where the mission stands
+
+**Committed and pushed to origin/main (all verified before each commit):**
+- `cbd194f` Step 1A: bounded mempool + miner integration (previous session).
+- `a4f9859` Step 2 / Phase 1: P2P transaction relay. Real bugs: banned peer
+  never released (Windows blocked read); my own fix then pre-empted the
+  wallet's one-shot connect (separate "we ended peer" from "stream ended");
+  unfulfilled GETDATA-TX requests had no expiry and could stall relay
+  globally; `send --relay` did not exist at all.
+- `fbe70a3` Step 3 / Phase 2: crates/jnt-store, append-only checksummed block
+  log + atomic metadata, replacing the O(n)-per-block blocks.json rewrite.
+  Five bugs pre-shipment: block/UTXO record-tag collision (block version byte
+  == snapshot tag), tip height read from the wrong end of the ancestry walk,
+  metadata checksum-line off-by-one, genesis missing from the height index,
+  stale file-length underflow in the recovery scan. Force-kill restart tested
+  twice with real binaries. Legacy JSON migration works.
+- `3f3cd62` Step 4 / Phase 3: real BLS. See the §14.5/RealBls entry above.
+
+**Verified at each milestone:** full workspace tests (currently 341),
+fmt --check, clippy -D warnings, release build, all five Python sims, plus
+real-binary e2e where relevant (two-node relay, force-kill restarts, JSON
+migration).
+
+**Remaining roadmap, in dependency order:**
+1. Phase 4 — cargo-fuzz targets: tx deserialization, block deserialization,
+   wire messages, mempool admission, storage recovery, BLS message parsing.
+   (Highest-risk parsers already have adversarial tests; fuzz comes next.)
+2. Phase 5 — jnt-l2 task system. BLOCKED ON A USER DECISION: the L2 fee
+   constants (D3) are ~80x below the L1 fee floor; four options exist and the
+   choice changes economics. I stop and present options before wiring
+   anything.
+3. Phase 6 — dispute engine + M2 slash integration.
+4. Phase 7 — Verified Work Certificates.
+5. Phase 8 — worker SDK (CPU-deterministic first).
+6. Phase 9 — M2/M3/M4 integration review + honest activation docs.
+7. Phase 10 — adaptive PoW experiment (isolated branch/mode, never consensus).
+8. Phase 3 residual — §14.6 validator-set economics = a user decision (D1
+   staking economics); the crypto is ready and waiting, consensus stays off.
+
+**Standing constraints honored:** docs/roadmap.md carries another author's
+uncommitted ~516-line change and is never touched; tests never weakened to
+pass; no consensus/economic decisions taken silently; no push beyond what was
+asked for.
