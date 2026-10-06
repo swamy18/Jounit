@@ -7,10 +7,10 @@ without weakening the security a hash chain depends on.
 > core protocol includes hybrid hash + neural PoW, 5 protocol mechanisms (PSCB fee
 > split, Time-Locked slash reserve, canonical compute IR, HBM scratchpad PoW, and
 > BLS finality gadget), `jnt-net` block relay and sync, and a working Layer 2
-> (`jnt-l2`): task contracts, the five L2 transaction types, D3 fees, and a
-> complete dispute engine with M2 slashing and M1 PSCB accounting. Verified Work
-> Certificates (Phase 4), the worker SDK (Phase 5) and testnet/finality
-> (Phase 6) remain. Read [Status](#status).
+> (`jnt-l2`): task contracts, the five L2 transaction types, D3 fees, a complete
+> dispute engine with M2 slashing and M1 PSCB accounting, and Verified Work
+> Certificates for settled work. The worker SDK (Phase 5) and
+> testnet/finality (Phase 6) remain. Read [Status](#status).
 
 ---
 
@@ -48,15 +48,15 @@ without weakening the security a hash chain depends on.
 - **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a sovereign BLS aggregate finality gadget (M5). See the M1–M5 table in [Protocol mechanisms](#protocol-mechanisms-m1m5) for what each one does and does not yet affect.
 - **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
 - **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
-- **Layer 2 (`jnt-l2`)**: Task contracts over the five L2 transaction types, D3 flat fees split 50/50 burn/PSCB, escrow accounting, replay protection, and a complete **dispute engine** — evidence validation, the M3 CPU-reference arbitration rule (SPEC.md §16), M2 slashing, PSCB whistleblower bounty, and a conservation invariant asserted after every scenario.
+- **Layer 2 (`jnt-l2`)**: Task contracts over the five L2 transaction types, D3 flat fees split 50/50 burn/PSCB, escrow accounting, replay protection, a complete **dispute engine** (evidence validation, the M3 CPU-reference arbitration rule per SPEC.md §16, M2 slashing, PSCB whistleblower bounty), and **Verified Work Certificates** (SPEC.md §17): every correctly settled task issues a deterministic, id-derived receipt — `Quorum`-verified for an explicit settle, `WindowElapsed` for an implicit one — with tamper-evident validation against the on-chain registry.
 
 **Roadmap / Future Work:**
 
 | | |
 |---|---|
-| Layer 2 — Verified Work Certificates | Phase 2 (task contracts, five L2 tx types, D3 fee path) and Phase 3 (dispute engine + M2/M1 integration) shipped in `crates/jnt-l2`. Certificates (Phase 4) and the worker SDK (Phase 5) remain. |
+| Layer 2 — Verified Work Certificates | Phases 2–4 shipped in `crates/jnt-l2`: task contracts and the five L2 tx types (Phase 2), the dispute engine with M2/M1 integration (Phase 3), and Verified Work Certificates (Phase 4) — an automatic, quorum-verifiable receipt for every correctly settled task. The worker SDK (Phase 5) remains. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
-| Coverage-guided fuzzing | Shipped: eleven cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
+| Coverage-guided fuzzing | Shipped: twelve cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
 | License file | Shipped: dual `LICENSE-MIT` / `LICENSE-APACHE` at the repo root, matching `Cargo.toml`'s `MIT OR Apache-2.0`. |
 
 ---
@@ -135,7 +135,7 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-net/tests/integration.rs` | 500+ | P2P integration tests, including a real-socket end-to-end sync. |
 | `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
 | `crates/jnt-store/` | 2 200+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
-| `crates/jnt-l2/` | 3 900+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty. |
+| `crates/jnt-l2/` | 5 400+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates. |
 | `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
 | `sim/` | 1 609 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
@@ -154,7 +154,7 @@ Five crates in one workspace:
 jnt-core   pure protocol library — no I/O, no clock, no network
 jnt-net    P2P wire protocol, peer state machines, sync and relay
 jnt-store  persistent storage: append-only block log + atomic metadata
-jnt-l2     Layer 2: task contracts, the five L2 transaction types, D3 fees, the dispute engine
+jnt-l2     Layer 2: task contracts, the five L2 transaction types, D3 fees, the dispute engine, VWCs
 jnt-node   CLI and node daemon (serve, mine, status, verify)
 ```
 
@@ -209,6 +209,10 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
   accounts/escrow/replay layer, and arbitration. `TaskContract` holds transitions only (no
   balances, no crypto); `L2State` is the only thing that debits an account or consults a
   validator set; `DisputeEngine` compares result hashes and never executes task code.
+- **`VerifiedWorkCertificate`** (`jnt-l2::vwc`) — the receipt for verified correct work,
+  issued automatically at settlement. Its id is derived from its canonical encoding (never
+  serialized), and `Quorum` certificates carry the settle payload's own BLS aggregate, so a
+  third party can verify the decision offline against the validator set.
 - **`Error`** — 41 variants. Every one is *deterministic and consensus-visible*:
   two conforming nodes evaluating the same block must produce the same variant,
   because callers branch on it.
@@ -550,7 +554,7 @@ Per-command options: `--blocks`, `--interval`, `--wallet`, `--amount`, `--to`,
 ## Testing and verification
 
 ```sh
-cargo test --workspace                                   # 444 tests across five crates
+cargo test --workspace                                   # 468 tests across five crates
 cargo clippy --workspace --all-targets -- -D warnings    # 0 warnings
 cargo fmt --all --check
 ```
@@ -609,11 +613,11 @@ difficulty-attack containment simulation, the supply cross-check, and a
 
 ### Fuzzing and invariants
 
-`fuzz/` is a standalone cargo-fuzz crate with **eleven targets** over the
+`fuzz/` is a standalone cargo-fuzz crate with **twelve targets** over the
 attacker-controlled boundaries — L1: `tx_decode`, `block_decode`,
 `wire_msg_decode`, `mempool_admit`, `storage_recover`, `checkpoint_validate`,
-`meta_parse`; L2 (Phase 2–3): `l2_payload_decode`, `m3_readers`,
-`dispute_arbitrate`, `l2_state_apply`. They assert capability invariants (exact
+`meta_parse`; L2 (Phase 2–4): `l2_payload_decode`, `m3_readers`,
+`dispute_arbitrate`, `l2_state_apply`, `vwc_decode`. They assert capability invariants (exact
 decode→encode inversion, bounded allocation, value conservation under
 adversarial transaction programs), not merely panic-freedom. Campaign results
 are recorded in [docs/status.md](docs/status.md).
@@ -625,7 +629,7 @@ hostile length fields, forged and lying-count checkpoints, mutated dispute
 evidence — through the same invariants on stable tooling.
 
 ```sh
-cd fuzz && cargo check --bins       # all eleven targets compile
+cd fuzz && cargo check --bins       # all twelve targets compile
 cargo test -p jnt-l2 --test fuzz_invariants   # L2 invariants on stable
 ```
 

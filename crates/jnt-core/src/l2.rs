@@ -49,6 +49,9 @@ pub const DOM_L2_SUBMIT: &[u8] = b"jounit/l2/submit/v1";
 pub const DOM_L2_DISPUTE: &[u8] = b"jounit/l2/dispute/v1";
 pub const DOM_L2_SETTLE: &[u8] = b"jounit/l2/settle/v1";
 pub const DOM_L2_TXID: &[u8] = b"jounit/l2/txid/v1";
+/// Verified Work Certificate identity (SPEC.md §17.3). Derives a certificate id
+/// from its canonical encoding; a different preimage needs a new tag.
+pub const DOM_L2_VWC: &[u8] = b"jounit/l2/vwc/v1";
 
 /// Wire type codes. Deliberately `0x10`-based: L1 uses `0` and `1`, and leaving a
 /// clear gap means an L1 `tx_type` this build does not know is rejected as an

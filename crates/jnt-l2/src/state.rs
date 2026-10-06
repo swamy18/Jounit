@@ -31,12 +31,13 @@ use jnt_core::fees::split_flat_fee;
 use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
     ClaimTaskPayload, DisputePayload, L2Payload, L2Transaction, PostTaskPayload, SettlePayload,
-    SubmitResultPayload, Verdict,
+    SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
 };
 use jnt_core::slash::SlashVault;
 
 use crate::error::{L2Error, L2Result};
 use crate::task_contract::{L2Config, SettlementOutcome, TaskContract};
+use crate::vwc::{VerifiedWorkCertificate, VwcVerification};
 
 /// What an applied transaction did, for logging, tests and (later) event streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +69,10 @@ pub enum L2Effect {
         /// Whistleblower bounty paid from the PSCB reserve (Phase 3). Zero
         /// unless the challenge was upheld and the reserve had funds.
         challenger_bonus: u64,
+        /// The Verified Work Certificate issued by this settlement (Phase 4).
+        /// `Some` only for a `Correct` settlement of real work; `Fraudulent`
+        /// and `Expired` issue nothing (SPEC.md §17.4).
+        vwc_id: Option<Hash>,
     },
     Expired {
         task_id: Hash,
@@ -89,6 +94,9 @@ pub struct L2State {
     pub pscb: u64,
     /// M2 slash vault. Fraud slashes vest here.
     pub slash_vault: SlashVault,
+    /// Verified Work Certificates, keyed by task id (Phase 4, SPEC.md §17.7).
+    /// Certificates hold no value, so they are outside the conservation sum.
+    vwcs: HashMap<Hash, VerifiedWorkCertificate>,
 }
 
 impl L2State {
@@ -101,6 +109,7 @@ impl L2State {
             burned: 0,
             pscb: 0,
             slash_vault: SlashVault::new(),
+            vwcs: HashMap::new(),
         }
     }
 
@@ -308,7 +317,6 @@ impl L2State {
         if !verifier.verify_aggregate(&signers, &msg, &BlsSignature(p.bls_sig)) {
             return Err(L2Error::BadBlsSignature);
         }
-
         let (submitter, worker, challenger, outcome) = {
             let contract = self.tasks.get_mut(&p.task_id).ok_or(L2Error::UnknownTask)?;
             let submitter = contract.submitter;
@@ -317,6 +325,37 @@ impl L2State {
             let outcome = contract.settle(p.verdict, p.vwc_hash, height, fee)?;
             (submitter, worker, challenger, outcome)
         };
+
+        // Issue the certificate *before* any value moves, so a refusal leaves
+        // the state untouched (fail closed). Only a `Correct` settlement of real
+        // work certifies: a `Fraudulent` verdict is a SlashRecord and an
+        // `Expired` one is a refund, neither of which is a certificate
+        // (SPEC.md §17.4). The evidence is the payload's own quorum aggregate.
+        let vwc_id = if p.verdict == Verdict::Correct {
+            if p.vwc_hash == VWC_HASH_EXPIRED {
+                return Err(L2Error::VwcInvalid(
+                    "a correct settlement named the expired-placeholder hash",
+                ));
+            }
+            let worker =
+                worker.ok_or(L2Error::VwcInvalid("a correct settlement without a worker"))?;
+            let cert = VerifiedWorkCertificate::from_settlement(
+                p.task_id,
+                worker,
+                p.vwc_hash,
+                height,
+                outcome.worker_paid,
+                VwcVerification::Quorum {
+                    bls_sig: p.bls_sig,
+                    signer_bitmap: p.signer_bitmap.clone(),
+                    signer_count: p.signer_count,
+                },
+            )?;
+            Some(self.issue_vwc(cert)?)
+        } else {
+            None
+        };
+
         let challenger_bonus =
             self.apply_settlement(submitter, worker, challenger, outcome, txid, height)?;
         Ok(L2Effect::Settled {
@@ -326,6 +365,7 @@ impl L2State {
             submitter_refunded: outcome.submitter_refunded,
             worker_deposit_slashed: outcome.worker_deposit_slashed,
             challenger_bonus,
+            vwc_id,
         })
     }
 
@@ -421,6 +461,9 @@ impl L2State {
             let settled = {
                 let t = self.tasks.get_mut(&id).expect("id came from the map");
                 let attrs = (t.submitter, t.worker, t.challenger());
+                // The certificate binds to the result the settlement names, so
+                // read it while the contract still carries it.
+                let result = t.correct_settlement_hash(height);
                 let outcome = if t.due_for_auto_settle(height) {
                     t.auto_settle_correct(height).ok()
                 } else if t.due_for_dispute_lapse(height) {
@@ -428,12 +471,33 @@ impl L2State {
                 } else {
                     None
                 };
-                outcome.map(|o| (attrs, o))
+                outcome.map(|o| (attrs, result, o))
             };
-            if let Some(((submitter, worker, challenger), outcome)) = settled {
+            if let Some(((submitter, worker, challenger), result, outcome)) = settled {
                 let bonus = self
                     .apply_settlement(submitter, worker, challenger, outcome, [0u8; 32], height)
                     .unwrap_or(0);
+                // An implicit settlement carries no aggregate (nothing was
+                // transacted), so its certificate is `WindowElapsed` (§17.5). A
+                // task settles once, so a duplicate issuance here is impossible;
+                // recording nothing would mean a corrupt state, not a lost fee.
+                let vwc_id = worker.zip(result).and_then(|(w, r)| {
+                    match VerifiedWorkCertificate::from_settlement(
+                        id,
+                        w,
+                        r,
+                        height,
+                        outcome.worker_paid,
+                        VwcVerification::WindowElapsed,
+                    ) {
+                        Ok(cert) => {
+                            let cert_id = cert.id;
+                            let _ = self.issue_vwc(cert);
+                            Some(cert_id)
+                        }
+                        Err(_) => None,
+                    }
+                });
                 effects.push(L2Effect::Settled {
                     task_id: id,
                     verdict: Verdict::Correct,
@@ -441,6 +505,7 @@ impl L2State {
                     submitter_refunded: outcome.submitter_refunded,
                     worker_deposit_slashed: 0,
                     challenger_bonus: bonus,
+                    vwc_id,
                 });
                 continue;
             }
@@ -467,6 +532,57 @@ impl L2State {
         }
 
         effects
+    }
+
+    // --- verified work certificates (Phase 4, SPEC.md §17) -------------
+
+    /// The certificate issued for a task, if it settled as `Correct`.
+    pub fn vwc(&self, task_id: &Hash) -> Option<&VerifiedWorkCertificate> {
+        self.vwcs.get(task_id)
+    }
+
+    pub fn vwc_count(&self) -> usize {
+        self.vwcs.len()
+    }
+
+    /// Every certificate, sorted by task id. Enumeration is never `HashMap`
+    /// order, so two nodes holding the same state list the same certificates in
+    /// the same order (§17.9).
+    pub fn vwcs(&self) -> Vec<&VerifiedWorkCertificate> {
+        let mut ids: Vec<Hash> = self.vwcs.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|id| &self.vwcs[&id]).collect()
+    }
+
+    /// Validate a certificate against live state: everything
+    /// `VerifiedWorkCertificate::validate` checks, plus the registry comparison
+    /// (§17.6 check 4) — the certificate must be the one this state issued, byte
+    /// for byte. A structurally valid certificate that no state issued proves
+    /// nothing.
+    pub fn validate_vwc(
+        &self,
+        cert: &VerifiedWorkCertificate,
+        validators: &ValidatorSet,
+        verifier: &dyn BlsVerifier,
+    ) -> L2Result<()> {
+        cert.validate(validators, verifier)?;
+        match self.vwcs.get(&cert.task_id) {
+            Some(issued) if issued == cert => Ok(()),
+            Some(_) => Err(L2Error::VwcInvalid("differs from the issued certificate")),
+            None => Err(L2Error::VwcInvalid("was never issued by this state")),
+        }
+    }
+
+    /// Record a certificate. Exactly one per task, ever: a second issuance for
+    /// the same task is a protocol violation and is refused, never silently
+    /// overwritten (§17.7).
+    fn issue_vwc(&mut self, cert: VerifiedWorkCertificate) -> L2Result<Hash> {
+        if self.vwcs.contains_key(&cert.task_id) {
+            return Err(L2Error::VwcAlreadyIssued);
+        }
+        let id = cert.id;
+        self.vwcs.insert(cert.task_id, cert);
+        Ok(id)
     }
 
     // --- invariants ----------------------------------------------------

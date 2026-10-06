@@ -966,3 +966,87 @@ in the new suite, including the bounty path.
 **Still gated:** BLS/M5 finality activation (end of Phase 6). **Now unblocked:**
 Phase 4 (Verified Work Certificates) — a settled verdict and `vwc_hash` are what
 a certificate certifies.
+
+## Phase 4 — Verified Work Certificates: SHIPPED (`jnt-l2::vwc`) — 2026-10-06
+
+The VWC layer is built on top of the existing TaskContract, dispute engine and
+settlement path. SPEC.md §17 is its normative text. **No L1 consensus rule
+changed** and the D3 fee schedule is untouched; the one product fix (below) is a
+validation tightening, not an economic change.
+
+**What exists**
+
+- `crates/jnt-l2/src/vwc.rs` — `VerifiedWorkCertificate` + `VwcVerification`.
+  Canonical, exact-inverse encoding (version, task, worker, result hash,
+  settled height, payment, and — for `Quorum` — the settle payload's own BLS
+  aggregate, bitmap and count). The id is *derived* (`DOM_L2_VWC`, §17.3) and
+  never serialized, so a tampered certificate cannot carry a matching id.
+  `validate` fails closed: identity, sanity, then the quorum threshold and a
+  real aggregate check over the exact settle decision.
+- `crates/jnt-l2/src/state.rs` — the registry (`task_id → certificate`),
+  issuance wired into **both** settlement paths: an explicit `Settle` issues
+  `Quorum` (reusing the payload aggregate), an implicit auto-settle/lapse issues
+  `WindowElapsed`. Issuance happens *before* value moves, so a refusal leaves
+  the state untouched. Only `Correct` settlements certify; `Fraudulent` issues a
+  `SlashRecord` and `Expired` issues nothing. `L2Effect::Settled` gained
+  `vwc_id`.
+- `crates/jnt-l2/src/task_contract.rs` — **the Phase-4 product fix:** a worker
+  can no longer submit the all-zero result hash, because that hash is
+  `VWC_HASH_EXPIRED` and would collide with the expired-placeholder record
+  (`BadAttestation`, regression-tested).
+- `crates/jnt-core/src/l2.rs` — `DOM_L2_VWC` (`jounit/l2/vwc/v1`), frozen like
+  the other tags.
+
+**Reused, not reimplemented:** the M5 `ValidatorSet`/`BlsVerifier`/aggregate path
+(no new key ceremony, no custom crypto), the dispute engine (certificates are a
+*consequence* of settlement, never a parallel dispute mechanism), `split_flat_fee`
+(M1+D3), and the existing `SettlePayload` codec bounds.
+
+**What a VWC proves — stated precisely (SPEC.md §17.1):** `Quorum` proves a
+validator quorum signed the settlement decision; `WindowElapsed` proves the
+protocol accepted the result unchallenged and is *not offline-verifiable*.
+Neither attests physical execution.
+
+**Verification.** 468 workspace tests (was 444, +24): +9 `vwc.rs` unit tests
+(real-blst aggregates, tamper/forgery/sub-quorum/zero-sig refusals, codec
+totality over truncations and bitflips, zero-payout certification), +14
+`vwc_flow.rs` integration tests (quorum and window-elapsed issuance, fraudulent
+and expired non-issuance, placeholder-hash refusal, tampered/re-id'd/stranger
+certificates refused by the registry, forged aggregates refused after
+re-deriving the id, dispute-of-settled refused, determinism across independent
+runs, sorted registry enumeration, conservation after every scenario), and the
+L2 fuzz-invariant program now also asserts registry tamper-freedom. fmt clean,
+clippy `-D warnings` clean, release build clean, all five sims green, all twelve
+fuzz targets compile.
+
+**Bugs found and fixed (1 product, several test-harness):**
+
+1. **Product:** a worker could submit `result_hash == VWC_HASH_EXPIRED`
+   (all-zero), making a certified-correct settlement indistinguishable from an
+   expired one in the settle record. Now refused at submission. Regression test
+   in `vwc_flow.rs` and a unit-level guard in `task_contract.rs`.
+2. **Spec, corrected by the tests:** the original §17.6 draft required
+   `payment_sat > 0` on a certificate. The existing fee==escrow test proved a
+   zero-payout `Correct` settlement is reachable, so the rule was corrected —
+   zero-payout work still certifies, honestly recording `payment_sat == 0` —
+   rather than silently excluding those workers from certification.
+3. **Test harness:** the first VWC unit fixture used placeholder validator keys
+   (`[i; 48]`), which are not curve points; the real verifier correctly refused
+   them. The fixture now derives real keys, so the tests exercise genuine
+   pairing verification. No product change.
+
+**Fuzzing.** New target `vwc_decode` (codec totality, exact inversion, id
+stability, `validate` totality) — CI fuzz-smoke now loops all twelve targets.
+Campaign (WSL nightly + ASan, 40 s each): `vwc_decode` 1,163,630;
+`dispute_arbitrate` 3,760,893; `l2_state_apply` 12,630 (crypto-bound). Total
+~4.9M execs, **0 crashes**. No product bug surfaced by fuzzing this phase.
+
+**Performance (measured, release, `vwc_perf_probe`):** encode 4.6 µs, decode
+3.4 µs, `validate` ~2.4 ms with a real blst pairing — validation is BLS-bound by
+construction, the same cost class as checkpoint verification, and no
+optimization is justified. The probe is an `#[ignore]`d test kept in `vwc.rs`
+for re-measurement.
+
+**Still gated:** BLS/M5 L1 finality activation (end of Phase 6). **Now
+unblocked:** Phase 5 (Worker SDK) — task discovery, claim/execute/submit,
+attestation, VWC handling, wallet integration.

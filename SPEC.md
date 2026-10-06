@@ -1505,9 +1505,11 @@ challenge earns nothing and burns the deposit.
 ### 15.9 What is not specified here
 
 - How L2 transactions reach a block (Phase 6).
-- Verified Work Certificate issuance (Phase 4); `vwc_hash` is `result_hash` for
-  `Correct`, the counter-result for `Fraudulent`, and all-zero for `Expired`
-  until then.
+- Verified Work Certificate issuance, representation and validation — now
+  specified in §17. The `vwc_hash` field of a settlement remains the value that
+  a certificate commits to: `result_hash` for `Correct`, the counter-result for
+  `Fraudulent`, and all-zero (`VWC_HASH_EXPIRED`) for `Expired`; only a `Correct`
+  settlement issues a certificate.
 - The off-chain mechanics of producing `re_execution_result` (scheduling the
   arbitrator set, distributing the IR and input bytes) — Phase 5/6.
 - Binding BLS finality activation (end of Phase 6).
@@ -1600,3 +1602,171 @@ Consequences, stated so they are not discovered later:
 - Floating point is never introduced, in the reference or any backend.
 - The reference does not replace attestation or hardware proof; it determines
   correctness only after a result has been challenged.
+
+---
+
+## 17. Verified Work Certificates (VWC, Phase 4)
+
+A Verified Work Certificate is the protocol's receipt for **verified correct
+work**: a deterministic, canonical, off-chain-transferable record that task `T`
+was settled as `Correct` with result `R`, that worker `W` was paid `P` sats for
+it at height `H`, and — when the verification kind is quorum — a BLS aggregate
+over exactly that decision, verifiable by anyone holding the validator set.
+
+### 17.1 What a VWC proves, and what it does not
+
+A VWC proves **digital verification**, not physical-world truth. Precisely:
+
+- `Quorum` verification proves that a validator quorum signed a settlement
+  decision naming `(task_id, Correct, result_hash)`. What the quorum signed is a
+  decision; the strength of that decision is whatever produced the reference
+  result (§16 for a challenged task, the unchallenged submission otherwise).
+- `WindowElapsed` verification proves that the protocol settled the task as
+  `Correct` after the dispute window closed with no challenge. It is *accepted*,
+  not independently re-verified: its strength is the on-chain record, and it is
+  not offline-verifiable. A relying party who needs stronger evidence MUST
+  require the `Quorum` kind.
+
+Nothing here attests that a human or machine physically executed anything. M4
+proves hardware in mining; a VWC proves only that the protocol's verification
+path accepted a result.
+
+### 17.2 Representation
+
+Canonical, little-endian, exact-inverse encoding (the same codec rules as §15.1):
+
+```
+u32le  version                      // 1; unknown versions are refused
+fixed  task_id        (32)
+fixed  worker         (20)
+fixed  result_hash    (32)
+u64le  settled_height
+u64le  payment_sat                    // what the worker was paid
+u8     verification_kind              // 1 = Quorum, 2 = WindowElapsed
+if Quorum:
+  raw    bls_sig        (96)          // aggregate over the SettlePayload signing hash
+  u32le  bitmap_len     (<= 64)
+  raw    signer_bitmap
+  u32le  signer_count
+```
+
+The certificate id is *not* stored in the encoding — it is derived (§17.3), so a
+tampered certificate cannot carry a matching id, and two encodings of the same
+certificate are byte-identical.
+
+### 17.3 Identity
+
+```
+vwc_id = SHA256("jounit/l2/vwc/v1" ‖ body)
+```
+
+where `body` is the entire encoding above (version included). The id is a
+function of the certificate's content alone: no wall clock, no randomness, no
+iteration order. Two implementations encoding the same settlement MUST derive
+the same id.
+
+### 17.4 Issuance rule
+
+A VWC is issued **by the protocol, automatically, at settlement**. There is no
+issuance transaction and no actor who can request one, because a certificate is
+a *derived consequence* of an already-authorized settlement, not a new claim.
+The rules:
+
+1. Only a settlement with `verdict == Correct` and `vwc_hash != VWC_HASH_EXPIRED`
+   issues one. `Fraudulent` settlements issue none — a certificate of fraud is a
+   `SlashRecord`, not a VWC. `Expired` settlements issue none — no work was
+   verified.
+2. Exactly **one** certificate exists per task, ever. The registry (§17.7) keys
+   on `task_id`; a second issuance attempt for the same task is refused and
+   fails closed.
+3. The certificate is issued with the settlement, atomically: a settlement that
+   cannot record its certificate is a programming error surfaced as an error on
+   the explicit path, and the implicit path cannot produce one (a task settles
+   once — see §17.8).
+4. Issuance moves **no value**. The conservation invariant of §15.5 is
+   unaffected by certificate creation.
+
+The worker cannot forge a VWC by claiming work: issuance requires the settlement
+path, which requires either a validator-quorum-signed `Settle` transaction or
+the dispute window closing unchallenged. A worker's own attestation is necessary
+but never sufficient.
+
+### 17.5 Verification kinds
+
+| Kind | Value | Evidence carried | Offline-verifiable | Strength |
+|---|---|---|---|---|
+| `Quorum` | 1 | BLS aggregate + signer bitmap + count | Yes, given the validator set | A quorum signed this exact decision |
+| `WindowElapsed` | 2 | none | No | The on-chain record; unchallenged for one full window |
+
+An explicit `Settle` transaction always yields `Quorum` — its payload already
+carries the aggregate, and the certificate reuses it rather than re-signing.
+An implicit settlement (auto-settle or dispute lapse, §15.7) yields
+`WindowElapsed`, because no aggregate exists for a transition no one transacted.
+
+### 17.6 Validation
+
+`validate` is total, deterministic and fails closed. It MUST check, in order:
+
+1. **Identity.** `vwc_id == derived(body)` — any tampered field is caught here.
+2. **Sanity.** `result_hash != VWC_HASH_EXPIRED`; `worker != 0^20`;
+   `settled_height > 0`. `payment_sat` MAY be zero — an escrow that exactly
+   covered the settle fee pays the worker nothing, but the work was still
+   verified and still certifies.
+3. **Kind-specific.** For `Quorum`: bitmap and count agree; count ≥ quorum
+   threshold; the aggregate verifies over
+   `SettlePayload { task_id, Correct, result_hash }.signing_hash()` with the
+   *same* verifier the settlement path uses. For `WindowElapsed`: nothing
+   further — its strength is the on-chain record (§17.5).
+4. **Presence.** When checked against live state, the certificate MUST be in the
+   registry under its own `task_id`, byte-identical. A certificate that is not
+   in the registry was never issued; one that differs from the registry entry
+   has been tampered with after issuance.
+
+Validation never panics on any input; every failure is a named error.
+
+### 17.7 Registry and replay
+
+The L2 state keeps one registry entry per settled task (`task_id →
+certificate`). This is the replay guard: a task settles once, so a second
+certificate for the same task is impossible, and a decoded certificate claiming
+a task that already settled differently is detected by comparison against the
+registry entry. The registry stores full certificates so validation against
+live state is a byte comparison, not a re-derivation from state the task no
+longer carries (a settled contract keeps its outcome, but the evidence the
+certificate binds to is the registry's job).
+
+### 17.8 Lifecycle, and why there is no revocation
+
+The lifecycle is exactly two states: **issued** and — from a relying party's
+view — **validated** (or refused). There is no pending, accepted, revoked or
+expired state, because:
+
+- Issuance happens at settlement, so there is nothing before "issued".
+- Settlement is terminal and one-way (§15.3): a task that reached `Settled`
+  can never be disputed or re-settled. A `Correct` settlement therefore can
+  never be overturned later, which is precisely the condition that would make
+  revocation necessary. If a re-litigation mechanism is ever specified, it must
+  come with a revocation rule as a separate, reviewable change.
+- Certificates do not expire. A receipt for verified work does not become false
+  with time; a relying party who cares about recency keys on `settled_height`
+  itself.
+
+### 17.9 Determinism
+
+Id derivation, encoding, validation results and registry contents are pure
+functions of settlement data. No clock, no RNG, no `HashMap` iteration order
+(any enumeration of the registry is sorted by task id), no platform-dependent
+behaviour.
+
+### 17.10 Non-goals
+
+- **No new transaction type.** Certificates are protocol outputs, not inputs;
+  nothing authorizes one that the settlement did not already authorize. (This
+  supersedes the roadmap's Step-6 note that VWC lands with new tx types; the
+  reason is recorded in `docs/decisions.md`.)
+- **No issuer key of its own.** The issuer is the protocol; `Quorum`
+  authentication reuses the existing M5 aggregate and `BlsVerifier`. No custom
+  cryptography, no new key ceremony.
+- **No on-chain VWC transactions, no transfer semantics, no marketplace.** A
+  certificate is a receipt; what third parties do with it is Phase 5+.
+- **No claim of physical execution.** See §17.1.

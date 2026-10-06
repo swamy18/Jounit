@@ -21,8 +21,12 @@
 //! - **BLS finality activation.** `Settle` verifies a validator-quorum aggregate
 //!   through the existing `BlsVerifier` trait, but nothing here finalizes an L1
 //!   block. M5 stays inert until the end of the cycle (`docs/decisions.md`).
-//! - **Verified Work Certificates.** Settlement releases payment against a
-//!   verdict; issuing a VWC is Phase 4.
+//!
+//! What arrived with Phase 4:
+//! - **Verified Work Certificates** ([`vwc`], SPEC.md §17): the protocol's
+//!   receipt for verified correct work, issued automatically at settlement —
+//!   `Quorum`-verified for an explicit `Settle`, `WindowElapsed` for an implicit
+//!   one. Certificates hold no value and sit outside the conservation sum.
 //!
 //! Everything here is deterministic: no wall clock, no floating point, no
 //! iteration-order dependence. `L2State::advance_block` sorts task ids before it
@@ -32,6 +36,7 @@ pub mod dispute;
 pub mod error;
 pub mod state;
 pub mod task_contract;
+pub mod vwc;
 
 pub use dispute::{Arbiter, DisputeEngine, DisputeEvidence, DisputeVerdict};
 pub use error::{L2Error, L2Result};
@@ -39,3 +44,4 @@ pub use state::{L2Effect, L2State};
 pub use task_contract::{
     ContractState, DisputeChallenge, ExpiryOutcome, L2Config, SettlementOutcome, TaskContract,
 };
+pub use vwc::{VerifiedWorkCertificate, VwcVerification, VWC_VERSION};

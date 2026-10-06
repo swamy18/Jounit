@@ -97,7 +97,7 @@ jobs:
         # a crash. Long campaigns run locally (see docs/status.md) and any
         # minimized crash lands here as a regression test.
         run: |
-          for t in tx_decode block_decode wire_msg_decode mempool_admit storage_recover checkpoint_validate meta_parse l2_payload_decode m3_readers dispute_arbitrate l2_state_apply; do
+          for t in tx_decode block_decode wire_msg_decode mempool_admit storage_recover checkpoint_validate meta_parse l2_payload_decode m3_readers dispute_arbitrate l2_state_apply vwc_decode; do
             cargo fuzz run "$t" -- -max_total_time=20 -rss_limit_mb=4096
           done
         working-directory: fuzz

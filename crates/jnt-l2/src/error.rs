@@ -52,6 +52,12 @@ pub enum L2Error {
     /// The reference re-execution reproduced neither claim, so no verdict can be
     /// reached and nothing is slashed.
     InconclusiveDispute,
+    /// A certificate already exists for this task; a task settles once, so a
+    /// second issuance is a protocol violation, never an update.
+    VwcAlreadyIssued,
+    /// A certificate was refused: the reason is stated, and validation always
+    /// fails closed (SPEC.md §17.6).
+    VwcInvalid(&'static str),
     /// An account cannot cover the required fee, deposit or escrow.
     InsufficientBalance { needed: u64, available: u64 },
     /// The held amount cannot cover the settle fee.
@@ -90,6 +96,13 @@ impl fmt::Display for L2Error {
             L2Error::InconclusiveDispute => {
                 write!(f, "arbitration was inconclusive; nothing to settle")
             }
+            L2Error::VwcAlreadyIssued => {
+                write!(
+                    f,
+                    "a verified-work certificate already exists for this task"
+                )
+            }
+            L2Error::VwcInvalid(why) => write!(f, "certificate refused: {why}"),
             L2Error::InsufficientBalance { needed, available } => {
                 write!(f, "insufficient balance: need {needed}, have {available}")
             }

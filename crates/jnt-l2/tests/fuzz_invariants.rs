@@ -607,6 +607,19 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
             credited,
             "value conservation broke after step {step} (op {op})"
         );
+
+        // Phase 4: the certificate registry stays tamper-free and bounded by
+        // the task set. Certificates hold no value, so the conservation sum
+        // above is unaffected — which is itself the invariant.
+        for cert in state.vwcs() {
+            assert_eq!(
+                cert.id,
+                cert.id(),
+                "registry certificates stay self-consistent"
+            );
+            assert_ne!(cert.payment_sat, u64::MAX);
+        }
+        assert!(state.vwc_count() <= state.task_count());
     }
 
     // Every explicit path was actually reached at least once, so the invariant
@@ -618,6 +631,10 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
     assert!(
         seen[4] > 0,
         "the program never settled an arbitrated dispute"
+    );
+    assert!(
+        state.vwc_count() > 0,
+        "the program never certified a settled task"
     );
 
     // And a mismatch between the bitmap and the declared count is refused

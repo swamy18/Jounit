@@ -274,6 +274,15 @@ impl TaskContract {
         if submit.attestation.result_hash != submit.result_hash {
             return Err(L2Error::BadAttestation("attestation result_hash"));
         }
+        // An all-zero result hash is the expired placeholder, not a commitment.
+        // Allowing it would make a certified-correct settlement and an expired
+        // one indistinguishable in the settle record, which is exactly the
+        // collision Phase 4's certificates must not have (SPEC.md §17.6).
+        if submit.result_hash == VWC_HASH_EXPIRED {
+            return Err(L2Error::BadAttestation(
+                "result_hash is the expired placeholder; a result must commit to real output",
+            ));
+        }
         if submit.attestation.signature.is_empty() {
             return Err(L2Error::BadAttestation("attestation is unsigned"));
         }

@@ -2082,14 +2082,15 @@ are the chronological build log this ledger summarizes.
 Jounit is a spec-first L1 blockchain (hybrid PoW + LWMA difficulty, EIP-1559-
 shaped 50/50 burn/PSCB fees, 40M JNT hard cap, NN puzzle mining, real blst BLS
 checkpoint machinery shipped inert) that is production-ready at L1 and one
-reviewable change away from a public testnet. Phases 1-3 of the L2 roadmap are
+reviewable change away from a public testnet. Phases 1-4 of the L2 roadmap are
 complete: mempool, crash-safe storage, P2P tx relay, real BLS, fuzzing (P1);
 `jnt-l2` TaskContract + the five L2 tx types + D3 fees (P2); the dispute engine
-with M2 slashing and M1 PSCB bounty wiring (P3). Every economic decision is
-recorded in docs/decisions.md (D3 fees, validator economics, and now the
-dispute arbitration/lapse/whistleblower-bounty rules), so nothing is blocked on
-the owner. Next work item: Phase 4 - Verified Work Certificates (unblocked: a
-settled verdict and vwc_hash are what a certificate certifies).
+with M2 slashing and M1 PSCB bounty wiring (P3); Verified Work Certificates
+issued automatically at settlement (P4). Every economic decision is recorded in
+docs/decisions.md (D3 fees, validator economics, dispute rules, and now the VWC
+receipt design), so nothing is blocked on the owner. Next work item: Phase 5 -
+the worker SDK (task discovery, claim/execute/submit, attestation, VWC
+handling, wallet integration), now unblocked by the certificate layer.
 
 ## B. Work DONE (shipped, tested, on main)
 
@@ -2130,6 +2131,10 @@ L2 (jnt-l2, Phases 2-3):
   inconclusive slashes nothing; resolution window = filing window with lapse;
   whistleblower bounty 25% of slashed, from PSCB, capped, a transfer not a
   mint; M2 SlashVault receives fraud slashes.
+- Verified Work Certificates (Phase 4): derived receipt per correctly settled
+  task, Quorum (reused settle aggregate) or WindowElapsed verification,
+  registry keyed by task_id, one per task ever, no value moved, no revocation
+  (settlement is terminal and one-way).
 
 Node (jnt-node):
 - CLI (jnt-node serve --listen ...), wallet/balance/transfer paths,
@@ -2161,8 +2166,10 @@ Documentation:
 Phase 2 - TaskContract + L2 tx types (DONE - see session 12).
 Phase 3 - Dispute engine + M2/M1 integration (DONE - see session 13; the M3
 CPU-reference spec note is SPEC.md section 16, written before the code).
+Phase 4 - Verified Work Certificates (DONE - see session 14; SPEC.md section 17
+written first; deliberately NO new tx type - see Decision 4).
 
-Phase 4 - VWC issuance (needs 3, NOW UNBLOCKED):
+Phase 5 - Worker SDK (needs 2+4, NOW UNBLOCKED):
 - VerifiedWorkCertificate: signing_hash over all fields, canonical
   serialization, quorum-gated verify, lookup by task/worker.
 
@@ -2205,14 +2212,19 @@ Phase 6 - Public testnet (needs 2-5):
 
 ## F. Numbers (verified, not claimed)
 
-- Tests: 444 workspace, 0 failed (fmt/clippy -D warnings/release/sims green).
-- Fuzz: 11 targets. Phase-1/L1 seven, 13,403,223 execs, 0 crashes.
-  Phase-2/3 L2 four (40 s each, ~7.2M execs): l2_payload_decode 2,975,308;
-  dispute_arbitrate 2,784,817; m3_readers 1,387,682; l2_state_apply 11,880
-  (crypto-bound). One harness false-positive found and fixed; no product bug.
-- Bugs found by invariants: 2 in Phase 1 (both fixed + regression-tested);
-  0 product bugs in Phases 2-3.
-- Repo: 39 commits; Phase 2 shipped as e3c0dab; Phase 3 is this commit.
+- Tests: 468 workspace, 0 failed (fmt/clippy -D warnings/release/sims green).
+- Fuzz: 12 targets. Phase-1/L1 seven, 13,403,223 execs, 0 crashes.
+  Phase-2/3 L2 four, ~7.2M execs: l2_payload_decode 2,975,308;
+  dispute_arbitrate 2,784,817 (plus 3,760,893 in the Phase-4 campaign);
+  m3_readers 1,387,682; l2_state_apply 11,880/12,630 (crypto-bound).
+  Phase-4 VWC one: vwc_decode 1,163,630. One harness false-positive fixed in
+  Phase 3; no product bug from fuzzing.
+- Bugs found by invariants: 2 in Phase 1 (fixed + regression-tested);
+  1 product fix in Phase 4 (zero result-hash submission refused) + one spec
+  rule corrected by tests (zero-payout settlements do certify).
+- VWC perf (release): encode 4.6 us, decode 3.4 us, validate ~2.4 ms (real
+  blst pairing; BLS-bound by construction).
+- Repo: Phase 2 e3c0dab, Phase 3 bce55df, Phase 4 is this commit.
 
 ## G. Environment notes (so future sessions don't re-learn)
 
@@ -2482,3 +2494,104 @@ already a named constant, so replacing the pre-VWC convention is mechanical.
 Then Phase 5 (worker SDK), Phase 6 (testnet/finality). The standing open
 question carried to Phase 6: a task whose escrow/deposit is smaller than the
 20 000 sat settle fee cannot be settled (`AmountTooSmallForFee` fails closed).
+---
+
+# Working memory — session 14: Phase 4, Verified Work Certificates (SHIPPED)
+
+**Date:** 2026-10-06
+**Branch:** `main`, based on `c12f090` (post-Phase-3 + README reconciliation +
+roadmap commit). `docs/roadmap.md` was committed at the owner's explicit
+request in `c12f090` and is no longer a foreign diff.
+**Scope:** Phase 4 — SPEC §17 first, then the VWC data model, issuance,
+validation, TaskContract/dispute/settlement integration, security + determinism
++ conservation tests, fuzzing, docs.
+**Outcome:** built, tested, documented. **468 workspace tests pass (was 444).**
+fmt / clippy `-D warnings` / release / all five sims clean. No L1 consensus rule
+changed, D3 untouched.
+
+## 59. The design decision that shaped everything: a VWC is a receipt, not a transaction
+
+The roadmap's Step-6 note expected VWC to land with new transaction types. It
+does not, and the reason is the security property: an issuance transaction
+would let an actor *request* a certificate the protocol did not decide to
+grant. Instead, SPEC.md §17.4 makes issuance an automatic consequence of
+settlement — the settlement path (quorum-signed `Settle`, or the dispute window
+closing unchallenged) already did all the authorizing, so there is nothing left
+to authenticate. Consequences:
+
+- **No issuer key, no key ceremony, no new crypto.** `Quorum` certificates reuse
+  the settle payload's own M5 aggregate and verify through the existing
+  `BlsVerifier`. `WindowElapsed` certificates (implicit settlements) carry no
+  aggregate because none exists for a transition nobody transacted — and §17.5
+  says plainly they are NOT offline-verifiable, so nobody over-trusts them.
+- **No revocation, no expiry, no pending state.** Settlement is terminal and
+  one-way, so a `Correct` settlement can never be overturned later — exactly
+  the condition revocation would exist for. §17.8 records this reasoning so a
+  future reviewer doesn't re-derive it as a "missing feature".
+- **The id is derived, never serialized** (§17.3). A tampered certificate
+  cannot carry a matching id; and even a re-id'd forgery fails the registry
+  comparison (§17.6 check 4) or — for quorum certificates — the pairing check
+  over the original decision. The id is a pointer; the signature is the proof.
+
+## 60. What shipped, file by file
+
+- `crates/jnt-l2/src/vwc.rs` (new): `VerifiedWorkCertificate`,
+  `VwcVerification` (`Quorum` / `WindowElapsed`), canonical exact-inverse
+  codec, derived id, fail-closed `validate`, `matches_settle` binding check,
+  9 unit tests + the `#[ignore]`d perf probe.
+- `crates/jnt-l2/src/state.rs`: the registry (`task_id → certificate`),
+  issuance wired into both settlement paths (explicit `Settle` → `Quorum`,
+  implicit auto-settle/lapse → `WindowElapsed`), issuance BEFORE value moves so
+  a refusal leaves state untouched, `L2Effect::Settled.vwc_id`, sorted
+  `vwcs()` enumeration, `validate_vwc` against live state, `VwcAlreadyIssued`.
+- `crates/jnt-l2/src/task_contract.rs`: **the product fix** — submitting the
+  all-zero result hash is now refused (`BadAttestation`), because zero is
+  `VWC_HASH_EXPIRED` and would collide with the expired record.
+- `crates/jnt-core/src/l2.rs`: `DOM_L2_VWC` (`jounit/l2/vwc/v1`), frozen.
+- `crates/jnt-l2/tests/vwc_flow.rs` (new, 14 tests), `fuzz_invariants.rs`
+  extended with registry tamper-freedom, `fuzz/fuzz_targets/vwc_decode.rs`
+  (new), CI fuzz-smoke → 12 targets.
+
+## 61. The one product bug (and the spec rule the tests corrected)
+
+**Product bug:** a worker could submit `result_hash == VWC_HASH_EXPIRED`
+(all-zero). Before certificates this was merely odd; after them it would let a
+worker make a certified-correct settlement and an expired one indistinguishable
+in the settle record — a certificate-forgery footgun. Fixed at submission
+(`BadAttestation`), regression-tested in `vwc_flow.rs`. This is exactly the
+"the new feature exposes the old assumption" pattern.
+
+**Spec rule corrected by tests, not by fiat:** the §17.6 draft required
+`payment_sat > 0`. The existing Phase-3 test `a_payment_equal_to_the_settle_fee
+_settles_with_a_zero_payout` proved a zero-payout `Correct` settlement is
+reachable — so requiring positive payment would have silently excluded exactly
+the workers whose escrow exactly covered the fee. The rule was corrected
+(zero-payout work still certifies) and documented, rather than the test being
+weakened. Both the correction and its reason are in `docs/decisions.md`
+(Decision 4, item 5).
+
+**Test-harness note:** the first VWC fixture used `[i; 48]` placeholder BLS
+keys; the real verifier correctly refused them (not curve points), so the
+"happy path" test failed. Fixing the fixture to derive real keys made the tests
+exercise genuine pairing verification — the failure was the feature working.
+
+## 62. Numbers, verified
+
+- 468 workspace tests (was 444): +10 vwc unit (incl. zero-payout probe),
+  +14 vwc_flow integration.
+- Fuzz (WSL nightly + ASan, 40 s each): vwc_decode 1,163,630;
+  dispute_arbitrate 3,760,893; l2_state_apply 12,630. ~4.9M execs, 0 crashes.
+- Perf (release, `vwc_perf_probe`): encode 4.6 µs, decode 3.4 µs,
+  validate ~2.4 ms — BLS-bound by construction, no optimization justified.
+- fmt / clippy `-D warnings` / release / 5 sims all clean; 12 fuzz targets
+  compile.
+
+## 63. Next work item
+
+**Phase 5 — Worker SDK** (`crates/jnt-worker`), now unblocked: node connection
+via `jnt-net`, task discovery/scan, claim/execute/submit loop, attestation
+generation, VWC handling (fetch + validate receipts), wallet integration,
+earnings, dispute participation; CLI (`jnt-worker run/status/earnings`) +
+`WorkerClient`. The standing open question carried to Phase 6: tasks whose
+escrow/deposit is smaller than the 20 000 sat settle fee fail closed
+(`AmountTooSmallForFee`).

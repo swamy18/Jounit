@@ -311,3 +311,64 @@ from elsewhere or the D3 schedule is re-parameterised.
 | 4 — VWC issuance | NOT STARTED (needs Phase 3 — now unblocked) |
 | 5 — Worker SDK | NOT STARTED (needs Phases 2+4) |
 | 6 — Testnet + finality activation | PREPARED, gated on 4–5 |
+
+---
+
+# Implementation status — Phase 4 SHIPPED (2026-10-06)
+
+Phase 4 (Verified Work Certificates) is built on top of the Phase-2/3 task,
+dispute and settlement machinery. **No L1 consensus rule changed**, the D3 fee
+schedule is untouched, and the M1 50/50 split still routes every L2 fee. SPEC.md
+§17 is the normative VWC text.
+
+## Decision 4 — VWC: a derived receipt, not a transaction
+
+**Chosen, and now normative in SPEC.md §17:**
+
+1. **Issuance is automatic at settlement; there is no VWC transaction type.**
+   The roadmap's Step-6 note expected VWC to land with new tx types. It does
+   not, deliberately: a certificate is a *derived consequence* of a settlement
+   that was already authorized (quorum-signed `Settle`, or the dispute window
+   closing unchallenged). An issuance transaction would let an actor request a
+   certificate the protocol did not decide to grant — the exact thing a
+   verified-work receipt must not allow. No new wire type, no new fee, no new
+   authorization surface.
+2. **No issuer key of its own.** The issuer is the protocol. `Quorum`
+   certificates reuse the settle payload's M5 aggregate and verify through the
+   existing `BlsVerifier`; `WindowElapsed` certificates (implicit settlements)
+   carry no aggregate because none exists for a transition nobody transacted,
+   and are documented as *not offline-verifiable* (§17.5) rather than being
+   dressed up as stronger than they are.
+3. **One certificate per task, ever.** The L2 state keeps a registry keyed by
+   `task_id`; a second issuance is refused (`VwcAlreadyIssued`), never
+   overwritten. Certificates hold no value and sit outside the conservation
+   sum.
+4. **No revocation, no expiry.** Settlement is terminal and one-way, so a
+   `Correct` settlement can never be overturned later — exactly the condition
+   that would make revocation necessary. If re-litigation is ever specified, it
+   must bring a revocation rule as its own reviewable change.
+5. **A zero-payout settlement still certifies.** An escrow that exactly covered
+   the settle fee pays the worker nothing, but the work was still verified.
+   `payment_sat == 0` is legal on a certificate; the Phase-4 tests caught the
+   original assumption ("payment > 0") as wrong against the existing
+   fee==escrow behaviour and it was corrected rather than papered over.
+6. **A submitted result may never be all-zero.** `VWC_HASH_EXPIRED` is the
+   all-zero hash; allowing a worker to submit it as their result would make a
+   certified-correct settlement and an expired one indistinguishable in the
+   settle record. Submission of the placeholder hash is now refused
+   (`BadAttestation`). This is the one Phase-4 product fix; it has a permanent
+   regression test.
+
+**Explicitly unchanged:** D3 fees (post 5 000 / claim 2 000 / submit 2 000 /
+dispute 10 000 / settle 20 000 sats), flat fee = `full_base`, the M1 50/50
+burn/PSCB split, the L1 gas floor, `payment_jnt` as a market price, validator
+economics, binding finality only at the end of Phase 6.
+
+| Phase | Status |
+|---|---|
+| 1 — L1 production | DONE |
+| 2 — TaskContract + L2 txs | DONE |
+| 3 — Dispute engine + M2/M1 | DONE |
+| 4 — Verified Work Certificates | **DONE** (this change) |
+| 5 — Worker SDK | NOT STARTED (needs Phases 2+4 — now unblocked) |
+| 6 — Testnet + finality activation | PREPARED, gated on 5 |

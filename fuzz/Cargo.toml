@@ -108,3 +108,10 @@ path = "fuzz_targets/l2_state_apply.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "vwc_decode"
+path = "fuzz_targets/vwc_decode.rs"
+test = false
+doc = false
+bench = false
