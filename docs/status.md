@@ -685,3 +685,36 @@ for every command.
   yet write snapshots; `load_chain` still replays from genesis. Correct, but
   O(chain) at startup — the snapshot path lands with the next step.
 - Mempool is still memory-only across restarts (unchanged from step 2).
+
+## Step 4 — Real BLS verification (blst): crypto core DONE, gadget NOT active
+
+SPEC.md gained §14.5, normative for real-BLS builds: min-pk BLS12-381 (keys
+G1/48B, signatures G2/96B), DST `JNT_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_`,
+IETF KeyGen derivation for deterministic fixtures, validator-set identity
+`sha256_dom([0xB2], [n ‖ sorted keys])`, bitmap padding bits declared
+malformed, replay ruled out by construction, and set rotation explicitly
+deferred to §14.6 (unresolved: D1 economics).
+
+`crates/jnt-core/src/bls.rs` adds `SecretKey::derive`, `sign`, `RealBls`
+(single verify, aggregate, fast-aggregate verify), `validator_set_hash`, and
+point validation that rejects infinity/non-subgroup/garbage keys and
+signatures without panicking. `bls_checkpoint::verify_checkpoint` now runs
+real pairing checks when handed `RealBls`; `MockBls` remains only for
+structural unit tests, and a test pins that a forgery MockBls accepts RealBls
+rejects.
+
+**No consensus change.** `Chain::submit` does not consult any `BlsVerifier`;
+M5 remains inactive; §14.6 (who validators are, rotation, checkpoint entry
+into blocks) is the documented blocker. Nothing here was activated silently.
+
+Bugs found: `validator_set_hash` initially hashed caller order rather than
+`ValidatorSet` sorted order — two views of the same committee would compute
+two identities (caught by the order-insensitivity test). The committed key
+fixture caught that I cannot predict derived keys by hand; the real
+SEED_A value is now the test's constant. 18 adversarial checkpoint tests
+(quorum boundary, bitmap padding/junk/lying count, wrong-set, tampered
+payload/hash/network, zero sig, poisoned key set, replay, finality
+monotonicity) all pass against RealBls.
+
+341 workspace tests (was 293). fmt/clippy -D warnings/release clean; five
+sims green.

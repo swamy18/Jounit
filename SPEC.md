@@ -1115,6 +1115,102 @@ does not depend on insertion order. Quorum is `ceil(n × 2/3)`, and a signer set
 is carried as a bitmap of `n` bits. `BlsVerifier` is a trait so the pairing check
 can be swapped for a real implementation (`blst`) without touching the chain.
 
-**It is a mock today.** `MockBls` accepts any non-zero signature, so no code path
-in this repository performs a pairing, and no absolute-finality guarantee is in
-force. Treat §14.4 as a specification of an envelope, not of a working gadget.
+**The pairing core is real; the gadget is not active.** Since §14.5, a
+`blst`-backed `RealBls` verifier performs actual pairing checks, and
+`verify_checkpoint` with `RealBls` rejects forgeries that `MockBls` (kept for
+CI-only structural tests) would accept. What is still missing for M5 to be
+consensus-active is §14.6: who the validators are, how the set rotates, and
+how checkpoints enter blocks. Until that is resolved, nothing in
+`Chain::submit` consults any `BlsVerifier`, and no absolute-finality guarantee
+is in force. Treat §14.4 + §14.5 as a real cryptographic core attached to an
+inactive gadget.
+
+### 14.5 M5 — Real BLS signatures (blst): wire and protocol semantics
+
+§14.4 specified the envelope with a mock verifier. This section specifies the
+real cryptography and is **normative for any build that sets
+`real-bls` on**. It does NOT activate M5 consensus; activation additionally
+requires §14.6 (validator-set economics), which is unresolved.
+
+**Curve and scheme.** BLS12-381, min-signature layout: public keys in G1
+(48 bytes compressed), signatures in G2 (96 bytes compressed). Aggregation is
+point addition in G2, so an aggregate is one 96-byte value regardless of the
+number of signers. The `blst` library (Supranational; NCC Group-audited, the
+implementation behind Ethereum consensus) performs all pairing checks.
+
+**Domain separation tag (DST).** All hashing-to-curve uses the DST
+
+    "JNT_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_"
+
+— the IETF `BLS12381G2_XMD:SHA-256_SSWU_RO_` suite string prefixed with the
+protocol namespace `JNT_SIG_`. No other message type may sign under this DST;
+future BLS-signed protocol messages get their own `JNT_`-prefixed DST. The
+`0xB1` domain tag in `signing_hash` (§14.4) remains as a pre-image domain tag:
+the message presented to BLS is `sha256_dom([0xB1], [payload_bytes])`, and that
+32-byte hash — not the raw payload — is hashed to curve under the DST.
+
+**Key encoding.** A `BlsPublicKey` is the 48-byte compressed serialization of a
+G1 point. Validation at deserialization: `blst_p1_deserialize` + membership
+check. The all-zeros point, points not in the correct subgroup, and infinity
+are all rejected — a key that fails validation cannot enter a `ValidatorSet`.
+
+**Signature encoding.** A `BlsSignature` is the 96-byte compressed G2 point.
+Validation at verification time, never trusted from the wire alone.
+
+**Message format.** The signed message is exactly:
+
+    msg = sha256_dom([0xB1], [CheckpointPayload.serialize()])
+
+    CheckpointPayload = height(u64) ‖ block_hash(32) ‖ net_id_len(u32) ‖
+                        net_id(bytes) ‖ epoch(u64)
+
+All integers little-endian. The message handed to BLS is the 32-byte hash; two
+payloads with the same serialization always produce the same message, and the
+hash binds network_id, so mainnet signatures never verify on mini.
+
+**Validator-set identity.** A validator set is identified by
+`set_hash = sha256_dom([0xB2], [n(u32) ‖ pk_1 ‖ … ‖ pk_n])` with keys in the
+sorted order `ValidatorSet` already imposes. A checkpoint does not carry the
+set; verifiers compute the set they expect for (epoch, height) and reject a
+checkpoint whose `signer_bitmap` does not decode against it. The payload's
+epoch and the set used must agree — a signature from a different epoch's set
+fails simply because its keys are not in the verifying set.
+
+**Quorum and bitmap.** Quorum is `ceil(n × 6667 / 10000)` (§14.4). The bitmap
+is `ceil(n/8)` bytes, bit `i` (LSB-first within each byte) set means validator
+`i` in sorted order signed. Bitmap bytes beyond `ceil(n/8)` are rejected; bits
+at or above `n` within the last byte must be zero, and a set bit there is
+malformed, not "extra signers" — this prevents a peer from smuggling
+significance into padding bits.
+
+**Duplicates.** Aggregation is over the set of distinct signers decoded from
+the bitmap; each validator contributes at most one key by construction, so a
+"duplicate signer" cannot occur in a well-formed checkpoint, and a verifier
+MUST reject any hand-aggregated signature claiming to represent a signer list
+with repeats — the bitmap makes repeats unrepresentable, which is the point.
+
+**Replay protection.** A checkpoint is replay-protected by construction:
+(epoch, height, block_hash, network_id) is unique per signing event because
+heights advance monotonically and `CheckpointChain::accept` refuses a height
+at or below the finalized tip. A signature over an already-accepted checkpoint
+is therefore a no-op, and a signature over a future height cannot be produced
+without the block hash of a real block at that height.
+
+**Set changes.** Validator-set rotation is out of scope until §14.6 resolves
+who validators are (D1: the M5 set is the staked top-21 per epoch — economics
+unresolved). Until rotation exists, the set is a fixed genesis parameter per
+network. A build MUST NOT implement rotation silently; set changes are a
+consensus decision requiring explicit activation.
+
+**Activation boundary (unchanged from §14.4).** `RealBls` gives this repository
+real pairing verification. It does NOT make checkpoints consensus-relevant:
+nothing in `Chain::submit` consults a `BlsVerifier`, and the block-validation
+rules of §4–§9 are unchanged. M5 remains not consensus-active; what changed is
+that the cryptographic core is real, tested against malformed input, and
+shared between the checkpoint machinery and any future message type.
+
+**Test fixtures.** Deterministic tests derive keys from `KeyGen`-style seeds
+(IETF BLS key generation: `sk = HKDF-Extract(ikm, "" ‖ I2OSP(48,))` per draft-
+irtf-cfrg-bls-signature-05 §2.3) over fixed 32-byte IKM values committed in the
+test source, so every CI run verifies the same keys and signatures byte for
+byte.

@@ -139,11 +139,7 @@ impl RecordLog {
 
         let (refs, recovery) = scan(&mut file, &path, file_len)?;
         if recovery.truncated {
-            let keep = LOG_HEADER_LEN
-                + refs
-                    .iter()
-                    .map(|r| u64::from(r.len) + 8)
-                    .sum::<u64>();
+            let keep = LOG_HEADER_LEN + refs.iter().map(|r| u64::from(r.len) + 8).sum::<u64>();
             file.set_len(keep).map_err(|e| StoreError::io(&path, e))?;
             file.sync_all().map_err(|e| StoreError::io(&path, e))?;
         }

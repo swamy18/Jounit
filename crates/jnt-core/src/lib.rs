@@ -18,6 +18,7 @@
 //! - M5: Sovereign BLS finality gadget  (`bls_checkpoint.rs`)
 
 pub mod block;
+pub mod bls;
 pub mod bls_checkpoint;
 pub mod chain;
 pub mod compute_ir;

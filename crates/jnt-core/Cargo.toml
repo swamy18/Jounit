@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 rand.workspace = true
+blst.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

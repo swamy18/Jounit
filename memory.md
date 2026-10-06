@@ -1925,3 +1925,21 @@ node B was force-killed (`taskkill /F`) and restarted twice, replaying cleanly
 both times; legacy JSON migration verified. 293 workspace tests (was 263),
 fmt/clippy -D warnings/release clean, all five sims green. docs/roadmap.md
 still carries the other author's uncommitted work and remains untouched.
+
+## Session 10 (cont.) — Step 4: real BLS via blst
+
+SPEC.md §14.5 written BEFORE any code (semantics first): min-pk BLS12-381,
+protocol-namespaced DST, IETF KeyGen fixtures, sorted-order set hashing,
+bitmap padding = malformed, replay impossible by construction, rotation
+deferred to unresolved §14.6. `RealBls` in crates/jnt-core/src/bls.rs:
+derive/sign/aggregate/fast-aggregate-verify with full point validation; wired
+into `verify_checkpoint` behind the existing `BlsVerifier` trait. MockBls kept
+for CI structural tests only, and a test proves the difference (forgery:
+mock accepts, real rejects).
+
+Two bugs caught by red tests: validator_set_hash hashed caller order (two
+identities for one committee — fixed to sorted order matching ValidatorSet);
+a fixture test caught a hand-guessed key hash (real value committed). 18
+adversarial checkpoint tests green. 341 workspace tests total, all checks
+clean. M5 still NOT consensus-active — the honest boundary is §14.6 validator
+economics, a user decision, not mine.
