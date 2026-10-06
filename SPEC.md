@@ -1456,12 +1456,147 @@ applied, and a *rejected* transaction is not marked applied — a transaction
 refused on a precondition (a task not yet posted) may be retried once the
 precondition holds, but it can never apply twice.
 
-### 15.6 What is not specified here
+### 15.6 Dispute evidence and arbitration
+
+A `Disputed` contract carries two competing results: the worker's submitted
+`result_hash` and the challenger's `counter_result`. Arbitration turns those,
+plus a reference re-execution (SPEC.md §16), into a verdict:
+
+```
+re_execution == submitted_result  and != counter_result  ->  WorkerCorrect
+re_execution == counter_result    and != submitted_result ->  ChallengerCorrect
+anything else (matches neither, or no reference result)   ->  Inconclusive
+```
+
+`counter_result == submitted_result` is refused at dispute-filing time, so the
+two "and" clauses can never both hold. **`Inconclusive` is not a verdict**: it
+settles nothing, slashes nothing and burns nothing. A task can only be settled
+by `Correct` or `Fraudulent` (or implicitly `Expired`).
+
+Evidence is validated before it is arbitrated, and every failure is named:
+both attestations must bind to this task and to the result they claim, both must
+carry a signature, and the two results must differ. Evidence is never executed —
+the engine compares result *hashes* only (§16.4).
+
+The verdict names the hash a settlement must carry: `submitted_result` for
+`Correct`, `counter_result` for `Fraudulent`. A `Settle` transaction whose
+`vwc_hash` does not match its verdict is refused (`BadVwcHash`), which is what
+binds a settlement decision to the evidence it was derived from.
+
+### 15.7 Dispute resolution window and lapse
+
+A filed dispute must be resolved within the **same** window length as the filing
+window, measured from `filed_at`. If it is not, the dispute **lapses**: the
+worker's submitted result stands and the settlement is applied as `Correct` with
+no fee, which burns the challenger's deposit. A challenge that is filed and then
+abandoned is therefore not free — the same anti-spam rule as a challenge that
+was filed and lost. Lapse is an implicit transition and is applied by
+`L2State::advance_block` in deterministic, sorted task order.
+
+### 15.8 Whistleblower bounty
+
+When a challenge is **upheld** (`Fraudulent`), the challenger is refunded their
+deposit and additionally receives a bounty of **25% of the slashed amount**,
+paid from the M1 PSCB reserve and capped by the reserve's current balance. The
+bounty is a transfer *out of* the reserve to the challenger, so it moves value
+rather than minting it and the conservation invariant is unchanged. A failing
+challenge earns nothing and burns the deposit.
+
+### 15.9 What is not specified here
 
 - How L2 transactions reach a block (Phase 6).
 - Verified Work Certificate issuance (Phase 4); `vwc_hash` is `result_hash` for
   `Correct`, the counter-result for `Fraudulent`, and all-zero for `Expired`
   until then.
-- Contested arbitration, evidence handling beyond the challenge payload, and the
-  whistleblower bonus (Phase 3).
+- The off-chain mechanics of producing `re_execution_result` (scheduling the
+  arbitrator set, distributing the IR and input bytes) — Phase 5/6.
 - Binding BLS finality activation (end of Phase 6).
+
+---
+
+## 16. M3 CPU-reference execution (normative for dispute arbitration)
+
+This section is the note §15.6 and `docs/roadmap.md` §11 (open question 2) call
+for: how a validator decides which of two competing compute results is correct,
+without owning the hardware the task was run on. **Dispute arbitration depends
+on this section and on nothing else**, so it is written before the engine that
+consumes it (Phase 3).
+
+### 16.1 Why a reference is needed at all
+
+M3 makes a task hardware-neutral on purpose: the same task may run on a GPU, an
+NPU, a TPU, or a CPU. That is only a marketplace if the hardware does not change
+the *answer*. The protocol therefore needs one execution path that is defined by
+these bytes alone — no driver, no vendor library, no scheduler — and that path
+is the CPU reference. Every other backend is measured against it.
+
+This is tractable precisely because M3 already forbids floating point (decision
+D2, `docs/decisions.md`). Integer-only IR means the GPU path and the CPU path
+are two readers of the same bytes, not two rounding-error chains that were
+never going to agree. Had M3 allowed FP, this section could not be written.
+
+### 16.2 The reference execution function
+
+```
+reference_eval(ir_bytes, input_bytes) -> output_bytes
+result_hash = SHA-256(output_bytes)          // the M3 result commitment
+```
+
+`reference_eval` MUST satisfy, for any inputs:
+
+1. **Determinism.** Two runs on two machines, at two times, on two architectures
+   produce byte-identical `output_bytes`. There is no wall clock, no RNG, no
+   address-space dependence, no thread-count dependence, and no
+   floating-point value anywhere in the evaluation.
+2. **Canonical output.** `output_bytes` is the little-endian encoding of the
+   task's output lanes. No padding, no platform endianness, no length prefix
+   beyond what the task's IR declares.
+3. **Total arithmetic.** Integer overflow is defined, not undefined: lane
+   arithmetic is wrapping modulo the lane width (`u64` lanes mod 2^64, `u32`
+   lanes mod 2^32). A backend that traps on overflow is non-conformant; a
+   backend that saturates is non-conformant; only wrapping agrees with the
+   reference.
+4. **Fixed reduction order.** Any reduction over lanes fixes its order in the IR
+   (ascending lane index). A backend may parallelise internally but MUST
+   reproduce the specified order's result.
+5. **Bounded.** Evaluation terminates on every input. An IR that cannot
+   terminate is malformed and MUST be rejected before execution.
+
+### 16.3 Backend conformance
+
+A backend is **conformant** iff, for every task, its `result_hash` equals the
+reference's `result_hash`. A disagreement is not "numeric noise" and MUST NOT be
+tolerated by tolerance or rounding: it is a non-conformance, and the CPU
+reference is the arbiter. This is what makes a challenge resolvable at all — a
+challenger's counter-result can only be *correct* if it is what the reference
+produces.
+
+### 16.4 What the dispute engine consumes
+
+Arbitration consumes only the **result hash** of the reference run. The engine
+does not execute IR, does not parse IR, and does not carry a runtime: it is a
+pure state machine over `(task_id, submitted_result, counter_result,
+re_execution_result)`. Producing `re_execution_result` is the arbitrator set's
+off-chain job, exactly as signing a checkpoint is. Keeping execution out of the
+engine is what keeps the engine deterministic and reviewable.
+
+Consequences, stated so they are not discovered later:
+
+- The engine learns *which* result is right; it never learns *why*. A verdict is
+  a comparison of hashes, not an evaluation.
+- A task whose IR cannot be executed by the reference (malformed, non-terminating,
+  out-of-memory) is arithmetically indistinguishable from an inconclusive
+  dispute: the reference produces no `result_hash`, so no hash matches, and the
+  engine returns `Inconclusive` rather than a verdict. The task is not slashed on
+  an inconclusive outcome.
+- The reference is a *tie-breaker*, not a re-miner. It is not required to be
+  fast or to prove that the worker did the work; M4 is what proves hardware. The
+  reference only answers "what is the correct output?".
+
+### 16.5 Non-goals
+
+- No on-chain IR execution, and no interpreter in `jnt-core` or `jnt-l2`.
+- No gas metering of IR here (a Phase 5/6 concern for the worker SDK).
+- Floating point is never introduced, in the reference or any backend.
+- The reference does not replace attestation or hardware proof; it determines
+  correctness only after a result has been challenged.

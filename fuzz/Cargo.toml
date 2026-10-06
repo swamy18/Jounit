@@ -17,6 +17,9 @@ libfuzzer-sys = "0.4"
 [dependencies.jnt-core]
 path = "../crates/jnt-core"
 
+[dependencies.jnt-l2]
+path = "../crates/jnt-l2"
+
 [dependencies.jnt-store]
 path = "../crates/jnt-store"
 
@@ -74,6 +77,34 @@ bench = false
 [[bin]]
 name = "meta_parse"
 path = "fuzz_targets/meta_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "l2_payload_decode"
+path = "fuzz_targets/l2_payload_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "m3_readers"
+path = "fuzz_targets/m3_readers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dispute_arbitrate"
+path = "fuzz_targets/dispute_arbitrate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "l2_state_apply"
+path = "fuzz_targets/l2_state_apply.rs"
 test = false
 doc = false
 bench = false

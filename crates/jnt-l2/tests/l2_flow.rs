@@ -267,13 +267,19 @@ fn a_dispute_settled_as_fraudulent_slashes_the_workers_deposit() {
     w.submit(id, [0xAAu8; 32], 3);
     w.dispute(id, [0xBBu8; 32], 4, 50_000);
 
+    let pscb_before = w.state.pscb;
     let effect = w
         .settle(id, Verdict::Fraudulent, [0xBBu8; 32], 3, 5)
         .unwrap();
+    let slashed = 100_000 - 20_000;
+    // Phase 3: a successful challenger is paid a 25% bounty from the PSCB
+    // reserve, capped by the reserve's balance.
+    let bounty = (slashed * 25 / 100).min(pscb_before);
     match effect {
         L2Effect::Settled {
             submitter_refunded,
             worker_deposit_slashed,
+            challenger_bonus,
             ..
         } => {
             assert_eq!(
@@ -281,18 +287,23 @@ fn a_dispute_settled_as_fraudulent_slashes_the_workers_deposit() {
                 "the defrauded submitter is made whole"
             );
             assert_eq!(
-                worker_deposit_slashed,
-                100_000 - 20_000,
+                worker_deposit_slashed, slashed,
                 "the settle fee comes out of the losing worker's deposit"
             );
+            assert_eq!(challenger_bonus, bounty);
         }
         other => panic!("unexpected effect {other:?}"),
     }
 
     // M2: half burned immediately, half vesting.
-    assert_eq!(w.state.slash_vault.total_burned, 80_000 / 2);
-    assert_eq!(w.state.vault_remaining(), 80_000 - 80_000 / 2);
-    assert_eq!(w.state.balance(&addr(&w.challenger)), 10_000_000 - 10_000);
+    assert_eq!(w.state.slash_vault.total_burned, slashed / 2);
+    assert_eq!(w.state.vault_remaining(), slashed - slashed / 2);
+    // The challenger paid the dispute fee, got the deposit back, and earned the
+    // bounty.
+    assert_eq!(
+        w.state.balance(&addr(&w.challenger)),
+        10_000_000 - 10_000 + bounty
+    );
     assert_eq!(w.state.conservation_total(), CREDITED);
 }
 

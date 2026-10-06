@@ -2071,7 +2071,8 @@ TaskContract state machine, five L2 tx types with D3 fee routing.
 
 # MASTER STATUS LEDGER (the "everything" document)
 
-Written 2026-10-06, at commit `43bf4c3`. This is the one section to read to
+Written 2026-10-06 at commit `43bf4c3`, refreshed after Phases 2-3. This is
+the one section to read to
 know the exact state of the Jounit project: what exists, what is left, what is
 on hold, and what each remaining piece needs. Sections above it (Sessions 1-11)
 are the chronological build log this ledger summarizes.
@@ -2081,14 +2082,14 @@ are the chronological build log this ledger summarizes.
 Jounit is a spec-first L1 blockchain (hybrid PoW + LWMA difficulty, EIP-1559-
 shaped 50/50 burn/PSCB fees, 40M JNT hard cap, NN puzzle mining, real blst BLS
 checkpoint machinery shipped inert) that is production-ready at L1 and one
-reviewable change away from a public testnet. Phase 1 of the L2 roadmap is
-complete (mempool, persistent crash-safe storage, P2P tx relay, real BLS,
-fuzzing). Phases 2-5 (L2: TaskContract, disputes, VWC, worker SDK) are not
-started but every primitive they need already exists. Both blocking protocol
-decisions (L2 fee path, validator economics) are now recorded in
-docs/decisions.md, so nothing is blocked on the owner anymore. Next work item:
-Phase 2 - jnt-l2 crate + TaskContract state machine + five L2 tx types with
-D3 fee routing.
+reviewable change away from a public testnet. Phases 1-3 of the L2 roadmap are
+complete: mempool, crash-safe storage, P2P tx relay, real BLS, fuzzing (P1);
+`jnt-l2` TaskContract + the five L2 tx types + D3 fees (P2); the dispute engine
+with M2 slashing and M1 PSCB bounty wiring (P3). Every economic decision is
+recorded in docs/decisions.md (D3 fees, validator economics, and now the
+dispute arbitration/lapse/whistleblower-bounty rules), so nothing is blocked on
+the owner. Next work item: Phase 4 - Verified Work Certificates (unblocked: a
+settled verdict and vwc_hash are what a certificate certifies).
 
 ## B. Work DONE (shipped, tested, on main)
 
@@ -2118,6 +2119,18 @@ Storage (jnt-store):
   canonical height index rebuilt from the tip, UTXO snapshots,
   network-bound metadata with atomic rename, adversarial-tail hardening.
 
+L2 (jnt-l2, Phases 2-3):
+- Five L2 tx types in jnt_core::l2 with canonical codecs, domain-separated
+  signing hashes, hybrid auth, derive_task_id, D3 fee mapping.
+- TaskContract state machine (Open -> InProgress -> ResultSubmitted ->
+  Disputed -> Settled/Expired), L2State accounts/escrow/replay/fees,
+  deterministic advance_block, conservation invariant.
+- Dispute engine: DisputeEvidence + named validation errors, Arbiter,
+  DisputeEngine::arbitrate/resolve (hash comparison only, no IR runtime),
+  inconclusive slashes nothing; resolution window = filing window with lapse;
+  whistleblower bounty 25% of slashed, from PSCB, capped, a transfer not a
+  mint; M2 SlashVault receives fraud slashes.
+
 Node (jnt-node):
 - CLI (jnt-node serve --listen ...), wallet/balance/transfer paths,
   P2P serve + relay wiring, storage integration.
@@ -2145,22 +2158,11 @@ Documentation:
 
 ## C. Work REMAINING (phased, in dependency order)
 
-Phase 2 - TaskContract + L2 tx types (NEXT, unblocked):
-- New crate crates/jnt-l2/: TaskContract + ContractState machine
-  (Open -> InProgress -> ResultSubmitted -> Disputed -> Settled/Expired),
-  7 methods per roadmap Step 3, happy-path + attack tests.
-- 5 L2 tx types in jnt-core (TxPostTask, TxClaimTask, TxSubmitResult,
-  TxDispute, TxSettle): Writer/Reader serialization, domain-separated
-  signing hashes (new DOM_ constants), validation rules, round-trip tests.
-- D3 fee routing: l2_fee_for(tx_type), flat fee as full_base in
-  split_fees; replace the tripwire test with positive fee tests.
+Phase 2 - TaskContract + L2 tx types (DONE - see session 12).
+Phase 3 - Dispute engine + M2/M1 integration (DONE - see session 13; the M3
+CPU-reference spec note is SPEC.md section 16, written before the code).
 
-Phase 3 - Dispute engine (needs 2):
-- DisputeChallenge/Verdict/Engine, M2 SlashVault + PSCB wiring,
-  whistleblower bonus from PSCB. Prereq: small spec note on M3 CPU-reference
-  re-execution (roadmap section 11, open question 2).
-
-Phase 4 - VWC issuance (needs 3):
+Phase 4 - VWC issuance (needs 3, NOW UNBLOCKED):
 - VerifiedWorkCertificate: signing_hash over all fields, canonical
   serialization, quorum-gated verify, lookup by task/worker.
 
@@ -2203,13 +2205,14 @@ Phase 6 - Public testnet (needs 2-5):
 
 ## F. Numbers (verified, not claimed)
 
-- Tests: 360 workspace, 0 failed (fmt/clippy -D warnings/release/sims green).
-- Fuzz: 7 targets, 13,403,223 total execs, 0 crashes/leaks/OOMs.
-  Per target: tx_decode 4,829,687; wire_msg_decode 2,960,697; mempool_admit
-  2,460,827; block_decode 2,291,347; meta_parse 539,534; storage_recover
-  248,534; checkpoint_validate 72,997.
-- Bugs found by invariants this session: 2 (both fixed + regression-tested).
-- Repo: 38 commits; latest pushed 43bf4c3.
+- Tests: 444 workspace, 0 failed (fmt/clippy -D warnings/release/sims green).
+- Fuzz: 11 targets. Phase-1/L1 seven, 13,403,223 execs, 0 crashes.
+  Phase-2/3 L2 four (40 s each, ~7.2M execs): l2_payload_decode 2,975,308;
+  dispute_arbitrate 2,784,817; m3_readers 1,387,682; l2_state_apply 11,880
+  (crypto-bound). One harness false-positive found and fixed; no product bug.
+- Bugs found by invariants: 2 in Phase 1 (both fixed + regression-tested);
+  0 product bugs in Phases 2-3.
+- Repo: 39 commits; Phase 2 shipped as e3c0dab; Phase 3 is this commit.
 
 ## G. Environment notes (so future sessions don't re-learn)
 
@@ -2358,3 +2361,124 @@ and the whistleblower bonus, plus the fee-vs-escrow decision from §48.
 so a wallet *is* its seed — two different wallets need two different seeds. A
 test that "changes a key" by re-seeding with the same byte produces the same
 wallet and will silently pass for the wrong reason.
+---
+
+# Working memory — session 13: Phase 3, the dispute engine (SHIPPED)
+
+**Date:** 2026-10-06
+**Branch:** `main`, based on `e3c0dab` (Phase 2). `docs/roadmap.md` still carries
+another author's uncommitted diff and was not touched.
+**Scope:** Phase 3 — M3 CPU-reference spec note first, then the dispute engine +
+M2/M1 integration, security/determinism/regression tests, fuzzing, docs.
+**Outcome:** built, tested, documented. **444 workspace tests pass (was 410).**
+fmt / clippy `-D warnings` / release / all five sims clean. No L1 consensus rule
+changed and no Phase-1/2 economic decision changed.
+
+## 51. The M3 CPU-reference note came first, and it is why the engine is small
+
+SPEC.md §16 is the note the roadmap's open question 2 asked for, written before
+any Phase 3 code. The whole argument: M3 forbids floating point, so a GPU path
+and a CPU path are two readers of the same bytes rather than two rounding-error
+chains that were never going to agree. That is what makes a CPU reference
+possible at all. §16 defines `reference_eval(ir, input) -> output`, the
+`result_hash = SHA-256(output)` commitment, and five requirements — determinism,
+canonical little-endian output, *wrapping* integer arithmetic, fixed reduction
+order, boundedness — plus backend conformance (the CPU reference is the arbiter)
+and explicit non-goals (no on-chain IR execution, no interpreter, no gas
+metering, no float).
+
+The consequence that shaped the engine: **arbitration consumes only the result
+hash.** `DisputeEngine` holds no runtime, parses no IR, verifies no BLS, and
+moves no value. A verdict is a comparison of three hashes.
+
+## 52. What Phase 3 ships
+
+- `crates/jnt-l2/src/dispute.rs` (new): `DisputeEvidence` (read from a
+  `Disputed` contract, `validate` with named errors), `Arbiter`,
+  `DisputeVerdict` (`verdict`, `vwc_hash`, `settle_payload`),
+  `DisputeEngine::{arbitrate, resolve}`. Pure and total.
+- `task_contract.rs`: `DisputeChallenge` now stores `against_attestation`, so a
+  `Disputed` contract is self-describing; `L2Config::whistleblower_bounty_percent`
+  (25, both profiles); `due_for_dispute_lapse` + `lapse_dispute`.
+- `state.rs`: `L2Effect::Settled.challenger_bonus`; `apply_settlement` returns
+  the bounty, computes it as `min(slashed * percent / 100, pscb)` against the
+  reserve *before* the settlement's own PSCB fee share is added; `advance_block`
+  also fires dispute lapse, sorted by task id.
+- `error.rs`: `EvidenceIncomplete`, `EvidenceMismatch`, `InconclusiveDispute`.
+- SPEC.md §15.6-§15.9 + §16; docs/decisions.md gains **Decision 3** (arbitration
+  rule, resolution window = filing window, bounty = 25% from PSCB); README,
+  docs/status.md updated.
+
+Reused, not reimplemented: `SlashVault` (M2), `fees::split_flat_fee` (M1+D3),
+`ComputeTask`/`ComputeAttestation` (M3), `ValidatorSet`/`BlsVerifier` (M5), and
+the Phase-2 settle path — a verdict's only output is a `SettlePayload` the
+existing path already applies.
+
+## 53. The design rule that keeps the engine safe
+
+**A refusal to arbitrate and an inconclusive arbitration are both *failures to
+convict*, never defaults to guilt.** Validation happens before arbitration, so a
+malformed evidence pair can never produce a verdict that slashes a worker; a
+reference that matches neither claim returns `Inconclusive`, which is not a wire
+verdict, settles nothing and yields no payload. `Inconclusive` is a real `Ok`
+value — this exact point is what the fuzzer got wrong, below.
+
+## 54. The fuzzer crash that was not a bug (recorded so nobody re-litigates it)
+
+The 40 s `dispute_arbitrate` campaign crashed. Root cause was **in the fuzz
+harness, not the product**: it asserted `assert_ne!(v.arbiter, Inconclusive)`
+for any `Ok` arbitration — i.e. that an `Ok` verdict must be a conviction. The
+design is the opposite: `Ok(Inconclusive)` is the safe outcome for a reference
+matching neither claim. The harness was fixed to assert the real contract
+(inconclusive ⇒ no wire verdict ⇒ no settle payload ⇒ nothing slashed) and
+re-fuzzed clean (2,784,817 runs). No product change; the deterministic
+`fuzz_invariants.rs` suite carries the case permanently. **Zero product bugs
+were found in Phase 3.**
+
+## 55. Test layout, so the next session extends it rather than duplicating it
+
+- `dispute.rs` 8 unit tests — evidence validation, the three verdicts,
+  determinism, payload shape.
+- `tests/dispute_flow.rs` 18 tests — honest worker wins (challenger deposit
+  burned), fraudulent worker slashed (bounty capped *and* uncapped),
+  inconclusive settles nothing and can still lapse, evidence only readable from
+  `Disputed`, fee==escrow zero payout, fee>escrow refused, zero deposit refused,
+  unauthorized challenger, second dispute, replayed dispute, wrong settle hash,
+  no double settle/slash, challenge-agrees refused, determinism across runs,
+  quorum still required.
+- `tests/fuzz_invariants.rs` 7 tests — the deterministic counterpart of the four
+  new fuzz targets: decode totality + exact inversion (every truncation and
+  bitflip of five real L2 transactions), M3 reader bounds (the signature cap
+  refused before allocation), evidence-validation totality over 11 mutations,
+  arbitration totality over 260 references, and **value conservation across a
+  300-step adversarial program** of real signed transactions with per-step
+  `conservation_total() == credited` and end-of-run counters proving every path
+  was reached.
+- `tests/l2_flow.rs` updated for the bounty (PSCB reduction + challenger credit).
+
+Harness note worth keeping: the conservation-program test asserts counters
+(`seen[0..4] > 0`) at the end, so it cannot pass by doing nothing.
+
+## 56. Fuzz campaign, Phase 3 targets (WSL nightly + ASan, 40 s each)
+
+l2_payload_decode 2,975,308; dispute_arbitrate 2,784,817 (after the harness fix
+above); m3_readers 1,387,682; l2_state_apply 11,880 (crypto-bound: every
+iteration signs real transactions). Total ~7.2M, 0 crashes, 0 leaks. CI
+fuzz-smoke now loops all eleven targets.
+
+## 57. Numbers, verified
+
+- `cargo test --workspace` — **444 pass, 0 fail** (was 410): +8 dispute unit,
+  +18 dispute_flow, +7 jnt-l2 fuzz_invariants, +1 l2_flow net change.
+- fmt clean; clippy `-D warnings` clean; release build clean; all five sims
+  exit 0; `git status` shows no vector file changed.
+- `cd fuzz && cargo check --bins` — clean (11 targets).
+
+## 58. Next work item
+
+**Phase 4 — Verified Work Certificates.** Now unblocked: a settled verdict and
+its `vwc_hash` are exactly what a certificate certifies. `VWC_HASH_EXPIRED` is
+already a named constant, so replacing the pre-VWC convention is mechanical.
+Then Phase 5 (worker SDK), Phase 6 (testnet/finality). The standing open
+question carried to Phase 6: a task whose escrow/deposit is smaller than the
+20 000 sat settle fee cannot be settled (`AmountTooSmallForFee` fails closed).

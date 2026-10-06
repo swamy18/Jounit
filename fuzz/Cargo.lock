@@ -262,9 +262,17 @@ name = "jnt-core-fuzz"
 version = "0.0.0"
 dependencies = [
  "jnt-core",
+ "jnt-l2",
  "jnt-net",
  "jnt-store",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "jnt-l2"
+version = "0.1.0"
+dependencies = [
+ "jnt-core",
 ]
 
 [[package]]

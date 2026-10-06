@@ -764,10 +764,12 @@ sims green.
 
 ## Phase 4 — Fuzzing: harness shipped, campaign executed, invariants enforced
 
-`fuzz/` is a standalone cargo-fuzz crate (kept out of the workspace) with seven
-targets over the highest-risk boundaries: `tx_decode`, `block_decode`,
-`wire_msg_decode`, `mempool_admit`, `storage_recover`, `checkpoint_validate`,
-`meta_parse`. Each asserts round-trip and capability invariants — decode →
+`fuzz/` is a standalone cargo-fuzz crate (kept out of the workspace) with eleven
+targets over the highest-risk boundaries. Seven are Phase-1/L1: `tx_decode`,
+`block_decode`, `wire_msg_decode`, `mempool_admit`, `storage_recover`,
+`checkpoint_validate`, `meta_parse`. Four are Phase-2/3 L2 (added with the
+dispute engine, SPEC.md §15–§16): `l2_payload_decode`, `m3_readers`,
+`dispute_arbitrate`, `l2_state_apply`. Each asserts round-trip and capability invariants — decode →
 encode → decode identity, mempool byte cap under hostile admission, store
 reopen after an adversarial tail, accepted checkpoint ⇒ honest count + quorum
 + real signature — not merely panic-freedom.
@@ -792,6 +794,25 @@ crashes, no leaks, no OOMs:
 (checkpoint_validate is BLS-bound: every iteration does real blst pairings;
 storage_recover is fsync-bound. Both are capability-bound, which is the point.)
 
+### Phase-3 L2 fuzz campaign (2026-10-06, WSL nightly + ASan)
+
+The four L2 targets were run for 40 s each. **One crash was found, and it was a
+false alarm in the harness, not the product** (`dispute_arbitrate` asserted that
+an `Ok` arbitration can never be `Inconclusive`; the design is precisely that it
+*can*, and that this is the safe outcome — SPEC.md §15.6). The harness assertion
+was corrected to assert the real contract (inconclusive ⇒ no wire verdict ⇒ no
+settle payload ⇒ nothing slashed), after which the target fuzzed clean. No
+product-code change resulted. The deterministic counterpart is
+`crates/jnt-l2/tests/fuzz_invariants.rs` (7 tests, run on every `cargo test`).
+
+| target            | execs     | result |
+|-------------------|-----------|--------|
+| l2_payload_decode | 2,975,308 | clean  |
+| dispute_arbitrate | 2,784,817 | clean (after harness fix) |
+| m3_readers        | 1,387,682 | clean  |
+| l2_state_apply    |    11,880 | clean (crypto-bound: every iteration signs real transactions) |
+| **total (new)**   | **7.2M**  | 0 crashes |
+
 The deterministic counterparts run on every `cargo test`: three
 `fuzz_invariants.rs` suites (jnt-core, jnt-net, jnt-store) feed hand-built
 adversarial inputs — every truncation and bitflip of a valid tx/block, hostile
@@ -810,9 +831,9 @@ fuzzer ran, both fixed with regression tests:
    `BadMeta`.
 
 CI gained a `fuzz-smoke` job: nightly + cargo-fuzz, 20 s per target per push,
-so the harness is executed — not just compiled — on every change. Longer
-campaigns run locally; any minimized crash lands in the invariant suites as a
-regression test.
+so the harness is executed — not just compiled — on every change. It now loops
+all eleven targets. Longer campaigns run locally; any minimized crash lands in
+the invariant suites as a regression test.
 
 360 workspace tests (was 347). fmt/clippy -D warnings/release clean; five sims
 green. No consensus rule touched: `Chain::submit` still never references
@@ -870,3 +891,78 @@ convention (`result_hash` / counter-result / all-zero) that Phase 4 replaces.
 **Still gated:** BLS/M5 finality activation remains off until the end of
 Phase 6. `Settle` verifies a quorum aggregate through the existing trait, but no
 checkpoint finalizes an L1 block.
+
+## Phase 3 — Dispute engine + M2/M1 integration: SHIPPED — 2026-10-06
+
+The dispute lifecycle is built end to end and wired into the existing L2 state
+machine, the M2 slash vault and the M1 PSCB reserve. SPEC.md §15.6–§15.8 are its
+normative rules; **SPEC.md §16 is the M3 CPU-reference note** written first, as
+the roadmap requires. **No L1 consensus rule changed** and no Phase-1/Phase-2
+economic decision changed — the D3 schedule, the 50/50 split, the L1 gas floor
+and validator economics are untouched.
+
+**What exists**
+
+- `SPEC.md §16` — the M3 CPU-reference execution note: `reference_eval(ir, input)
+  -> output`, `result_hash = SHA-256(output)`, determinism, canonical
+  little-endian output, wrapping integer arithmetic, fixed reduction order, and
+  boundedness; backend conformance (the CPU reference is the arbiter); the engine
+  consumes only the result hash; explicit non-goals (no on-chain IR execution, no
+  interpreter, no gas metering, no float).
+- `SPEC.md §15.6–§15.8` — the arbitration rule (`reference == submitted →
+  WorkerCorrect`, `== counter → ChallengerCorrect`, else `Inconclusive`),
+  evidence-validation rules, the verdict↔`vwc_hash` binding, the resolution window
+  (same length as the filing window, **lapse** settles as `Correct` with no fee
+  and burns the challenger deposit), and the **whistleblower bounty** (25% of the
+  slashed amount, drawn from PSCB, capped by the reserve; a transfer, not a mint).
+- `crates/jnt-l2/src/dispute.rs` — `DisputeEvidence` (read from a `Disputed`
+  contract, `validate` with named errors), `Arbiter`, `DisputeVerdict`,
+  `DisputeEngine::{arbitrate, resolve}`. The engine is pure and total: it compares
+  result *hashes*, never executes IR, never verifies BLS (quorum is the existing
+  settle path's job), and never moves value. `Inconclusive` produces no settle
+  payload (`InconclusiveDispute`) — a malformed or unexecutable task fails to
+  convict rather than defaulting to guilt.
+- `crates/jnt-l2/src/task_contract.rs` — `DisputeChallenge` now stores
+  `against_attestation`, so a `Disputed` contract is self-describing; `L2Config`
+  gained `whistleblower_bounty_percent` (25); `due_for_dispute_lapse` and
+  `lapse_dispute` implement the resolution window.
+- `crates/jnt-l2/src/state.rs` — `L2Effect::Settled` gained `challenger_bonus`;
+  `apply_settlement` returns the bounty paid, credits the submitter refunds and
+  the challenger refund, computes the bounty as
+  `min(slashed × percent / 100, pscb)` against the reserve *before* this
+  settlement's own PSCB share is added, and hands the slashed deposit to the M2
+  `SlashVault`. `advance_block` now also fires dispute lapse, in sorted task-id
+  order.
+
+**Reused, not reimplemented:** `SlashVault` (M2), `fees::split_flat_fee` (M1 +
+D3), `ComputeAttestation`/`ComputeTask` (M3), `ValidatorSet`/`BlsVerifier` (M5),
+and the exact Phase-2 settle path (`Settle` → `apply_settle`) — a verdict's only
+output is a `SettlePayload` the existing path already applies.
+
+**Verification.** 444 workspace tests (was 410, +34): +8 `dispute.rs` unit tests,
++18 `dispute_flow.rs` integration tests (honest worker wins, fraudulent worker
+slashed with capped and uncapped bounty, inconclusive settles nothing and can
+still lapse, fee==escrow and fee>escrow boundaries, unauthorized challenger,
+second/replayed dispute, wrong settle hash, no double settle/slash, determinism
+across independent runs, and the quorum gate), +7 deterministic
+`fuzz_invariants.rs` tests (decode totality/inversion, M3 reader bounds, evidence
+validation totality, arbitration determinism, and value conservation across a
+300-step adversarial transaction program), plus the `l2_flow.rs` bounty update.
+fmt clean, clippy `-D warnings` clean, release build clean, all five sims green,
+all eleven fuzz targets compile, L1 vectors unchanged.
+
+**Fuzzing.** Four new targets (`l2_payload_decode`, `m3_readers`,
+`dispute_arbitrate`, `l2_state_apply`), CI fuzz-smoke extended to all eleven. A
+40-second campaign per target (~7.2M execs) found **one harness false-positive**
+(not a product bug): the `dispute_arbitrate` assertion wrongly forbade an `Ok`
+`Inconclusive` verdict, which is the designed safe outcome. Fixed in the harness
+with the correct contract asserted; re-fuzzed clean. The deterministic
+`fuzz_invariants.rs` suite carries this case permanently.
+
+**No new product bug was found in Phase 3.** The Phase-2 missing-submitter-refund
+bug stays fixed and the conservation invariant is asserted after every scenario
+in the new suite, including the bounty path.
+
+**Still gated:** BLS/M5 finality activation (end of Phase 6). **Now unblocked:**
+Phase 4 (Verified Work Certificates) — a settled verdict and `vwc_hash` are what
+a certificate certifies.

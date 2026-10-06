@@ -33,14 +33,21 @@ use crate::error::{L2Error, L2Result};
 
 /// Protocol parameters for the L2 task layer.
 ///
-/// Two values, both network-wide rather than per-task. `dispute_window` is how
-/// long a submitted result can be challenged; `vesting_period` is the M2 vesting
-/// horizon for a fraud slash, taken from `jnt_core::slash` so L2 slashing and M2
-/// cannot drift apart.
+/// All three are network-wide rather than per-task, because a value an actor
+/// chooses is a value an actor can choose badly (a zero challenge window is not
+/// a challenge window). `dispute_window` is how long a submitted result can be
+/// challenged, and also how long a filed dispute has to be resolved;
+/// `vesting_period` is the M2 vesting horizon for a fraud slash, taken from
+/// `jnt_core::slash` so L2 slashing and M2 cannot drift apart;
+/// `whistleblower_bounty_percent` is the share of a slashed deposit paid to a
+/// successful challenger out of the PSCB reserve (SPEC.md §15.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L2Config {
     pub dispute_window: u64,
     pub vesting_period: u64,
+    /// Whole percent, 0..=100. Not a basis-point value because the bounty is a
+    /// coarse incentive, not a fee split that has to reconcile to the satoshi.
+    pub whistleblower_bounty_percent: u64,
 }
 
 impl L2Config {
@@ -50,15 +57,19 @@ impl L2Config {
         L2Config {
             dispute_window: 100,
             vesting_period: VESTING_BLOCKS_MAINNET,
+            whistleblower_bounty_percent: 25,
         }
     }
 
     /// The `mini` profile's shortened window, so a dispute can be resolved inside
-    /// a test run.
+    /// a test run. The bounty share is identical to mainnet: it is an incentive,
+    /// not a timing parameter, and a test that used a different share would be
+    /// testing a different rule.
     pub fn mini() -> Self {
         L2Config {
             dispute_window: 5,
             vesting_period: jnt_core::slash::VESTING_BLOCKS_MINI,
+            whistleblower_bounty_percent: 25,
         }
     }
 }
@@ -97,12 +108,19 @@ impl ContractState {
     }
 }
 
-/// A filed challenge. `against_result` is the submitted result being challenged,
-/// kept here so a `Disputed` contract is self-describing without a second lookup.
+/// A filed challenge.
+///
+/// Both sides of the dispute are kept: `against_result` and `against_attestation`
+/// are the challenged submission, and `counter_result` /
+/// `counter_attestation` the challenger's answer. That makes a `Disputed`
+/// contract self-describing, so the arbitration engine can read complete
+/// evidence from the contract alone rather than reaching back into a prior
+/// state the contract no longer carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisputeChallenge {
     pub challenger: Address,
     pub against_result: Hash,
+    pub against_attestation: ComputeAttestation,
     pub counter_result: Hash,
     pub counter_attestation: ComputeAttestation,
     pub deposit_sat: u64,
@@ -274,12 +292,12 @@ impl TaskContract {
         dispute: &DisputePayload,
         current_height: u64,
     ) -> L2Result<()> {
-        let (result_hash, submitted_at) = match &self.state {
+        let (result_hash, submitted_at, against_attestation) = match &self.state {
             ContractState::ResultSubmitted {
                 result_hash,
                 submitted_at,
-                ..
-            } => (*result_hash, *submitted_at),
+                attestation,
+            } => (*result_hash, *submitted_at, attestation.clone()),
             _ => return Err(self.illegal("file a dispute")),
         };
         if dispute.task_id != self.task_id || actor != dispute.challenger {
@@ -303,6 +321,7 @@ impl TaskContract {
         self.state = ContractState::Disputed(DisputeChallenge {
             challenger: actor,
             against_result: result_hash,
+            against_attestation,
             counter_result: dispute.counter_result,
             counter_attestation: dispute.counter_attestation.clone(),
             deposit_sat: dispute.challenge_deposit_sat,
@@ -342,6 +361,35 @@ impl TaskContract {
             .correct_settlement_hash(current_height)
             .filter(|_| matches!(self.state, ContractState::ResultSubmitted { .. }))
             .ok_or_else(|| self.illegal("auto-settle"))?;
+        self.settle_inner(Verdict::Correct, hash, current_height, 0)
+    }
+
+    /// True when a filed dispute has gone unresolved past its resolution window.
+    ///
+    /// The window is the same length as the filing window, measured from
+    /// `filed_at`. A challenge that is filed and then abandoned does not stall
+    /// the task forever, and it is not free: lapsing burns the challenger's
+    /// deposit exactly as a lost challenge would.
+    pub fn due_for_dispute_lapse(&self, current_height: u64) -> bool {
+        match &self.state {
+            ContractState::Disputed(c) => {
+                current_height > c.filed_at.saturating_add(self.dispute_window)
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply the implicit settlement of a lapsed dispute: the submitted result
+    /// stands, the challenger's deposit is burned, and no fee is charged because
+    /// nothing was transacted.
+    pub fn lapse_dispute(&mut self, current_height: u64) -> L2Result<SettlementOutcome> {
+        let hash = match &self.state {
+            ContractState::Disputed(c) if self.due_for_dispute_lapse(current_height) => {
+                c.against_result
+            }
+            ContractState::Disputed(_) => return Err(L2Error::DisputeWindowClosed),
+            _ => return Err(self.illegal("lapse a dispute")),
+        };
         self.settle_inner(Verdict::Correct, hash, current_height, 0)
     }
 

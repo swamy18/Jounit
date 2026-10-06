@@ -65,6 +65,9 @@ pub enum L2Effect {
         worker_paid: u64,
         submitter_refunded: u64,
         worker_deposit_slashed: u64,
+        /// Whistleblower bounty paid from the PSCB reserve (Phase 3). Zero
+        /// unless the challenge was upheld and the reserve had funds.
+        challenger_bonus: u64,
     },
     Expired {
         task_id: Hash,
@@ -314,18 +317,30 @@ impl L2State {
             let outcome = contract.settle(p.verdict, p.vwc_hash, height, fee)?;
             (submitter, worker, challenger, outcome)
         };
-        self.apply_settlement(submitter, worker, challenger, outcome, txid, height)?;
+        let challenger_bonus =
+            self.apply_settlement(submitter, worker, challenger, outcome, txid, height)?;
         Ok(L2Effect::Settled {
             task_id: p.task_id,
             verdict: p.verdict,
             worker_paid: outcome.worker_paid,
             submitter_refunded: outcome.submitter_refunded,
             worker_deposit_slashed: outcome.worker_deposit_slashed,
+            challenger_bonus,
         })
     }
 
     /// Move value according to a settlement. Shared by explicit `Settle` and the
-    /// implicit auto-settle path, so both are accounted identically.
+    /// implicit auto-settle/lapse paths, so all are accounted identically.
+    ///
+    /// Returns the whistleblower bounty paid, which is the only part of a
+    /// settlement that depends on state outside the contract (the PSCB balance).
+    ///
+    /// The bounty is a transfer *out of* the reserve to the challenger, not a
+    /// mint: the reserve falls by exactly what the challenger gains, so the
+    /// conservation invariant is untouched. It is computed against the reserve
+    /// balance *before* this settlement's own PSCB fee share is added, so a
+    /// settlement cannot fund its own bounty.
+    #[allow(clippy::too_many_arguments)]
     fn apply_settlement(
         &mut self,
         submitter: Address,
@@ -334,7 +349,7 @@ impl L2State {
         o: SettlementOutcome,
         txid: Hash,
         height: u64,
-    ) -> L2Result<()> {
+    ) -> L2Result<u64> {
         // The submitter is always owed a refund on the paths that refund them
         // (fraud, expiry) and zero on the paths that do not, so it is credited
         // unconditionally rather than behind an `Option`.
@@ -354,8 +369,20 @@ impl L2State {
                 );
             }
         }
+        let mut bonus = 0u64;
         if let Some(c) = challenger {
             self.pay(&c, o.challenger_refunded)?;
+            if o.worker_deposit_slashed > 0 {
+                let wanted = o
+                    .worker_deposit_slashed
+                    .saturating_mul(self.config.whistleblower_bounty_percent)
+                    / 100;
+                bonus = wanted.min(self.pscb);
+                if bonus > 0 {
+                    self.pay(&c, bonus)?;
+                    self.pscb -= bonus;
+                }
+            }
         }
         self.burned = self
             .burned
@@ -363,7 +390,7 @@ impl L2State {
             .saturating_add(o.worker_deposit_burned)
             .saturating_add(o.fee_burned);
         self.pscb = self.pscb.saturating_add(o.fee_pscb);
-        Ok(())
+        Ok(bonus)
     }
 
     // --- implicit transitions -----------------------------------------
@@ -387,32 +414,34 @@ impl L2State {
         ids.sort_unstable();
 
         for id in ids {
-            let due = self
-                .tasks
-                .get(&id)
-                .map(|t| t.due_for_auto_settle(height))
-                .unwrap_or(false);
-            if due {
-                let settled = {
-                    let t = self.tasks.get_mut(&id).expect("id came from the map");
-                    let attrs = (t.submitter, t.worker, t.challenger());
-                    match t.auto_settle_correct(height) {
-                        Ok(outcome) => Some((attrs, outcome)),
-                        Err(_) => None,
-                    }
+            // Two implicit settlements share this path: the dispute window
+            // closing with no challenge, and a filed dispute lapsing without a
+            // resolution. Both settle as `Correct` with no fee; the difference
+            // is which deposits move, and `settle_inner` accounts for that.
+            let settled = {
+                let t = self.tasks.get_mut(&id).expect("id came from the map");
+                let attrs = (t.submitter, t.worker, t.challenger());
+                let outcome = if t.due_for_auto_settle(height) {
+                    t.auto_settle_correct(height).ok()
+                } else if t.due_for_dispute_lapse(height) {
+                    t.lapse_dispute(height).ok()
+                } else {
+                    None
                 };
-                if let Some(((submitter, worker, challenger), outcome)) = settled {
-                    let _ = self.apply_settlement(
-                        submitter, worker, challenger, outcome, [0u8; 32], height,
-                    );
-                    effects.push(L2Effect::Settled {
-                        task_id: id,
-                        verdict: Verdict::Correct,
-                        worker_paid: outcome.worker_paid,
-                        submitter_refunded: outcome.submitter_refunded,
-                        worker_deposit_slashed: 0,
-                    });
-                }
+                outcome.map(|o| (attrs, o))
+            };
+            if let Some(((submitter, worker, challenger), outcome)) = settled {
+                let bonus = self
+                    .apply_settlement(submitter, worker, challenger, outcome, [0u8; 32], height)
+                    .unwrap_or(0);
+                effects.push(L2Effect::Settled {
+                    task_id: id,
+                    verdict: Verdict::Correct,
+                    worker_paid: outcome.worker_paid,
+                    submitter_refunded: outcome.submitter_refunded,
+                    worker_deposit_slashed: 0,
+                    challenger_bonus: bonus,
+                });
                 continue;
             }
 

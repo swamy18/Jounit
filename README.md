@@ -3,11 +3,14 @@
 An AI-native cryptocurrency: mining that pulls compute onto GPU and AI hardware
 without weakening the security a hash chain depends on.
 
-> **Status: Layer 1 base layer + P2P networking layer implemented.** The core
-> protocol includes hybrid hash + neural PoW, 5 protocol mechanisms (PSCB fee split,
-> Time-Locked slash reserve, canonical compute IR, HBM scratchpad PoW, and BLS
-> finality gadget), and `jnt-net` block relay and sync. Layer 2 Useful Work
-> remains as a future milestone. Read [Status](#status).
+> **Status: Layer 1 base layer + P2P networking + Layer 2 core implemented.** The
+> core protocol includes hybrid hash + neural PoW, 5 protocol mechanisms (PSCB fee
+> split, Time-Locked slash reserve, canonical compute IR, HBM scratchpad PoW, and
+> BLS finality gadget), `jnt-net` block relay and sync, and a working Layer 2
+> (`jnt-l2`): task contracts, the five L2 transaction types, D3 fees, and a
+> complete dispute engine with M2 slashing and M1 PSCB accounting. Verified Work
+> Certificates (Phase 4), the worker SDK (Phase 5) and testnet/finality
+> (Phase 6) remain. Read [Status](#status).
 
 ---
 
@@ -45,14 +48,15 @@ without weakening the security a hash chain depends on.
 - **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a sovereign BLS aggregate finality gadget (M5). See the status table above for what each one does and does not yet affect.
 - **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
 - **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
+- **Layer 2 (`jnt-l2`)**: Task contracts over the five L2 transaction types, D3 flat fees split 50/50 burn/PSCB, escrow accounting, replay protection, and a complete **dispute engine** — evidence validation, the M3 CPU-reference arbitration rule (SPEC.md §16), M2 slashing, PSCB whistleblower bounty, and a conservation invariant asserted after every scenario.
 
 **Roadmap / Future Work:**
 
 | | |
 |---|---|
-| Layer 2 — Verified Work Certificates | Phase 2 shipped: `crates/jnt-l2` task contracts, the five L2 transaction types, and the D3 fee path. Certificates (Phase 4) and the worker SDK (Phase 5) remain. |
+| Layer 2 — Verified Work Certificates | Phase 2 (task contracts, five L2 tx types, D3 fee path) and Phase 3 (dispute engine + M2/M1 integration) shipped in `crates/jnt-l2`. Certificates (Phase 4) and the worker SDK (Phase 5) remain. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
-| Coverage-guided fuzzing | Deterministic property and red-team suites cover the protocol; libFuzzer harness planned. |
+| Coverage-guided fuzzing | Shipped: eleven cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
 | License file | `Cargo.toml` declares `MIT OR Apache-2.0`. |
 
 ---
@@ -131,7 +135,7 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-net/tests/integration.rs` | 500+ | P2P integration tests, including a real-socket end-to-end sync. |
 | `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
 | `crates/jnt-store/` | 1 100+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
-| `crates/jnt-l2/` | 1 300+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, M2 slashing. |
+| `crates/jnt-l2/` | 1 900+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty. |
 | `crates/jnt-node/` | 760+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
 | `sim/` | 1 201 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
@@ -533,7 +537,7 @@ Per-command options: `--blocks`, `--interval`, `--wallet`, `--amount`, `--to`,
 ## Testing and verification
 
 ```sh
-cargo test --workspace                                   # 219 tests (190 core + 29 net)
+cargo test --workspace                                   # 444 tests across five crates
 cargo clippy --workspace --all-targets -- -D warnings    # 0 warnings
 cargo fmt --all --check
 ```
@@ -707,11 +711,11 @@ primitives it needs already exist.
 **State replays from genesis on every node load.** `Store::load_chain` re-submits
 every block. Fine at test scale, not at production scale.
 
-**`SPEC.md` references a `docs/roadmap.md` that does not exist.** The reference
-appears in `SPEC.md` (twice), `lib.rs`, `puzzle.rs` and `jnt-node/src/main.rs`.
-Layer 2 and the governance timelock are therefore described but not written
-down anywhere in the repository. Worth resolving before the specification is
-treated as complete.
+**The governance timelock is described but not written.** `SPEC.md` references a
+`docs/roadmap.md` (now present) and a governance timelock that has no
+implementation: Layer 2 is implemented through Phase 3, but the timelock and the
+remaining roadmap items (Phase 4-6) are still design text only. Worth resolving
+before the specification is treated as complete.
 
 **`Cargo.toml` declares a `repository` URL that does not match the actual
 remote.** Cosmetic, but it is the first thing `cargo publish` would use.

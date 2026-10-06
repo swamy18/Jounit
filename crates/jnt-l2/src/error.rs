@@ -44,6 +44,14 @@ pub enum L2Error {
     BadBlsSignature,
     /// The settle hash does not match the verdict it settles.
     BadVwcHash,
+    /// Arbitration evidence is missing a required part (for example an
+    /// unsigned attestation).
+    EvidenceIncomplete,
+    /// An attestation does not bind to the task or result it is filed with.
+    EvidenceMismatch(&'static str),
+    /// The reference re-execution reproduced neither claim, so no verdict can be
+    /// reached and nothing is slashed.
+    InconclusiveDispute,
     /// An account cannot cover the required fee, deposit or escrow.
     InsufficientBalance { needed: u64, available: u64 },
     /// The held amount cannot cover the settle fee.
@@ -77,6 +85,11 @@ impl fmt::Display for L2Error {
             L2Error::BadQuorum => write!(f, "settle evidence does not meet quorum"),
             L2Error::BadBlsSignature => write!(f, "settle BLS aggregate did not verify"),
             L2Error::BadVwcHash => write!(f, "settle hash does not match the verdict"),
+            L2Error::EvidenceIncomplete => write!(f, "dispute evidence is incomplete"),
+            L2Error::EvidenceMismatch(w) => write!(f, "dispute evidence mismatch: {w}"),
+            L2Error::InconclusiveDispute => {
+                write!(f, "arbitration was inconclusive; nothing to settle")
+            }
             L2Error::InsufficientBalance { needed, available } => {
                 write!(f, "insufficient balance: need {needed}, have {available}")
             }

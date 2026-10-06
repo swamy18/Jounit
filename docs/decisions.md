@@ -242,3 +242,72 @@ existing trait, but no checkpoint finalizes an L1 block.
 | 4 — VWC issuance | NOT STARTED (needs Phase 3) |
 | 5 — Worker SDK | NOT STARTED (needs Phases 2+4) |
 | 6 — Testnet + finality activation | PREPARED, gated on 3–5 |
+
+---
+
+# Implementation status — Phase 3 SHIPPED (2026-10-06)
+
+Phase 3 (dispute engine + M2/M1 integration) is built. **No L1 consensus rule
+changed**, and no Phase-1/Phase-2 decision changed: the D3 fee schedule, the flat
+fee = `full_base` rule, the M1 50/50 burn/PSCB split, the untouched L1 gas floor,
+`payment_jnt` as a market payment, and the §14.6 validator economics are all
+exactly as recorded above. Phase 3 consumes two of them (`split_flat_fee` for the
+settle fee, and the PSCB reserve as the bounty source) and adds one new value,
+recorded below rather than chosen quietly.
+
+## Decision 3 — Dispute: arbitration rule, resolution window, whistleblower bounty
+
+**Chosen, and now normative in SPEC.md §15.6–§15.8 (plus the M3 CPU-reference
+note in §16):**
+
+1. **Arbitration is a hash comparison, not an execution.** The reference
+   re-execution (SPEC.md §16) produces a result hash; the engine compares it to
+   the two competing claims. `reference == submitted → WorkerCorrect`,
+   `reference == counter → ChallengerCorrect`, otherwise **`Inconclusive`**.
+   `Inconclusive` is *not* a wire verdict: it settles nothing, slashes nothing
+   and burns nothing. A malformed or unexecutable task therefore fails to
+   *convict*, never defaults to guilt. The engine consumes only the reference
+   hash — it holds no IR interpreter and no runtime.
+
+2. **Resolution window = filing window.** A filed dispute must be resolved within
+   the same number of blocks as the challenge-filing window, measured from
+   `filed_at`. If it is not, the dispute **lapses**: the submitted result stands
+   and settles as `Correct` with no fee, burning the challenger's deposit. An
+   abandoned challenge is priced the same as a lost one.
+
+3. **Whistleblower bounty = 25% of the slashed amount, paid from PSCB, capped by
+   the reserve balance.** On an upheld challenge (`Fraudulent`) the challenger is
+   refunded their deposit and additionally receives 25% of the worker's slashed
+   deposit, drawn from the M1 PSCB reserve. It is a **transfer out of** the
+   reserve to the challenger, not a mint, and it is capped at the reserve's
+   *current* balance (computed before the settlement's own PSCB fee share is
+   added, so a settlement cannot fund its own bounty). A failing challenge earns
+   nothing and burns the deposit.
+
+   Rationale for 25%: it is a coarse incentive, not a fee split that must
+   reconcile to the satoshi, so it is a whole percent rather than a basis-point
+   value. It rewards the party who spent money to catch fraud while leaving the
+   reserve the larger share. It is parameterised in `L2Config`
+   (`whistleblower_bounty_percent`) and is identical for `mainnet` and `mini`,
+   because it is a rule, not a timing knob. The value can be re-parameterised
+   without a consensus-format change.
+
+**Explicitly unchanged:** the 5 000-sat post / 2 000 claim / 2 000 submit /
+10 000 dispute / 20 000 settle schedule; the M1 50/50 burn/PSCB split; L2 fee =
+`full_base`; the L1 gas floor; `payment_jnt` as a market price; no validator
+rewards/fee share; min bond 5 000 JNT; TopN 21; full-bond equivocation burn;
+binding finality only at the end of Phase 6.
+
+**Still open, still not silently decided:** a task whose escrow or worker deposit
+is smaller than the 20 000-sat settle fee cannot be settled (`AmountTooSmallForFee`
+fails closed). Carried forward from Phase 2 to Phase 6 — either the fee comes
+from elsewhere or the D3 schedule is re-parameterised.
+
+| Phase | Status |
+|---|---|
+| 1 — L1 production | DONE |
+| 2 — TaskContract + L2 txs | DONE |
+| 3 — Dispute engine + M2/M1 | **DONE** (this change) |
+| 4 — VWC issuance | NOT STARTED (needs Phase 3 — now unblocked) |
+| 5 — Worker SDK | NOT STARTED (needs Phases 2+4) |
+| 6 — Testnet + finality activation | PREPARED, gated on 4–5 |
