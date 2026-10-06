@@ -1,0 +1,79 @@
+[package]
+name = "jnt-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone on purpose: fuzzing pulls its own profile and toolchain
+# (nightly, sanitizer flags), which must never leak into the node's build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.jnt-core]
+path = "../crates/jnt-core"
+
+[dependencies.jnt-store]
+path = "../crates/jnt-store"
+
+[dependencies.jnt-net]
+path = "../crates/jnt-net"
+
+# Avoid the fuzz binary inheriting the workspace's panic="abort" release
+# profile, which is incompatible with libFuzzer's crash handlers.
+[profile.release]
+panic = "unwind"
+codegen-units = 1
+
+[[bin]]
+name = "tx_decode"
+path = "fuzz_targets/tx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_msg_decode"
+path = "fuzz_targets/wire_msg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mempool_admit"
+path = "fuzz_targets/mempool_admit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_recover"
+path = "fuzz_targets/storage_recover.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checkpoint_validate"
+path = "fuzz_targets/checkpoint_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "meta_parse"
+path = "fuzz_targets/meta_parse.rs"
+test = false
+doc = false
+bench = false
