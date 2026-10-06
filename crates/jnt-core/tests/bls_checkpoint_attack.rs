@@ -109,8 +109,8 @@ fn a_set_bit_in_bitmap_padding_is_rejected() {
     let cp = signed_checkpoint(&c, payload(100, 10), &[0, 1, 2]);
     let mut evil = cp.clone();
     evil.signer_bitmap[0] |= 0b0001_0000; // bit 4 — beyond n=4
-    // The bitmap decoder cannot see bit 4: there is no validator 4, so the
-    // extra bit is invisible to the signer list — it decodes exactly 3.
+                                          // The bitmap decoder cannot see bit 4: there is no validator 4, so the
+                                          // extra bit is invisible to the signer list — it decodes exactly 3.
     assert_eq!(
         c.set.signers_from_bitmap(&evil.signer_bitmap).len(),
         3,
