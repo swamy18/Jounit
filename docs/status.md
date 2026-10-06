@@ -626,3 +626,62 @@ output as spendable. Exactly one block on B's chain contains it.
 - `INV` announcements are sent only for the first `max_inv_per_msg` pool entries
   on connect, so a pool larger than 500 entries is not fully announced to a new
   peer. Bounded and honest, but incomplete.
+
+## Step 3 — Persistent storage (crates/jnt-store): DONE
+
+The node no longer rewrites the whole chain as JSON. `crates/jnt-store` is an
+append-only, checksummed block log plus atomic metadata, and `jnt-node` uses it
+for every command.
+
+### Design (no consensus rules live here)
+
+- One log file (`store/blocks.log`): magic `JNTS`, version 1, then records of
+  `len(4 LE) ‖ digest(4, first bytes of SHA256(payload)) ‖ payload`. Every
+  record is tagged (`0x00` block, `0x01` UTXO snapshot) — the tag byte exists
+  because a block's first serialized byte is its version (1), which is
+  byte-identical to a naive "no tag needed for blocks" scheme.
+- No index file: the hash index is rebuilt by scanning at open, so the only
+  copy of the data is the data. A corrupted index is a failure mode that does
+  not exist.
+- Canonical chain = one metadata row (network, genesis, tip, height), replaced
+  atomically (write-beside, rename). A reorg moves that row and nothing else.
+- Torn tail (crash mid-append) is dropped and REPORTED. Damage with committed
+  data after it refuses to open with the byte offset. The distinction matters:
+  one is survivable by construction, the other must never be silently
+  truncated into a shorter chain.
+
+### Bugs found during this step (all caught by the crate's own tests)
+
+1. Untagged block records collided with UTXO-snapshot records (block version
+   byte == snapshot tag) — blocks vanished from the index. Fixed with an
+   explicit tag on every record.
+2. `set_tip` recorded genesis's height (0) instead of the tip's, because the
+   ancestry walk is tip-first and the code read the last entry.
+3. The metadata parser read the checksum line after the hex-digest line, but
+   the file's trailing newline made it read an empty string.
+4. The height walk omitted genesis at height 0, so every reopen reported
+   `MissingParent` on the genesis block itself.
+5. A file shorter than one header underflowed `file_len - pos` in the log scan
+   (check_header may extend the file; the scan's length was stale).
+
+### Verified
+
+- 30 store tests: round-trip, duplicate, side branch, reorg + restart, orphan
+  survival, unprovable tip refused with metadata untouched, foreign network
+  refused, metadata lost -> honest genesis fallback, torn tail, damaged
+  mid-chain record refused, UTXO snapshot tagging.
+- End to end with the real binary: init -> mine -> restart -> verify; a legacy
+  `blocks.json` chain migrated into the store on first open and verified after;
+  two-node serve where B force-killed (`taskkill /F`, no flush) at height 35
+  restarted twice, mined to 58, and replays cleanly every time.
+- `verify` re-validates every stored block through `Chain::submit`, so a store
+  bug cannot hand the chain a bad block silently.
+- 293 workspace tests (up from 263), fmt/clippy (`-D warnings`)/release clean,
+  all five sims green.
+
+### Limitations
+
+- UTXO persistence is sketched (tagged snapshot records) but the node does not
+  yet write snapshots; `load_chain` still replays from genesis. Correct, but
+  O(chain) at startup — the snapshot path lands with the next step.
+- Mempool is still memory-only across restarts (unchanged from step 2).

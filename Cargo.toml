@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/jnt-core", "crates/jnt-net", "crates/jnt-node"]
+members = ["crates/jnt-core", "crates/jnt-net", "crates/jnt-node", "crates/jnt-store"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ repository = "https://github.com/jounit-network/jounit"
 [workspace.dependencies]
 jnt-core = { path = "crates/jnt-core" }
 jnt-net = { path = "crates/jnt-net" }
+jnt-store = { path = "crates/jnt-store" }
 sha2 = "0.10"
 k256 = { version = "0.13", features = ["ecdsa", "schnorr", "arithmetic"] }
 serde = { version = "1", features = ["derive"] }

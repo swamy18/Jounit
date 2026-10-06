@@ -1900,3 +1900,28 @@ Three, two of them proven by a failing test first.
   rustfmt differences, so a hotfix commit remains a possibility.
 - No commit of `docs/roadmap.md`: the file carries another author's uncommitted
   work, and my append is contiguous with it, so it cannot be staged separately.
+
+## Session 10 — Step 3: persistent storage (crates/jnt-store)
+
+Committed as milestone 2. The O(n)-per-block `blocks.json` rewrite is gone;
+every node command now reads and writes an append-only, checksummed block log
+(`store/blocks.log`) plus atomic metadata (`store/meta.json`), via the new
+`jnt-store` crate. Legacy `blocks.json` chains migrate once, on first open.
+
+Design invariants: no index file (rebuilt by scan at open — a corrupt index is
+a failure mode that cannot exist); canonical chain is one metadata row, so a
+reorg is a rename; torn tails are dropped and reported, damage-with-data-after
+refuses to open with an offset. The crate holds zero consensus rules; the
+worst a store bug can do is lose a block, never change one.
+
+Five real bugs were caught by the crate's own tests during development: the
+block/UTXO tag collision (a block's first byte is version 1), tip height taken
+from the wrong end of the ancestry walk, a checksum-line off-by-one in the
+metadata parser, genesis missing from the height walk, and a stale file length
+underflowing the scan on sub-header files.
+
+Verified: 30 store tests; real-binary e2e including a two-node serve run where
+node B was force-killed (`taskkill /F`) and restarted twice, replaying cleanly
+both times; legacy JSON migration verified. 293 workspace tests (was 263),
+fmt/clippy -D warnings/release clean, all five sims green. docs/roadmap.md
+still carries the other author's uncommitted work and remains untouched.

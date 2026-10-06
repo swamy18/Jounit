@@ -212,8 +212,17 @@ dependencies = [
  "hex",
  "jnt-core",
  "jnt-net",
+ "jnt-store",
  "rand",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jnt-store"
+version = "0.1.0"
+dependencies = [
+ "jnt-core",
  "serde_json",
 ]
 

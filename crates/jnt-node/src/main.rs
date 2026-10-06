@@ -40,6 +40,7 @@ use jnt_net::net::{NodeState, P2pConfig, P2pNode};
 use jnt_net::peer::{perform_handshake, HandshakeConfig};
 use jnt_net::relay::RelayManager;
 use jnt_net::syncer::SyncManager;
+use jnt_store::{AppendOutcome, BlockStore};
 
 const USAGE: &str = "\
 jnt-node - Jounit base-layer node
@@ -205,6 +206,9 @@ impl Args {
 struct Store {
     dir: PathBuf,
     params: NetworkParams,
+    /// The append-only block store. Opened lazily alongside the JSON chain
+    /// during migration; once present it is the authoritative block data.
+    block_store: Option<BlockStore>,
 }
 
 impl Store {
@@ -213,6 +217,7 @@ impl Store {
         Ok(Store {
             dir: args.data_dir.clone(),
             params,
+            block_store: None,
         })
     }
 
@@ -225,36 +230,97 @@ impl Store {
     }
 
     fn meta_path(&self) -> PathBuf {
+        // The jnt-store metadata. blocks.json is legacy; this is what the
+        // append-only store reads.
         self.dir.join("meta.json")
     }
 
-    fn load_chain(&self) -> Result<Chain, String> {
-        let path = self.chain_path();
-        if !path.exists() {
-            return Err(format!(
-                "no chain at {} - run `jnt-node init` first",
-                self.dir.display()
-            ));
+    /// Open the append-only store, migrating `blocks.json` if it exists and
+    /// the store does not.
+    fn ensure_block_store(&mut self) -> Result<&mut BlockStore, String> {
+        if self.block_store.is_none() {
+            let legacy = self.chain_path();
+            let store_dir = self.dir.join("store");
+            let fresh = !store_dir.join("blocks.log").exists();
+            let (mut bs, recovery) =
+                BlockStore::open(&store_dir, &self.params).map_err(|e| e.to_string())?;
+            if !recovery.truncated {
+                // recovery handled below via bs.recovery()
+            }
+            if fresh && legacy.exists() {
+                // One-time migration: read every block from the JSON chain and
+                // append it, then mark the store's tip at the JSON tip. The
+                // JSON file is kept until the migration is verified on the
+                // next open, then left in place (harmless, and deleting a
+                // user's chain file automatically is not a decision a node
+                // makes silently).
+                let text = fs::read_to_string(&legacy).map_err(|e| e.to_string())?;
+                let blocks: Vec<Block> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                for b in &blocks {
+                    bs.append_block(b).map_err(|e| e.to_string())?;
+                }
+                if let Some(last) = blocks.last() {
+                    bs.set_tip(&last.block_hash()).map_err(|e| e.to_string())?;
+                }
+                bs.sync().map_err(|e| e.to_string())?;
+                println!(
+                    "migrated {} blocks from blocks.json into the append-only store",
+                    blocks.len()
+                );
+            }
+            let rec = bs.recovery();
+            if rec.discarded_tail_bytes > 0 {
+                println!(
+                    "store recovered: {} record(s), dropped {} byte torn tail",
+                    rec.records, rec.discarded_tail_bytes
+                );
+            }
+            self.block_store = Some(bs);
         }
-        let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let blocks: Vec<Block> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let mut chain = Chain::new(self.params.clone()).map_err(|e| e.to_string())?;
-        for block in blocks.iter().skip(1) {
-            chain.submit(block.clone()).map_err(|e| e.to_string())?;
+        Ok(self.block_store.as_mut().expect("just set"))
+    }
+
+    fn load_chain(&mut self) -> Result<Chain, String> {
+        // The block store is the source of truth once it exists. Every stored
+        // block is re-validated on load by `Chain::submit`, so a store bug that
+        // hands the chain a bad block fails here, not silently.
+        let params = self.params.clone();
+        let mut chain = Chain::new(params).map_err(|e| e.to_string())?;
+        {
+            let bs = self.ensure_block_store()?;
+            let (_tip, height) = bs.tip();
+            for h in 1..=height {
+                let block = bs
+                    .block_at_height(h)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("store has no block at canonical height {h}"))?;
+                chain.submit(block).map_err(|e| e.to_string())?;
+            }
         }
         Ok(chain)
     }
 
-    fn save_chain(&self, chain: &Chain) -> Result<(), String> {
-        fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-        let mut blocks = Vec::new();
-        for h in 0..=chain.height() {
-            if let Some(b) = chain.block_at(h) {
-                blocks.push(b.clone());
+    /// Append new blocks and move the canonical tip. O(new blocks), not O(chain).
+    fn save_chain(&mut self, chain: &Chain) -> Result<(), String> {
+        let bs = self.ensure_block_store()?;
+        let (_, stored_height) = bs.tip();
+        for h in stored_height + 1..=chain.height() {
+            let block = chain
+                .block_at(h)
+                .ok_or_else(|| format!("chain has no block at height {h}"))?;
+            let outcome = bs.append_block(block).map_err(|e| e.to_string())?;
+            match outcome {
+                AppendOutcome::Stored | AppendOutcome::Duplicate => {
+                    bs.set_tip(&block.block_hash()).map_err(|e| e.to_string())?;
+                }
+                AppendOutcome::Orphaned => {
+                    return Err(format!(
+                        "block at height {h} has no stored parent; refusing to advance the tip"
+                    ))
+                }
             }
         }
-        let text = serde_json::to_string_pretty(&blocks).map_err(|e| e.to_string())?;
-        fs::write(self.chain_path(), text).map_err(|e| e.to_string())
+        bs.sync().map_err(|e| e.to_string())
     }
 
     fn load_wallets(&self) -> Result<Vec<Wallet>, String> {
@@ -327,8 +393,8 @@ fn run(raw: &[String]) -> Result<(), String> {
 }
 
 fn cmd_init(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
-    if store.chain_path().exists() {
+    let mut store = Store::open(args)?;
+    if store.chain_path().exists() || store.dir.join("store/blocks.log").exists() {
         return Err(format!(
             "{} already holds a chain; delete it to start over",
             store.dir.display()
@@ -368,7 +434,7 @@ fn cmd_init(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_mine(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let mut chain = store.load_chain()?;
     let wallets = store.load_wallets()?;
     if wallets.is_empty() {
@@ -411,7 +477,7 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_send(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let mut chain = store.load_chain()?;
     let wallets = store.load_wallets()?;
     if wallets.is_empty() {
@@ -583,7 +649,7 @@ fn relay_transaction(
 }
 
 fn cmd_status(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let chain = store.load_chain()?;
     let report = chain.supply_report();
     let tip = chain.tip();
@@ -653,7 +719,7 @@ fn cmd_status(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_verify(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let chain = store.load_chain()?;
     chain.verify_canonical_chain().map_err(|e| e.to_string())?;
     println!(
@@ -664,7 +730,7 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_show_block(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let chain = store.load_chain()?;
     let height = args.num("height", chain.height())?;
     let block = chain
@@ -678,7 +744,7 @@ fn cmd_show_block(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_balance(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let chain = store.load_chain()?;
     let addr = address_from_hex(
         args.str("address")
@@ -752,7 +818,7 @@ fn cmd_wallet(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_export(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let chain = store.load_chain()?;
     let out = PathBuf::from(args.str_or("out", "chain.json"));
     let mut blocks = Vec::new();
@@ -775,7 +841,7 @@ fn cmd_export(args: &Args) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn cmd_serve(args: &Args) -> Result<(), String> {
-    let store = Store::open(args)?;
+    let mut store = Store::open(args)?;
     let mut chain = store.load_chain()?;
     let wallets = store.load_wallets()?;
 
