@@ -45,7 +45,7 @@ without weakening the security a hash chain depends on.
 
 **Built:** a complete, tested, specification-first L1 core and P2P networking layer:
 - **L1 Core (`jnt-core`)**: Hybrid hash + neural proof of work, UTXO ledger with undo, LWMA difficulty adjustment, EIP-1559 base fee with 50/50 PSCB split, fixed-cap halving supply schedule, and deepest-chain fork choice.
-- **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a sovereign BLS aggregate finality gadget (M5). See the status table above for what each one does and does not yet affect.
+- **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a sovereign BLS aggregate finality gadget (M5). See the M1–M5 table in [Protocol mechanisms](#protocol-mechanisms-m1m5) for what each one does and does not yet affect.
 - **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
 - **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
 - **Layer 2 (`jnt-l2`)**: Task contracts over the five L2 transaction types, D3 flat fees split 50/50 burn/PSCB, escrow accounting, replay protection, and a complete **dispute engine** — evidence validation, the M3 CPU-reference arbitration rule (SPEC.md §16), M2 slashing, PSCB whistleblower bounty, and a conservation invariant asserted after every scenario.
@@ -57,7 +57,7 @@ without weakening the security a hash chain depends on.
 | Layer 2 — Verified Work Certificates | Phase 2 (task contracts, five L2 tx types, D3 fee path) and Phase 3 (dispute engine + M2/M1 integration) shipped in `crates/jnt-l2`. Certificates (Phase 4) and the worker SDK (Phase 5) remain. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
 | Coverage-guided fuzzing | Shipped: eleven cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
-| License file | `Cargo.toml` declares `MIT OR Apache-2.0`. |
+| License file | Shipped: dual `LICENSE-MIT` / `LICENSE-APACHE` at the repo root, matching `Cargo.toml`'s `MIT OR Apache-2.0`. |
 
 ---
 
@@ -129,15 +129,15 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | Path | Lines | What it is |
 |---|---:|---|
 | [`SPEC.md`](SPEC.md) | — | **Normative.** The protocol specification. Where a disagreement exists, this wins. |
-| `crates/jnt-core/` | 9 800+ | Protocol implementation across 21 modules. All consensus logic. |
-| `crates/jnt-core/tests/redteam.rs` | 637 | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
-| `crates/jnt-net/` | 1 400+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
+| `crates/jnt-core/` | 14 900+ | Protocol implementation across 25 modules. All consensus logic. |
+| `crates/jnt-core/tests/redteam.rs` | 724 | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
+| `crates/jnt-net/` | 5 100+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
 | `crates/jnt-net/tests/integration.rs` | 500+ | P2P integration tests, including a real-socket end-to-end sync. |
 | `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
-| `crates/jnt-store/` | 1 100+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
-| `crates/jnt-l2/` | 1 900+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty. |
-| `crates/jnt-node/` | 760+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
-| `sim/` | 1 201 | Python: independent protocol reference plus attack and supply simulations. |
+| `crates/jnt-store/` | 2 200+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
+| `crates/jnt-l2/` | 3 900+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty. |
+| `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
+| `sim/` | 1 609 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
 | [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |
 | [`memory.md`](memory.md) | — | Working notes from the audits and implementations. Not normative. |
@@ -154,7 +154,7 @@ Five crates in one workspace:
 jnt-core   pure protocol library — no I/O, no clock, no network
 jnt-net    P2P wire protocol, peer state machines, sync and relay
 jnt-store  persistent storage: append-only block log + atomic metadata
-jnt-l2     Layer 2: task contracts, the five L2 transaction types, D3 fees
+jnt-l2     Layer 2: task contracts, the five L2 transaction types, D3 fees, the dispute engine
 jnt-node   CLI and node daemon (serve, mine, status, verify)
 ```
 
@@ -166,28 +166,31 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 
 | Module | Lines | Responsibility |
 |---|---:|---|
-| `lib.rs` | 42 | Crate root and protocol scope statement |
+| `lib.rs` | 46 | Crate root and protocol scope statement |
 | `error.rs` | 196 | `Error` — 41 consensus-visible failure modes |
-| `params.rs` | 230 | `NetworkParams`: mainnet and mini profiles, magic bytes, network IDs |
+| `params.rs` | 331 | `NetworkParams`: mainnet and mini profiles, magic bytes, network IDs, L2 fee schedule |
 | `hash.rs` | 87 | SHA-256 helpers and domain-separation tags |
-| `ser.rs` | 185 | `Reader`/`Writer` — canonical byte encoding with non-chaining aliases |
+| `ser.rs` | 194 | `Reader`/`Writer` — canonical byte encoding with non-chaining aliases |
 | `hexserde.rs` | 58 | Serde helpers for hex-encoded types |
 | `u256.rs` | 212 | 256-bit target arithmetic by long division. No floating point |
-| `fees.rs` | 240 | M1: 50/50 base-fee split (50% burn, 50% PSCB reserve) + miner tips |
-| `slash.rs` | 330 | M2: 50% Anti-collusion slash burn + 1-year linear vesting Compute Reserve |
-| `compute_ir.rs` | 420 | M3: Hardware-agnostic canonical compute IR (GPU/NPU/TPU/Photonic) |
-| `hbm_pow.rs` | 320 | M4: Memory-bound HBM/GDDR scratchpad latency PoW puzzle |
-| `bls_checkpoint.rs` | 560 | M5: Sovereign BLS aggregate signature checkpoint finality gadget |
-| `l2.rs` | 780 | L2: five transaction payload types, actor auth, signing hashes, D3 fee mapping |
+| `fees.rs` | 299 | M1: 50/50 base-fee split (50% burn, 50% PSCB reserve) + miner tips, `split_flat_fee` (D3) |
+| `slash.rs` | 329 | M2: 50% Anti-collusion slash burn + 1-year linear vesting Compute Reserve |
+| `compute_ir.rs` | 550 | M3: Hardware-agnostic canonical compute IR (GPU/NPU/TPU/Photonic) + bounded decoders |
+| `hbm_pow.rs` | 285 | M4: Memory-bound HBM/GDDR scratchpad latency PoW puzzle |
+| `bls.rs` | 523 | blst-backed BLS12-381: derive/sign/verify/aggregate, IETF keygen |
+| `bls_checkpoint.rs` | 561 | M5: Sovereign BLS aggregate signature checkpoint finality gadget |
+| `l2.rs` | 1 051 | L2: five transaction payload types, actor auth, signing hashes, D3 fee mapping |
 | `supply.rs` | 335 | Halving ladder, cumulative issuance, the cap invariant |
 | `wallet.rs` | 362 | Keys, addresses, transaction building and signing |
 | `block.rs` | 465 | Header, block, merkle root, genesis block |
 | `difficulty.rs` | 570 | LWMA retarget, median-time rule, local-clock policy |
 | `ledger.rs` | 596 | UTXO set, undo records, atomic transaction checking |
+| `mempool.rs` | 938 | Byte-bounded, fee-rate-ordered pool with conflict checking |
 | `sig.rs` | 636 | Signature schemes and hybrid post-quantum bundles |
 | `tx.rs` | 704 | Transactions, inputs, outputs, sighash |
 | `puzzle.rs` | 830 | The three PoW stages and the versioned puzzle registry |
-| `chain.rs` | 1 310 | Validation, application, fork choice, reorg, PSCB reserve, mining |
+| `validators.rs` | 936 | §14.6 validator-set machinery (deterministic TopN, checkpoint validation) — inert |
+| `chain.rs` | 1 680 | Validation, application, fork choice, reorg, PSCB reserve, mining |
 
 ### Key types
 
@@ -201,7 +204,11 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 - **`Transaction` / `Input` / `Output`** — the transaction model.
 - **`PuzzleSpec` / `PuzzleSolver` / `PuzzleRegistry`** — PoW parameters, an
   epoch-cached weight set, and the versioned registry.
-- **`NetworkParams`** — every consensus constant, in one struct.
+- **`NetworkParams`** — every consensus constant, in one struct (including the D3 L2 fee schedule).
+- **`TaskContract` / `L2State` / `DisputeEngine`** (`jnt-l2`) — the L2 task lifecycle, its
+  accounts/escrow/replay layer, and arbitration. `TaskContract` holds transitions only (no
+  balances, no crypto); `L2State` is the only thing that debits an account or consults a
+  validator set; `DisputeEngine` compares result hashes and never executes task code.
 - **`Error`** — 41 variants. Every one is *deterministic and consensus-visible*:
   two conforming nodes evaluating the same block must produce the same variant,
   because callers branch on it.
@@ -226,26 +233,32 @@ bytes ──▶ Reader (bounds-checked) ──▶ Block/Transaction
                                      UTXO set + undo records
 ```
 
+The L2 data flow is deliberately separate and pure: a `Disputed` task hands its two
+competing hashes to `DisputeEngine`, which returns a verdict; the verdict is emitted as a
+`SettlePayload` that the *existing* settle path applies with quorum, fees, M2 slashing and
+the PSCB bounty. Task code is never executed on-chain (SPEC.md §16).
+
 ---
 
 ## Protocol mechanisms (M1–M5)
 
 Jounit defines five protocol-level mechanisms to align economic incentives with
 long-term AI compute infrastructure. **Only M1 is consensus-active today** —
-that is, only M1 can change whether a node accepts a block. M2–M5 are fully
-implemented, unit-tested modules with no effect on chain state yet: each needs a
-rule this repository has not specified (what proves a compute result fraudulent,
-how a task enters a block, whether the HBM puzzle replaces or composes with §5,
-who the validator set is). SPEC.md §14 records that status per mechanism, and
-this list is repeated in `docs/status.md`.
+that is, only M1 can change whether an L1 node accepts a block. Phase 2–3 gave
+M2, M3 and M5 their first real *consumers* at Layer 2 (L2 fraud slashes vest
+through the M2 vault, L2 transactions carry M3 envelopes, L2 settlement verifies
+an M5-shaped quorum aggregate), but an L2 transaction is not yet carried in an
+L1 block, so L1 chain state is untouched. M4 still needs its rule (whether the
+HBM puzzle replaces or composes with §5). SPEC.md §14 and §16 record that
+status, and this list is repeated in `docs/status.md`.
 
 | # | Mechanism | Consensus-active | Module |
 |---|---|---|---|
 | M1 | 50/50 PSCB base-fee split | **Yes** — changes the UTXO set | `fees.rs`, `chain.rs` |
-| M2 | Anti-collusion slash vault | No | `slash.rs` |
-| M3 | Hardware-agnostic compute IR | No | `compute_ir.rs` |
+| M2 | Anti-collusion slash vault | No — but holds L2 fraud slashes | `slash.rs` |
+| M3 | Hardware-agnostic compute IR | No — envelopes carried by L2; §16 CPU reference | `compute_ir.rs` |
 | M4 | Memory-bound HBM scratchpad PoW | No | `hbm_pow.rs` |
-| M5 | BLS aggregate finality | No — verifier is a mock | `bls_checkpoint.rs` |
+| M5 | BLS aggregate finality | No — L2 settle verifies the quorum trait; L1 finality inert | `bls_checkpoint.rs` |
 
 ### M1 — 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
 Base fees collected in each block are split equally:
@@ -289,7 +302,7 @@ The `jnt-net` crate provides a robust, zero-external-dependency P2P transport la
 
 - **Wire Framing (`frame.rs`):** 4-byte network magic, 2-byte message type ID, and 4-byte payload length prefix with allocation bounds checking.
 - **Network Isolation (`magic.rs`):** Distinct magic bytes and IDs for `mainnet` (`[0x6A, 0x4E, 0x54, 0x01]`, `"jounit/mainnet"`) and `mini` (`[0x6A, 0x4E, 0x54, 0x02]`, `"jounit/mini"`) preventing cross-profile peer contamination.
-- **Message Codecs (`msg.rs`):** `Version`, `Verack`, `Inv`, `GetData`, `Block`, `GetBlocks`, `Ping`, `Pong`, `Reject`.
+- **Message Codecs (`msg.rs`):** `Version`, `Verack`, `Ping`, `Pong`, `Inv`, `GetData`, `Block`, `GetBlocks`, `Addr`, and `Tx` (transaction relay, §13.14 — additive, so older nodes ignore it rather than disconnect).
 - **Peer Lifecycle (`peer.rs`):** Thread-per-connection model with non-blocking socket timeouts and handshake timeout enforcement.
 - **Sync Manager (`syncer.rs`):** Locator-based block synchronization with exponential backoff and a bounded orphan pool (512 blocks).
 - **Node Server Daemon (`jnt-node serve`):**
@@ -590,11 +603,35 @@ merely self-consistent with the code implementing it.
 
 `.github/workflows/ci.yml` runs on every push and PR: format check, clippy with
 `-D warnings`, the full test suite, a release build, the vector cross-checks, the
-difficulty-attack containment simulation, and the supply cross-check.
+difficulty-attack containment simulation, the supply cross-check, and a
+`fuzz-smoke` job that runs all eleven libFuzzer targets for 20 s each on nightly
++ ASan.
+
+### Fuzzing and invariants
+
+`fuzz/` is a standalone cargo-fuzz crate with **eleven targets** over the
+attacker-controlled boundaries — L1: `tx_decode`, `block_decode`,
+`wire_msg_decode`, `mempool_admit`, `storage_recover`, `checkpoint_validate`,
+`meta_parse`; L2 (Phase 2–3): `l2_payload_decode`, `m3_readers`,
+`dispute_arbitrate`, `l2_state_apply`. They assert capability invariants (exact
+decode→encode inversion, bounded allocation, value conservation under
+adversarial transaction programs), not merely panic-freedom. Campaign results
+are recorded in [docs/status.md](docs/status.md).
+
+The deterministic counterparts run on every `cargo test`: `fuzz_invariants.rs`
+suites in `jnt-core`, `jnt-net`, `jnt-store` and `jnt-l2` feed hand-built
+adversarial inputs — every truncation and bitflip of a valid transaction/block,
+hostile length fields, forged and lying-count checkpoints, mutated dispute
+evidence — through the same invariants on stable tooling.
+
+```sh
+cd fuzz && cargo check --bins       # all eleven targets compile
+cargo test -p jnt-l2 --test fuzz_invariants   # L2 invariants on stable
+```
 
 ### Red-team suite
 
-`crates/jnt-core/tests/redteam.rs` holds 9 adversarial integration tests, written
+`crates/jnt-core/tests/redteam.rs` holds 11 adversarial integration tests, written
 attack-first. Each builds the hostile input a peer would send and asserts the
 node refuses it; each was confirmed to fail against the code it now guards.
 
@@ -732,7 +769,6 @@ normative.
 
 ---
 
-## License
-
-`Cargo.toml` declares `MIT OR Apache-2.0`. **No `LICENSE` file has been added
-yet** — this needs resolving before the code is distributed.
+## License`Cargo.toml` declares `MIT OR Apache-2.0`, and both licence texts ship at the
+root (`LICENSE-MIT`, `LICENSE-APACHE`). The `repository` URL `Cargo.toml`
+declares does not match the actual remote — see the limitation above.
