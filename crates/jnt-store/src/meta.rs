@@ -203,8 +203,17 @@ impl MetaFile {
     /// does not verify" call for different responses, and collapsing them would
     /// let a corrupt tip silently become an empty store.
     pub fn load(&self) -> Result<Option<Meta>, StoreError> {
-        match fs::read_to_string(&self.path) {
-            Ok(text) => Meta::parse(&text).map(Some),
+        match fs::read(&self.path) {
+            Ok(bytes) => {
+                // Non-UTF-8 bytes are damage to a text-format file, not an OS
+                // failure: report them as BadMeta rather than leaking a raw
+                // `InvalidData` IO error. (Found by the fuzz-invariant tests,
+                // which feed binary garbage to the parser.)
+                let text = String::from_utf8(bytes).map_err(|_| StoreError::BadMeta {
+                    detail: "meta.json is not valid utf-8".into(),
+                })?;
+                Meta::parse(&text).map(Some)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(StoreError::io(&self.path, e)),
         }

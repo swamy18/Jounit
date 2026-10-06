@@ -198,10 +198,17 @@ impl Message {
                 // reserving for it.
                 w.raw(&tx.serialize());
             }
-            Message::Unknown { ty, raw } => {
-                w.u8(*ty)
-                    .u32le(u32::try_from(raw.len()).unwrap_or(0))
-                    .raw(raw);
+            Message::Unknown { raw, .. } => {
+                // `raw` is the payload verbatim as received — decode stores the
+                // whole payload, not a re-framed copy — so encoding is a
+                // verbatim copy and decode(encode(x)) is the identity. (This
+                // arm used to write `ty + len + raw` on top of bytes that
+                // already were the payload, growing an unknown message by 5
+                // bytes on every decode→encode cycle. Found by the
+                // fuzz-invariant tests; never consensus-critical since nodes
+                // do not relay unknown messages, but the asymmetry is a wire
+                // correctness bug.)
+                w.raw(raw);
             }
         }
     }
@@ -371,13 +378,17 @@ mod tests {
             w.into_vec()
         };
         let msg = Message::decode(0xFF, &payload).unwrap();
-        match msg {
+        match &msg {
             Message::Unknown { ty, raw } => {
-                assert_eq!(ty, 0xFF);
-                assert_eq!(raw, payload);
+                assert_eq!(*ty, 0xFF);
+                assert_eq!(raw, &payload);
             }
             other => panic!("expected Unknown, got {other:?}"),
         }
+        // Encode must be the exact inverse: verbatim payload, no re-framing,
+        // so a decode→encode→decode cycle is the identity (regression test for
+        // the growth bug found by the fuzz-invariant tests).
+        assert_eq!(msg.encode(), payload);
     }
 
     #[test]
