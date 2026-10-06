@@ -305,7 +305,7 @@ Tests needed:
   - expired task eviction
 ```
 
-Estimated effort: 2-3 weeks.
+
 
 ---
 
@@ -337,7 +337,7 @@ Tests needed:
   - block log is strictly append-only (no rewrite)
 ```
 
-Estimated effort: 1-2 weeks.
+
 
 ---
 
@@ -384,7 +384,7 @@ Tests needed:
   - settlement without BLS quorum rejected
 ```
 
-Estimated effort: 3-4 weeks.
+
 
 ---
 
@@ -437,7 +437,7 @@ Tests needed:
   - self-slash attack: colluding challenger cannot recover 100%
 ```
 
-Estimated effort: 2-3 weeks.
+
 
 ---
 
@@ -471,7 +471,7 @@ Tests needed:
   - VWC store lookup by task_id and by worker address
 ```
 
-Estimated effort: 1-2 weeks.
+
 
 ---
 
@@ -485,7 +485,7 @@ Each payload needs:
 - Validation rules enforced in `chain.rs::submit_at`
 - Round-trip serialization tests
 
-Estimated effort: 2 weeks.
+
 
 ---
 
@@ -514,31 +514,31 @@ SDK struct:
   WorkerClient::run_loop(&mut self)
 ```
 
-Estimated effort: 3-4 weeks.
+
 
 ---
 
-## 8. Full Timeline
+## 8. Build Order
 
 ```
-Month 1  -- Step 1 + 2:  Mempool + Persistent storage
+Phase 1  -- Step 1 + 2:  Mempool + Persistent storage
             L1 becomes production-ready for live nodes
 
-Month 2  -- Step 3:      TaskContract + state machine
+Phase 2  -- Step 3:      TaskContract + state machine
 
-Month 3  -- Step 4:      Dispute engine + M2/M1 wiring
+Phase 3  -- Step 4:      Dispute engine + M2/M1 wiring
 
-Month 4  -- Step 5 + 6:  VWC issuance + new Tx types in jnt-core
+Phase 4  -- Step 5 + 6:  VWC issuance + new Tx types in jnt-core
 
-Month 5  -- Step 7:      Worker client/SDK
+Phase 5  -- Step 7:      Worker client/SDK
 
-Month 6  -- Integration + testnet launch
+Phase 6  -- Integration + testnet launch
             All modules connected end-to-end
             Multi-node testnet running
             Chaos testing (dispute storms, network partitions)
             Bug bounty program
 
-Month 7+ -- Mainnet
+Phase 7  -- Mainnet
 ```
 
 ---
@@ -629,3 +629,572 @@ provides all five guarantees simultaneously.
    TxSettle involves BLS verification which is expensive.
    Recommendation: flat fee schedule per Tx type, not per-byte, to make
    costs predictable for workers and submitters.
+
+---
+
+## 12. Agent Integration Layer
+
+The goal of this layer is to make JNT usable by any AI agent running on
+any existing framework — without those agents or their developers needing
+to learn anything new. We do not invent a new framework. We build thin
+adapters on top of what already exists and is already widely adopted.
+
+The single prerequisite that unlocks everything else is a REST API on
+`jnt-node`. Every integration below is a wrapper around that API.
+
+---
+
+## 13. REST API — `jnt-node`
+
+Add an HTTP server to `jnt-node serve` alongside the existing P2P daemon.
+All endpoints are read-only except `/v1/tx/broadcast` and `/v1/tx/build`.
+
+```
+Target file: crates/jnt-node/src/api.rs
+HTTP library: axum (already a common Rust choice; add to workspace Cargo.toml)
+Binding:      --api-listen flag on `jnt-node serve`, e.g. 127.0.0.1:8080
+              Disabled by default; opt-in.
+```
+
+### Endpoints
+
+```
+GET  /v1/status
+     Response: { network, height, tip_hash, peers, pscb_reserve }
+
+GET  /v1/balance/{address}
+     Response: { address, confirmed_jnt, pending_jnt }
+
+GET  /v1/block/latest
+     Response: full block header + tx count
+
+GET  /v1/block/{hash}
+     Response: full block including all transactions
+
+GET  /v1/tx/{hash}
+     Response: { tx, status: Confirmed|Pending|Unknown, block_hash, block_height }
+
+GET  /v1/mempool
+     Response: [ { tx_hash, fee_rate, payload_type } ... ]
+
+POST /v1/tx/build
+     Body:    { from: address, to: address, amount_jnt: u64, max_fee_jnt: u64 }
+     Response: { unsigned_tx_hex, fee_jnt, selected_utxos }
+     Note:    server performs UTXO selection and fee calculation.
+              Caller signs the returned bytes and broadcasts.
+
+POST /v1/tx/broadcast
+     Body:    { signed_tx_hex: string }
+     Response: { tx_hash } or error
+
+GET  /v1/utxo/{address}
+     Response: [ { txid, index, value_jnt } ... ]
+
+GET  /v1/task/{task_id}
+     Response: TaskContract state (once L2 is live)
+
+GET  /v1/tasks/open
+     Response: [ open TaskContracts available to claim ] (once L2 is live)
+
+WS   /v1/stream/blocks
+     Push:    { event: "block", hash, height, tx_count } on each new block
+
+WS   /v1/stream/mempool
+     Push:    { event: "tx", tx_hash, payload_type } on each new mempool entry
+```
+
+### Files to create / modify
+
+```
+crates/jnt-node/src/api.rs          -- axum router, all handlers
+crates/jnt-node/src/api/balance.rs  -- balance handler
+crates/jnt-node/src/api/tx.rs       -- build + broadcast handlers
+crates/jnt-node/src/api/stream.rs   -- WebSocket block/mempool streams
+crates/jnt-node/src/main.rs         -- add --api-listen flag, spawn api server
+Cargo.toml (workspace)              -- add axum, tokio features
+```
+
+### Tests needed
+
+```
+- GET /v1/balance returns correct confirmed balance after mining
+- POST /v1/tx/build selects UTXOs and returns valid unsigned tx bytes
+- POST /v1/tx/broadcast accepts a validly signed tx and returns tx_hash
+- POST /v1/tx/broadcast rejects a tx with a bad signature (400)
+- WS /v1/stream/blocks delivers an event within one block of mining
+- All endpoints return 404 for unknown hashes, not 500
+```
+
+---
+
+## 14. Protocol Change — `TxMemo` field
+
+A single optional 32-byte field added to the existing `Transfer` payload
+in `crates/jnt-core/src/tx.rs`. Agents use it to attach task IDs,
+correlation IDs, or any structured context to a payment without a
+separate on-chain record.
+
+```rust
+// crates/jnt-core/src/tx.rs
+
+struct TransferPayload {
+    recipient: [u8; 20],
+    amount:    u64,
+    memo:      Option<[u8; 32]>,   // new — None serializes as a zero byte
+}
+```
+
+### Serialization rules
+
+```
+Presence flag: u8 — 0x00 = no memo, 0x01 = memo present
+If present:    write 32 raw bytes
+If absent:     write nothing after the flag
+```
+
+### Files to modify
+
+```
+crates/jnt-core/src/tx.rs       -- add memo field, update Writer/Reader
+crates/jnt-core/src/wallet.rs   -- expose memo param in build_tx
+tests/vectors/                  -- regenerate transfer vectors
+```
+
+### Tests needed
+
+```
+- Transfer with None memo round-trips identically to current format
+- Transfer with Some(memo) round-trips with correct 33 extra bytes
+- Memo is covered by the signing hash (change memo -> different signature)
+- wallet::build_tx passes memo through correctly
+- Vector crosscheck still passes after regeneration
+```
+
+---
+
+## 15. MCP Server — `jnt-mcp/`
+
+An MCP (Model Context Protocol) server that wraps the JNT REST API.
+Any MCP-compatible AI client — Claude Desktop, any LLM using the MCP
+standard — gains the ability to interact with JNT with no additional
+integration work on the client side.
+
+```
+Target directory: jnt-mcp/
+Language:         Python 3.11+
+Library:          fastmcp  (pip install fastmcp)
+Dependency:       jnt-node must be running with --api-listen
+```
+
+### Project layout
+
+```
+jnt-mcp/
+  pyproject.toml
+  README.md
+  jnt_mcp/
+    __init__.py
+    server.py      -- FastMCP app, all tool definitions
+    client.py      -- thin HTTP client wrapping the jnt-node REST API
+    config.py      -- node URL, network profile from env vars
+  tests/
+    test_server.py
+```
+
+### Tools to expose
+
+```python
+@mcp.tool()
+async def jnt_get_balance(address: str) -> dict:
+    """
+    Get the confirmed and pending JNT balance for an address.
+    Returns: { address, confirmed_jnt, pending_jnt }
+    """
+
+@mcp.tool()
+async def jnt_get_status() -> dict:
+    """
+    Get current JNT node status: network, block height, tip hash, peer count.
+    """
+
+@mcp.tool()
+async def jnt_build_transaction(
+    from_address: str,
+    to_address: str,
+    amount_jnt: float,
+    memo_hex: str | None,
+    max_fee_jnt: float,
+) -> dict:
+    """
+    Build an unsigned JNT transaction. The node selects UTXOs and calculates
+    fees. Returns unsigned_tx_hex for the caller to sign and broadcast.
+    Does NOT handle private keys.
+    """
+
+@mcp.tool()
+async def jnt_broadcast_transaction(signed_tx_hex: str) -> dict:
+    """
+    Broadcast a signed transaction to the JNT network.
+    Returns: { tx_hash }
+    """
+
+@mcp.tool()
+async def jnt_get_transaction(tx_hash: str) -> dict:
+    """
+    Look up a transaction by hash. Returns status, block, and payload.
+    """
+
+@mcp.tool()
+async def jnt_get_open_tasks() -> list:
+    """
+    List open AI compute tasks available to claim on the JNT L2 marketplace.
+    (Active once L2 is live.)
+    """
+
+@mcp.tool()
+astype jnt_get_task_status(task_id: str) -> dict:
+    """
+    Get the current state of a compute task and its Verified Work Certificate
+    if settled. (Active once L2 is live.)
+    """
+```
+
+### Configuration
+
+```
+JNT_NODE_URL=http://127.0.0.1:8080   -- jnt-node REST API base URL
+JNT_NETWORK=mini                     -- network profile (mini | mainnet)
+```
+
+### MCP server entry point
+
+```
+mcp run jnt_mcp/server.py
+```
+
+For Claude Desktop, add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "jnt": {
+      "command": "mcp",
+      "args": ["run", "/path/to/jnt-mcp/jnt_mcp/server.py"],
+      "env": { "JNT_NODE_URL": "http://127.0.0.1:8080" }
+    }
+  }
+}
+```
+
+### Tests needed
+
+```
+- jnt_get_balance calls correct REST endpoint and parses response
+- jnt_build_transaction sends correct body and returns unsigned_tx_hex
+- jnt_broadcast_transaction sends signed bytes and returns tx_hash
+- jnt_get_status returns all required fields
+- All tools return structured errors (not Python exceptions) on node failure
+```
+
+---
+
+## 16. ElizaOS Plugin — `@jnt/plugin-elizaos`
+
+A plugin for the ElizaOS framework, following the same plugin interface
+as `@elizaos/plugin-evm` and `@elizaos/plugin-solana`. Any ElizaOS agent
+can add JNT support by adding this plugin to its character config.
+
+```
+Target directory: jnt-elizaos-plugin/
+Language:         TypeScript
+Framework:        ElizaOS (@elizaos/core)
+Registry prefix:  @jnt/plugin-elizaos
+```
+
+### Project layout
+
+```
+jnt-elizaos-plugin/
+  package.json
+  tsconfig.json
+  README.md
+  src/
+    index.ts          -- plugin export
+    plugin.ts         -- Plugin interface implementation
+    actions/
+      transfer.ts     -- TRANSFER_JNT action
+      balance.ts      -- GET_JNT_BALANCE action
+      buildTx.ts      -- BUILD_JNT_TX action (unsigned, for human-approval flows)
+      postTask.ts     -- POST_COMPUTE_TASK action (L2, once live)
+    providers/
+      walletProvider.ts  -- exposes balance + address to agent context
+      nodeProvider.ts    -- exposes node status to agent context
+    evaluators/
+      jntEvaluator.ts    -- detects when a message is requesting a JNT action
+  tests/
+    plugin.test.ts
+```
+
+### Plugin interface implementation
+
+```typescript
+// src/plugin.ts
+import { Plugin } from "@elizaos/core";
+import { transferAction } from "./actions/transfer";
+import { balanceAction } from "./actions/balance";
+import { walletProvider } from "./providers/walletProvider";
+import { nodeProvider } from "./providers/nodeProvider";
+import { jntEvaluator } from "./evaluators/jntEvaluator";
+
+export const jntPlugin: Plugin = {
+    name: "jnt",
+    description: "Jounit (JNT) blockchain integration for ElizaOS agents",
+    actions: [transferAction, balanceAction],
+    providers: [walletProvider, nodeProvider],
+    evaluators: [jntEvaluator],
+    services: [],
+};
+```
+
+### Configuration (via ElizaOS character secrets)
+
+```
+JNT_NODE_URL       -- jnt-node REST API URL
+JNT_PRIVATE_KEY    -- agent wallet private key (hex)
+JNT_NETWORK        -- mini | mainnet
+```
+
+### Installation for an ElizaOS agent
+
+```bash
+elizaos plugins add @jnt/plugin-elizaos
+```
+
+Then in `character.ts`:
+
+```typescript
+import { jntPlugin } from "@jnt/plugin-elizaos";
+
+export const character = {
+    name: "MyAgent",
+    plugins: [jntPlugin],
+    // ...
+};
+```
+
+### Tests needed
+
+```
+- walletProvider returns correct balance from mocked REST API
+- transferAction builds and broadcasts a tx end-to-end against mock node
+- jntEvaluator fires on messages containing JNT payment intent
+- Plugin loads without error when added to a character
+- Secrets are never logged or exposed in provider output
+```
+
+---
+
+## 17. LangChain Tool Wrapper — `jnt-langchain/`
+
+A Python package exposing JNT operations as LangChain tools. Any agent
+built with LangChain (the most widely used Python AI orchestration
+framework) can add JNT support in three lines.
+
+```
+Target directory: jnt-langchain/
+Language:         Python 3.11+
+Dependency:       langchain-core, httpx
+```
+
+### Project layout
+
+```
+jnt-langchain/
+  pyproject.toml
+  README.md
+  jnt_langchain/
+    __init__.py
+    tools.py       -- all LangChain tool classes
+    client.py      -- shared REST client (same pattern as jnt-mcp/client.py)
+  tests/
+    test_tools.py
+```
+
+### Tools to implement
+
+```python
+# jnt_langchain/tools.py
+from langchain_core.tools import BaseTool
+
+class JntGetBalanceTool(BaseTool):
+    name = "jnt_get_balance"
+    description = "Get the JNT balance for a given address."
+    # Input: address: str
+    # Output: str describing confirmed and pending balance
+
+class JntBuildTransactionTool(BaseTool):
+    name = "jnt_build_transaction"
+    description = (
+        "Build an unsigned JNT transfer transaction. "
+        "Input: from_address, to_address, amount_jnt, optional memo_hex. "
+        "Output: unsigned_tx_hex ready for signing."
+    )
+
+class JntBroadcastTransactionTool(BaseTool):
+    name = "jnt_broadcast_transaction"
+    description = "Broadcast a signed JNT transaction. Input: signed_tx_hex."
+
+class JntGetNodeStatusTool(BaseTool):
+    name = "jnt_get_node_status"
+    description = "Get current JNT network status: height, tip, peers."
+
+class JntGetTaskStatusTool(BaseTool):
+    name = "jnt_get_task_status"
+    description = "Get the status of a JNT L2 compute task by task_id."
+    # Active once L2 is live
+
+# Convenience bundle — add all tools at once
+JNT_TOOLS = [
+    JntGetBalanceTool(),
+    JntBuildTransactionTool(),
+    JntBroadcastTransactionTool(),
+    JntGetNodeStatusTool(),
+    JntGetTaskStatusTool(),
+]
+```
+
+### Usage by a LangChain agent
+
+```python
+from jnt_langchain import JNT_TOOLS
+from langchain.agents import initialize_agent
+
+agent = initialize_agent(
+    tools=JNT_TOOLS,
+    llm=llm,
+    agent="zero-shot-react-description",
+)
+agent.run("What is the JNT balance of address abc123?")
+```
+
+### Tests needed
+
+```
+- JntGetBalanceTool._run calls correct endpoint with address param
+- JntBuildTransactionTool._run sends correct body and returns hex string
+- JntBroadcastTransactionTool._run returns tx_hash on success
+- All tools raise ToolException (not raw httpx error) on node failure
+- JNT_TOOLS list contains all five tools with correct names
+```
+
+---
+
+## 18. Integration Completion Order
+
+The items in §13–§17 depend on each other in a fixed order:
+
+```
+§14 TxMemo protocol change
+  -- can be done in parallel with §13
+  -- must be done before L2 tx types (§7 Step 6)
+
+§13 REST API
+  -- must be done first
+  -- §15, §16, §17 all depend on it
+
+§15 MCP server
+  -- depends on §13
+  -- no other dependencies
+
+§16 ElizaOS plugin
+  -- depends on §13
+  -- no other dependencies
+
+§17 LangChain tools
+  -- depends on §13
+  -- no other dependencies
+
+§15, §16, §17 can be built in parallel once §13 is done.
+```
+
+### What each integration unlocks
+
+| Integration | Who can use JNT immediately after |
+|---|---|
+| REST API (§13) | Any HTTP client, any language, any tool |
+| MCP server (§15) | Claude Desktop, any MCP-compatible LLM client |
+| ElizaOS plugin (§16) | Any ElizaOS agent (largest open-source agent framework) |
+| LangChain tools (§17) | Any LangChain-based Python agent |
+| TxMemo (§14) | Any agent that needs to attach task context to a payment |
+
+None of these require JNT users or developers to learn a new framework,
+install new tooling, or adopt a new standard. They use what already
+exists and what the ecosystem already trusts.
+---
+
+## 19. L1 implementation status
+
+Tracked here so §7 and §8 can be read against reality rather than intent. Nothing
+above this section has been edited; this is an append, because the document
+carried uncommitted work from another author and rewriting it would have mixed
+two changes together.
+
+**Completed**
+
+- **§8 step 1 — Mempool.** `crates/jnt-core/src/mempool.rs`. Bounded by real
+  serialized bytes, ordered by fee *rate* with a total, deterministic tie-break,
+  conflict-checked before the size check. 10 attack tests pin the rules the pool
+  exists to enforce.
+- **§8 step 1A — Mempool integrated into L1.** `Chain::mine_from_pool`,
+  `Chain::confirmed_above`, `Chain::reconcile_mempool`, and
+  `Chain::take_disconnected`. Reorg disconnection and re-admission are part of the
+  chain-reorg path itself, so a failed reorg publishes nothing and a committed one
+  cannot lose a transaction silently. 10 integration tests in
+  `crates/jnt-core/tests/mempool_l1.rs`, including two reorg cases.
+- **D3 flat L2 fees recorded** as `FEE_TX_*_SAT` and `L2_FEE_SCHEDULE` in
+  `params.rs`, pinned by two tests.
+
+**Not started**
+
+- §8 step 2 — transaction relay over P2P. This is what makes the pool earn its
+  keep: today nothing feeds it over the wire, and a node relaying nothing is a
+  node the rest of the network cannot use.
+- §8 step 3 — `crates/jnt-store/`. Blocks are still rewritten in full on every
+  chain change (§13.10 item 4) and state is replayed from genesis on load.
+- §8 step 4 — real `blst` BLS. M5 remains `MockBls`.
+- §8 step 5 — `cargo-fuzz`.
+- §8 step 6 — L2.
+
+**Blocking before any L2 code**
+
+The D3 fee schedule does not clear the L1 fee floor (`base_fee * gas_used`, with
+`GAS_TX_BASE` = 16 000 as the smallest possible gas). Four options are analysed in
+`docs/status.md`; the recommended one gives the five L2 transaction types their
+own fee schedule and routes the flat fee through the existing M1 50/50
+burn/PSCB split, so no invariant is weakened and no exemption is created. This
+must be written into SPEC.md and signed off before the first L2 transaction type
+is implemented, because it changes what a JNT price means for L2 work.
+
+**Also still open before §8 step 4**
+
+M5's validator-set semantics (D1/D4: permissionless staking, top-21 stakers per
+epoch, genesis bootstrapped by founder nodes) are recorded as a decision but are
+not yet normative in SPEC.md. They must be, before `blst` verification is wired
+into consensus — not after.
+
+## 20. P2P transaction relay status
+
+Step 2 of the build order is done. See `docs/status.md` for the full account; the
+summary is that `TX` (`msg_type = 10`), `kind = 0` announcements, request expiry
+and the wallet submission path all exist, no consensus rule changed, and three
+defects were found — two of them by tests that first failed.
+
+Notable for planning what comes next:
+
+- The relay budget is `max_block_bytes`, the unit the network already bounds, so
+  no new quantity was introduced to reason about. There is deliberately **no**
+  separate transaction size cap: a relay limit tighter than `max_block_bytes`
+  would make a transaction consensus accepts permanently unrelayable.
+- Two nodes now demonstrably exchange a wallet-signed transaction. That makes
+  step 3 (persistent storage) the next real constraint, because the pool is still
+  in-memory and a restart loses everything it held.
