@@ -33,6 +33,7 @@ EXPECTED = {
     "ser_vectors.json": "input / output / tx / header byte layouts",
     "supply_vectors.json": "reward ladder, cumulative supply, cap invariant",
     "difficulty_vectors.json": "LWMA next-difficulty, timestamp clamp",
+    "net_vectors.json": "frame envelope, every msg_type payload, VERSION, bounds",
 }
 
 problems: list[str] = []
@@ -109,6 +110,31 @@ def check_puzzle_against_reference() -> None:
         )
 
 
+def check_net_against_reference() -> None:
+    """Cross-check the wire format against the independent Python encoder.
+
+    Round-trip tests only prove a codec agrees with itself, so a field order
+    that differs from SPEC.md 13.5 passes every Rust test and still breaks every
+    other implementation. `net_reference.py` is written from the prose, so a
+    disagreement points at the spec rather than at either implementation. It
+    has already earned its place: it caught ADDR encoding `ip | port` where the
+    spec says `port | ip`.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "sim" / "net_reference.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        problems.append(
+            "net_reference.py failed -- the Rust and Python wire-format "
+            f"implementations disagree:\n{proc.stdout}\n{proc.stderr}"
+        )
+    else:
+        notes.append("wire format cross-checked against an independent encoder")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="verify or regenerate Jounit test vectors")
     parser.add_argument(
@@ -136,6 +162,8 @@ def main() -> int:
     check_supply_values()
     if (VECTORS_DIR / "puzzle_vectors.json").exists():
         check_puzzle_against_reference()
+    if (VECTORS_DIR / "net_vectors.json").exists():
+        check_net_against_reference()
 
     for name in sorted(EXPECTED):
         path = VECTORS_DIR / name

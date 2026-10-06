@@ -167,7 +167,16 @@ impl Message {
             Message::Addr(addrs) => {
                 w.u16le(u16::try_from(addrs.len()).unwrap_or(0));
                 for a in addrs {
-                    w.fixed(&a.ip).u16le(a.port);
+                    // SPEC.md §13.5: `count x (port(2 LE) | ip(16))` — port
+                    // first. The previous order was `ip | port`, which still
+                    // round-trips through our own decoder and so passed every
+                    // test in this crate while disagreeing with the spec, and
+                    // therefore with every other implementation. Caught by
+                    // `sim/net_reference.py`, the independent encoder written
+                    // from the prose. Note the payload length is identical
+                    // either way (18 bytes per entry), so a length assertion
+                    // could never have found it.
+                    w.u16le(a.port).fixed(&a.ip);
                 }
             }
             Message::Unknown { ty, raw } => {
@@ -289,8 +298,10 @@ fn decode_addr(r: &mut Reader<'_>) -> NetResult<Vec<SocketAddr>> {
     }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let ip: [u8; 16] = r.fixed()?;
+        // Field order MUST match `encode_into` and SPEC.md §13.5: port, then
+        // ip.
         let port = r.u16le()?;
+        let ip: [u8; 16] = r.fixed()?;
         out.push(SocketAddr { ip, port });
     }
     Ok(out)
@@ -301,6 +312,10 @@ pub const MAX_ADDR_PER_MSG: usize = 100;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
     #[test]
     fn version_round_trips_and_bounds_strings() {
@@ -371,5 +386,37 @@ mod tests {
         let mut r = Reader::new(&buf);
         let res = decode_inv(&mut r);
         assert!(matches!(res, Err(NetError::Decode(_))));
+    }
+
+    /// ADDR carried `ip | port` and the spec says `port | ip` (§13.5). A
+    /// round-trip test cannot see this, because both sides of our own codec
+    /// agreed; only `sim/net_reference.py` caught it. Assert the literal bytes
+    /// so the order cannot drift back.
+    #[test]
+    fn addr_entry_is_port_then_ip() {
+        let mut ip = [0u8; 16];
+        ip[10] = 0xFF;
+        ip[11] = 0xFF;
+        ip[12] = 127;
+        ip[15] = 1;
+        let msg = Message::Addr(vec![SocketAddr { ip, port: 8333 }]);
+        let enc = msg.encode();
+        assert_eq!(
+            hex_of(&enc),
+            concat!(
+                "0100",                             // count = 1
+                "8d20",                             // port 8333 LE, FIRST
+                "00000000000000000000ffff7f000001", // 16-byte ip, SECOND
+            ),
+            "ADDR entry order must match SPEC.md 13.5"
+        );
+        match Message::decode(MessageType::Addr as u8, &enc).unwrap() {
+            Message::Addr(got) => {
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].port, 8333);
+                assert_eq!(got[0].ip, ip);
+            }
+            other => panic!("expected Addr, got {other:?}"),
+        }
     }
 }
