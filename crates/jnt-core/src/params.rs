@@ -15,14 +15,14 @@ pub const SAT_PER_JNT: u64 = 100_000_000;
 /// makes the price of the same logical operation depend on how the payload
 /// serializer happens to encode it.
 ///
-/// **These are not yet consensus, and they do not currently clear the fee
-/// floor.** The only fee rule in the node today is `base_fee * gas_used`
-/// (`fees::required_fee`), and even the smallest transaction uses
-/// `GAS_TX_BASE` gas, so the floor is orders of magnitude above every number
-/// below. Nothing consumes these constants yet — the L2 transaction types do not
-/// exist — and wiring them in will need either an L2 fee path of its own or an
-/// explicit exemption from the gas floor. `l2_flat_fees_sit_below_the_gas_floor`
-/// pins that open question so it cannot be forgotten.
+/// **These do not clear the L1 fee floor, and they are not supposed to.** The
+/// only L1 fee rule is `base_fee * gas_used` (`fees::required_fee`), and even the
+/// smallest transaction uses `GAS_TX_BASE` gas, so that floor is orders of
+/// magnitude above every number below. Decision D3 resolved this by giving L2 a
+/// fee path of its own rather than an exemption: `l2::L2TxType::fee_sat` returns
+/// these values, and `fees::split_flat_fee` routes the whole flat fee through the
+/// unchanged M1 50/50 burn/PSCB rule. The L1 floor is untouched and L2 never
+/// consults it. `l2_fees_do_not_use_the_l1_gas_floor` pins that separation.
 pub const FEE_TX_POST_TASK_SAT: u64 = 5_000;
 pub const FEE_TX_CLAIM_TASK_SAT: u64 = 2_000;
 pub const FEE_TX_SUBMIT_RESULT_SAT: u64 = 2_000;
@@ -296,24 +296,35 @@ mod tests {
         );
     }
 
-    /// A canary, not a requirement. Fails the day someone makes these fees
-    /// spendable without deciding what happens to the gas floor — at which point
-    /// the doc comment on `FEE_TX_POST_TASK_SAT` stops being true too.
+    /// The decision, stated as a test: L2 fees ride a flat path of their own, the
+    /// L1 `base_fee * gas_used` floor is unchanged, and the two are deliberately
+    /// unrelated. Fails if someone makes an L2 fee clear the gas floor (which
+    /// would mean L1 and L2 had been quietly merged) or if the D3 path stops
+    /// preserving the M1 invariant.
     #[test]
-    fn l2_flat_fees_sit_below_the_gas_floor() {
-        // `base_fee_min_sat` is the cheapest base fee either profile can reach,
-        // so this is the most favourable possible floor: if the flat fees are
-        // under *this*, they are under every fee the node would ever charge.
+    fn l2_fees_do_not_use_the_l1_gas_floor() {
+        use crate::fees::{required_fee, split_flat_fee};
         for profile in [NetworkParams::mainnet(), NetworkParams::mini()] {
-            let floor = profile.base_fee_min_sat * crate::tx::GAS_TX_BASE;
+            // The cheapest fee the L1 rule can ever charge, for the smallest
+            // possible transaction.
+            let floor = required_fee(profile.base_fee_min_sat, crate::tx::GAS_TX_BASE);
+            assert_eq!(
+                floor,
+                profile.base_fee_min_sat * crate::tx::GAS_TX_BASE,
+                "the L1 floor must be exactly base_fee * gas_used"
+            );
             for (name, fee) in L2_FEE_SCHEDULE {
                 assert!(
                     *fee < floor,
-                    "{name} at {fee} sat now clears the {floor} sat gas floor on {} \
-                     — the open fee-path question in params.rs has been answered, \
-                     so update the comment and delete this test",
+                    "{name} at {fee} sat now clears the {floor} sat L1 gas floor on {} \
+                     — L2 must keep its own path, not inherit the L1 floor",
                     profile.name
                 );
+                let split = split_flat_fee(*fee);
+                assert_eq!(split.total_fees, *fee);
+                assert_eq!(split.tip, 0);
+                assert_eq!(split.burned + split.pscb, *fee);
+                assert_eq!(split.pscb, *fee / 2);
             }
         }
     }

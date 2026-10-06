@@ -70,6 +70,28 @@ pub fn split_fees(total_gas: u64, total_fees: u64, base_fee: u64) -> Result<FeeS
     })
 }
 
+/// M1 split for the flat L2 fee schedule (decision D3).
+///
+/// L2 transactions pay a flat fee per type instead of `base_fee * gas_used`, so
+/// there is no gas component here: the **whole flat fee is the `full_base`** and
+/// the existing 50/50 burn/PSCB rule applies to it unchanged. The miner tip is
+/// zero, because an L2 fee is not paid to whichever miner happens to include it.
+///
+/// This is deliberately a separate entry point from [`split_fees`] rather than a
+/// relaxed parameter to it: the L1 gas floor stays exactly as it is, and L2 does
+/// not gain an exemption from it — it has its own rule. The odd-satoshi rounding
+/// matches [`split_fees`] (`burned` gets the extra sat).
+pub fn split_flat_fee(fee: u64) -> FeeSplit {
+    let pscb = fee / 2;
+    let burned = fee - pscb; // == ceil(fee / 2)
+    FeeSplit {
+        total_fees: fee,
+        burned,
+        pscb,
+        tip: 0,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeeSplit {
     pub total_fees: u64,
@@ -236,6 +258,32 @@ mod tests {
             split.tip < split.total_fees,
             "the burned + pscb base fee must never reach the miner"
         );
+    }
+
+    #[test]
+    fn flat_fee_split_preserves_the_m1_invariant_and_leaves_no_tip() {
+        for fee in [0u64, 1, 2, 3, 4_999, 5_000, 10_000, 20_000, 20_001] {
+            let split = split_flat_fee(fee);
+            assert_eq!(split.total_fees, fee);
+            assert_eq!(split.tip, 0, "an L2 fee is never a miner tip");
+            assert_eq!(split.pscb, fee / 2, "50% to PSCB");
+            assert_eq!(split.burned, fee - split.pscb, "burned gets the odd sat");
+            assert_eq!(
+                split.burned + split.pscb + split.tip,
+                fee,
+                "burned + pscb + tip must equal the flat fee"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_split_puts_the_odd_satoshi_where_split_fees_does() {
+        // Both paths must round the same way, or an L2 fee and an L1 fee of the
+        // same size would burn different amounts.
+        let flat = split_flat_fee(9);
+        let l1 = split_fees(1, 9, 9).unwrap();
+        assert_eq!(flat.burned, l1.burned);
+        assert_eq!(flat.pscb, l1.pscb);
     }
 
     #[test]

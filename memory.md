@@ -2225,3 +2225,136 @@ Phase 6 - Public testnet (needs 2-5):
   never stage, commit, or revert it.
 - CI must keep running the fuzz-smoke job; the invariant suites keep the
   same guarantees on stable cargo test.
+
+---
+
+# Working memory — session 12: Phase 2, the L2 task layer (SHIPPED)
+
+**Date:** 2026-10-06
+**Branch:** `main`, based on `acc365d`. `docs/roadmap.md` still carries another
+author's uncommitted diff and was not touched.
+**Scope:** Phase 2 of the 6-phase roadmap — `jnt-l2` crate + the five L2
+transaction types + TaskContract state machine + D3 fee routing.
+**Outcome:** built, tested, documented. **410 workspace tests pass (was 360).**
+fmt / clippy `-D warnings` / release / all five sims clean. No L1 consensus rule
+changed.
+
+## 45. What Phase 2 ships
+
+The long-standing next-work item from the master ledger is done. Phase 2 is the
+first L2 slice, and the single most important property of it is what it *does
+not* touch: **no L1 consensus rule changed.** The five L2 payloads are new types
+that are not yet carried inside a block, so nothing here is reachable from
+`Chain::submit`, and every L1 vector is byte-identical. This is the same
+"module first, wire later" pattern M2–M5 shipped with, for the same reason —
+the state machine has to be exercised before an integration can be designed
+around it.
+
+Files, in the order they matter:
+
+- `crates/jnt-core/src/l2.rs` (new). The five payload types with wire codes
+  `0x10`–`0x14`, canonical codecs, domain-separated signing hashes, hybrid actor
+  authorization, `derive_task_id`, `Verdict`, and `L2TxType::fee_sat()`.
+- `crates/jnt-core/src/fees.rs` (+`split_flat_fee`). The D3 fee path: whole flat
+  fee becomes `full_base`, 50/50 burn/PSCB, `tip = 0`, odd sat to `burned`.
+- `crates/jnt-core/src/compute_ir.rs` (`from_reader` for `ComputeTask` and
+  `ComputeAttestation`). The M3 envelope now round-trips; the attestation
+  signature length is bounded before allocation.
+- `crates/jnt-core/src/params.rs`. The D3 open-question canary
+  (`l2_flat_fees_sit_below_the_gas_floor`) is **replaced** by the positive test
+  `l2_fees_do_not_use_the_l1_gas_floor`, and the doc comment on the fee
+  constants now describes the decided path instead of an open question.
+- `crates/jnt-l2/` (new crate). `TaskContract` + `ContractState` +
+  `L2State` + `L2Config`, plus 18 unit and 17 integration tests.
+- `SPEC.md` §15 (normative for the above), `docs/status.md`, `docs/decisions.md`
+  updated.
+
+Reused rather than reimplemented, as rule §25 requires: `ComputeTask` /
+`ComputeAttestation` (M3), `SlashVault` (M2), `ValidatorSet` /
+`BlsVerifier` / `BlsSignature` (M5), `fees` + `params` (M1 + D3), and the
+hybrid wallet signing path.
+
+## 46. Design decisions taken (and why), recorded here because they are not all in a doc
+
+1. **L2 transactions are payload types, not L1 `tx_type` variants yet.** The
+   roadmap's `docs/roadmap.md` §4 sketches adding a payload field to `tx.rs`'s
+   `Transaction`. Doing that now would change the L1 wire format and every L1
+   vector — a consensus change bundled into a feature whose state machine had
+   never run. The codes are `0x10`-based so an L1 type this build does not know
+   is refused *as an L1 type*, never silently read as L2. Bounded decode is
+   identical in spirit to `Bundle`/`Transaction` decoding.
+2. **The dispute window is a network parameter, not a per-transaction field.**
+   The roadmap sketches `dispute_window` on `SubmitResult`. A window chosen by a
+   worker could be made too short to challenge; one chosen by a submitter could
+   be zero. `L2Config` fixes it per network (`mini` = 5, mainnet = 100). This is
+   a deliberate supersession of the roadmap sketch.
+3. **The L2 deadline must equal the M3 envelope's `expiry_height`.** Two
+   deadlines for one task is an ambiguity, and a mismatch is rejected rather
+   than resolved by precedence.
+4. **Implicit transitions cost nothing.** A deadline passing or a dispute window
+   closing charges no fee, because nothing was transacted. Explicit `Settle`
+   charges the D3 20 000 flat fee.
+5. **Settle authorization is the M5 quorum**, verified through the existing
+   `BlsVerifier` trait, messaging `signing_hash(task_id, verdict, vwc_hash)`.
+   The M5 machinery is reused; finality itself stays inert.
+6. **Actor identities are hybrid.** `Auth` builds an ECDSA + Schnorr bundle from
+   the wallet, so an L2 actor's address is the wallet's L1 `address()`. That
+   avoids the trap of an L2 account that cannot be funded from an L1 output.
+
+## 47. The bug the tests caught (and how it was found)
+
+`L2State::apply_settlement` paid the worker and the challenger but **never
+credited `submitter_refunded`**. Every `Fraudulent` and `Expired` settlement
+silently dropped the escrow. The conservation invariant caught it exactly: the
+two-node determinism test asserted `accounts + locked + burned + pscb + vault ==
+credited` and reported 29 000 000 against 30 000 000 — the missing 1 000 000
+being precisely the escrow.
+
+The lesson repeats the project's oldest one: the untested *combination* is where
+the bug was. The contract-level unit test of `settle` passed (it returns the
+right `SettlementOutcome`); the failure was in the one place that had to turn an
+outcome into balances. A conservation check is what made a silent omission
+loud, which is why it is now asserted after every integration scenario rather
+than once.
+
+## 48. Two open items, surfaced by implementation rather than decided quietly
+
+1. **Fee-vs-escrow sizing.** A `Correct` settle takes 20 000 sat from the escrow
+   and a `Fraudulent` one from the worker's deposit. A task whose escrow or
+   deposit is smaller than the settle fee therefore cannot be settled: it fails
+   closed with `AmountTooSmallForFee`. This is a real consequence of a 20 000 sat
+   settle fee against a 5 000 sat post fee. Recorded for Phase 3/6 — either the
+   fee comes from elsewhere or the D3 schedule is re-parameterised — rather than
+   papered over by dipping into the escrow the defrauded submitter is owed.
+2. **`vwc_hash` before Phase 4.** `Correct` settles on the submitted
+   `result_hash`, `Fraudulent` on the counter-result, `Expired` on all-zero
+   (`VWC_HASH_EXPIRED`). Phase 4 replaces this with a real certificate hash. It
+   is a named constant, not a magic zero, so the replacement is mechanical.
+
+## 49. Numbers, verified
+
+- `cargo test --workspace` — **410 pass, 0 fail** (was 360). Breakdown:
+  242 jnt-core lib, 18 bls_checkpoint_attack, 7 jnt-core fuzz_invariants,
+  10 mempool_l1, 11 redteam, **18 jnt-l2 lib, 17 jnt-l2 integration**,
+  27 jnt-net lib, 2 jnt-net fuzz_invariants, 12 jnt-net integration,
+  2 net_vectors, 10 tx_relay, 30 jnt-store lib, 4 jnt-store fuzz_invariants.
+- `cargo fmt --all --check` — clean. `RUSTFLAGS="-D warnings" cargo clippy
+  --workspace --all-targets` — clean. `cargo build --workspace --release` —
+  clean.
+- All five Python sims exit 0; `git status` shows no vector file changed.
+
+## 50. Next work item
+
+**Phase 3 — the dispute engine + M2/M1 wiring.** Per the standing plan, write the
+small M3 CPU-reference/spec note (roadmap §11 open question 2) *before* any Phase
+3 code, because the arbitration path depends on a CPU-only, bit-identical
+execution of the M3 IR. The pieces already exist: `DisputeChallenge` and the
+`Disputed` state are in `jnt-l2::task_contract`, `SlashVault` is wired through
+`L2State::apply_settlement`, and the PSCB counter is on `L2State`. What is
+missing is the arbitration verdict path (re-execution → quorum vote → verdict)
+and the whistleblower bonus, plus the fee-vs-escrow decision from §48.
+
+**Test-harness note for future L2 work:** the L2 tests use `Wallet::from_private_key_bytes(&[seed; 32], ..)`,
+so a wallet *is* its seed — two different wallets need two different seeds. A
+test that "changes a key" by re-seeding with the same byte produces the same
+wallet and will silently pass for the wrong reason.

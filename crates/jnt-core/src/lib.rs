@@ -28,6 +28,7 @@ pub mod fees;
 pub mod hash;
 pub mod hbm_pow;
 pub mod hexserde;
+pub mod l2;
 pub mod ledger;
 pub mod mempool;
 pub mod params;

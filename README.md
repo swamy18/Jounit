@@ -50,7 +50,7 @@ without weakening the security a hash chain depends on.
 
 | | |
 |---|---|
-| Layer 2 — Verified Work Certificates | Specced as project direction; useful-work layer. |
+| Layer 2 — Verified Work Certificates | Phase 2 shipped: `crates/jnt-l2` task contracts, the five L2 transaction types, and the D3 fee path. Certificates (Phase 4) and the worker SDK (Phase 5) remain. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
 | Coverage-guided fuzzing | Deterministic property and red-team suites cover the protocol; libFuzzer harness planned. |
 | License file | `Cargo.toml` declares `MIT OR Apache-2.0`. |
@@ -130,6 +130,8 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-net/` | 1 400+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
 | `crates/jnt-net/tests/integration.rs` | 500+ | P2P integration tests, including a real-socket end-to-end sync. |
 | `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
+| `crates/jnt-store/` | 1 100+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
+| `crates/jnt-l2/` | 1 300+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, M2 slashing. |
 | `crates/jnt-node/` | 760+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
 | `sim/` | 1 201 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
@@ -142,11 +144,13 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 
 ### Crate layout
 
-Three crates in one workspace:
+Five crates in one workspace:
 
 ```
 jnt-core   pure protocol library — no I/O, no clock, no network
 jnt-net    P2P wire protocol, peer state machines, sync and relay
+jnt-store  persistent storage: append-only block log + atomic metadata
+jnt-l2     Layer 2: task contracts, the five L2 transaction types, D3 fees
 jnt-node   CLI and node daemon (serve, mine, status, verify)
 ```
 
@@ -170,6 +174,7 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 | `compute_ir.rs` | 420 | M3: Hardware-agnostic canonical compute IR (GPU/NPU/TPU/Photonic) |
 | `hbm_pow.rs` | 320 | M4: Memory-bound HBM/GDDR scratchpad latency PoW puzzle |
 | `bls_checkpoint.rs` | 560 | M5: Sovereign BLS aggregate signature checkpoint finality gadget |
+| `l2.rs` | 780 | L2: five transaction payload types, actor auth, signing hashes, D3 fee mapping |
 | `supply.rs` | 335 | Halving ladder, cumulative issuance, the cap invariant |
 | `wallet.rs` | 362 | Keys, addresses, transaction building and signing |
 | `block.rs` | 465 | Header, block, merkle root, genesis block |

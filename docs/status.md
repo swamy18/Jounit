@@ -817,3 +817,56 @@ regression test.
 360 workspace tests (was 347). fmt/clippy -D warnings/release clean; five sims
 green. No consensus rule touched: `Chain::submit` still never references
 validators.rs, supply/mining/rewards unchanged.
+
+## Phase 2 — L2 task contracts: SHIPPED (`crates/jnt-l2`) — 2026-10-06
+
+The first L2 slice is built. SPEC.md §15 is its normative text. **No L1
+consensus rule changed**: an L2 transaction is a payload type that is not yet
+carried in a block, so nothing in this change is reachable from `Chain::submit`,
+and the L1 vectors are byte-identical.
+
+**What exists**
+
+- `jnt_core::l2` — the five payload types (`PostTask`, `ClaimTask`,
+  `SubmitResult`, `Dispute`, `Settle`) with wire codes `0x10`–`0x14`, canonical
+  encode/decode (exact inverses, bounded length prefixes), domain-separated
+  signing hashes, hybrid actor authorization, and `L2TxType::fee_sat()` returning
+  the D3 schedule. `derive_task_id` binds submitter + nonce + task hash.
+- `jnt_core::fees::split_flat_fee` — the D3 fee path: the whole flat fee is
+  `full_base`, split 50/50 burn/PSCB with `tip = 0`, odd satoshi to `burned` to
+  match `split_fees`. The L1 gas floor is untouched.
+- `jnt_core::compute_ir` — `ComputeTask::from_reader` and
+  `ComputeAttestation::from_reader`, so the M3 envelope round-trips inside an L2
+  payload (the attestation signature length is bounded before allocation).
+- `crates/jnt-l2` — `TaskContract` + `ContractState`
+  (`Open → InProgress → ResultSubmitted → Disputed → Settled/Expired`) with
+  authorization, state-validation and replay rules, and `L2State`: accounts,
+  per-contract escrow, the M2 `SlashVault`, D3 fee collection, replay refusal by
+  transaction id, deterministic `advance_block` (sorted, no clock), and the
+  conservation invariant.
+
+**Reused, not reimplemented:** `ComputeTask`/`ComputeAttestation` (M3),
+`SlashVault` (M2), `ValidatorSet`/`BlsVerifier`/`BlsSignature` (M5),
+`fees`/`params` (M1 + D3), and the hybrid wallet signing path.
+
+**Verification.** 410 workspace tests (was 360): +15 `jnt_core::l2` unit tests,
++2 M3 decoder tests, +2 flat-split tests, +18 `jnt-l2` state-machine tests, +17
+`jnt-l2` integration tests (real wallet signatures, the quorum gate, a
+rejecting-verifier seam test, and a two-node determinism check that also asserts
+conservation). fmt clean, clippy `-D warnings` clean, release build clean, all
+five sims green, L1 vectors unchanged.
+
+**A real bug the tests caught before it shipped:** `apply_settlement` credited
+the worker and challenger but never the *submitter*, so a `Fraudulent` or
+`Expired` verdict silently failed to refund the escrow — and the conservation
+check reported exactly the missing 1 000 000 sats. Both the integration tests
+and the two-node determinism test failed on it; fixed and re-verified.
+
+**Two open items recorded, not silently decided** (see `docs/decisions.md`): a
+task whose escrow/deposit is smaller than the 20 000 sat settle fee cannot be
+settled (`AmountTooSmallForFee` fails closed), and `vwc_hash` is a pre-VWC
+convention (`result_hash` / counter-result / all-zero) that Phase 4 replaces.
+
+**Still gated:** BLS/M5 finality activation remains off until the end of
+Phase 6. `Settle` verifies a quorum aggregate through the existing trait, but no
+checkpoint finalizes an L1 block.

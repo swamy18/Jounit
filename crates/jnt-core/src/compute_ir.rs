@@ -34,8 +34,9 @@
 //!
 //! SPEC.md §M3.
 
+use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Hash};
-use crate::ser::Writer;
+use crate::ser::{Reader, Writer};
 
 /// Domain tag for compute task hashing (prevents cross-domain preimage attacks).
 pub const DOM_COMPUTE_TASK: u8 = 0xC0;
@@ -145,6 +146,11 @@ pub struct ComputeTask {
 }
 
 impl ComputeTask {
+    /// Exact serialized length. `serialize` writes a fixed set of fields with no
+    /// length-prefixed member, so the encoding is constant-size and a decoder
+    /// needs no bound arithmetic.
+    pub const SERIALIZED_LEN: usize = 32 + 32 + 32 + 8 + 1 + 8 + 8 + 8;
+
     /// Canonical serialization of the task for hashing.
     pub fn serialize(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -167,6 +173,32 @@ impl ComputeTask {
     /// True when the task is still valid at `current_height`.
     pub fn is_active(&self, current_height: u64) -> bool {
         current_height <= self.expiry_height
+    }
+
+    /// Parse the exact bytes [`ComputeTask::serialize`] produces.
+    ///
+    /// Field order must match `serialize` byte-for-byte. Kept beside it so a
+    /// reordering is a compile-adjacent change rather than a silent wire break:
+    /// an embedded task is part of an L2 transaction's signed body.
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let task_id = r.fixed()?;
+        let ir_hash = r.fixed()?;
+        let input_hash = r.fixed()?;
+        let required_memory_bytes = r.u64le()?;
+        let backend_hint = ComputeBackend::from_wire(r.u8()?);
+        let reward_sat = r.u64le()?;
+        let expiry_height = r.u64le()?;
+        let submit_height = r.u64le()?;
+        Ok(ComputeTask {
+            task_id,
+            ir_hash,
+            input_hash,
+            required_memory_bytes,
+            backend_hint,
+            reward_sat,
+            expiry_height,
+            submit_height,
+        })
     }
 }
 
@@ -193,6 +225,14 @@ pub struct ComputeAttestation {
 }
 
 impl ComputeAttestation {
+    /// Largest attestation signature this decoder will accept, in bytes.
+    ///
+    /// Generous on purpose: an ML-DSA-65 signature is 3309 bytes, so sizing this
+    /// to today's ~72-byte DER ECDSA signature would make a post-quantum
+    /// attestation undecodable. The cap exists so a declared length cannot force
+    /// a large reservation, exactly like `Bundle::MAX_COMPONENT_BYTES`.
+    pub const MAX_SIGNATURE_BYTES: usize = 4096;
+
     /// The bytes that the worker signs. Commits to every consensus-relevant
     /// field; excluding `signature` itself (prevents circular dependency).
     pub fn signing_payload(&self) -> Vec<u8> {
@@ -218,6 +258,36 @@ impl ComputeAttestation {
         payload.extend_from_slice(&self.signature);
         payload
     }
+
+    /// Parse the bytes [`ComputeAttestation::serialize`] produces.
+    ///
+    /// The signature length is attacker-controlled, so it is checked against the
+    /// cap and against the remaining bytes *before* any allocation is driven by
+    /// it. An empty signature is allowed here and rejected by the layer that
+    /// requires a signed attestation, so the codec is an exact inverse.
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let task_id = r.fixed()?;
+        let result_hash = r.fixed()?;
+        let backend = ComputeBackend::from_wire(r.u8()?);
+        let worker_address: [u8; 20] = r.fixed()?;
+        let attest_height = r.u64le()?;
+        let sig_len = r.u32le()? as usize;
+        if sig_len > Self::MAX_SIGNATURE_BYTES {
+            return Err(Error::Malformed("attestation signature over cap"));
+        }
+        if sig_len > r.remaining() {
+            return Err(Error::Malformed("attestation signature exceeds buffer"));
+        }
+        let signature = r.fixed_slice(sig_len)?.to_vec();
+        Ok(ComputeAttestation {
+            task_id,
+            result_hash,
+            backend,
+            worker_address,
+            attest_height,
+            signature,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +303,7 @@ impl ComputeAttestation {
 pub fn verify_quorum(
     attestations: &[ComputeAttestation],
     threshold: usize,
-) -> Result<Hash, Vec<usize>> {
+) -> std::result::Result<Hash, Vec<usize>> {
     if attestations.is_empty() || threshold == 0 {
         return Err(Vec::new());
     }
@@ -429,5 +499,52 @@ mod tests {
             let backend = ComputeBackend::from_wire(b);
             assert!(!backend.name().is_empty());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Decoders: the codec must be an exact inverse
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compute_task_round_trips_through_its_decoder() {
+        let task = ComputeTask {
+            task_id: dummy_hash(1),
+            ir_hash: dummy_hash(2),
+            input_hash: dummy_hash(3),
+            required_memory_bytes: 8 * 1024 * 1024,
+            backend_hint: ComputeBackend::Unknown(0x42),
+            reward_sat: 1_000_000,
+            expiry_height: 1000,
+            submit_height: 500,
+        };
+        let bytes = task.serialize();
+        assert_eq!(bytes.len(), ComputeTask::SERIALIZED_LEN);
+        let mut r = crate::ser::Reader::new(&bytes);
+        let back = ComputeTask::from_reader(&mut r).unwrap();
+        r.expect_end().unwrap();
+        assert_eq!(back, task);
+        assert_eq!(back.task_hash(), task.task_hash());
+    }
+
+    #[test]
+    fn attestation_round_trips_and_bounds_its_signature() {
+        let mut attest = make_attest(dummy_hash(4), dummy_hash(5), 6);
+        attest.signature = vec![0xAB; 72];
+        let bytes = attest.serialize();
+        let mut r = crate::ser::Reader::new(&bytes);
+        let back = ComputeAttestation::from_reader(&mut r).unwrap();
+        r.expect_end().unwrap();
+        assert_eq!(back, attest);
+
+        // A declared length over the cap is refused before it drives an
+        // allocation, even when the buffer really is that long.
+        let mut huge = vec![0u8; 32 + 32 + 1 + 20 + 8];
+        huge.extend_from_slice(&(ComputeAttestation::MAX_SIGNATURE_BYTES as u32 + 1).to_le_bytes());
+        huge.extend_from_slice(&vec![0u8; ComputeAttestation::MAX_SIGNATURE_BYTES + 1]);
+        let mut r = crate::ser::Reader::new(&huge);
+        assert!(matches!(
+            ComputeAttestation::from_reader(&mut r),
+            Err(crate::error::Error::Malformed(_))
+        ));
     }
 }

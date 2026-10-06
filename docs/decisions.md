@@ -183,3 +183,62 @@ Remaining for testnet:
 Recommended next: **Phase 2** — `jnt-l2` crate skeleton + TaskContract state
 machine + the five L2 tx types with D3 fee routing, in that order, with the
 M3-CPU-reference spec note written before Phase 3 starts.
+
+---
+
+# Implementation status — Phase 2 SHIPPED (2026-10-06)
+
+This addendum supersedes the Phase-2 rows above; the audit itself is kept as the
+record of what was true when it was written.
+
+**Decision 1 (D3) is now consumed, exactly as recorded.** The five flat fees are
+implemented and routed through the M1 split:
+
+- `jnt_core::l2` defines the five payload types, their wire codes, canonical
+  codecs, domain-separated signing hashes, and `L2TxType::fee_sat()` returning
+  the D3 schedule. Round-trip, signing-hash-coverage, and bounded-decode tests
+  live with it.
+- `fees::split_flat_fee(fee)` treats the whole flat fee as `full_base` and
+  applies the unchanged 50/50 burn/PSCB split (`tip = 0`; the odd satoshi goes
+  to `burned`, matching `split_fees`).
+- The open-question canary `l2_flat_fees_sit_below_the_gas_floor` is replaced by
+  the positive test `l2_fees_do_not_use_the_l1_gas_floor`, which pins the
+  separation instead of the question. **The L1 floor is untouched.**
+
+**Phase 2 is complete.** `crates/jnt-l2` exists with `TaskContract` + the
+`Open → InProgress → ResultSubmitted → Disputed → Settled/Expired` machine, and
+`L2State` with accounts, escrow, the M2 slash vault, replay protection, and the
+conservation invariant. SPEC.md §15 is the normative text. Dependencies reused
+rather than reimplemented: `ComputeTask`/`ComputeAttestation` (M3),
+`SlashVault` (M2), `ValidatorSet`/`BlsVerifier`/`BlsSignature` (M5),
+`fees::split_flat_fee` (M1), and the hybrid wallet signing path.
+
+Two implementation notes worth carrying into Phase 3:
+
+1. **One economic constraint surfaced by implementation.** A `Correct`
+   settlement takes its 20 000 sat fee out of the task escrow, and a `Fraudulent`
+   one out of the worker's deposit. A task whose `payment_sat` (or deposit) is
+   smaller than the settle fee therefore *cannot* be settled — the settle fails
+   closed with `AmountTooSmallForFee` rather than collecting a partial fee. This
+   is a real consequence of a 20 000 sat settle fee against a 5 000 sat post
+   fee, it is recorded as an open economic question for Phase 6 (not a silently
+   chosen rule), and Phase 3 should decide whether the fee comes from somewhere
+   else or the schedule is re-parameterised.
+2. **The `vwc_hash` convention before Phase 4.** `Correct` settles on the
+   submitted `result_hash`, `Fraudulent` on the challenger's counter-result, and
+   `Expired` on all-zero. Phase 4 replaces this with a real VWC hash; the
+   convention is documented in `jnt_core::l2` (`VWC_HASH_EXPIRED`) so it is a
+   named, replaceable constant rather than a magic zero.
+
+Still gated on its own step, unchanged by this work: **M5/BLS finality
+activation** (end of Phase 6). `Settle` verifies a quorum aggregate through the
+existing trait, but no checkpoint finalizes an L1 block.
+
+| Phase | Status |
+|---|---|
+| 1 — L1 production | DONE |
+| 2 — TaskContract + L2 txs | **DONE** (this change) |
+| 3 — Dispute engine | NOT STARTED (needs the M3 CPU-reference spec note first) |
+| 4 — VWC issuance | NOT STARTED (needs Phase 3) |
+| 5 — Worker SDK | NOT STARTED (needs Phases 2+4) |
+| 6 — Testnet + finality activation | PREPARED, gated on 3–5 |

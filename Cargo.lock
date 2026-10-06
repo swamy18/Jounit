@@ -239,6 +239,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jnt-l2"
+version = "0.1.0"
+dependencies = [
+ "jnt-core",
+]
+
+[[package]]
 name = "jnt-net"
 version = "0.1.0"
 dependencies = [

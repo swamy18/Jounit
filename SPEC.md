@@ -1339,3 +1339,129 @@ section as a pure library: `ValidatorRecord`, `SelectionRule::TopN`,
 with the grace-period drop), and the checkpoint clause checks as
 `validate_checkpoint_against_set` returning the failed clause. Tests attack
 every clause; none of it is reachable from consensus.
+
+---
+
+## 15. Layer 2: task contracts and the five L2 transaction types (Phase 2)
+
+Layer 2 is the verified-work marketplace: a submitter posts a compute task with
+a locked payment, a worker claims and runs it, and settlement releases the
+payment against a verdict. This section specifies the Phase-2 slice — the
+payload types, the task state machine, and the fee path. It is **normative for
+the `jnt-l2` crate and `jnt_core::l2`**, and it deliberately stops short of
+consensus:
+
+- These payloads are **not yet carried inside an L1 block**. How an L2
+  transaction enters a block is Phase 6, and inventing it now would mean
+  specifying a block rule above a state machine nobody had exercised.
+- Nothing here changes `Chain::submit`, fork choice, `finalized_height`,
+  issuance, or the block wire format. The L1 test vectors are untouched.
+
+### 15.1 Transaction types and wire codes
+
+Five payload types, each with an explicit wire code. The `0x10` base is
+deliberate: L1 uses `0` (`STANDARD`) and `1` (`COINBASE`), so an unknown L1 type
+is refused as an L1 type rather than silently read as an L2 one.
+
+| Type | Code | Fee (sat) | Actor |
+|---|---:|---:|---|
+| `PostTask` | `0x10` | 5 000 | submitter |
+| `ClaimTask` | `0x11` | 2 000 | worker |
+| `SubmitResult` | `0x12` | 2 000 | worker |
+| `Dispute` | `0x13` | 10 000 | challenger |
+| `Settle` | `0x14` | 20 000 | validator quorum |
+
+The first four carry an explicit actor address and a signature bundle over a
+domain-separated signing hash. The signing hash covers the payload **including
+the key bundle but excluding the signature bundle**, so re-signing does not
+change the message and swapping keys does. This is the same discipline as the L1
+`Transaction::sighash`.
+
+`Settle` has no single signer. Its authorization is a validator-quorum
+BLS12-381 aggregate (the M5 structure: bitmap + signer count + 96-byte
+aggregate), verified through the existing `BlsVerifier` trait. The aggregate
+message is the domain-separated hash of `(task_id, verdict, vwc_hash)`, so a
+settle decision cannot be replayed against another task or another verdict.
+
+Every payload is canonically encodable: `serialize` and `from_reader` are exact
+inverses, and every length prefix (signature bundle components, attestation
+signatures, signer bitmap) is bounded **before** it drives an allocation.
+
+### 15.2 Task identity
+
+```
+task_id = SHA256(DOM_L2_POST ‖ submitter(20) ‖ nonce(8 LE) ‖ ComputeTask::task_hash())
+```
+
+The nonce makes two otherwise identical posts distinct; the submitter is bound
+in so a third party cannot repost another actor's task under a colliding id. A
+post whose `task_id` is not the derivable one is refused, so the id is a
+commitment rather than a claim.
+
+### 15.3 Lifecycle
+
+```
+  Open ──claim──▶ InProgress ──submit──▶ ResultSubmitted ──dispute──▶ Disputed
+   │                 │                        │                          │
+   │                 │                        └─ window elapses ─▶ auto-settle Correct
+   │                 │
+   └─ deadline ─▶ Expired ◀─ deadline ────────┘
+```
+
+The **dispute window is a protocol parameter**, not a field an actor chooses: a
+submitter who could pick their own window could pick zero, and a worker who
+could pick it could make challenges impossible. `L2Config` fixes it per network.
+
+The L2 `deadline_height` must equal the embedded M3 envelope's `expiry_height`.
+Two deadlines for one task is an ambiguity, not a feature, and the mismatch is
+rejected rather than resolved.
+
+`Settle` verdicts:
+
+- **Correct** — from `ResultSubmitted` after the window, or from `Disputed` when
+the worker was right. Escrow minus the settle fee pays the worker; the worker's
+deposit is returned; a losing challenger's deposit is burned in full.
+- **Fraudulent** — from `Disputed`. The submitter is refunded the whole escrow,
+the challenger's deposit is returned, and the worker's deposit — after the
+settle fee — enters the M2 vault (50% burned, 50% vesting). The fee comes from
+the losing worker's deposit, not from the escrow the defrauded submitter is owed.
+- **Expired** — from `Open` or `InProgress`; submitter refunded, worker deposit
+  burned in full (no vest). Expiry is normally implicit and free; this verdict
+exists so the arbitrator set can close a task a vanished worker never delivered.
+
+Implicit transitions — a deadline passing, a dispute window closing — charge
+**no fee**, because nothing was transacted.
+
+### 15.4 Fees
+
+L2 fees are the flat D3 schedule and ride a path of their own:
+`fees::split_flat_fee(fee)` treats the whole flat fee as `full_base` and applies
+the unchanged M1 50/50 burn/PSCB rule, with the odd satoshi going to `burned`
+exactly as `split_fees` does. The L1 gas floor (`base_fee * gas_used`) is
+untouched and L2 never consults it. There is no exemption and no second fee
+market.
+
+### 15.5 Value conservation and replay
+
+An L2 fee or a slashed deposit is **moved, never conjured**. For any sequence of
+applied transactions:
+
+```
+Σ accounts + Σ locked + burned + PSCB + vault_remaining == Σ credited
+```
+
+`L2State::conservation_total` is that left-hand side, and the integration tests
+assert it after every scenario. A transaction is refused by id if it was already
+applied, and a *rejected* transaction is not marked applied — a transaction
+refused on a precondition (a task not yet posted) may be retried once the
+precondition holds, but it can never apply twice.
+
+### 15.6 What is not specified here
+
+- How L2 transactions reach a block (Phase 6).
+- Verified Work Certificate issuance (Phase 4); `vwc_hash` is `result_hash` for
+  `Correct`, the counter-result for `Fraudulent`, and all-zero for `Expired`
+  until then.
+- Contested arbitration, evidence handling beyond the challenge payload, and the
+  whistleblower bonus (Phase 3).
+- Binding BLS finality activation (end of Phase 6).
