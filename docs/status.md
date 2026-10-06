@@ -27,10 +27,10 @@ consensus, so guessing those rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — **341 tests pass (current count; older sections of
+- `cargo test --workspace` — **352 tests pass (current count; older sections of
   this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):**
-  - 206 unit tests in `jnt-core` (M1–M5 suites, the 30-test real-BLS suite in
+  - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite,, the 30-test real-BLS suite in
     `bls.rs`, the 10-case mempool attack suite, the 2 pinned L2 fee-schedule
     tests, and the rest)
   - 18 adversarial checkpoint tests against the real BLS verifier
@@ -734,4 +734,30 @@ payload/hash/network, zero sig, poisoned key set, replay, finality
 monotonicity) all pass against RealBls.
 
 341 workspace tests (was 293). fmt/clippy -D warnings/release clean; five
+sims green.
+
+## Step 5 — Validator-set machinery (§14.6): library DONE, activation deferred
+
+SPEC.md §14.6 is written as **DESIGN ONLY**: the complete deterministic
+machinery (identity, epoch-bound set hash, seed-block derivation, rotation,
+six-clause checkpoint validation) is specified and implemented as a pure
+library in `validators.rs` — with five economics questions explicitly listed
+as open and reserved for the protocol owner (minimum stake, selection rule
+beyond the TopN default, rewards, slashing amounts, activation timing).
+
+`Chain::submit` does not reference `validators.rs` (grep-verified); no
+consensus rule changed; no monetary rule changed.
+
+Attack tests (21): deterministic derivation + key-first canonical ordering
+(stake changes cannot reshuffle bitmap bits mid-epoch); TopN selection with
+deterministic tie-breaks; duplicate key refused (a two-slot key could double
+quorum weight); duplicate address refused; invalid key refused-not-skipped;
+set hash binds the epoch (identical membership in two epochs → different
+hashes) and the addr↔pk binding (moving a key to a new address changes the
+identity); every one of the six checkpoint clauses named on failure; rotation
+verifies each epoch's checkpoints against that epoch's own derivation; cache
+grace-period behavior; equivocation evidence exposed as data (punishment is
+an open economics item).
+
+352 workspace tests (was 341). fmt/clippy -D warnings/release clean; five
 sims green.

@@ -1217,3 +1217,125 @@ shared between the checkpoint machinery and any future message type.
 irtf-cfrg-bls-signature-05 §2.3) over fixed 32-byte IKM values committed in the
 test source, so every CI run verifies the same keys and signatures byte for
 byte.
+
+### 14.6 M5 — Validator-set semantics (DESIGN ONLY — not consensus-active)
+
+This section defines the validator-set machinery completely enough to
+implement and attack-test as a **library**, so that the remaining open
+questions are purely economic (who stakes, how much, what the rewards are).
+Nothing here changes block validation: `Chain::submit` does not consult any of
+it, and a build that ships this code ships it inert.
+
+**The unresolved economics** are, explicitly, and they are decisions for the
+protocol owner, not the implementer:
+
+1. minimum stake to enter the set, and whether stake is bonded/withdrawable;
+2. whether the top-N stakers (D1 suggested N=21) are the set, or stake-weighted
+   sampling, or a fixed genesis committee for testnets;
+3. validator rewards or fee shares, if any;
+4. slashing for equivocation (double-signing checkpoints), amounts and
+   evidence rules, and its interaction with M2;
+5. when the set activates at all.
+
+Everything else — identity, selection determinism, rotation, quorum,
+checkpoint rules — is specified here and is safe to build, because it
+prescribes no economics and touches no consensus path.
+
+**Validator identity.** A validator is a pair `(stake_address, bls_pk)` where
+`stake_address` is the 20-byte address (§1) that controls the stake and
+`bls_pk` is a validated 48-byte G1 key (§14.5). The binding is committed in
+the set hash, so a key cannot be moved between addresses without changing the
+set identity. A validator MUST NOT appear twice with the same `bls_pk` under
+different addresses — a key that signs for two slots could double its quorum
+weight; the derivation rules below make that construction fail closed.
+
+**Set representation and identity.** The validator set for epoch `e` is a
+sorted vector of `(stake_address, bls_pk)` pairs, sorted by
+`(bls_pk, stake_address)` — key first, because the key is what signatures
+verify against, so bitmap bit `i` stays aligned with §14.4's bitmap semantics.
+Identity is
+
+    set_hash(e) = sha256_dom([0xB2], [ epoch(u64) ‖ n(u32) ‖
+                                     for each validator sorted:
+                                        addr(20) ‖ pk(48) ])
+
+Binding the epoch makes a set for epoch 5 unusable as the set for epoch 6 even
+if membership is identical; a checkpoint for epoch `e` is only ever verifiable
+against `set_hash(e)`.
+
+**Set derivation (deterministic).** The set for epoch `e` is derived from
+chain state at a fixed boundary:
+
+    seed_block(e) = the canonical block at height
+                    max(0, e * EPOCH_BLOCKS - EPOCH_LOOKBACK)
+
+The full validator candidate list (stake table) at `seed_block`'s state, plus
+nothing else, determines the set for epoch `e`. Derivation is a pure function
+`f(stake_state_at_seed_block, epoch) -> ValidatorSet`, so two nodes at the
+same height compute the same set byte for byte, and a reorg across the seed
+boundary deterministically changes the set — no committee has a hidden
+continuity advantage. `EPOCH_LOOKBACK` gives nodes the set before it takes
+effect; a node learns epoch `e`'s validators while still in epoch `e-1`.
+
+**Selection within an epoch (the abstract rule).** Given the candidate list,
+the selection function selects at most `MAX_VALIDATORS` entries, deterministically,
+by a rule the economics decision will parameterize (top-N by stake is the D1
+default). The library exposes selection as a function of an explicit
+`SelectionRule` enum; shipping `TopN` now does not presume the economics,
+because the rule is a parameter, not a policy baked into consensus.
+
+**Quorum.** Unchanged from §14.4: `ceil(n * 6667 / 10000)` of the CURRENT
+epoch's set, computed over the set actually derived for the checkpoint's
+epoch — never "the set the proposer liked".
+
+**Checkpoint rules (validation, all of it, still inert).** A checkpoint for
+epoch `e` at height `h` is valid iff:
+
+1. `h` is within epoch `e` (`e == h / EPOCH_BLOCKS`);
+2. the verifier derives `set(e)` from its own canonical chain and computes
+   `set_hash(e)`;
+3. the bitmap decodes against `set(e)`: exactly `ceil(n/8)` bytes, no set bits
+   at or above `n`, and `signer_count` equals the popcount;
+4. signer count meets quorum;
+5. the aggregate verifies (§14.5) against the signers' keys under the
+   checkpoint DST;
+6. `h` is beyond the current finalized height.
+
+Failure of any clause is a rejection with the clause named; a checkpoint that
+fails clause 2 (wrong set) MUST count toward the peer's ban score, because a
+node that computes a different set is either out of sync or hostile, and the
+receiver cannot tell — it treats both as garbage.
+
+**Set changes (rotation).** Rotation happens only at epoch boundaries. Epoch
+`e`'s set is fixed at `seed_block(e)` and cannot change during `e`, even if
+stake moves — a validator whose stake is withdrawn mid-epoch still completes
+the epoch (this is why bonded stake matters, and why it is an economics
+question). Handover rules:
+
+- The last checkpoint of epoch `e` and the first of epoch `e+1` are verified
+  against their own epoch's sets respectively; there is no joint signature and
+  no overlap requirement.
+- A node tracks `set(e-1)` for one full epoch after handover, solely to
+  validate late-arriving checkpoints from the previous epoch that are still
+  higher than its finalized height. After that grace period the old set is
+  dropped.
+- Equivocation across a boundary (signing conflicting checkpoints for epochs
+  `e` and `e+1`) is two separate evidence events against one key; the
+  slashing economics are §14.6-open item 4, but the *evidence* (two
+  valid-but-conflicting signed checkpoints, same key, both verifiable) is
+  well-defined now and the library exposes it as data.
+
+**What this section deliberately does NOT do:**
+
+- It does not wire checkpoints into `Chain::submit`, fork choice, or
+  `finalized_height` reporting.
+- It does not define stake accounting, rewards, or slashing amounts.
+- It does not define how checkpoints travel on the wire (that is a §13.5
+  message-type decision, deferred so §13.12 vectors stay stable).
+
+**Implementation note.** `crates/jnt-core/src/validators.rs` implements this
+section as a pure library: `ValidatorRecord`, `SelectionRule::TopN`,
+`derive_set`, `set_hash`, `EpochSetCache` (holds current + previous epoch,
+with the grace-period drop), and the checkpoint clause checks as
+`validate_checkpoint_against_set` returning the failed clause. Tests attack
+every clause; none of it is reachable from consensus.

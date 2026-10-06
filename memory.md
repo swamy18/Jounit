@@ -1996,3 +1996,19 @@ pairing core is real but the gadget is unwired, and the relay/store/BLS
 milestones are listed under Verified. SPEC.md §13.10 item 4 marked resolved
 (jnt-store). docs/roadmap.md (other author's ~584-line in-flight diff) still
 untouched.
+
+## Session 11 (cont.) — Step 5: §14.6 validator-set machinery (design-only)
+
+Spec-first again: §14.6 defines validator identity (addr↔pk pair, duplicate
+key fails closed), epoch-bound set hashing (domain 0xB3, deliberately distinct
+from bls.rs's 0xB2 keys-only hash), deterministic seed-block derivation with
+lookback, SelectionRule as an enum parameter (TopN ships; economics decides
+later), six named checkpoint clauses, rotation only at epoch boundaries, a
+two-set cache with grace expiry, and equivocation evidence as data. Five
+economics questions are explicitly listed as open for the protocol owner.
+
+Implemented as a pure library (validators.rs); grep-verified that
+chain.rs/block.rs/main.rs never reference it — shipped inert. One test bug
+caught my own wrong expectation about the cache grace slot (it holds the
+epoch before current, it is not cleared on every rotation). 21 attack tests
+green. 352 workspace tests total, all checks clean, pushed.

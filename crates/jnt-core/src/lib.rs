@@ -38,6 +38,7 @@ pub mod slash;
 pub mod supply;
 pub mod tx;
 pub mod u256;
+pub mod validators;
 pub mod wallet;
 
 pub use error::{Error, Result};
