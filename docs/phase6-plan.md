@@ -288,16 +288,21 @@ chronological ledger, so the repair is a pointer, not a rewrite.
 
 ### Proposals to confirm at their milestone (additive, low risk)
 
-- **P1 (testnet profile, M5):** add a `testnet` `NetworkParams` profile
-  (mainnet-shaped parameters, distinct `network_magic`/`network_id`) rather than
-  running the public testnet on `mini`; note that genesis is identical across
-  profiles today, so the profile is not a chain-ID by itself.
+- **P1 (testnet profile, M5): CONFIRMED and shipped as Decision 13.**
+  `NetworkParams::testnet` — distinct `network_magic`/`network_id`, four
+  deterministic genesis validators (quorum 3), 10-block checkpoint interval,
+  explicit `finality_activation_height = 20`, no staking, no rotation, no
+  runtime entropy (two independent constructions are byte-identical). Genesis
+  itself remains identical across profiles, as this note anticipated, so the
+  magic/id — not the genesis — carry the chain identity.
 - **P2 (checkpoint message, M4):** add frozen `msg_type = 11 CHECKPOINT` per the
   §13.5 freeze rule, plus new §13.12 vectors, as §14.6 anticipates.
-- **P3 (finality authority, M4):** make `validators::validate_checkpoint_against_set`
-  the single checkpoint authority (it already enforces the six clauses and the
-  set hash), and decide what `Chain::finalized_height()` reports once binding
-  finality is activated.
+- **P3 (finality authority, M4): CONFIRMED; the open half is now resolved.**
+  `validators::validate_checkpoint_against_set` became the single checkpoint
+  authority in M4, and Decision 12 decided what `Chain::finalized_height()`
+  reports once binding finality activates: the **stronger** of the depth rule
+  and the binding point, `max(tip − finality_depth, binding)`, enforced by
+  `adopt()`.
 
 ---
 
@@ -310,7 +315,7 @@ chronological ledger, so the repair is a pointer, not a rewrite.
 | M2 | Value bridge + fee accounting | per D7; conservation asserted across L1+L2; `AmountTooSmallForFee` resolved or explicitly re-documented; `split_flat_fee` unchanged | D7, D6 |
 | M3 | Worker↔node transport | per D11; seam conformance tests; auth, malformed-rejection, replay, idempotent retry, stale-state, restart/reconnect; no key material in logs/errors | D11, M1 |
 | M4 | Validator set + finality (non-binding) | **DONE** (Decision 11, `SPEC.md` §14.7). Scoped per D8: no stake ledger, so a fixed genesis committee in `NetworkParams` (`mini` 4 test keys, `mainnet` empty → fail closed) instead of chain-state derivation; `validate_checkpoint_against_set` is the single authority; `FinalityManager` observes and reports; `msg_type = 11 CHECKPOINT` relays complete certificates (protocol v1, unfrozen-additive); bounded `Checkpoint`/`CheckpointPayload` deserialize. **Finality is visible but non-binding** — `Chain::submit`/fork choice untouched, reorg-crosses-checkpoint pinned by test. +13 tests (588 total) + `checkpoint_codec` fuzz target (14). Deferred to mainnet: bonded stake, unbonding, rewards, rotation, equivocation slashing. | D8, D11 |
-| M5 | Multi-node testnet | per P1; ≥3 nodes incl. validators; the 11 STEP-3 scenarios scripted and reproducible; chain sync, restart/recovery, L2 + worker + VWC + dispute flows | M1–M4 |
+| M5 | Binding finality + testnet profile + L2 finality integration | **DONE** (Decisions 12–15, `SPEC.md` §14.8). A valid canonical certificate becomes binding at `finality_activation_height` under the unchanged `ceil(n × 6667 / 10000)` quorum; `adopt()` refuses any fork at or below `max(tip − finality_depth, binding)`; conflicts fail closed with canonical, bounded, order-independent `EquivocationEvidence` (no punishment — no bond exists). `testnet` profile: unique magic/id, 4 deterministic keys (quorum 3), interval 10, activation 20. Finality persists in the store's metadata row and restores only onto the exact canonical block (before == after restart). L2 deposits mature only when depth **and** binding both hold; L2 settlement verifies against the declared committee (mainnet empty → fail closed). The multi-node testnet *launch* (≥3 nodes, STEP-3 scenarios) is **not** part of this milestone and stays deferred. Acceptance: all four Decision A/B/D/E matrices tested; +37 tests (625 total). | D12–D15, M1–M4 |
 | M6 | Adversarial + chaos | node/validator/worker/network attack matrix (STEP 5); every real bug: root cause → minimal fix → regression test → doc note | M5 |
 | M7 | Performance baseline | measured L1/L2/worker/network numbers (STEP 7) before any optimisation; document what is slow and why | M5 |
 | M8 | SPEC audit + mainnet checklist | implementation-vs-SPEC findings classified 1/2/3 (STEP 9); MAINNET READINESS CHECKLIST with PASS/FAIL/BLOCKED/REQUIRES DECISION (STEP 10); docs synced | M1–M7 |
@@ -323,5 +328,7 @@ libFuzzer (MSVC cannot run it); command shape `wsl bash -lc '…'`.
 
 **Standing constraints honoured by this plan:** no rewrite of Phases 1–5; no
 monetary-policy change (D7 is the one place a change could be *required*, and it
-stops for a decision); `docs/roadmap.md` untouched; binding finality only after
-M4's fuzzing and M6's chaos pass, in a separate reviewable change.
+stops for a decision); `docs/roadmap.md` untouched; binding finality only in a
+separate reviewable change after M4's foundation — now shipped as exactly that,
+under Decisions 12–14 (previously this line gated it behind M6's chaos pass; the
+M5 audit re-authorized it with the four decisions recorded first).

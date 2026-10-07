@@ -8,8 +8,9 @@ relying on anything here.
 Layer 1 (base layer) implementation per SPEC.md. Includes the P2P networking layer
 (`jnt-net`) supporting multi-peer block relay, locator-based sync, handshake
 isolation, ban scoring and side-branch pruning. Also defines the five core
-protocol mechanisms — **only M1 is consensus-active**, i.e. only M1 can change
-whether a node accepts a block:
+protocol mechanisms — **M1 is consensus-active everywhere, and M5's binding
+finality is consensus-active on activated profiles** (Decisions 11–12, §14.7–
+§14.8), i.e. these are what can change whether a node accepts a block:
 
 | # | Mechanism | Consensus-active | Module |
 |---|---|---|---|
@@ -17,13 +18,14 @@ whether a node accepts a block:
 | M2 | Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault | No — no rule creates a slash record yet | `slash.rs` |
 | M3 | Universal Hardware-Agnostic Canonical Compute IR | No — envelopes only | `compute_ir.rs` |
 | M4 | Memory-bound HBM scratchpad PoW puzzle | No — not a registered `puzzle_id` | `hbm_pow.rs` |
-| M5 | Sovereign BLS aggregate finality gadget checkpoints | No — pairing core is real (`blst`), the gadget is unwired; §14.6 validator-set semantics are design-only | `bls_checkpoint.rs`, `bls.rs` |
+| M5 | Sovereign BLS aggregate finality gadget checkpoints | **Conditional** — real `blst` verification; **binding** on profiles with a non-zero `finality_activation_height` (`testnet`, Decision 12/§14.8), observation-only on `mini`, unreachable on `mainnet` (empty committee fails closed) | `bls_checkpoint.rs`, `bls.rs`, `finality.rs` |
 
-SPEC.md §14 carries the same table and says why each of M2–M5 is inactive: each
-needs a rule this repository has not specified (what proves a compute result
-fraudulent, how a task enters a block, whether the HBM puzzle replaces or
-composes with the §5 puzzle, who the validator set is). M2 and M4 would change
-consensus, so guessing those rules in code would have been the wrong order.
+SPEC.md §14 carries the same table. M5's missing rules arrived as Decisions 11
+(committee + relay, §14.7) and 12 (binding activation, §14.8); M2–M4 remain
+inactive because each still needs a rule this repository has not specified
+(what proves a compute result fraudulent, how a task enters a block, whether
+the HBM puzzle replaces or composes with the §5 puzzle), and guessing those
+rules in code would have been the wrong order.
 
 ## Verified
 
@@ -1375,3 +1377,112 @@ clippy clean; release build clean; 14 fuzz targets compile; sim suite clean
 **Still ahead, unchanged:** bonded stake / unbonding / rewards (mainnet-gated,
 D8), validator rotation, equivocation slashing, L2-to-L1 exits, M5 testnet. No
 claim of testnet, binding finality, or mainnet readiness.
+---
+
+## Phase 6 — M5 binding finality + testnet profile + L2 finality integration (Decisions 12–15): SHIPPED — 2026-10-07
+
+The M5 audit (no code changed first) re-read the tree after M4 and found four
+decisions were missing before any consensus change: L1 finality was still
+depth-only (`finalized_height = tip − finality_depth`), `FinalityManager` was
+observation-only and consulted by nothing, there was no testnet profile,
+`equivocation_evidence` had no caller, L2 deposits matured by depth alone, and
+the node's L2 validator set was the M1 empty set (fail-closed by default).
+Decisions 12 (binding activation), 13 (testnet profile), 14 (equivocation
+policy) and 15 (L2 finality semantics) were recorded in `docs/decisions.md`
+**before** any consensus code changed, and this milestone implements exactly
+them — no more.
+
+**Binding finality (Decision 12, SPEC §14.8).** A checkpoint certificate becomes
+binding when its height reaches the profile's `finality_activation_height`
+(`testnet` 20; `mini`/`mainnet` 0 = never), and only if it is canonical,
+carries a valid certificate under the six clauses, satisfies the unchanged
+`ceil(n × 6667 / 10000)` quorum, is strictly monotonic, and conflicts with
+nothing already accepted. `Chain::finalized_height()` is now the stronger of
+the depth rule and the binding point — `max(tip − finality_depth, binding)` —
+and `adopt()` refuses any branch forking at or below it with
+`ReorgWouldCrossFinality` (the pre-existing error, finally fed by a real value).
+Below activation nothing changes: observation stays observation, pinned by the
+M4 non-binding test which still runs unchanged.
+
+**Conflict protection (Steps 4).** Every listed attack fails closed with a
+named refusal: insufficient quorum, forged aggregate, foreign committee, wrong
+network, signer count that cannot match its bitmap (a bitset cannot encode a
+duplicate signer), signer bits outside the committee, stale/replayed heights,
+future heights, non-canonical hashes, malformed input (codec and structure).
+A conflicting certificate is classified *before* the canonical clause, so
+`H → B` against a retained `H → A` proves the conflict instead of being
+misfiled as merely non-canonical — and no refusal ever moves finality.
+
+**Equivocation (Decision 14).** Conflicting valid certificates at one height
+retain `EquivocationEvidence {offender, first, second}`: the first common
+signer in canonical key order, and the two payload hashes in canonical
+serialized-byte order — so two nodes that saw A-then-B and B-then-A retain
+byte-identical evidence (pinned by test). Bounded at 1024 records, deduplicated
+by content, deterministic. Nothing is burned and no penalty exists: stake
+bonding does not exist yet, deliberately.
+
+**Restart (Step 3).** The finalized `(height, hash)` lives in the store's
+existing metadata row (no second database; older files without the fields parse
+as "no finality"). It is restored only onto the exact canonical block the node
+just replayed — a stale or forged row is refused — and the restored point gates
+`adopt()` exactly like the live one. Before-restart point == after-restart
+point, and a second restart derives the same point again.
+
+**Testnet profile (Decision 13).** `NetworkParams::by_name("testnet")`: unique
+`network_magic`/`network_id`, four deterministic genesis validators (distinct
+derivation from `mini`'s; quorum 3), 10-block checkpoint interval, activation
+20, depth fallback 20. Two independently constructed profiles are byte-identical
+(`testnet() == by_name("testnet")`, committee keys included) — no runtime
+entropy. Config-time guards refuse an activation that is off the epoch grid or
+has no committee. No staking, no rotation, no launch: this is the protocol
+profile required to exercise binding finality.
+
+**L2 deposit maturity (Decision 15, SPEC §19.5).** A deposit is spendable only
+when **both** hold: the M3 depth rule, and — once binding finality exists — the
+deposit's height at or below the binding-finalized height. Before activation the
+depth rule governs alone (never weaker than M3); after activation, depth alone
+cannot credit a deposit whose canonical history is unfinalized. The floor is
+read from the L1 chain's own finality layer on every sync; L2 keeps no
+checkpoint view. The node's sync also re-evaluates maturity when a checkpoint
+moves the floor **without moving the tip** — otherwise a finality-held deposit
+would sit pending until some unrelated block arrived.
+
+**L2 settlement seam (Decision 15, SPEC §15.1).** `jnt_node::l2::validator_set`
+now returns the profile's declared active committee — the same
+`genesis_validators` list the finality layer verifies checkpoints against —
+replacing the M1 empty-set dead end. `Settle` payloads signed by that committee
+apply through the real node path (task lifecycle → disputed → explicit Correct
+settle → VWC issued); foreign keys are refused by name (`BadBlsSignature`);
+`mainnet`'s intentionally empty committee still refuses everything
+(`BadQuorum`). `WindowElapsed` semantics and all existing VWC verification are
+untouched.
+
+**Tests:** 37 new, all M5-scoped — 25 in `jnt-core/tests/m5_finality.rs`
+(profile matrix, activation, the nine-case conflict matrix, the critical reorg
+below/above/at the finalized height, equivocation determinism + bounds,
+restore-refuses-lies, fresh==incremental finality), 4 in
+`jnt-l2/tests/m5_deposit_finality.rs` (pre-activation + Cases A/B/C/D), 6 in
+`jnt-node/tests/m5_node_finality.rs` (declared-committee settlement, foreign
+refusal, empty-committee fail-closed, checkpoint-without-tip maturity,
+restart determinism), 2 in `jnt-store/tests/m5_finality.rs` (persisted point
+survives reopen; every lying row refused).
+
+**Verified:** 625 workspace tests / 0 failed / 1 ignored (was 588; +37); fmt
+clean; clippy `-D warnings` clean workspace-wide; release build clean; sim
+suite clean (vector cross-check, difficulty attack, supply); 14 fuzz targets
+build under nightly cargo-fuzz — `checkpoint_validate` extended with a
+finality-state harness (no panic, bounded evidence, no conflicting-finality
+acceptance, evidence totality/determinism) and `meta_parse` with the new
+finality-field invariants. One local limitation, stated honestly: libFuzzer
+*execution* needs ASan, which this MSVC Windows box does not ship (the plan
+already notes "MSVC cannot run it"); the targets were compile- and
+link-verified here and CI's fuzz-smoke runs them on Linux.
+
+**Not built, still deferred:** validator staking/bonding/unbonding/rotation/
+rewards, economic slashing (evidence exists, punishment does not), L2→L1
+exits, monetary redesign, the multi-node public testnet launch (the profile
+exists; the launch is not this milestone), machine economy, Bridge Layer.
+
+**Still ahead:** M6 adversarial/chaos (attack matrix over this binding
+finality), M7 performance, M8 SPEC audit + mainnet checklist. No claim of
+mainnet readiness.

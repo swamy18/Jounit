@@ -3119,3 +3119,63 @@ final message instead of a commit.
   caused by this change.
 - Next: per task order, STOP after M4. Do not start M5 testnet, bodies of
   bonded stake/rotation/slashing, or exits — those need their own decisions.
+# Working memory — session 23: Phase 6 M5 binding finality + testnet profile + L2 finality integration (Decisions 12–15)
+
+## 95. Audit first, decisions before code
+
+- In-flight M5 work already existed at session start (decisions D12–D15 text,
+  `FinalityManager` wiring into `Chain`, `Meta.finalized_*` fields, a `testnet`
+  profile, `NodeState.finality` removed) but did not compile (3 missing-field
+  errors in `meta.rs` tests) and had no M5 tests, no persistence wiring, no L2
+  changes, and no docs beyond `decisions.md`.
+- The audit's four decisions were already recorded; everything else followed
+  the task order: verify the wiring, make restart safe, protect conflicts,
+  gate deposits, fix the settlement seam, test, fuzz, document, verify.
+
+## 96. What was built
+
+- **Conflict ordering fix (subtle, important):** `FinalityManager::accept`
+  checked the canonical clause *before* the conflict clause, so a quorum-valid
+  `H → hash_B` against retained `H → hash_A` was misfiled as `NotCanonical`
+  and produced no evidence. Reordered: conflict first (evidence + fail closed),
+  then canonical, then monotonic. Evidence payloads are canonically ordered by
+  serialized bytes so arrival order cannot change the retained evidence.
+- **Persistence:** `BlockStore::{finalized, set_finalized}` (fail-closed:
+  within tip, exact canonical hash, no regressions, no conflicting re-finalize)
+  + node `load_chain` restores onto the replayed chain (refuses a lying row) +
+  `persist_finality` in the serve loop (its own condition — checkpoints move
+  finality without moving the tip) and in `save_chain` paths.
+- **L2 deposits (Decision 15):** `deposit_is_spendable(d, tip, binding, depth)`
+  in `jnt-l2/replay.rs` = depth AND (binding==0 OR height ≤ binding);
+  `apply_block`/`has_pending_matured` gained a `binding_finalized` argument;
+  `ChainL2::replay` reads the floor from the chain itself. Node sync
+  re-evaluates pending deposits when a checkpoint moves the floor with the tip
+  unchanged (early-return condition now includes `has_pending_matured`).
+- **Settlement seam (Decision 15):** `validator_set(&NetworkParams)` returns
+  the declared committee; `NodeL2` holds it fixed at construction. Mainnet
+  empty set still fails closed. Explicit `Settle` through blocks requires a
+  *disputed* task — at the first height past the window `advance_block`
+  auto-settles before the block's txs, so an explicit Correct settle on a
+  merely-ResultSubmitted task can never win that race (learned from a failing
+  test: `DisputeWindowClosed`).
+- **Tests:** 37 new across 4 files (core 25, store 2, l2 4, node 6). Fuzz:
+  `checkpoint_validate` gained a `FinalityManager::accept` state harness
+  (merged into the single `fuzz_target!` — two macros in one file collide on
+  `LLVMFuzzerInitialize` at link time, invisible to `cargo check`);
+  `meta_parse` asserts the new finality-field invariants.
+- **Docs:** SPEC §14.8 (new: rule, activation, quorum, conflicts, evidence,
+  restart, testnet profile, L2 pointers) + §14 table/intro, §13.5, §9.3, §10
+  (testnet column), §15.1, §19.5 (both maturity conditions); status (top table
+  + M5 section); phase6-plan (P1/P3 confirmed, M5 row, constraint note);
+  decisions already carried D12–D15.
+
+## 97. State after this session
+
+- 625 workspace tests / 0 failed / 1 ignored (was 588; +37); fmt clean; clippy
+  `-D warnings` clean; release build clean; sim suite clean; 14 fuzz targets
+  build under nightly cargo-fuzz. Local fuzz *execution* blocked: no ASan
+  runtime DLL on Windows MSVC (plan already says "MSVC cannot run it") — CI
+  fuzz-smoke covers it.
+- Next per task order: STOP after M5. Staking/bonding/rotation/rewards/
+  slashing, exits, public testnet launch, monetary redesign, Bridge Layer all
+  remain deferred to their own milestones and decisions.

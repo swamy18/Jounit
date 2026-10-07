@@ -140,9 +140,10 @@ fn full_replay_equals_incremental_application() {
     // block: with no sink outputs present the tip value is moot, but the call
     // must still name the tip maturity is measured against.
     let tip = chain.height();
+    let binding = chain.finality().binding_finalized_height();
     for h in 1..=tip {
         let block = chain.block_at(h).unwrap();
-        incremental.apply_block(block, tip, &set, &verifier);
+        incremental.apply_block(block, tip, binding, &set, &verifier);
     }
 
     assert_eq!(

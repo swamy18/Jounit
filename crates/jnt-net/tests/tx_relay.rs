@@ -59,9 +59,6 @@ struct Peer {
     pool: Mempool,
     syncer: SyncManager,
     relay: RelayManager,
-    /// M4 finality observation (Decision 11). Non-binding and inert for these
-    /// tests; held so the `NodeState` the serve loop passes stays complete.
-    finality: jnt_core::finality::FinalityManager,
     /// Height the pool was last reconciled against.
     cursor: u64,
     /// Synthetic clock handed to `poll_events`.
@@ -95,14 +92,12 @@ impl Peer {
         )
         .unwrap();
         let cursor = chain.height();
-        let finality = jnt_core::finality::FinalityManager::new(chain.params());
         Peer {
             node,
             chain,
             pool: Mempool::default(),
             syncer: SyncManager::new(),
             relay: RelayManager::new(),
-            finality,
             cursor,
             clock: None,
         }
@@ -117,7 +112,6 @@ impl Peer {
                 pool: &mut self.pool,
                 syncer: &mut self.syncer,
                 relay: &mut self.relay,
-                finality: &mut self.finality,
             },
             self.clock,
         );

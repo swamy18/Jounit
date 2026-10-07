@@ -488,8 +488,10 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 |---|---|
 | `coinbase_maturity` | blocks before coinbase value is spendable |
 | `finality_depth` | `h ≤ tip − finality_depth` is immutable; a reorg crossing it is rejected as `ReorgWouldCrossFinality` |
+| `finality_activation_height` | height from which a valid canonical checkpoint certificate becomes binding finality on top of the depth rule (§14.8); `0` = never |
 
-Mainnet: maturity `100`, finality `100`. Mini: `10`, `20`.
+Mainnet: maturity `100`, finality `100`, activation `0`. Mini: `10`, `20`, `0`.
+Testnet: `10`, `20`, activation `20` (§14.8).
 
 ---
 
@@ -497,25 +499,32 @@ Mainnet: maturity `100`, finality `100`. Mini: `10`, `20`.
 
 The mini version is **not** a second codebase. It is the same `jnt-core` with a different `NetworkParams`. Non-consensus constants live in code; consensus constants live in `params.rs` and are mirrored by `sim/` cross-checks.
 
-| Parameter | `mainnet` | `mini` |
-|---|---|---|
-| `target_block_time_ms` | `600 000` | `1 000` |
-| `halving_period` | `262 800` | `2 000` |
-| `start_reward_jnt` | `76` | `76` |
-| `supply_cap_jnt` | `39 945 600` | `304 000` |
-| `difficulty_window` | `60` | `60` |
-| `change_limit_bps` | `1000` | `1000` |
-| `genesis_difficulty` | `1` | `1` |
-| `min_difficulty` | `1` | `1` |
-| `max_difficulty` | `2^96` | `2^40` |
-| `coinbase_maturity` | `100` | `10` |
-| `finality_depth` | `100` | `20` |
-| `gas_cap` | `2 000 000` | `2 000 000` |
-| `base_fee_initial_sat` | `1 000` | `100` |
-| `nn_epoch_blocks` | `50 000` | `2 000` |
-| `puzzle_id` | `1` | `1` |
+| Parameter | `mainnet` | `mini` | `testnet` |
+|---|---|---|---|
+| `target_block_time_ms` | `600 000` | `1 000` | `1 000` |
+| `halving_period` | `262 800` | `2 000` | `2 000` |
+| `start_reward_jnt` | `76` | `76` | `76` |
+| `supply_cap_jnt` | `39 945 600` | `304 000` | `304 000` |
+| `difficulty_window` | `60` | `60` | `60` |
+| `change_limit_bps` | `1000` | `1000` | `1000` |
+| `genesis_difficulty` | `1` | `1` | `1` |
+| `min_difficulty` | `1` | `1` | `1` |
+| `max_difficulty` | `2^96` | `2^40` | `2^40` |
+| `coinbase_maturity` | `100` | `10` | `10` |
+| `finality_depth` | `100` | `20` | `20` |
+| `gas_cap` | `2 000 000` | `2 000 000` | `2 000 000` |
+| `base_fee_initial_sat` | `1 000` | `100` | `100` |
+| `nn_epoch_blocks` | `50 000` | `2 000` | `2 000` |
+| `puzzle_id` | `1` | `1` | `1` |
+| `network_id` | `jounit/mainnet` | `jounit/mini` | `jounit/testnet` |
+| `network_magic` | `6A 4E 54 01` | (distinct) | `6A 4E 54 03` |
+| `checkpoint_interval_blocks` | `100` | `10` | `10` |
+| `finality_activation_height` | `0` | `0` | `20` |
+| `genesis_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
 
-`supply_cap_mini = 2 × 2 000 × 76 = 304 000 JNT`.
+`supply_cap_mini = 2 × 2 000 × 76 = 304 000 JNT`; `testnet` shares the mini
+cap and block schedule but has its own magic/id, its own deterministic
+committee (distinct derivation), and the §14.8 activation height.
 
 ---
 
@@ -747,8 +756,11 @@ which is a peer's choice and not a protocol violation.
 same rule: a node that predates it drops `CHECKPOINT` and stays connected. It
 carries a complete checkpoint certificate, never a proposal or a vote — no BFT
 round protocol exists in M4 to give those meaning. A receiver verifies the
-certificate against its own local committee and relays it if valid; consensus
-never consults it. The payload is `CheckpointPayload.serialize()` (§14.5), and
+certificate against its own local committee and relays it if valid; it then
+applies it through the chain's finality layer (§14.8), which either records an
+observation (profiles without activation) or, on an activated profile, moves
+binding finality — the relay rule itself is unchanged: a bad or conflicting
+certificate is not relayed. The payload is `CheckpointPayload.serialize()` (§14.5), and
 every length field is bounded (`MAX_CHECKPOINT_PAYLOAD_BYTES`,
 `MAX_SIGNER_BITMAP_BYTES`) before allocation, per the rule below.
 
@@ -1054,7 +1066,8 @@ authoritative statement of which are **consensus-active today** — meaning a
 node's validation or state machine depends on them — and which are defined
 data structures with no effect on consensus yet. The distinction is stated here
 because the alternative, a document that lists all five as shipped, hides the
-most important fact about them: **only M1 can change what a node accepts.**
+most important fact about them: **only M1, plus M5's binding finality on an
+activated profile (§14.8), can change what a node accepts.**
 
 | # | Mechanism | Module | Consensus-active | § |
 |---|---|---|---|---|
@@ -1062,17 +1075,23 @@ most important fact about them: **only M1 can change what a node accepts.**
 | M2 | Anti-collusion slash vault (50% burn + 50% linear vesting) | `slash.rs` | No — defined and tested, nothing creates a slash record yet | this section |
 | M3 | Hardware-agnostic compute IR + attestation envelope | `compute_ir.rs` | No — serialization and signing hashes only | this section |
 | M4 | Memory-bound HBM scratchpad PoW | `hbm_pow.rs` | No — an alternative puzzle body, not registered in the §5.1 registry | this section |
-| M5 | BLS12-381 aggregate finality gadget | `bls_checkpoint.rs` | No — `BlsVerifier` is a trait; only a mock implementation exists | this section |
+| M5 | BLS12-381 aggregate finality gadget | `bls_checkpoint.rs`, `finality.rs` | **Conditional** — pairing-checked since §14.5; binding only on profiles with a non-zero `finality_activation_height` (Decision 12): active on `testnet` (§14.8), observation-only on `mini`, unreachable on `mainnet` (empty committee fails closed) | §14.5–§14.8 |
 
-**Why M2–M5 are not wired in.** Each needs a rule that no spec currently
+**Why M2–M4 are not wired in.** Each needs a rule that no spec currently
 states: what evidence proves a compute result fraudulent (M2), who is allowed to
 submit a compute task and how a result enters a block (M3), whether the HBM
 puzzle replaces or composes with the §5 puzzle and how difficulty maps onto it
-(M4), and who the validator set is and how a checkpoint is relayed (M5). M2 and
-M4 in particular would change consensus: a slash moves coins and an HBM stage
+(M4). M2 and M4 in particular would change consensus: a slash moves coins and an HBM stage
 changes what counts as valid work. Guessing those rules in code rather than in
 this document would have been the wrong order, so the modules exist, are tested
 against their stated invariants, and are documented as inactive.
+
+**M5's missing rules arrived as Decisions 11 and 12.** Decision 11 (§14.7)
+named the committee — an explicit genesis list of BLS keys — and the relay
+message; Decision 12 (§14.8) named the activation condition under which a
+checkpoint stops being an observation and starts being finality. M5 is wired
+exactly as far as those decisions reach and no further: no stake ledger, no
+rotation, no stake-weighted quorum.
 
 ### 14.1 M2 — Anti-collusion slash vault
 
@@ -1378,6 +1397,105 @@ activated; a future milestone that wants it needs its own decision.
   `Settle` quorums are untouched — they belong to task arbitration, not the L1
   checkpoint committee.
 
+### 14.8 M5 — Binding finality, testnet profile, equivocation (Decisions 12–14)
+
+M4 (§14.7) built the committee machinery and deliberately left it
+observation-only. This section is the rule that makes it *binding* under an
+explicit activation condition, the profile that exercises it, and the conflict
+policy that bounds it. It is normative for `jnt_core::finality`,
+`Chain::{apply_checkpoint, restore_finality, finalized_height, adopt}`, the
+store's finalized metadata fields, and the `testnet` profile.
+
+**Activation condition (Decision 12).** Every profile carries
+`finality_activation_height`: the height at which a valid certificate becomes
+binding, or `0` for *never*. Below the activation height an accepted
+certificate is an observation — it never gates `Chain::adopt()`, never
+persists as finality, and never matures an L2 deposit (§19.5). The value must
+be a multiple of `checkpoint_interval_blocks` and require a non-empty
+committee, or `NetworkParams::validate` refuses the profile at config time —
+a rule that could never fire is refused rather than silently inert. `mini` and
+`mainnet` carry `0`; `testnet` carries `20`.
+
+**The finalized checkpoint.** A certificate over height `H` becomes the
+binding finalized point only if all five hold:
+
+1. its block hash is the **canonical** block this chain holds at `H`;
+2. the certificate is valid — the six clauses of §14.5/§14.6 (epoch, derived
+   set, bitmap, count, quorum, aggregate signature), with the network id
+   checked before any signature work;
+3. it satisfies the existing quorum `ceil(n × 6667 / 10000)` — unchanged,
+   never stake-weighted;
+4. `H` is **strictly monotonic** above every previously accepted height (a
+   replay or stale certificate is refused, not re-finalized);
+5. it does **not conflict** with an already-accepted/finalized certificate at
+   `H` (see below).
+
+Every refusal fails closed: nothing is recorded, finality does not move, and
+the error names its clause (`FinalityError::{InvalidCertificate, NotCanonical,
+NotMonotonic, ConflictingFinality}`).
+
+**Enforcement.** `Chain::finalized_height()` is the stronger of the two rules:
+`max(tip − finality_depth, binding_finalized_height)`. `adopt()` refuses any
+competing branch whose fork point is at or below it with
+`ReorgWouldCrossFinality`. Before activation the first term is the whole rule,
+exactly as before M5; after activation a branch forking at or below the
+finalized height is refused no matter how much work it carries, and a branch
+forking strictly above it is adopted when otherwise valid. Fork choice itself
+is not redesigned.
+
+**Conflict behavior and equivocation evidence (Decision 14).** Given two
+otherwise-valid certificates at the same height, `H → A` and `H → B`:
+
+- both are never accepted: the first retains the height, the second is refused
+  as `ConflictingFinality` — so the system can never finalize two different
+  block hashes at one height, before *or* after a restart;
+- the conflict is classified **before** the canonical clause, so a certificate
+  for a competing hash proves the conflict instead of being misfiled as merely
+  non-canonical;
+- `EquivocationEvidence { offender, first, second }` is retained: `offender` is
+  the first common signer in canonical key order; `first`/`second` are payload
+  hashes in canonical serialized-byte order, so two nodes that saw the
+  certificates in opposite orders retain byte-identical evidence;
+- retention is bounded (at most 1024 evidence records and 256 recent
+  certificates), deduplicated by content, and refusals record nothing else;
+- **no punishment**: stake bonding does not exist yet, nothing is burned, and
+  no penalty is invented. The evidence is proof, not an execution.
+
+**Restart.** The finalized `(height, hash)` is persisted in the store's existing
+metadata row — not a second database — and restored after block replay only
+onto the exact canonical block at that height; a stale or forged row is
+refused. Finality before restart equals finality after restart, the restored
+point enforces `adopt()` exactly as the live one did, and evidence itself is
+in-memory (diagnostic until slashing exists).
+
+**Testnet profile (Decision 13).** `NetworkParams::by_name("testnet")`:
+
+| Property | Value |
+|---|---|
+| network id | `jounit/testnet` (unique) |
+| network magic | `6A 4E 54 03` (unique) |
+| genesis validator committee | 4 deterministic keys (public test material, distinct derivation from `mini`'s), canonically sorted |
+| quorum | `ceil(4 × 6667 / 10000) = 3` |
+| `checkpoint_interval_blocks` | `10` (epoch = height / 10) |
+| `finality_activation_height` | `20` |
+| `finality_depth` (fallback) | `20` |
+| staking / rotation | none — the committee is the fixed genesis list |
+
+Determinism is a test-pinned property: two independently constructed
+`testnet` profiles — by name or by constructor — are byte-identical, key
+material included, with no runtime entropy anywhere. This is the protocol
+profile required to test binding finality, **not** a public testnet launch;
+validator staking, rotation, rewards and slashing remain deferred (§14.6 open
+items).
+
+**L2 consumes this finality, it does not duplicate it.** Deposit maturity
+requires both the depth rule and this binding rule (§19.5), read from the L1
+chain's own finality layer; L2 settlement verifies against the profile's
+declared active committee — the same `genesis_validators` list this section
+verifies checkpoints against — never against ad-hoc keys (§15.1). A profile
+that intentionally declares no committee (mainnet) keeps an empty set and
+refuses every settlement by name.
+
 ---
 
 ## 15. Layer 2: task contracts and the five L2 transaction types (Phase 2)
@@ -1417,7 +1535,12 @@ change the message and swapping keys does. This is the same discipline as the L1
 
 `Settle` has no single signer. Its authorization is a validator-quorum
 BLS12-381 aggregate (the M5 structure: bitmap + signer count + 96-byte
-aggregate), verified through the existing `BlsVerifier` trait. The aggregate
+aggregate), verified through the existing `BlsVerifier` trait **against the
+profile's declared active committee** — the same `genesis_validators` list the
+L1 finality layer verifies checkpoints against (§14.8), never keys pulled from
+finality machinery by convenience. A profile with an intentionally empty
+committee (mainnet) verifies against nothing and therefore refuses every
+settlement by name (`BadQuorum`) — fail closed, never fail open. The aggregate
 message is the domain-separated hash of `(task_id, verdict, vwc_hash)`, so a
 settle decision cannot be replayed against another task or another verdict.
 
@@ -2291,22 +2414,37 @@ never trusted: the credited value is read from the committed output.
 is refused as a duplicate. Restart and reorg re-derive the set from the
 winning chain.
 
-**Maturity.** Detected at acceptance, spendable once the carrying block is
-final by the existing depth rule: `tip − deposit_height ≥ finality_depth` (20
-on `mini`, 100 on `mainnet`). No new finality mechanism exists and none was
-invented. Before maturity the deposit is pending (visible via
+**Maturity.** Detected at acceptance, spendable once **both** required safety
+conditions hold (Decision 15):
+
+1. **depth** — the M3 rule, unchanged: `tip − deposit_height ≥ finality_depth`
+   (20 on `mini`/`testnet`, 100 on `mainnet`); and
+2. **binding finality** — once the chain has a binding checkpoint (§14.8), the
+   deposit's own height must be at or below the binding-finalized height.
+
+Before binding finality activates (finalized height `0`), the depth rule
+governs alone — deposits are never less safe than M3, and no new finality
+mechanism was invented. After activation, depth alone cannot make a deposit
+spendable while the canonical history it sits in is not yet finalized.
+Before maturity the deposit is pending (visible via
 `pending_deposits`, not spendable). A consequence worth stating plainly: a
-matured deposit sits below the finality line, so consensus already makes it as
-irremovable as its block — tying maturity to finality depth is what makes
-reorg-removal of credited deposits unrepresentable except through a finality
-violation, which L1 refuses on its own.
+matured deposit sits below **both** finality lines, so consensus already makes
+it as irremovable as its block — tying maturity to the stronger of the two
+finality rules is what makes reorg-removal of credited deposits
+unrepresentable except through a finality violation, which L1 refuses on its
+own.
 
 **Processing order.** Per block: clock, then L2 transactions in order, then
-detected deposits in output order. Maturity is evaluated against the tip:
-full replay evaluates every deposit at the final tip, while the incremental
+detected deposits in output order. Maturity is evaluated against the tip and
+the L1 binding-finalized height together:
+full replay evaluates every deposit at the final tip and the chain's current
+finality point, while the incremental
 path evaluates new blocks at the new tip and rebuilds by full replay when an
-old pending deposit matures (it never re-scans old blocks, so extending would
-leave the deposit pending forever while a replay would credit it).
+old pending deposit becomes spendable — whether by depth catching up **or** by
+a checkpoint moving the binding floor (it never re-scans old blocks, so
+extending would leave the deposit pending forever while a replay would credit
+it). The binding floor is read from the L1 chain's own finality layer on every
+sync; L2 keeps no checkpoint view of its own.
 
 **Conservation.** Per deposit, L1 sink value equals L2 credited value. Globally
 the M2 joint check grows a sink term, because sink outputs remain in the L1

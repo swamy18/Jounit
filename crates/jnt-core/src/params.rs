@@ -115,6 +115,30 @@ pub fn mini_committee_secrets() -> Vec<crate::bls::SecretKey> {
     (1u8..=4).map(mini_validator_secret).collect()
 }
 
+/// Deterministic `testnet` validator key for `seed` (Decision 13).
+///
+/// A distinct seed domain from `mini`'s, so testnet and mini committees never
+/// coincide, while staying a pure function of the seed — no runtime entropy,
+/// two independently constructed `testnet` profiles are identical.
+pub fn testnet_validator_key(seed: u8) -> BlsPublicKey {
+    testnet_validator_secret(seed).public_key()
+}
+
+/// The deterministic `testnet` committee secret for `seed`. Public test
+/// material (the seeds are in source), matching the mini committee's status.
+pub fn testnet_validator_secret(seed: u8) -> crate::bls::SecretKey {
+    let mut s = [0u8; 32];
+    s[0] = seed;
+    s[16] = seed;
+    s[31] = seed;
+    crate::bls::SecretKey::derive(&s).expect("constant seeds are valid scalars")
+}
+
+/// The four `testnet` committee secrets, in the same order as the seeds.
+pub fn testnet_committee_secrets() -> Vec<crate::bls::SecretKey> {
+    (1u8..=4).map(testnet_validator_secret).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkParams {
     pub name: String,
@@ -182,6 +206,11 @@ pub struct NetworkParams {
     /// Blocks per checkpoint epoch (Decision 11). `mini` uses 10 so finality
     /// observation is exercisable in tests; `mainnet` uses 100.
     pub checkpoint_interval_blocks: u64,
+    /// Height at which a valid checkpoint certificate becomes **binding**
+    /// finality (Decisions 12/13, SPEC.md §14.8). `0` means never: the profile
+    /// keeps the depth-based fallback only. A checkpoint at a height below this
+    /// is observed but never gates `Chain::adopt()`.
+    pub finality_activation_height: u64,
 }
 
 impl NetworkParams {
@@ -248,10 +277,10 @@ impl NetworkParams {
         match name {
             "mainnet" => Ok(Self::mainnet()),
             "mini" => Ok(Self::mini()),
-            other => Err(Error::Malformed(match other {
-                "testnet" => "unknown network \"testnet\"; use \"mainnet\" or \"mini\"",
-                _ => "unknown network; use \"mainnet\" or \"mini\"",
-            })),
+            "testnet" => Ok(Self::testnet()),
+            _ => Err(Error::Malformed(
+                "unknown network; use \"mainnet\", \"testnet\", or \"mini\"",
+            )),
         }
     }
 
@@ -293,6 +322,9 @@ impl NetworkParams {
             // (fail closed), which is the honest pre-committee state.
             genesis_validators: Vec::new(),
             checkpoint_interval_blocks: 100,
+            // Binding finality is not activated on mainnet (Decision 12):
+            // `0` keeps the depth-based fallback only.
+            finality_activation_height: 0,
         }
     }
 
@@ -356,6 +388,66 @@ impl NetworkParams {
                 v
             },
             checkpoint_interval_blocks: 10,
+            // M4 built the machinery; M5 does not activate binding finality on
+            // mini either (that is the dedicated `testnet` profile's job), so
+            // mini keeps depth-only finality.
+            finality_activation_height: 0,
+        }
+    }
+
+    /// Testnet: the binding-finality profile (Decision 13). Fast blocks and a
+    /// small deterministic committee so the full finality path — certificate,
+    /// quorum, conflict, reorg-refusal — is exercisable end to end before any
+    /// public deployment.
+    ///
+    /// Distinct `network_magic`/`network_id` from both other profiles; genesis
+    /// is (as always) identical, so the magic/id are the chain identifiers.
+    /// No staking, no rotation: the committee is the fixed genesis list.
+    pub fn testnet() -> Self {
+        NetworkParams {
+            name: "testnet".into(),
+            target_block_time_ms: 1_000,
+            halving_period: 2_000,
+            start_reward_sat: 76 * SAT_PER_JNT,
+            supply_cap_sat: 304_000 * SAT_PER_JNT,
+            difficulty_window: 60,
+            change_limit_bps: 1_000,
+            genesis_difficulty: 1,
+            min_difficulty: 1,
+            max_difficulty: 1u128 << 40,
+            coinbase_maturity: 10,
+            // Depth fallback before activation (Decision 12). After activation
+            // the checkpoint rule is authoritative and strictly stronger.
+            finality_depth: 20,
+            gas_cap: 2_000_000,
+            base_fee_initial_sat: 100,
+            base_fee_min_sat: 10,
+            base_fee_max_sat: 1_000_000,
+            nn_epoch_blocks: 2_000,
+            puzzle_id: 1,
+            max_tx_count: 5_000,
+            max_block_bytes: 4_000_000,
+            require_hybrid_signatures: false,
+            network_magic: [0x6A, 0x4E, 0x54, 0x03],
+            network_id: "jounit/testnet".into(),
+            // Testnet carries no user grants yet (deposits/exits remain
+            // deferred); the escrow is a real, accountable genesis reserve.
+            l2_genesis_escrow_sat: 10 * SAT_PER_JNT,
+            l2_genesis_grants: Vec::new(),
+            l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
+            // Four deterministic testnet keys (distinct derivation from mini),
+            // canonically sorted. Quorum for n=4 is ceil(4×6667/10000)=3.
+            genesis_validators: {
+                let mut v: Vec<BlsPublicKey> = (1u8..=4).map(testnet_validator_key).collect();
+                v.sort_by_key(|a| a.0);
+                v.dedup();
+                v
+            },
+            checkpoint_interval_blocks: 10,
+            // Binding finality turns on at height 20 (Decision 13): an explicit,
+            // deterministic activation condition. Below it, observed
+            // certificates are never binding.
+            finality_activation_height: 20,
         }
     }
 
@@ -452,6 +544,24 @@ impl NetworkParams {
         }
         if self.checkpoint_interval_blocks == 0 {
             return Err(Error::Malformed("checkpoint_interval_blocks must be > 0"));
+        }
+        // Binding finality (Decisions 12/13): an activation height must land on
+        // an epoch boundary, or no epoch-aligned checkpoint could ever reach it
+        // and finality would silently never activate.
+        if self.finality_activation_height > 0
+            && self.finality_activation_height % self.checkpoint_interval_blocks != 0
+        {
+            return Err(Error::Malformed(
+                "finality_activation_height must be a multiple of checkpoint_interval_blocks",
+            ));
+        }
+        // Binding finality requires a committee to verify against; a nonzero
+        // activation with an empty committee would be a rule that can never
+        // fire (or, worse, one that accepts nothing). Fail at config time.
+        if self.finality_activation_height > 0 && self.genesis_validators.is_empty() {
+            return Err(Error::Malformed(
+                "finality_activation_height > 0 requires a genesis validator committee",
+            ));
         }
         Ok(())
     }

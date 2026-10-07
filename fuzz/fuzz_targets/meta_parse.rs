@@ -28,6 +28,24 @@ fuzz_target!(|data: &[u8]| {
                     "accepted metadata: height 0 must mean genesis tip"
                 );
             }
+            // M5 finality fields (Decision 12): their pairing invariants hold
+            // for every accepted file, present or absent (absent parses as the
+            // zero pair).
+            if meta.finalized_height == 0 {
+                assert_eq!(
+                    meta.finalized_hash, [0u8; 32],
+                    "no finalized height must mean no finalized hash"
+                );
+            } else {
+                assert_ne!(
+                    meta.finalized_hash, [0u8; 32],
+                    "a finalized height must carry its hash"
+                );
+                assert!(
+                    meta.finalized_height <= meta.height,
+                    "finalized height cannot exceed the tip"
+                );
+            }
             // Round-trip: whatever parses must re-render and re-parse identically.
             mf.save(&meta).unwrap();
             let reparsed = mf.load().unwrap().expect("saved metadata must reload");

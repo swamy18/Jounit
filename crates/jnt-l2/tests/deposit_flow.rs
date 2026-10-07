@@ -339,8 +339,9 @@ fn deposits_mature_at_final_depth_and_replay_agrees_incrementally() {
     );
     let mut inc = ChainL2::empty(L2Config::mini(), &g, d);
     let tip = chain.height();
+    let binding = chain.finality().binding_finalized_height();
     for h in 1..=tip {
-        inc.apply_block(chain.block_at(h).unwrap(), tip, &set, &v);
+        inc.apply_block(chain.block_at(h).unwrap(), tip, binding, &set, &v);
     }
     assert_eq!(inc.state(), after.state());
     assert_eq!(inc.pending_deposits(), after.pending_deposits());
@@ -397,13 +398,14 @@ fn absorbing_the_same_block_twice_credits_once() {
         jnt_core::bls_checkpoint::MockBls,
     );
     let tip = chain.height();
+    let binding = chain.finality().binding_finalized_height();
     let mut view = ChainL2::empty(L2Config::mini(), &g, d);
-    view.apply_block(&b, tip, &set, &v);
+    view.apply_block(&b, tip, binding, &set, &v);
     assert_eq!(view.deposits_applied_count(), 1);
     assert_eq!(view.state().balance(&miner_addr), to_sink);
     // Second absorption of the same block: duplicate by name, balance and
     // totals untouched.
-    view.apply_block(&b, tip, &set, &v);
+    view.apply_block(&b, tip, binding, &set, &v);
     assert_eq!(view.deposits_applied_count(), 1);
     assert_eq!(view.state().balance(&miner_addr), to_sink);
     assert_eq!(view.state().deposited_total(), to_sink);

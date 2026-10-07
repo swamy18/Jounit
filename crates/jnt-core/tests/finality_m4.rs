@@ -1,18 +1,15 @@
 //! M4 validator-set + finality foundation (Decision 11, SPEC.md §14).
 //!
-//! These tests pin the properties that make M4 a *foundation* rather than an
-//! activation:
+//! These tests pin the properties that make the *committee machinery* real
+//! before binding activation: the genesis committee is a pure function of
+//! `NetworkParams`; a full-quorum certificate is accepted and a sub-quorum one
+//! is not; `mainnet`'s empty committee fails closed; a certificate for another
+//! network is refused; and on a profile with no activation height (`mini`),
+//! finality stays **non-binding** — a reorg crossing an accepted checkpoint
+//! still applies.
 //!
-//! - the genesis committee is a pure function of `NetworkParams`, identical on
-//!   every node holding them;
-//! - a full-quorum certificate observes, a sub-quorum one does not;
-//! - `mainnet`'s empty committee fails closed (nothing verifies);
-//! - a certificate for another network is refused even under the same keys;
-//! - **finality is non-binding**: a reorg crossing an observed checkpoint
-//!   still applies to the chain, because nothing consults the observation.
-//!
-//! The last property is the most important: it is the test that fails the day
-//! someone wires `FinalityManager` into `Chain::submit`.
+//! Binding activation and its reorg-refusal live in `m5_finality.rs`; this file
+//! proves the M4 base is unchanged when `finality_activation_height == 0`.
 
 use jnt_core::bls::{RealBls, SecretKey};
 use jnt_core::bls_checkpoint::{BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload};
@@ -61,6 +58,15 @@ fn payload(height: u64) -> CheckpointPayload {
     }
 }
 
+/// Accept a certificate against the payload's own declared block hash, which is
+/// all the observation tests need.
+fn accept(
+    fm: &mut FinalityManager,
+    cp: &Checkpoint,
+) -> Result<(), jnt_core::finality::FinalityError> {
+    fm.accept(cp, Some(cp.payload.block_hash), &RealBls)
+}
+
 // ---------------------------------------------------------------------------
 // Committee derivation
 // ---------------------------------------------------------------------------
@@ -71,6 +77,7 @@ fn mini_carries_a_four_key_committee_and_mainnet_none() {
     mini.validate().unwrap();
     assert_eq!(mini.genesis_validators.len(), 4);
     assert_eq!(mini.checkpoint_interval_blocks, 10);
+    assert_eq!(mini.finality_activation_height, 0, "mini does not activate");
 
     let main = NetworkParams::mainnet();
     main.validate().unwrap();
@@ -79,6 +86,7 @@ fn mini_carries_a_four_key_committee_and_mainnet_none() {
         "mainnet has no committee yet; an empty set is the honest pre-committee state"
     );
     assert_eq!(main.checkpoint_interval_blocks, 100);
+    assert_eq!(main.finality_activation_height, 0);
 }
 
 #[test]
@@ -106,10 +114,13 @@ fn a_full_quorum_certificate_is_observed() {
     let mut fm = FinalityManager::new(&params);
     // 4 validators, quorum ceil(4*6667/10000) = 3.
     let cp = signed(payload(10), &[0, 1, 2]);
-    fm.observe(&cp, &RealBls).unwrap();
-    assert_eq!(fm.observed_height(), 10);
-    assert!(fm.is_observed_final(10));
-    assert!(!fm.is_observed_final(11));
+    accept(&mut fm, &cp).unwrap();
+    assert_eq!(fm.accepted_height(), 10);
+    assert!(fm.is_observed(10));
+    assert!(!fm.is_observed(11));
+    // mini does not activate: nothing is binding.
+    assert!(!fm.is_finalized(10));
+    assert_eq!(fm.binding_finalized_height(), 0);
 }
 
 #[test]
@@ -117,9 +128,8 @@ fn a_sub_quorum_certificate_is_refused() {
     let params = NetworkParams::mini();
     let mut fm = FinalityManager::new(&params);
     let cp = signed(payload(10), &[0, 1]);
-    assert!(fm.observe(&cp, &RealBls).is_err());
-    assert_eq!(fm.observed_height(), 0, "nothing observed on refusal");
-    assert_eq!(fm.observed_count(), 0);
+    assert!(accept(&mut fm, &cp).is_err());
+    assert_eq!(fm.accepted_height(), 0, "nothing accepted on refusal");
 }
 
 #[test]
@@ -128,8 +138,8 @@ fn a_forged_signature_is_refused() {
     let mut fm = FinalityManager::new(&params);
     let mut cp = signed(payload(10), &[0, 1, 2]);
     cp.aggregate_sig = BlsSignature([0u8; 96]);
-    assert!(fm.observe(&cp, &RealBls).is_err());
-    assert_eq!(fm.observed_height(), 0);
+    assert!(accept(&mut fm, &cp).is_err());
+    assert_eq!(fm.accepted_height(), 0);
 }
 
 #[test]
@@ -138,20 +148,17 @@ fn a_certificate_for_another_network_is_refused() {
     let mut fm = FinalityManager::new(&params);
     let mut cp = signed(payload(10), &[0, 1, 2]);
     cp.payload.network_id = "jounit/mainnet".into();
-    assert!(fm.observe(&cp, &RealBls).is_err());
-    assert_eq!(fm.observed_height(), 0);
+    assert!(accept(&mut fm, &cp).is_err());
+    assert_eq!(fm.accepted_height(), 0);
 }
 
 #[test]
 fn observation_never_moves_backwards() {
     let params = NetworkParams::mini();
     let mut fm = FinalityManager::new(&params);
-    fm.observe(&signed(payload(20), &[0, 1, 2]), &RealBls)
-        .unwrap();
-    assert!(fm
-        .observe(&signed(payload(10), &[0, 1, 2]), &RealBls)
-        .is_err());
-    assert_eq!(fm.observed_height(), 20);
+    accept(&mut fm, &signed(payload(20), &[0, 1, 2])).unwrap();
+    assert!(accept(&mut fm, &signed(payload(10), &[0, 1, 2])).is_err());
+    assert_eq!(fm.accepted_height(), 20);
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +166,7 @@ fn observation_never_moves_backwards() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mainnet_with_no_committee_observes_nothing() {
+fn mainnet_with_no_committee_accepts_nothing() {
     let params = NetworkParams::mainnet();
     let mut fm = FinalityManager::new(&params);
     assert_eq!(fm.committee_len(), 0);
@@ -175,25 +182,25 @@ fn mainnet_with_no_committee_observes_nothing() {
         signer_bitmap: vec![],
         signer_count: 0,
     };
-    assert!(fm.observe(&cp, &RealBls).is_err());
-    assert_eq!(fm.observed_height(), 0);
+    assert!(accept(&mut fm, &cp).is_err());
+    assert_eq!(fm.accepted_height(), 0);
 }
 
 // ---------------------------------------------------------------------------
-// THE non-binding test
+// THE non-binding test (mini activation = 0)
 // ---------------------------------------------------------------------------
 
-/// **The rule:** observed finality does not gate chain acceptance.
+/// **The rule:** on a profile with no activation height, an accepted checkpoint
+/// does not gate chain acceptance.
 ///
-/// A reorg that crosses an observed checkpoint still applies. If someone ever
-/// makes `Chain::submit` consult `FinalityManager`, this test starts failing
-/// — which is the point. M4 observes; it does not enforce.
+/// A reorg that crosses an accepted checkpoint still applies. If someone ever
+/// makes activation fire on a zero-activation profile, this test starts failing
+/// — which is the point. `mini` observes; it does not enforce.
 #[test]
-fn a_reorg_crossing_an_observed_checkpoint_still_applies() {
+fn a_reorg_crossing_an_accepted_checkpoint_still_applies() {
     use jnt_core::hash::Address;
     use jnt_core::wallet::Wallet;
 
-    let params = NetworkParams::mini();
     let miner = Wallet::new_random("m4-miner");
     let addr: Address = miner.address().unwrap();
     // Base timestamps on genesis, or the median-timestamp rule clamps a small
@@ -208,14 +215,22 @@ fn a_reorg_crossing_an_observed_checkpoint_still_applies() {
     }
     let observed = main.block_hash_at(10).unwrap();
 
-    // Observe a checkpoint at height 10 on the canonical chain.
-    let mut fm = FinalityManager::new(&params);
-    fm.observe(&signed(payload(10), &[0, 1, 2]), &RealBls)
-        .unwrap();
-    assert!(fm.is_observed_final(10));
+    // Accept a checkpoint at height 10 over the real canonical block.
+    let cp = signed(
+        CheckpointPayload {
+            height: 10,
+            block_hash: observed,
+            network_id: "jounit/mini".into(),
+            epoch: 1,
+        },
+        &[0, 1, 2],
+    );
+    main.apply_checkpoint(&cp, &RealBls).unwrap();
+    assert!(main.finality().is_observed(10));
+    assert_eq!(main.finality().binding_finalized_height(), 0);
 
     // Build a heavier rival that shares blocks 1..=5 and then diverges at
-    // height 6 — *below* the observed height — so adopting it necessarily
+    // height 6 — *below* the accepted height — so adopting it necessarily
     // rewrites the block at height 10.
     let mut rival = Chain::new(NetworkParams::mini()).unwrap();
     for h in 1..=5u64 {
@@ -230,12 +245,11 @@ fn a_reorg_crossing_an_observed_checkpoint_still_applies() {
     assert_ne!(
         rival.block_hash_at(10).unwrap(),
         observed,
-        "the fixture must actually rewrite the observed height, or this proves nothing"
+        "the fixture must actually rewrite the accepted height, or this proves nothing"
     );
 
-    // Submit the rival branch to `main`. Nothing consults the finality
-    // observation, so the cross-finality reorg applies and `main` follows the
-    // heavier chain, silently superseding the observed checkpoint.
+    // Submit the rival branch to `main`. With activation 0, nothing enforces the
+    // observation, so the reorg applies and `main` follows the heavier chain.
     for h in 6..=18u64 {
         main.submit(rival.block_at(h).unwrap().clone()).unwrap();
     }
@@ -244,12 +258,9 @@ fn a_reorg_crossing_an_observed_checkpoint_still_applies() {
     assert_eq!(
         main.block_hash_at(10).unwrap(),
         rival.block_hash_at(10).unwrap(),
-        "the reorg crossed the observed checkpoint: finality is non-binding"
+        "the reorg crossed the accepted checkpoint: finality is non-binding"
     );
     assert_ne!(main.block_hash_at(10).unwrap(), observed);
-    // The observation is *unchanged* — it recorded history that consensus then
-    // rewrote, which is exactly why it carries no authority.
-    assert!(fm.is_observed_final(10));
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +289,6 @@ fn an_oversized_signer_bitmap_is_refused() {
     use jnt_core::bls_checkpoint::MAX_SIGNER_BITMAP_BYTES;
     let cp = signed(payload(10), &[0, 1, 2]);
     let mut bytes = cp.payload.serialize();
-    // Wrap as a checkpoint body with a giant bitmap length.
     let mut body = Vec::new();
     body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     body.append(&mut bytes);

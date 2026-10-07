@@ -37,15 +37,20 @@
 //!   production path calls `credit` after that — user deposits are deferred.
 //!   Payloads from genuinely unfunded accounts are still refused with
 //!   `InsufficientBalance` and recorded as skipped.
-//! - **No validator set yet.** Settlements are checked against an empty set
-//!   with the production [`RealBls`] verifier, so any `Settle` payload is
-//!   refused with `BadQuorum` deterministically. The fixed genesis committee
-//!   (Decision 8) arrives with M4; nothing about this module's shape changes
-//!   when it does — the set just stops being empty.
+//! - **The declared committee only.** `Settle` payloads are checked against
+//!   the active validator committee the network profile declares (Decision 15,
+//!   the same `genesis_validators` list the L1 finality layer verifies
+//!   checkpoints against — not keys pulled from the finality machinery by
+//!   convenience). A profile that intentionally declares no committee
+//!   (`mainnet`) keeps the empty set, so every settlement fails closed with
+//!   `BadQuorum` deterministically rather than applying without authority.
 //! - **No new consensus rule.** A block the L1 layer rejects never reaches
 //!   `sync` with a moved tip, so L2 state cannot be mutated by a block the node
 //!   did not accept. L2 failures never reject a block either: they are recorded
 //!   as skipped payloads per the M1 skip semantics.
+//! - **No second finality system.** Deposit maturity consumes the L1 chain's
+//!   binding-finalized height through the same [`Chain`] the tip came from
+//!   (Decision 15); L2 never keeps its own checkpoint view.
 
 use jnt_core::bls::RealBls;
 use jnt_core::bls_checkpoint::ValidatorSet;
@@ -68,13 +73,19 @@ pub fn config_for(params: &NetworkParams) -> L2Config {
     }
 }
 
-/// The validator set the node checks `Settle` payloads against.
+/// The validator set the node checks `Settle` payloads against (Decision 15).
 ///
-/// Empty until the M4 genesis committee (Decision 8). With an empty set every
-/// quorum check fails deterministically, so settlements are skipped by name
-/// rather than applied without authority — fail closed, never fail open.
-pub fn validator_set() -> ValidatorSet {
-    ValidatorSet::new(Vec::new())
+/// The profile's *declared active committee* — the same `genesis_validators`
+/// list the L1 finality layer verifies checkpoint certificates against, in its
+/// canonical order. Not a convenience alias for checkpoint-signing state: this
+/// reads the profile declaration, so L1 and L2 agree on who the validators are
+/// by construction rather than by shared plumbing.
+///
+/// `mainnet` intentionally declares no committee, so this stays empty there
+/// and every settlement fails deterministically with `BadQuorum` — fail closed,
+/// never fail open.
+pub fn validator_set(params: &NetworkParams) -> ValidatorSet {
+    ValidatorSet::new(params.genesis_validators.clone())
 }
 
 /// How a [`NodeL2::sync`] call ended.
@@ -125,6 +136,10 @@ pub struct NodeL2 {
     config: L2Config,
     genesis: L2Genesis,
     deposits: DepositParams,
+    /// The profile's declared active committee (Decision 15), fixed at
+    /// construction so every replay and incremental step in this view verifies
+    /// settlements against the same set.
+    validators: ValidatorSet,
     synced_tip: Option<Hash>,
     synced_height: u64,
 }
@@ -138,11 +153,13 @@ impl NodeL2 {
         let config = config_for(params);
         let genesis = L2Genesis::for_params(params);
         let deposits = DepositParams::for_params(params);
+        let validators = validator_set(params);
         NodeL2 {
             inner: ChainL2::empty(config, &genesis, deposits),
             config,
             genesis,
             deposits,
+            validators,
             synced_tip: None,
             synced_height: 0,
         }
@@ -158,14 +175,8 @@ impl NodeL2 {
         let config = config_for(params);
         let genesis = L2Genesis::for_params(params);
         let deposits = DepositParams::for_params(params);
-        let inner = ChainL2::replay(
-            chain,
-            config,
-            &genesis,
-            deposits,
-            &validator_set(),
-            &RealBls,
-        );
+        let validators = validator_set(params);
+        let inner = ChainL2::replay(chain, config, &genesis, deposits, &validators, &RealBls);
         let synced_height = inner.height();
         let synced_tip = Some(chain.tip_hash());
         NodeL2 {
@@ -173,6 +184,7 @@ impl NodeL2 {
             config,
             genesis,
             deposits,
+            validators,
             synced_tip,
             synced_height,
         }
@@ -187,11 +199,21 @@ impl NodeL2 {
     pub fn sync(&mut self, chain: &Chain) -> SyncReport {
         let tip = chain.tip_hash();
         let tip_height = chain.height();
+        // Both Decision 15 inputs come off the same chain the tip came from:
+        // the depth condition is evaluated against `tip_height`, the binding
+        // floor against the L1 finality layer. A checkpoint can move this
+        // floor without moving the tip, which is why it is read fresh on
+        // every sync rather than cached alongside the tip.
+        let binding = chain.finality().binding_finalized_height();
         let from_height = self.synced_height;
         let applied_before = self.inner.applied_count();
         let skipped_before = self.inner.skipped().len();
 
-        if self.synced_tip == Some(tip) {
+        // Unchanged means: same tip *and* nothing a later checkpoint could now
+        // release. A pending deposit held back only by binding finality matures
+        // when a certificate arrives, tip untouched — without this second
+        // condition the view would sit on a spendable deposit forever.
+        if self.synced_tip == Some(tip) && !self.inner.has_pending_matured(tip_height, binding) {
             return SyncReport {
                 outcome: SyncOutcome::Unchanged,
                 from_height,
@@ -213,6 +235,7 @@ impl NodeL2 {
         // naming the allocation to rebuild from.
         let genesis = self.genesis.clone();
         let deposits = self.deposits;
+        let validators = self.validators.clone();
 
         let outcome = if can_extend {
             let from = self.synced_height + 1;
@@ -221,7 +244,7 @@ impl NodeL2 {
                 match chain.block_at(h) {
                     Some(block) => {
                         self.inner
-                            .apply_block(block, tip_height, &validator_set(), &RealBls);
+                            .apply_block(block, tip_height, binding, &validators, &RealBls);
                     }
                     None => {
                         missing = true;
@@ -239,22 +262,24 @@ impl NodeL2 {
                     self.config,
                     &genesis,
                     deposits,
-                    &validator_set(),
+                    &validators,
                     &RealBls,
                 );
                 SyncOutcome::FullReplay { blocks: tip_height }
-            } else if self.inner.has_pending_matured(tip_height) {
-                // A deposit detected in an old block just became final-deep.
-                // Incremental sync never re-scans old blocks, so extending
-                // would leave it pending forever while a replay would credit
-                // it — the two paths would diverge. Rebuild instead: replay
-                // evaluates every deposit at the new tip.
+            } else if self.inner.has_pending_matured(tip_height, binding) {
+                // A deposit detected in an old block just became spendable —
+                // by depth at the new tip, or by binding finality moving
+                // without the tip. Incremental sync never re-scans old blocks,
+                // so extending would leave it pending forever while a replay
+                // would credit it — the two paths would diverge. Rebuild
+                // instead: replay evaluates every deposit at the new tip and
+                // binding floor.
                 self.inner = ChainL2::replay(
                     chain,
                     self.config,
                     &genesis,
                     deposits,
-                    &validator_set(),
+                    &validators,
                     &RealBls,
                 );
                 SyncOutcome::FullReplay { blocks: tip_height }
@@ -269,7 +294,7 @@ impl NodeL2 {
                 self.config,
                 &genesis,
                 deposits,
-                &validator_set(),
+                &validators,
                 &RealBls,
             );
             SyncOutcome::FullReplay { blocks: tip_height }

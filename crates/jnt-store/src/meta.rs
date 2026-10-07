@@ -36,6 +36,13 @@ pub struct Meta {
     pub tip: Hash,
     /// Height of the canonical tip. `0` means genesis.
     pub height: u64,
+    /// Binding-finalized height (Decision 12), or `0` for none/unactivated.
+    /// Persisted so a restart does not "un-finalize" history the node already
+    /// committed to. Restored only if the block at this height still matches
+    /// `finalized_hash`.
+    pub finalized_height: u64,
+    /// Canonical hash finalized at `finalized_height` (zero when none).
+    pub finalized_hash: Hash,
 }
 
 impl Meta {
@@ -46,7 +53,16 @@ impl Meta {
             genesis,
             tip: genesis,
             height: 0,
+            finalized_height: 0,
+            finalized_hash: [0u8; 32],
         }
+    }
+
+    /// Attach the binding-finalized point (Decision 12) for persistence.
+    pub fn with_finalized(mut self, finalized_height: u64, finalized_hash: Hash) -> Self {
+        self.finalized_height = finalized_height;
+        self.finalized_hash = finalized_hash;
+        self
     }
 
     /// The state a store can always prove without trusting metadata: genesis,
@@ -63,6 +79,11 @@ impl Meta {
             genesis: self.genesis,
             tip: self.genesis,
             height: 0,
+            // A recovered store proves nothing, including finality: dropping the
+            // finalized point to 0 is the fail-closed choice, re-derived from
+            // the depth rule until new checkpoints arrive.
+            finalized_height: 0,
+            finalized_hash: [0u8; 32],
         }
     }
 
@@ -70,12 +91,14 @@ impl Meta {
     /// truncated or partially-written file cannot be read as a shorter valid one.
     fn render(&self) -> String {
         let body = format!(
-            "{{\n  \"version\": {},\n  \"network\": \"{}\",\n  \"genesis\": \"{}\",\n  \"tip\": \"{}\",\n  \"height\": {}\n}}",
+            "{{\n  \"version\": {},\n  \"network\": \"{}\",\n  \"genesis\": \"{}\",\n  \"tip\": \"{}\",\n  \"height\": {},\n  \"finalized_height\": {},\n  \"finalized_hash\": \"{}\"\n}}",
             self.version,
             escape(&self.network),
             hash_to_hex(&self.genesis),
             hash_to_hex(&self.tip),
-            self.height
+            self.height,
+            self.finalized_height,
+            hash_to_hex(&self.finalized_hash)
         );
         let sum = sha256(&[body.as_bytes()]);
         format!("{body}\n{}\n", jnt_core::hash::to_hex(&sum))
@@ -167,17 +190,66 @@ fn parse_body(body: &str) -> Result<Meta, StoreError> {
             detail: "height 0 with a tip that is not genesis".into(),
         });
     }
+    // Finality fields were added after the first metadata format. An older file
+    // simply lacks them, which means "no binding finality recorded" — the same
+    // as 0 — so absence is not an error and must not be read as corruption.
+    let finalized_height: u64 = match optional_field(body, "finalized_height")? {
+        Some(s) => s.parse().map_err(|_| StoreError::BadMeta {
+            detail: "finalized_height is not a number".into(),
+        })?,
+        None => 0,
+    };
+    let finalized_hash = match optional_field(body, "finalized_hash")? {
+        Some(s) => hash_from_hex(&s).map_err(|e| StoreError::BadMeta {
+            detail: format!("finalized hash: {e}"),
+        })?,
+        None => [0u8; 32],
+    };
+    if finalized_height == 0 && finalized_hash != [0u8; 32] {
+        return Err(StoreError::BadMeta {
+            detail: "finalized_height 0 with a nonzero finalized hash".into(),
+        });
+    }
+    if finalized_height > height {
+        return Err(StoreError::BadMeta {
+            detail: "finalized height is above the tip".into(),
+        });
+    }
     Ok(Meta {
         version,
         network,
         genesis,
         tip,
         height,
+        finalized_height,
+        finalized_hash,
     })
 }
 
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Extract an optional field the same way `parse_body`'s closure extracts
+/// required ones, but returning `None` when the key is absent. Used for fields
+/// added after the first format, so an older file stays readable.
+fn optional_field(body: &str, name: &str) -> Result<Option<String>, StoreError> {
+    let key = format!("\"{name}\":");
+    let Some(idx) = body.find(&key) else {
+        return Ok(None);
+    };
+    let rest = body[idx + key.len()..].trim_start();
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"').ok_or_else(|| StoreError::BadMeta {
+            detail: format!("unterminated string for `{name}`"),
+        })?;
+        Ok(Some(stripped[..end].to_string()))
+    } else {
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        Ok(Some(rest[..end].to_string()))
+    }
 }
 
 /// The metadata file.
@@ -277,6 +349,8 @@ mod tests {
             genesis: genesis(),
             tip: [7u8; 32],
             height: 42,
+            finalized_height: 0,
+            finalized_hash: [0u8; 32],
         };
         f.save(&m).unwrap();
         assert_eq!(f.load().unwrap(), Some(m));
@@ -313,6 +387,8 @@ mod tests {
             genesis: genesis(),
             tip: [3u8; 32],
             height: 9,
+            finalized_height: 0,
+            finalized_hash: [0u8; 32],
         })
         .unwrap();
         let text = fs::read_to_string(f.path()).unwrap();
@@ -343,10 +419,14 @@ mod tests {
             genesis: genesis(),
             tip: [9u8; 32],
             height: 100,
+            finalized_height: 60,
+            finalized_hash: [0xAB; 32],
         };
         let r = m.recover_to_genesis();
         assert_eq!(r.tip, genesis());
         assert_eq!(r.height, 0);
+        assert_eq!(r.finalized_height, 0, "recovery drops finality");
+        assert_eq!(r.finalized_hash, [0u8; 32]);
         assert_eq!(r.genesis, genesis());
         assert_eq!(r.network, "mini");
     }

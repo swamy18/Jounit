@@ -711,3 +711,67 @@ observation without activation.**
    M4 (that is M5's P1 proposal). `mini` carries the test committee and a
    10-block checkpoint interval; `mainnet` carries an empty committee and a
    100-block interval. No public testnet starts in M4.
+
+---
+
+# Implementation status — Phase 6 M5 STEP 0 audit: binding finality needs four decisions
+
+The M5 audit (no code changed) re-read the tree after M4 and found: L1 finality
+is still depth-only (`Chain::finalized_height()` = `tip − finality_depth`), the
+`FinalityManager` is observation-only and consulted by nothing, there is no
+testnet profile, `equivocation_evidence` has no caller, L2 deposits mature by
+depth only, and the node's L2 validator set is empty (fail-closed). Four
+decisions are required before any consensus change: binding finality activation
+(A), a testnet profile (B), equivocation detection policy (D), and L2 finality
+semantics (E). This milestone records those four and implements exactly them.
+
+## Decision 12 — Binding finality activation (A)
+
+**Chosen: a valid checkpoint certificate over the active committee becomes
+binding once the configured activation height is reached; `Chain::adopt()`
+refuses to rewrite finalized history; the depth rule remains the fallback.**
+
+The finalized checkpoint must be the canonical block at its height, carry a
+valid certificate, satisfy `ceil(n × 6667 / 10000)` quorum (unchanged — no
+stake-weighted quorum is invented), be strictly monotonic in height, and not
+conflict with an already-finalized height. Once height H is finalized,
+`Chain::adopt()` rejects any competing branch whose fork point is at or below
+H (the existing `ReorgWouldCrossFinality` error, now fed by a real finalized
+height). Before `activation_height`, only the depth rule applies and an
+observed certificate is never binding.
+
+## Decision 13 — Testnet profile (B)
+
+**Chosen: a dedicated `testnet` profile — unique `network_magic`/`network_id`,
+four deterministic genesis validators (quorum 3), a 10-block checkpoint
+interval, and an explicit activation height. No staking, no rotation, no public
+launch.**
+
+The committee is a fixed genesis list derived from public test seeds, built by
+the same derivation as `mini`, so two independently constructed `testnet`
+profiles are byte-identical. This is the network config required to exercise
+binding finality, not a public deployment.
+
+## Decision 14 — Equivocation detection, no economic punishment (D)
+
+**Chosen: retain deterministic `EquivocationEvidence` for conflicting valid
+certificates; never finalize two different hashes at one height; fail closed on
+the conflicting transition. Economic slashing stays deferred (no stake exists).**
+
+When two otherwise-valid certificates disagree at the same height
+(`H → A` and `H → B`), the second finalization transition is refused, the
+conflict is detected, and canonical, bounded evidence is retained. Nothing is
+burned and no penalty is invented, because there is no bond to burn.
+
+## Decision 15 — L2 finality semantics (E)
+
+**Chosen: deposit maturity requires BOTH depth and binding checkpoint finality
+(take the stronger/safer); L2 settlement verifies against the declared active
+committee, not the checkpoint-signing keys by convenience.**
+
+Before binding finality activates, the M3 depth rule still governs, so M3 is
+never made less safe. After activation, a deposit is not spendable merely
+because depth is satisfied if the canonical history at that height is not
+finalized. L2 does not grow a second finality system. `Settle`/VWC keep their
+existing verification semantics but use the declared committee; a profile with
+an intentionally empty committee (mainnet) continues to fail closed.

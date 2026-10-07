@@ -29,6 +29,18 @@
 //! blocks at the new tip and rebuilds by full replay when an old pending
 //! deposit matures (`has_pending_matured`), so the two paths cannot disagree.
 //!
+//! # Binding finality (Decision 15, SPEC.md §19.4.1)
+//!
+//! Depth is the *minimum* safety, never the whole of it. Once the L1 chain has
+//! a binding checkpoint (Decision 12), a deposit also requires that its own
+//! block height lies at or below the binding-finalized height — so depth alone
+//! cannot make a deposit spendable when the canonical history it sits in is not
+//! yet finalized. Before binding finality activates (the finalized height is
+//! 0), the M3 depth rule governs alone, unchanged: this gate can only make
+//! deposits *safer* than M3, never less safe. The binding floor is read from
+//! the L1 [`Chain`]'s own finality layer — L2 never grows a second finality
+//! system; it consumes the one consensus answer.
+//!
 //! # What replay does with a transaction that does not apply
 //!
 //! It records it in [`ChainL2::skipped`] and carries on. This is deliberate and
@@ -126,6 +138,10 @@ impl ChainL2 {
         verifier: &dyn BlsVerifier,
     ) -> Self {
         let tip = chain.height();
+        // The one binding-finality floor for this replay: a pure read of the L1
+        // chain's finality layer, fixed for the whole pass so every deposit is
+        // judged against the same consensus answer (Decision 15).
+        let binding = chain.finality().binding_finalized_height();
         let mut l2 = ChainL2::empty(config, genesis, deposits);
         for height in 1..=tip {
             // `block_at` is total over 1..=height on a canonical chain. A
@@ -134,7 +150,7 @@ impl ChainL2 {
             let block = chain
                 .block_at(height)
                 .expect("canonical chain must have a block at every height up to its tip");
-            l2.absorb(height, block, tip, validators, verifier);
+            l2.absorb(height, block, tip, binding, validators, verifier);
         }
         l2
     }
@@ -144,16 +160,27 @@ impl ChainL2 {
     ///
     /// `height` is taken from the block itself so the two paths cannot disagree
     /// about which height a transaction was applied at; `tip` is the chain tip
-    /// *after* this block, which is what deposit maturity is evaluated against
-    /// (Decision 10 item 4).
+    /// *after* this block, which is what deposit depth-maturity is evaluated
+    /// against (Decision 10 item 4). `binding_finalized` is the L1 binding-
+    /// finalized height at call time (0 = not activated), the second of the two
+    /// Decision 15 conditions — the caller reads it from the same `Chain` the
+    /// tip came from, so the two inputs can never describe different views.
     pub fn apply_block(
         &mut self,
         block: &jnt_core::block::Block,
         tip: u64,
+        binding_finalized: u64,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) {
-        self.absorb(block.header.height, block, tip, validators, verifier);
+        self.absorb(
+            block.header.height,
+            block,
+            tip,
+            binding_finalized,
+            validators,
+            verifier,
+        );
     }
 
     fn absorb(
@@ -161,6 +188,7 @@ impl ChainL2 {
         height: u64,
         block: &jnt_core::block::Block,
         tip: u64,
+        binding: u64,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) {
@@ -177,17 +205,17 @@ impl ChainL2 {
             }
         }
         // Deposits ride the same block in the same order: detection is a pure
-        // function of the block, maturity a pure function of the tip, and
-        // exactly-once comes from the state's consumed set.
+        // function of the block, maturity a pure function of tip + binding
+        // finality, and exactly-once comes from the state's consumed set.
         let (detected, mut ignored) = scan_block(block, height, &self.deposits);
         self.ignored.append(&mut ignored);
         for d in detected {
-            self.absorb_deposit(d, tip);
+            self.absorb_deposit(d, tip, binding);
         }
         self.height = height;
     }
 
-    fn absorb_deposit(&mut self, d: DetectedDeposit, tip: u64) {
+    fn absorb_deposit(&mut self, d: DetectedDeposit, tip: u64, binding: u64) {
         let id = d.id();
         if self.state.deposit_credited(&id) {
             // Same bytes in an earlier block: refused by name, never twice.
@@ -200,15 +228,17 @@ impl ChainL2 {
             });
             return;
         }
-        if tip >= d.matures_at(self.deposits.maturity_depth) {
-            // Mature: credit exactly the sink output's satoshis. `apply_deposit`
-            // cannot fail here — the id is fresh (checked above) and the amount
-            // is non-zero (the scan enforces the minimum, and L1 rejects zero
-            // outputs) — but fail closed rather than unwrap, because this is
-            // value creation and an error must never become a silent credit.
+        if deposit_is_spendable(&d, tip, binding, self.deposits.maturity_depth) {
+            // Mature under both Decision 15 conditions: depth *and* binding
+            // finality (when activated). Credit exactly the sink output's
+            // satoshis. `apply_deposit` cannot fail here — the id is fresh
+            // (checked above) and the amount is non-zero (the scan enforces the
+            // minimum, and L1 rejects zero outputs) — but fail closed rather
+            // than unwrap, because this is value creation and an error must
+            // never become a silent credit.
             // Remove any stale pending entry for the same deposit first: it was
-            // detected immature and is now credited, and `pending` must describe
-            // exactly the uncredited set.
+            // detected immature and is now credited, and `pending` must
+            // describe exactly the uncredited set.
             self.pending.retain(|p| p.deposit.id() != id);
             if self
                 .state
@@ -218,7 +248,7 @@ impl ChainL2 {
                 self.deposits_applied += 1;
             }
         } else {
-            // Detected but not final-deep: visible, not spendable. Recorded
+            // Detected but not yet safe: visible, not spendable. Recorded
             // once — a re-scan of the same block (incremental re-sync after a
             // restart of the loop, never a reorg, which replays) must not stack
             // duplicate pending entries.
@@ -281,12 +311,40 @@ impl ChainL2 {
         self.deposits_applied
     }
 
-    /// Whether any pending deposit reaches maturity at `tip`. The node's
-    /// incremental path calls this after extending the tip: a matured pending
-    /// deposit lives in an old block that incremental sync never re-scans, so
-    /// `true` means rebuild by full replay (which evaluates every deposit at
-    /// the new tip) instead of extending.
-    pub fn has_pending_matured(&self, tip: u64) -> bool {
-        self.pending.iter().any(|p| tip >= p.matures_at)
+    /// Whether any pending deposit is now spendable under **both** Decision 15
+    /// conditions (depth and binding finality). The node's incremental path
+    /// calls this after extending the tip *and* after a checkpoint moves the
+    /// binding floor: either event can mature a pending deposit that lives in
+    /// an old block the incremental path never re-scans, so `true` means
+    /// rebuild by full replay (which evaluates every deposit against both
+    /// conditions) instead of extending.
+    pub fn has_pending_matured(&self, tip: u64, binding_finalized: u64) -> bool {
+        self.pending.iter().any(|p| {
+            deposit_is_spendable(
+                &p.deposit,
+                tip,
+                binding_finalized,
+                self.deposits.maturity_depth,
+            )
+        })
     }
+}
+
+/// The two safety conditions for spendability (Decision 15): depth over the
+/// tip, and — once binding finality has activated — the deposit's own height at
+/// or below the binding-finalized height. `binding == 0` means binding finality
+/// has never activated on this chain, in which case the M3 depth rule governs
+/// alone, exactly as before.
+///
+/// A deposit becomes spendable only when BOTH required conditions hold, so
+/// this can only ever be stricter than the depth rule, never weaker.
+fn deposit_is_spendable(
+    d: &DetectedDeposit,
+    tip: u64,
+    binding_finalized: u64,
+    maturity_depth: u64,
+) -> bool {
+    let depth_ok = tip >= d.matures_at(maturity_depth);
+    let binding_ok = binding_finalized == 0 || d.height <= binding_finalized;
+    depth_ok && binding_ok
 }

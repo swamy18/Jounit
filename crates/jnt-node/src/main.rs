@@ -297,6 +297,18 @@ impl Store {
                     .ok_or_else(|| format!("store has no block at canonical height {h}"))?;
                 chain.submit(block).map_err(|e| e.to_string())?;
             }
+            // Binding finality (Decision 12) survives restart: restore the
+            // persisted point, but only onto the exact canonical block the
+            // chain just replayed — `restore_finality` refuses anything else,
+            // so a stale or forged metadata row cannot finalize a block the
+            // chain does not hold.
+            if let Some((fh, fhash)) = bs.finalized() {
+                if !chain.restore_finality(fh, fhash) {
+                    return Err(format!(
+                        "persisted finalized point {fh} does not match the canonical chain"
+                    ));
+                }
+            }
         }
         Ok(chain)
     }
@@ -348,6 +360,31 @@ impl Store {
         });
         let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
         fs::write(self.meta_path(), text).map_err(|e| e.to_string())
+    }
+
+    /// Persist the chain's binding-finalized point if it advanced (Decision 12).
+    ///
+    /// A checkpoint moves finality without moving the tip, so this runs on its
+    /// own condition, not on the height-change condition. Blocks are saved
+    /// first — a finalized height must always be provable from stored history.
+    /// Idempotent: an unchanged point is a no-op, and the store refuses any
+    /// regressing or conflicting write.
+    fn persist_finality(&mut self, chain: &Chain) -> Result<(), String> {
+        let Some((fh, fhash)) = chain.finalized_point() else {
+            return Ok(());
+        };
+        let bs = self.ensure_block_store()?;
+        if bs.finalized() == Some((fh, fhash)) {
+            return Ok(());
+        }
+        if bs.tip().1 < fh {
+            // The blocks below the finalized height are not stored yet (a
+            // checkpoint arrived in the same batch as the blocks it finalizes).
+            // Save them first; `set_finalized` proves against stored history.
+            self.save_chain(chain)?;
+        }
+        let bs = self.ensure_block_store()?;
+        bs.set_finalized(fh, fhash).map_err(|e| e.to_string())
     }
 }
 
@@ -1043,10 +1080,6 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // distrust; see `docs/status.md`.
     let mut pool = Mempool::default();
     let mut relay = RelayManager::new();
-    // M4 finality observation (Decision 11). Non-binding: records what the
-    // declared committee signs. On `mainnet` the committee is empty until the
-    // testnet standup, so every checkpoint fails closed.
-    let mut finality = jnt_core::finality::FinalityManager::new(&store.params);
     let mut pool_cursor = chain.height();
     let mut relay_seen = (0u64, 0u64);
     // L2 follows the tip the same way after a restart as on first boot: replay
@@ -1108,7 +1141,6 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 pool: &mut pool,
                 syncer: &mut syncer,
                 relay: &mut relay,
-                finality: &mut finality,
             },
             Some(now_ms()),
         );
@@ -1184,6 +1216,12 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             store.save_chain(&chain).ok();
             store.write_meta(&chain).ok();
         }
+        // Binding finality can advance without a height change (a certificate
+        // over a height the chain already holds), so it persists on its own
+        // condition. Silent on failure like the writes above: this is a
+        // durability optimization — consensus state lives in memory — and a
+        // lost write means a restart re-derives less finality, never more.
+        store.persist_finality(&chain).ok();
 
         if interval_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));

@@ -13,7 +13,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use jnt_core::chain::Chain;
-use jnt_core::finality::FinalityManager;
 use jnt_core::hash::Hash;
 use jnt_core::mempool::{Mempool, MempoolError};
 use jnt_core::params::NetworkParams;
@@ -130,9 +129,6 @@ pub struct NodeState<'a> {
     pub pool: &'a mut Mempool,
     pub syncer: &'a mut SyncManager,
     pub relay: &'a mut RelayManager,
-    /// M4 finality observation (Decision 11). Non-binding: records what the
-    /// committee signed, never gates block acceptance.
-    pub finality: &'a mut FinalityManager,
 }
 
 impl<'a> NodeState<'a> {
@@ -146,7 +142,6 @@ impl<'a> NodeState<'a> {
             pool: self.pool,
             syncer: self.syncer,
             relay: self.relay,
-            finality: self.finality,
         }
     }
 }
@@ -527,7 +522,6 @@ impl P2pNode {
             pool,
             syncer,
             relay,
-            finality,
         } = state;
         match msg {
             Message::GetBlocks { locator, stop } => {
@@ -687,12 +681,14 @@ impl P2pNode {
                 // Ignored per spec
             }
             Message::Checkpoint(cp) => {
-                // M4 finality observation (Decision 11). Non-binding: on a
-                // valid certificate we record the height and relay it to other
-                // peers; we never refuse a block because of it. `RealBls` is
-                // the pairing-checked verifier, so a forged aggregate is
+                // M5 binding finality (Decisions 12/14). Apply the certificate
+                // through the chain, which verifies it, binds it to the
+                // canonical block at its height, and records any conflict
+                // evidence. On acceptance we relay it; on any rejection we do
+                // not — a bad or conflicting certificate must not propagate.
+                // `RealBls` is pairing-checked, so a forged aggregate is
                 // rejected here rather than merely counted.
-                if finality.observe(&cp, &jnt_core::bls::RealBls).is_ok() {
+                if chain.apply_checkpoint(&cp, &jnt_core::bls::RealBls).is_ok() {
                     let peers = self.peers.lock().unwrap();
                     for (id, peer) in peers.iter() {
                         if *id != peer_id {

@@ -14,6 +14,7 @@ use crate::block::{genesis_block, Block, Header};
 use crate::difficulty::{next_difficulty, validate_local_clock, validate_timestamp};
 use crate::error::{Error, Result};
 use crate::fees::{next_base_fee, split_fees, FeeSplit};
+use crate::finality::{FinalityError, FinalityManager};
 use crate::hash::{Hash, DOM_BLOCK};
 use crate::ledger::{check_tx, Undo, Utxo, UtxoSet};
 use crate::mempool::{Mempool, ReconcileReport};
@@ -69,6 +70,11 @@ pub struct Chain {
     /// still contains, and the pool would then relay an unmineable duplicate of
     /// a confirmed transaction.
     disconnected_txs: Vec<Transaction>,
+    /// M5 binding finality (Decisions 12/14, SPEC.md §14.8). Observation before
+    /// activation; once activated, `adopt()` refuses to rewrite finalized
+    /// history. Restored from the store on load, never re-derived from blocks
+    /// (see `restore_finality`).
+    finality: FinalityManager,
 }
 
 impl Chain {
@@ -96,7 +102,9 @@ impl Chain {
             pscb_reserve: 0,
             pscb_undo: HashMap::new(),
             disconnected_txs: Vec::new(),
+            finality: FinalityManager::default(),
         };
+        chain.finality = FinalityManager::new(&chain.params);
         chain.blocks.insert(hash, genesis.clone());
         chain.work.insert(hash, genesis.header.difficulty);
         // Genesis mints nothing, so the UTXO set stays empty; only the block
@@ -159,8 +167,71 @@ impl Chain {
     }
 
     /// Height below which history is immutable.
+    ///
+    /// The stronger of the depth rule and any binding checkpoint finality
+    /// (Decision 12): before activation this is exactly the old depth rule, so
+    /// pre-M5 behavior is unchanged; after a checkpoint finalizes at H it is
+    /// at least H. `adopt()` consults this, which is what makes checkpoints
+    /// binding rather than merely observed.
     pub fn finalized_height(&self) -> u64 {
-        self.height().saturating_sub(self.params.finality_depth)
+        self.height()
+            .saturating_sub(self.params.finality_depth)
+            .max(self.finality.binding_finalized_height())
+    }
+
+    /// The binding-finality manager (Decisions 12/14). Read-only inspection;
+    /// checkpoints are applied through [`Chain::apply_checkpoint`].
+    pub fn finality(&self) -> &FinalityManager {
+        &self.finality
+    }
+
+    /// Apply a verified checkpoint certificate, updating observed and binding
+    /// finality. Returns the accepted point or a named rejection; a rejection
+    /// never changes consensus state.
+    ///
+    /// The certificate must name the block this chain holds canonically at its
+    /// height; a valid signature over a non-canonical or future block is
+    /// refused (`NotCanonical`). Passing a height already finalized to a
+    /// *different* hash is refused as conflicting finality and retained as
+    /// evidence (Decision 14).
+    pub fn apply_checkpoint(
+        &mut self,
+        checkpoint: &crate::bls_checkpoint::Checkpoint,
+        verify: &dyn crate::bls_checkpoint::BlsVerifier,
+    ) -> std::result::Result<(), FinalityError> {
+        let height = checkpoint.payload.height;
+        // The canonical hash this node holds at that height, if any. Fetch
+        // before borrowing `finality` mutably.
+        let canonical = self.block_hash_at(height);
+        self.finality.accept(checkpoint, canonical, verify)
+    }
+
+    /// Restore the binding-finalized point after a restart.
+    ///
+    /// Only installs it if this chain actually holds that exact block
+    /// canonically at that height — a stale or forged metadata row cannot
+    /// finalize a block the chain does not have. Returns whether it was
+    /// installed.
+    pub fn restore_finality(&mut self, height: u64, hash: Hash) -> bool {
+        if height == 0 {
+            return false;
+        }
+        if self.block_hash_at(height) != Some(hash) {
+            return false;
+        }
+        self.finality.restore_finalized(height, hash);
+        true
+    }
+
+    /// The `(height, hash)` of the binding-finalized point, for persistence.
+    /// `None` when binding finality has not activated or has not advanced.
+    pub fn finalized_point(&self) -> Option<(u64, Hash)> {
+        let h = self.finality.binding_finalized_height();
+        if h == 0 {
+            None
+        } else {
+            Some((h, self.finality.binding_finalized_hash()))
+        }
     }
 
     /// Store size above which side-branch pruning runs. Sized off the finality

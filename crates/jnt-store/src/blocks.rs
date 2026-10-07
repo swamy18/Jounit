@@ -195,6 +195,50 @@ impl BlockStore {
         (self.meta.tip, self.meta.height)
     }
 
+    /// The persisted binding-finalized point, or `None` when no checkpoint has
+    /// ever finalized (Decision 12).
+    pub fn finalized(&self) -> Option<(u64, Hash)> {
+        if self.meta.finalized_height == 0 {
+            None
+        } else {
+            Some((self.meta.finalized_height, self.meta.finalized_hash))
+        }
+    }
+
+    /// Persist the binding-finalized point (Decision 12), fail-closed.
+    ///
+    /// Refused unless the store itself proves the claim: the height must be at
+    /// or below the stored tip and the stored canonical block at that height
+    /// must hash to `hash`. A finalized height can never move backwards or to a
+    /// different hash — that would "un-finalize" history the node already
+    /// committed to, which is precisely the transition this exists to prevent.
+    pub fn set_finalized(&mut self, height: u64, hash: Hash) -> Result<(), StoreError> {
+        if height == 0 || height > self.meta.height {
+            return Err(StoreError::BadMeta {
+                detail: "finalized height must be within the stored chain".into(),
+            });
+        }
+        if self.hash_at_height(height) != Some(hash) {
+            return Err(StoreError::BadMeta {
+                detail: "finalized hash is not the stored canonical block".into(),
+            });
+        }
+        if height < self.meta.finalized_height {
+            return Err(StoreError::BadMeta {
+                detail: "finalized height cannot move backwards".into(),
+            });
+        }
+        if self.meta.finalized_height == height && self.meta.finalized_hash != hash {
+            return Err(StoreError::BadMeta {
+                detail: "conflicting finalized hash at an already-final height".into(),
+            });
+        }
+        self.meta.finalized_height = height;
+        self.meta.finalized_hash = hash;
+        self.meta_file.save(&self.meta)?;
+        Ok(())
+    }
+
     /// Look up a block by its hash.
     ///
     /// Reads are bounded by the record's own length, which was itself bounded at
