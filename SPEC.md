@@ -2049,12 +2049,12 @@ regression tests assert that over every public error and debug path.
 
 ---
 
-## 19. Phase 6: L1↔L2 integration (specified in three parts)
+## 19. Phase 6: L1↔L2 integration (specified in four parts)
 
 §15.9 left "how L2 transactions reach a block" deliberately unspecified. This
-section specifies it. **§19.1 and §19.4 describe behaviour that is implemented
-and tested; §19.2 and §19.3 are specified but not yet built**, and are marked
-so rather than being folded in with the implemented part.
+section specifies it. **§19.1, §19.4 and §19.5 describe behaviour that is
+implemented and tested; §19.2 and §19.3 are specified but not yet built**, and
+are marked so rather than being folded in with the implemented part.
 
 ### 19.1 L2 transactions in L1 blocks — IMPLEMENTED, normative
 
@@ -2222,3 +2222,75 @@ l2_escrow_address}` + `validate` (gap-fit and shape rules),
 `jnt_l2::genesis::L2Genesis` (allocation view), `L2State::{apply_genesis,
 funded_total, check_conservation}`, `ChainL2::{empty, replay}` (genesis-first
 construction), `jnt-node verify` (joint conservation checks).
+
+### 19.5 User L1 → L2 deposits (Decision 10) — IMPLEMENTED, normative
+
+A STANDARD L1 payment carrying an output to the deposit sink is a deposit. L1
+validates it as a payment like any other — no L1 rule changed, no new
+transaction type — and L2 replay reads the deposit out of the accepted block.
+
+**Sink.** `SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]`
+(`NetworkParams::l2_deposit_sink`): deterministic per profile, distinct from
+the escrow identity, holding no key. Another network's sink on this chain is
+an ordinary burn.
+
+**Recipient.** The common owner of the transaction's inputs, each read as its
+input key bundle's address — which L1 consensus already proved equals the
+spent UTXO's owner, so replay derives ownership without re-verifying
+signatures and without UTXO history. Inputs with different owners, and
+coinbase transactions, are not deposits: the value stays burned, nothing is
+credited, and the refusal is recorded with its reason. There is no
+third-party recipient in M3: the depositor funds only itself.
+
+**Amount.** Exactly the sink output's satoshis, 1:1, no rate and no fee on the
+credit itself. Each sink output is an independent deposit. Outputs below the
+per-output minimum (1,000,000 sat both profiles,
+`NetworkParams::l2_deposit_minimum_sat`) stay burned. A claimed amount is
+never trusted: the credited value is read from the committed output.
+
+**Replay identity.** `(txid, output_index)`, tracked in a consumed set in
+`L2State`. The same bytes in a later block credit once; the second occurrence
+is refused as a duplicate. Restart and reorg re-derive the set from the
+winning chain.
+
+**Maturity.** Detected at acceptance, spendable once the carrying block is
+final by the existing depth rule: `tip − deposit_height ≥ finality_depth` (20
+on `mini`, 100 on `mainnet`). No new finality mechanism exists and none was
+invented. Before maturity the deposit is pending (visible via
+`pending_deposits`, not spendable). A consequence worth stating plainly: a
+matured deposit sits below the finality line, so consensus already makes it as
+irremovable as its block — tying maturity to finality depth is what makes
+reorg-removal of credited deposits unrepresentable except through a finality
+violation, which L1 refuses on its own.
+
+**Processing order.** Per block: clock, then L2 transactions in order, then
+detected deposits in output order. Maturity is evaluated against the tip:
+full replay evaluates every deposit at the final tip, while the incremental
+path evaluates new blocks at the new tip and rebuilds by full replay when an
+old pending deposit matures (it never re-scans old blocks, so extending would
+leave the deposit pending forever while a replay would credit it).
+
+**Conservation.** Per deposit, L1 sink value equals L2 credited value. Globally
+the M2 joint check grows a sink term, because sink outputs remain in the L1
+UTXO set while their twins live in L2: `L1 live + L2 held − sink-held ≤ cap`.
+Without the term every deposit would read as inflation; with it the sum is
+constant across deposits and falls on burns.
+
+**Failure behaviour.** Ineligible sink outputs (mixed owners, dust) are burns
+without credit, recorded with named reasons. Duplicates are refused by name.
+Unfunded L2 accounts are still refused with `InsufficientBalance`. No deposit
+rule is an L1 block rule: funding changes what applies, never what is
+accepted.
+
+**Exits.** None exist. Deposits without exits trap user funds in L2, so this
+section makes *testnet* deposits functional while mainnet still requires a
+separate exit decision and implementation. Nothing here may be read as
+mainnet readiness.
+
+**Implementations.** `NetworkParams::{l2_deposit_sink, l2_deposit_minimum_sat}`
++ `validate`, `jnt_l2::deposits::{DepositParams, scan_block, DetectedDeposit,
+PendingDeposit, IgnoredDeposit}` (detection is a pure function of one block),
+`L2State::{apply_deposit, deposited_total, deposit_credited}`,
+`ChainL2::{pending_deposits, ignored_deposits, has_pending_matured}`,
+`jnt-node` sync (maturation-triggered replay) + `status`/`verify` (deposit
+pipeline and sink-aware joint check).

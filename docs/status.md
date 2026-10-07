@@ -1270,3 +1270,59 @@ workspace-wide; release build clean; 13 fuzz targets compile; sim suite clean.
 Decision 7 — needs its own decision before mainnet), M3 transport, M4
 committee + finality, M5 testnet. No claim of testnet, finality, or mainnet
 readiness.
+
+---
+
+## Phase 6 — M3 user deposits (Decision 10, burn-to-sink overlay): SHIPPED — 2026-10-07
+
+M3 was gated on a decision Decision 7 explicitly withheld, so it began with an
+audit that stopped with zero implementation changes. The audit recommended the
+burn-to-sink overlay; Decision 10 (recorded in `docs/decisions.md` before any
+M3 code) authorises it with seven explicit parameters. This builds exactly
+that — nothing more.
+
+**The mechanism.** An ordinary STANDARD payment to the params-derived sink
+(`SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]`, distinct from the
+escrow identity, network-bound) is interpreted by L2 replay as a deposit. No
+new L1 transaction type; L1 consensus, layouts, fees, issuance and cap rules
+all untouched. Recipient = common input owner derived from key bundles (which
+L1 already proved equal the UTXO owners); mixed owners and coinbases are burns
+without credit. Amount = exact sink output satoshis, 1:1, per-output minimum
+1,000,000 sat both profiles. Maturity = `tip − height ≥ finality_depth`
+(mini 20, mainnet 100): pending before, spendable after, using the existing
+depth finality — no new finality invented. Identity = `(txid, index)` in a
+state consumed set: credited once, ever. A matured deposit sits below the
+finality line, so it is as irremovable as its block by existing consensus.
+
+**Processing.** Detection is a pure function of one block
+(`jnt_l2::deposits::scan_block`); crediting is `L2State::apply_deposit`
+(exactly-once, counted into `funded_total` and `deposited_total`);
+`ChainL2` evaluates maturity against the tip and exposes pending/ignored;
+`NodeL2` rebuilds by full replay when an old pending deposit matures
+(incremental never re-scans old blocks). Restart and reorg re-derive
+everything: no persisted deposit record exists to go stale, duplicate, or
+survive its block.
+
+**Conservation.** The M2 joint check grew its sink term (sink outputs stay in
+the L1 UTXO set while their twins live in L2):
+`L1 live + L2 held − sink-held ≤ cap`, asserted by `verify` alongside
+`funded == escrow + deposits` and self-checked conservation. `verify` also
+names pending (with spendable height) and ignored (with reason) deposits.
+
+**Tests:** 22 new (553 → 575): 1 params (sink determinism/binding/minimum),
+9 L2 scan/apply/maturity incl. double-absorption, 12 node e2e + attacks
+(end-to-end deposit→post→restart-identical; mixed owners; zero-amount and
+mutated rejected at L1 build; dust; wrong sinks silent; competing-branch
+single credit; two-output independence; unfunded still closed; pending-deposit
+reorg removal + winner re-credit exactly once; incremental/full agreement with
+pending; joint cap with live deposits). No new fuzz target: the scan consumes
+already-decoded transactions (no new codec); the `l2_state_apply` target is
+unaffected (custom-funded states, invariant intact).
+
+**Verified:** 575 workspace tests / 0 failed / 1 ignored; fmt clean;
+`clippy -D warnings` clean workspace-wide; release build clean; 13 fuzz
+targets compile; sim suite clean.
+
+**Still ahead, unchanged:** L2-to-L1 exits (no decision recorded — deposits
+without exits trap funds, so mainnet stays blocked by design), M4 committee +
+finality, M5 testnet. No claim of testnet, finality, or mainnet readiness.

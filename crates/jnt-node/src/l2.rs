@@ -52,7 +52,9 @@ use jnt_core::bls_checkpoint::ValidatorSet;
 use jnt_core::chain::Chain;
 use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
-use jnt_l2::{ChainL2, L2Config, L2Genesis, L2State, SkippedL2};
+use jnt_l2::{
+    ChainL2, DepositParams, IgnoredDeposit, L2Config, L2Genesis, L2State, PendingDeposit, SkippedL2,
+};
 
 /// L2 dispute-window parameters follow the L1 network profile: `mini` gets the
 /// short test window, every other profile gets production values. The bounty
@@ -122,6 +124,7 @@ pub struct NodeL2 {
     inner: ChainL2,
     config: L2Config,
     genesis: L2Genesis,
+    deposits: DepositParams,
     synced_tip: Option<Hash>,
     synced_height: u64,
 }
@@ -134,10 +137,12 @@ impl NodeL2 {
     pub fn fresh(params: &NetworkParams) -> Self {
         let config = config_for(params);
         let genesis = L2Genesis::for_params(params);
+        let deposits = DepositParams::for_params(params);
         NodeL2 {
-            inner: ChainL2::empty(config, &genesis),
+            inner: ChainL2::empty(config, &genesis, deposits),
             config,
             genesis,
+            deposits,
             synced_tip: None,
             synced_height: 0,
         }
@@ -152,13 +157,22 @@ impl NodeL2 {
     pub fn replay_from(chain: &Chain, params: &NetworkParams) -> Self {
         let config = config_for(params);
         let genesis = L2Genesis::for_params(params);
-        let inner = ChainL2::replay(chain, config, &genesis, &validator_set(), &RealBls);
+        let deposits = DepositParams::for_params(params);
+        let inner = ChainL2::replay(
+            chain,
+            config,
+            &genesis,
+            deposits,
+            &validator_set(),
+            &RealBls,
+        );
         let synced_height = inner.height();
         let synced_tip = Some(chain.tip_hash());
         NodeL2 {
             inner,
             config,
             genesis,
+            deposits,
             synced_tip,
             synced_height,
         }
@@ -198,13 +212,17 @@ impl NodeL2 {
         // Cloned, not borrowed: both replay arms replace `self.inner` while
         // naming the allocation to rebuild from.
         let genesis = self.genesis.clone();
+        let deposits = self.deposits;
 
         let outcome = if can_extend {
             let from = self.synced_height + 1;
             let mut missing = false;
             for h in from..=tip_height {
                 match chain.block_at(h) {
-                    Some(block) => self.inner.apply_block(block, &validator_set(), &RealBls),
+                    Some(block) => {
+                        self.inner
+                            .apply_block(block, tip_height, &validator_set(), &RealBls);
+                    }
                     None => {
                         missing = true;
                         break;
@@ -216,8 +234,29 @@ impl NodeL2 {
                 // height it has no block for). Incremental application would
                 // silently skip the hole, so fall back to replay, which fails
                 // loudly on the same inconsistency instead of papering over it.
-                self.inner =
-                    ChainL2::replay(chain, self.config, &genesis, &validator_set(), &RealBls);
+                self.inner = ChainL2::replay(
+                    chain,
+                    self.config,
+                    &genesis,
+                    deposits,
+                    &validator_set(),
+                    &RealBls,
+                );
+                SyncOutcome::FullReplay { blocks: tip_height }
+            } else if self.inner.has_pending_matured(tip_height) {
+                // A deposit detected in an old block just became final-deep.
+                // Incremental sync never re-scans old blocks, so extending
+                // would leave it pending forever while a replay would credit
+                // it — the two paths would diverge. Rebuild instead: replay
+                // evaluates every deposit at the new tip.
+                self.inner = ChainL2::replay(
+                    chain,
+                    self.config,
+                    &genesis,
+                    deposits,
+                    &validator_set(),
+                    &RealBls,
+                );
                 SyncOutcome::FullReplay { blocks: tip_height }
             } else {
                 SyncOutcome::Incremental {
@@ -225,7 +264,14 @@ impl NodeL2 {
                 }
             }
         } else {
-            self.inner = ChainL2::replay(chain, self.config, &genesis, &validator_set(), &RealBls);
+            self.inner = ChainL2::replay(
+                chain,
+                self.config,
+                &genesis,
+                deposits,
+                &validator_set(),
+                &RealBls,
+            );
             SyncOutcome::FullReplay { blocks: tip_height }
         };
 
@@ -249,9 +295,10 @@ impl NodeL2 {
     }
 
     /// Mutable access. Unit tests use this for custom-funded states; production
-    /// never funds post-genesis (Decision 7 defers deposits), so a production
-    /// state whose `funded_total` exceeds its genesis total proves an
-    /// unauthorized funding happened — and `verify` checks exactly that.
+    /// funds only through genesis and matured deposits (Decisions 7 and 10),
+    /// so a production state whose `funded_total` exceeds genesis plus
+    /// deposits proves an unauthorized funding happened — and `verify` checks
+    /// exactly that.
     pub fn state_mut(&mut self) -> &mut L2State {
         self.inner.state_mut()
     }
@@ -259,6 +306,11 @@ impl NodeL2 {
     /// The genesis allocation this view was built from.
     pub fn genesis(&self) -> &L2Genesis {
         &self.genesis
+    }
+
+    /// The deposit rules this view scans with.
+    pub fn deposit_params(&self) -> DepositParams {
+        self.deposits
     }
 
     /// L2 height replayed to — always a chain height, never ahead of it.
@@ -275,6 +327,21 @@ impl NodeL2 {
     /// Never a reason to reject a block.
     pub fn skipped(&self) -> &[SkippedL2] {
         self.inner.skipped()
+    }
+
+    /// Deposits detected but not yet final-deep: visible, not spendable.
+    pub fn pending_deposits(&self) -> &[PendingDeposit] {
+        self.inner.pending_deposits()
+    }
+
+    /// Sink outputs that credited nothing, with the named reason.
+    pub fn ignored_deposits(&self) -> &[IgnoredDeposit] {
+        self.inner.ignored_deposits()
+    }
+
+    /// Deposits credited (matured and applied).
+    pub fn deposits_applied_count(&self) -> u64 {
+        self.inner.deposits_applied_count()
     }
 
     /// Whether every replayed L2 transaction applied.
@@ -295,13 +362,18 @@ impl NodeL2 {
             applied: self.inner.applied_count(),
             skipped: self.inner.skipped().len(),
             clean: self.inner.is_clean(),
+            deposits_applied: self.inner.deposits_applied_count(),
+            deposits_pending: self.inner.pending_deposits().len(),
+            deposits_ignored: self.inner.ignored_deposits().len(),
+            deposited_sat: self.inner.state().deposited_total(),
         }
     }
 }
 
 /// The minimum the node reports so an operator can verify L2 processing
 /// actually happened: which height was replayed to, how much applied, how much
-/// was refused and why (the reasons live in [`NodeL2::skipped`]).
+/// was refused and why (the reasons live in [`NodeL2::skipped`]), plus the
+/// deposit pipeline (credited, pending maturity, refused with reason).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L2Status {
     pub chain_height: u64,
@@ -309,4 +381,8 @@ pub struct L2Status {
     pub applied: u64,
     pub skipped: usize,
     pub clean: bool,
+    pub deposits_applied: u64,
+    pub deposits_pending: usize,
+    pub deposits_ignored: usize,
+    pub deposited_sat: u64,
 }

@@ -16,7 +16,7 @@ use jnt_core::params::NetworkParams;
 use jnt_core::wallet::Wallet;
 use jnt_core::Address;
 
-use jnt_l2::{ChainL2, L2Config, L2Error, L2Genesis, L2State};
+use jnt_l2::{ChainL2, DepositParams, L2Config, L2Error, L2Genesis, L2State};
 
 const MAX_ATTEMPTS: u64 = 4_000_000;
 
@@ -99,10 +99,14 @@ fn replay(chain: &Chain) -> ChainL2 {
     // Empty genesis, deliberately: these tests pin the M1 unfunded behaviour
     // (every payload refused for insufficient balance). Funded replay is
     // covered by `genesis_funding.rs` and the node integration tests.
+    // Real deposit params: no test block pays the sink, so no deposit is ever
+    // detected and the M1 assertions stand unchanged.
+    let deposits = DepositParams::for_params(&NetworkParams::mini());
     ChainL2::replay(
         chain,
         L2Config::mini(),
         &L2Genesis::empty(),
+        deposits,
         &set,
         &verifier,
     )
@@ -130,10 +134,15 @@ fn full_replay_equals_incremental_application() {
     let full = replay(&chain);
 
     let (set, verifier) = empty_set();
-    let mut incremental = ChainL2::empty(L2Config::mini(), &L2Genesis::empty());
-    for h in 1..=chain.height() {
+    let deposits = DepositParams::for_params(&NetworkParams::mini());
+    let mut incremental = ChainL2::empty(L2Config::mini(), &L2Genesis::empty(), deposits);
+    // Evaluated at the final tip, exactly as full replay evaluates every
+    // block: with no sink outputs present the tip value is moot, but the call
+    // must still name the tip maturity is measured against.
+    let tip = chain.height();
+    for h in 1..=tip {
         let block = chain.block_at(h).unwrap();
-        incremental.apply_block(block, &set, &verifier);
+        incremental.apply_block(block, tip, &set, &verifier);
     }
 
     assert_eq!(

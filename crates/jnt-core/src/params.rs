@@ -15,6 +15,17 @@ pub const SAT_PER_JNT: u64 = 100_000_000;
 /// only by protocol rule, never by signature.
 pub const DOM_L2_ESCROW: &[u8] = b"jounit/l2-escrow/v1";
 
+/// Domain tag for the L2 deposit sink (Decision 10, SPEC.md §19.5). A distinct
+/// tag from the escrow identity so the two can never coincide; a sink output
+/// is an ordinary L1 payment that L2 replay interprets as a deposit.
+pub const DOM_L2_DEPOSIT_SINK: &[u8] = b"jounit/l2-deposit-sink/v1";
+
+/// Minimum deposit per sink output, in satoshis (Decision 10 item 3). A
+/// dust/bloat floor, not a fee: every credited deposit leaves permanent
+/// unspendable UTXO entries, so crediting dust would bloat both ledgers for
+/// free. Identical on both profiles — it is economic, not timing.
+pub const L2_DEPOSIT_MINIMUM_SAT: u64 = 1_000_000;
+
 /// Flat fee per L2 transaction type, in satoshis (decision D3).
 ///
 /// Flat **per type, not per byte.** A worker deciding whether to post a task has
@@ -124,6 +135,11 @@ pub struct NetworkParams {
     pub l2_genesis_escrow_sat: u64,
     /// Genesis-funded L2 accounts, paid out of `l2_genesis_escrow_sat`.
     pub l2_genesis_grants: Vec<L2GenesisGrant>,
+    /// Minimum deposit per sink output in satoshis (Decision 10, SPEC.md
+    /// §19.5). A per-profile field rather than the shared constant so a
+    /// future network can price its own dust floor without touching code —
+    /// but both shipped profiles carry the constant's value.
+    pub l2_deposit_minimum_sat: u64,
 }
 
 impl NetworkParams {
@@ -148,6 +164,22 @@ impl NetworkParams {
     /// a disbursement rule for it.
     pub fn l2_escrow_address(&self) -> Address {
         let digest: Hash = crate::hash::sha256_dom(DOM_L2_ESCROW, &[self.network_id.as_bytes()]);
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&digest[..20]);
+        out
+    }
+
+    /// The deposit sink: an ordinary address nobody can spend from (Decision
+    /// 10, SPEC.md §19.5).
+    ///
+    /// Derived exactly like the escrow identity but under its own domain tag,
+    /// so the two can never coincide, and bound to `network_id` so one
+    /// network's sink is another network's ordinary burn address. A STANDARD
+    /// payment here is valid L1 with no rule change; only L2 replay reads a
+    /// deposit into it.
+    pub fn l2_deposit_sink(&self) -> Address {
+        let digest: Hash =
+            crate::hash::sha256_dom(DOM_L2_DEPOSIT_SINK, &[self.network_id.as_bytes()]);
         let mut out = [0u8; 20];
         out.copy_from_slice(&digest[..20]);
         out
@@ -213,6 +245,7 @@ impl NetworkParams {
             // with the deposit mechanism, not as hard-coded allocations.
             l2_genesis_escrow_sat: 100_000 * SAT_PER_JNT,
             l2_genesis_grants: Vec::new(),
+            l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
         }
     }
 
@@ -266,6 +299,7 @@ impl NetworkParams {
                     amount_sat: SAT_PER_JNT,
                 },
             ],
+            l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
         }
     }
 
@@ -340,6 +374,11 @@ impl NetworkParams {
             return Err(Error::Malformed(
                 "l2 genesis escrow exceeds the unmintable supply gap",
             ));
+        }
+        // Deposit floor (Decision 10 item 3): a zero minimum would credit dust
+        // and let anyone bloat the UTXO set and L2 state for free.
+        if self.l2_deposit_minimum_sat == 0 {
+            return Err(Error::Malformed("l2_deposit_minimum_sat must be > 0"));
         }
         Ok(())
     }
@@ -558,6 +597,33 @@ mod tests {
         // Escrow above the gap is inflation against the cap.
         let mut p = good.clone();
         p.l2_genesis_escrow_sat = p.supply_cap_sat;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn l2_deposit_sink_is_deterministic_network_bound_and_not_escrow() {
+        let mini = NetworkParams::mini();
+        let main = NetworkParams::mainnet();
+        assert_eq!(mini.l2_deposit_sink(), mini.l2_deposit_sink());
+        // Bound to the network: a mainnet sink output on mini is a plain burn.
+        assert_ne!(mini.l2_deposit_sink(), main.l2_deposit_sink());
+        assert_ne!(mini.l2_deposit_sink(), [0u8; 20]);
+        // A distinct domain tag from the escrow identity, so the two can never
+        // coincide and a deposit can never fund the escrow by confusion.
+        assert_ne!(mini.l2_deposit_sink(), mini.l2_escrow_address());
+        assert_ne!(main.l2_deposit_sink(), main.l2_escrow_address());
+        // The minimum is the decided floor on both profiles.
+        assert_eq!(mini.l2_deposit_minimum_sat, L2_DEPOSIT_MINIMUM_SAT);
+        assert_eq!(main.l2_deposit_minimum_sat, L2_DEPOSIT_MINIMUM_SAT);
+        assert_eq!(L2_DEPOSIT_MINIMUM_SAT, 1_000_000);
+        // No grant may name the sink either: grants fund accounts, the sink
+        // only receives burns.
+        for g in &mini.l2_genesis_grants {
+            assert_ne!(g.address, mini.l2_deposit_sink());
+        }
+        // A zero floor admits dust: refused.
+        let mut p = mini.clone();
+        p.l2_deposit_minimum_sat = 0;
         assert!(p.validate().is_err());
     }
 }

@@ -371,11 +371,14 @@ fn jnt(sat: u64) -> String {
 fn print_l2_summary(l2: &NodeL2, chain: &Chain) {
     let s = l2.status(chain.height());
     println!(
-        "l2             height {}  applied {}  skipped {}{}",
+        "l2             height {}  applied {}  skipped {}{}  deposits {} credited / {} pending / {} ignored",
         s.l2_height,
         s.applied,
         s.skipped,
-        if s.clean { "" } else { " (see verify)" }
+        if s.clean { "" } else { " (see verify)" },
+        s.deposits_applied,
+        s.deposits_pending,
+        s.deposits_ignored,
     );
 }
 
@@ -737,6 +740,10 @@ fn cmd_status(args: &Args) -> Result<(), String> {
     if !ls.clean {
         println!("l2 replay      not clean (run verify for the named refusals)");
     }
+    println!(
+        "l2 deposits    {} credited ({} sat) / {} pending / {} ignored",
+        ls.deposits_applied, ls.deposited_sat, ls.deposits_pending, ls.deposits_ignored
+    );
 
     let wallets = store.load_wallets()?;
     if !wallets.is_empty() {
@@ -798,25 +805,43 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         a.applied_count(),
         a.skipped().len()
     );
-    // Joint conservation (Decision 7, SPEC.md §19.4): L2 holds at most its
-    // genesis escrow, and L1 live supply plus everything L2 ever held stays
-    // under the cap. Both are cheap, both are exact, and either failing means
-    // value was created — which must never print "ok".
+    // Joint conservation (Decisions 7 and 10, SPEC.md §19.4–§19.5): L2 holds
+    // at most genesis plus matured deposits, and L1 live supply plus
+    // everything L2 ever held, minus what sits identifiably in the deposit
+    // sink, stays under the cap. The sink term is the M3 correction: sink
+    // outputs remain in the L1 UTXO set (unspendable) while their twins live
+    // in L2, so counting both sides without subtracting the sink would cry
+    // inflation on every deposit. Burns anywhere move the sum down, never up —
+    // either check failing means value was created, which must never print
+    // "ok".
     if !a.state().check_conservation() {
         return Err("l2 conservation broken: released value exceeds value in the system".into());
     }
-    if a.state().funded_total() != a.genesis().escrow_total_sat {
-        return Err("l2 funding anomaly: released value differs from the genesis escrow".into());
+    let expected_funded = a
+        .genesis()
+        .escrow_total_sat
+        .saturating_add(a.state().deposited_total());
+    if a.state().funded_total() != expected_funded {
+        return Err("l2 funding anomaly: released value is not genesis plus deposits".into());
     }
+    let sink_held: u64 = chain
+        .utxo()
+        .outputs_for_address(&chain.params().l2_deposit_sink())
+        .iter()
+        .map(|(_, v)| v)
+        .sum();
     let joint = chain
         .utxo()
         .total_value()
-        .saturating_add(a.state().conservation_total());
+        .saturating_add(a.state().conservation_total())
+        .saturating_sub(sink_held);
     if joint > chain.params().supply_cap_sat {
-        return Err("joint supply exceeds the cap: L1 live plus L2 held is inflation".into());
+        return Err(
+            "joint supply exceeds the cap: L1 live plus L2 held minus sink is inflation".into(),
+        );
     }
     println!(
-        "ok: joint supply conserved (l1 live + l2 held = {} sat of {} cap)",
+        "ok: joint supply conserved (l1 live + l2 held - sink = {} sat of {} cap)",
         joint,
         chain.params().supply_cap_sat
     );
@@ -830,6 +855,32 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
     }
     if a.skipped().len() > 10 {
         println!("  ... and {} more", a.skipped().len() - 10);
+    }
+    for p in a.pending_deposits().iter().take(10) {
+        println!(
+            "  pending height {:>6}  {}:{}  {} sat (spendable at {})",
+            p.deposit.height,
+            &hash_to_hex(&p.deposit.txid)[..16],
+            p.deposit.index,
+            p.deposit.amount_sat,
+            p.matures_at
+        );
+    }
+    if a.pending_deposits().len() > 10 {
+        println!("  ... and {} more", a.pending_deposits().len() - 10);
+    }
+    for ig in a.ignored_deposits().iter().take(10) {
+        println!(
+            "  ignored height {:>6}  {}:{}  {} sat ({:?})",
+            ig.height,
+            &hash_to_hex(&ig.txid)[..16],
+            ig.index,
+            ig.amount_sat,
+            ig.reason
+        );
+    }
+    if a.ignored_deposits().len() > 10 {
+        println!("  ... and {} more", a.ignored_deposits().len() - 10);
     }
     Ok(())
 }

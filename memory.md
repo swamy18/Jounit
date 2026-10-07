@@ -3017,3 +3017,61 @@ that way.
   suite — all clean (counts confirmed in the verification run before push).
 - Next: M3 worker-node transport per Decision 9. Stop — do not start it
   automatically.
+
+# Working memory — session 20: Phase 6 M3 deposit audit (stopped at decision gate)
+
+## 88. Outcome: no implementation, by task design
+
+M3 STEPs 1–3 required an audit first and a stop if Decision 7 does not
+authorize user deposits. It does not — D7 says the deposit/exit mechanism "is
+not authorised by this decision". So per the M3 instructions: no protocol
+change, no new types, no code, no SPEC/decisions edits. Deliverable is the
+audit + design + options report (items 1–5 of STEP 3), given as the session's
+final message instead of a commit.
+
+## 89. Audit facts worth keeping
+
+- L1 is scriptless with two tx types; every input is sig-verified against its
+  UTXO owner; sighash commits all outputs; zero-value outputs rejected. A
+  STANDARD payment to an unspendable sink is valid L1 today with no rule
+  change — only L2 replay would need to interpret it (overlay, not new type).
+- L1 address == L2 address per wallet, so depositor==recipient needs no key
+  mapping; third-party funding would need an explicit recipient field (new
+  type territory).
+- Sink outputs would stay in the UTXO set forever (unspendable bloat) while
+  joint conservation still balances exactly.
+- Replay/reorg/restart safety comes free with derivation (replay the winner);
+  only user-facing finality (spend-now vs mature-first) is a rule choice.
+- Recommended path if owner proceeds: Option A (burn-to-sink overlay) as a
+  recorded Decision 10; Option C (defer to joint deposit+exit design) is the
+  safe fallback; Option B (new tx type) only if third-party deposits required.
+
+# Working memory — session 21: Phase 6 M3 deposits (Decision 10) implemented
+
+## 90. What was built
+
+- Decision 10 recorded first (7 items: sink, recipient, minimum, maturity,
+  replay identity, conservation, reorg), then built exactly: burn-to-sink
+  overlay, no new L1 type, no L1 rule change.
+- `NetworkParams::{l2_deposit_sink, l2_deposit_minimum_sat}` (1M sat floor both
+  profiles) + validate; `jnt-l2::deposits` (pure scan: common-owner rule, dust
+  and mixed-owner refusals with reasons); `L2State::{apply_deposit,
+  deposited_total, deposit_credited}` + `DuplicateDeposit` error;
+  `ChainL2` pending/ignored/maturation-at-tip + full-replay-on-maturation;
+  `NodeL2` carries deposit params; `verify` asserts funded==escrow+deposits
+  and the sink-aware joint cap; `status` shows the deposit pipeline.
+- Key design point found in testing: matured deposits sit below the finality
+  line, so reorg-removal of credited deposits is unrepresentable — the reorg
+  test targets pending deposits instead, which is the honest case.
+- Joint invariant corrected for deposits: `U + L2 − sink ≤ cap` (M2's form was
+  the S=0 special case); proven by test with live deposits.
+- Tests: 22 new (553 → 575). No new fuzz target (no new codec). No exit built
+  or decided (mainnet blocker, documented in SPEC §19.5 + status).
+
+## 91. State after this session
+
+- 575 workspace tests / 0 failed / 1 ignored; fmt, clippy `-D warnings`,
+  release build, 13 fuzz targets, sim suite — all clean (counts confirmed in
+  the verification run before push).
+- Next: per task order, STOP after M3. Do not start exits, committee,
+  finality, testnet, transport, chaos, or performance work.

@@ -108,6 +108,16 @@ pub struct L2State {
     /// enforced by flag: a second application is refused rather than
     /// double-funding every grant.
     genesis_applied: bool,
+    /// Deposit `(txid, output_index)` identities already credited (Decision 10
+    /// item 5, SPEC.md §19.5). The same L1 bytes in a later block hit this set
+    /// and are refused — replay protection for value that arrives via blocks
+    /// rather than via L2 transactions (which have the separate `applied` set).
+    deposits: HashSet<(Hash, u32)>,
+    /// Satoshis credited through deposits, append-only. Feeds `funded_total`
+    /// (every deposit credit counts there too) and lets `verify` prove
+    /// `funded == escrow + deposits` — i.e. no unauthorized funding — without
+    /// re-scanning blocks.
+    deposited_total: u64,
     /// Permanently destroyed satoshis (fees + failed-challenge and expiry burns).
     pub burned: u64,
     /// Protocol Security & Compute Buffer accrual from L2 fees (M1).
@@ -128,6 +138,8 @@ impl L2State {
             applied: HashSet::new(),
             funded_total: 0,
             genesis_applied: false,
+            deposits: HashSet::new(),
+            deposited_total: 0,
             burned: 0,
             pscb: 0,
             slash_vault: SlashVault::new(),
@@ -162,6 +174,46 @@ impl L2State {
     /// ad-hoc credits (unit tests).
     pub fn has_genesis(&self) -> bool {
         self.genesis_applied
+    }
+
+    /// Credit a detected L1 deposit: exactly the sink output's satoshis to the
+    /// common input owner, 1:1, no rate, no fee on the credit itself (Decision
+    /// 10 item 6).
+    ///
+    /// The caller (replay) guarantees maturity and detection; this enforces
+    /// exactly-once per `(txid, index)` and conservation. A duplicate is
+    /// refused by name rather than double-credited — the second occurrence of
+    /// the same L1 bytes is a replay, never a second deposit.
+    pub fn apply_deposit(
+        &mut self,
+        recipient: Address,
+        amount_sat: u64,
+        id: (Hash, u32),
+    ) -> L2Result<()> {
+        if self.deposits.contains(&id) {
+            return Err(L2Error::DuplicateDeposit);
+        }
+        if amount_sat == 0 {
+            return Err(L2Error::ZeroAmount("deposit"));
+        }
+        self.credit(recipient, amount_sat)?;
+        self.deposits.insert(id);
+        self.deposited_total = self
+            .deposited_total
+            .checked_add(amount_sat)
+            .ok_or(L2Error::Overflow)?;
+        Ok(())
+    }
+
+    /// Whether this deposit identity already credited.
+    pub fn deposit_credited(&self, id: &(Hash, u32)) -> bool {
+        self.deposits.contains(id)
+    }
+
+    /// Satoshis credited through deposits. `funded_total` always equals the
+    /// genesis release plus this — anything else is invented money.
+    pub fn deposited_total(&self) -> u64 {
+        self.deposited_total
     }
 
     pub fn config(&self) -> L2Config {

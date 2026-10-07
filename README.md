@@ -18,8 +18,10 @@ without weakening the security a hash chain depends on.
 > block (`status`/`verify` surface it). M2 funds L2 from a genesis escrow
 > (**SPEC.md §19.4**): `mini` grants three operator identities, the remainder
 > parks with a derived protocol escrow, and `verify` proves joint L1+L2 supply
-> stays under the cap. Still ahead:
-> user deposits and L2-to-L1 exits, the worker-node transport, the genesis
+> stays under the cap. M3 adds user deposits (**SPEC.md §19.5**): an ordinary
+> L1 payment to a derived sink credits the depositor after finality depth, 1:1
+> with no new transaction type; exits are still ahead, so mainnet is not ready.
+> Still ahead: L2-to-L1 exits, the worker-node transport, the genesis
 > validator committee and binding finality. Read [Status](#status).
 
 ---

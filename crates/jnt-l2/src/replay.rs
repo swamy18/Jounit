@@ -15,11 +15,19 @@
 //! # The one ordering rule
 //!
 //! For each height, the clock advances first (`L2State::advance_block`), then
-//! the block's own L2 transactions are applied in block order. That order is
+//! the block's own L2 transactions are applied in block order, then the
+//! block's detected deposits are processed in output order. That order is
 //! fixed and stated once, because two nodes must agree on whether a transaction
 //! that lands on the same height as an expiry sees the task open or expired.
 //! Vesting and expiry happen *at* the height; the block's transactions then act
-//! on the result.
+//! on the result. Deposits credit recipient accounts, never tasks, so their
+//! position after the transactions is observable only in balances.
+//!
+//! Deposit maturity is evaluated against the *tip*, not the block: a deposit
+//! detected at height `h` credits once `tip − h ≥ finality_depth`. Full replay
+//! evaluates every deposit at the final tip; the incremental path evaluates new
+//! blocks at the new tip and rebuilds by full replay when an old pending
+//! deposit matures (`has_pending_matured`), so the two paths cannot disagree.
 //!
 //! # What replay does with a transaction that does not apply
 //!
@@ -34,9 +42,11 @@
 
 use jnt_core::bls_checkpoint::{BlsVerifier, ValidatorSet};
 use jnt_core::chain::Chain;
-use jnt_core::l2::L2Transaction;
 use jnt_core::Hash;
 
+use crate::deposits::{
+    scan_block, DepositIgnoreReason, DepositParams, DetectedDeposit, IgnoredDeposit, PendingDeposit,
+};
 use crate::error::L2Error;
 use crate::genesis::L2Genesis;
 use crate::state::L2State;
@@ -62,6 +72,14 @@ pub struct ChainL2 {
     height: u64,
     applied: u64,
     skipped: Vec<SkippedL2>,
+    deposits: DepositParams,
+    /// Deposits detected but not yet final-deep: visible, not spendable
+    /// (Decision 10 item 4). Re-derived on every replay, never persisted.
+    pending: Vec<PendingDeposit>,
+    /// Sink outputs that credited nothing, with the named reason.
+    ignored: Vec<IgnoredDeposit>,
+    /// Deposits credited (matured and applied).
+    deposits_applied: u64,
 }
 
 impl ChainL2 {
@@ -76,7 +94,7 @@ impl ChainL2 {
     /// This is also the second half of the recovery story: `replay` and
     /// "start empty, then apply each block" must reach the same state, and a
     /// test asserts exactly that.
-    pub fn empty(config: L2Config, genesis: &L2Genesis) -> Self {
+    pub fn empty(config: L2Config, genesis: &L2Genesis, deposits: DepositParams) -> Self {
         let mut state = L2State::new(config);
         state
             .apply_genesis(genesis)
@@ -86,6 +104,10 @@ impl ChainL2 {
             height: 0,
             applied: 0,
             skipped: Vec::new(),
+            deposits,
+            pending: Vec::new(),
+            ignored: Vec::new(),
+            deposits_applied: 0,
         }
     }
 
@@ -99,18 +121,20 @@ impl ChainL2 {
         chain: &Chain,
         config: L2Config,
         genesis: &L2Genesis,
+        deposits: DepositParams,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) -> Self {
-        let mut l2 = ChainL2::empty(config, genesis);
-        for height in 1..=chain.height() {
+        let tip = chain.height();
+        let mut l2 = ChainL2::empty(config, genesis, deposits);
+        for height in 1..=tip {
             // `block_at` is total over 1..=height on a canonical chain. A
             // missing block would mean the chain is internally inconsistent,
             // which is a bug in `Chain`, not an input to route around here.
             let block = chain
                 .block_at(height)
                 .expect("canonical chain must have a block at every height up to its tip");
-            l2.absorb(height, &block.l2_txs, validators, verifier);
+            l2.absorb(height, block, tip, validators, verifier);
         }
         l2
     }
@@ -119,26 +143,30 @@ impl ChainL2 {
     /// used by a node that already holds state and is following the tip.
     ///
     /// `height` is taken from the block itself so the two paths cannot disagree
-    /// about which height a transaction was applied at.
+    /// about which height a transaction was applied at; `tip` is the chain tip
+    /// *after* this block, which is what deposit maturity is evaluated against
+    /// (Decision 10 item 4).
     pub fn apply_block(
         &mut self,
         block: &jnt_core::block::Block,
+        tip: u64,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) {
-        self.absorb(block.header.height, &block.l2_txs, validators, verifier);
+        self.absorb(block.header.height, block, tip, validators, verifier);
     }
 
     fn absorb(
         &mut self,
         height: u64,
-        l2_txs: &[L2Transaction],
+        block: &jnt_core::block::Block,
+        tip: u64,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) {
         // The clock first, then the block's transactions. See the module docs.
         self.state.advance_block(height);
-        for tx in l2_txs {
+        for tx in &block.l2_txs {
             match self.state.apply(tx, height, validators, verifier) {
                 Ok(_) => self.applied += 1,
                 Err(error) => self.skipped.push(SkippedL2 {
@@ -148,7 +176,59 @@ impl ChainL2 {
                 }),
             }
         }
+        // Deposits ride the same block in the same order: detection is a pure
+        // function of the block, maturity a pure function of the tip, and
+        // exactly-once comes from the state's consumed set.
+        let (detected, mut ignored) = scan_block(block, height, &self.deposits);
+        self.ignored.append(&mut ignored);
+        for d in detected {
+            self.absorb_deposit(d, tip);
+        }
         self.height = height;
+    }
+
+    fn absorb_deposit(&mut self, d: DetectedDeposit, tip: u64) {
+        let id = d.id();
+        if self.state.deposit_credited(&id) {
+            // Same bytes in an earlier block: refused by name, never twice.
+            self.ignored.push(IgnoredDeposit {
+                height: d.height,
+                txid: d.txid,
+                index: d.index,
+                amount_sat: d.amount_sat,
+                reason: DepositIgnoreReason::Duplicate,
+            });
+            return;
+        }
+        if tip >= d.matures_at(self.deposits.maturity_depth) {
+            // Mature: credit exactly the sink output's satoshis. `apply_deposit`
+            // cannot fail here — the id is fresh (checked above) and the amount
+            // is non-zero (the scan enforces the minimum, and L1 rejects zero
+            // outputs) — but fail closed rather than unwrap, because this is
+            // value creation and an error must never become a silent credit.
+            // Remove any stale pending entry for the same deposit first: it was
+            // detected immature and is now credited, and `pending` must describe
+            // exactly the uncredited set.
+            self.pending.retain(|p| p.deposit.id() != id);
+            if self
+                .state
+                .apply_deposit(d.recipient, d.amount_sat, id)
+                .is_ok()
+            {
+                self.deposits_applied += 1;
+            }
+        } else {
+            // Detected but not final-deep: visible, not spendable. Recorded
+            // once — a re-scan of the same block (incremental re-sync after a
+            // restart of the loop, never a reorg, which replays) must not stack
+            // duplicate pending entries.
+            if !self.pending.iter().any(|p| p.deposit.id() == id) {
+                self.pending.push(PendingDeposit {
+                    deposit: d,
+                    matures_at: d.matures_at(self.deposits.maturity_depth),
+                });
+            }
+        }
     }
 
     /// The replayed state. Compare two of these directly: equal means the two
@@ -183,5 +263,30 @@ impl ChainL2 {
     /// Whether every L2 transaction in every block applied.
     pub fn is_clean(&self) -> bool {
         self.skipped.is_empty()
+    }
+
+    /// Deposits detected but not yet final-deep: visible, not spendable.
+    pub fn pending_deposits(&self) -> &[PendingDeposit] {
+        &self.pending
+    }
+
+    /// Sink outputs that credited nothing, with the named reason, in block
+    /// order. Never a reason to reject a block.
+    pub fn ignored_deposits(&self) -> &[IgnoredDeposit] {
+        &self.ignored
+    }
+
+    /// Deposits credited (matured and applied).
+    pub fn deposits_applied_count(&self) -> u64 {
+        self.deposits_applied
+    }
+
+    /// Whether any pending deposit reaches maturity at `tip`. The node's
+    /// incremental path calls this after extending the tip: a matured pending
+    /// deposit lives in an old block that incremental sync never re-scans, so
+    /// `true` means rebuild by full replay (which evaluates every deposit at
+    /// the new tip) instead of extending.
+    pub fn has_pending_matured(&self, tip: u64) -> bool {
+        self.pending.iter().any(|p| tip >= p.matures_at)
     }
 }

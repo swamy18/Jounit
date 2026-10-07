@@ -576,3 +576,67 @@ discriminators.
 | 4 — Verified Work Certificates | DONE |
 | 5 — Worker SDK | DONE |
 | 6 — Testnet + finality activation | **IN PROGRESS** — STEP 0 audit done; D6–D9 decided, none built; finality still gated |
+
+---
+
+# Implementation status — Phase 6 M3 STEP 0 audit: deposits need a decision (2026-10-07)
+
+The M3 audit (no code changed) confirmed Decision 7 does **not** authorise user
+deposits: it calls the deposit/exit mechanism "a new L1 mechanism" that "is not
+authorised by this decision". The audit's recommended mechanism is Option A, a
+burn-to-sink overlay needing no L1 rule change and no new transaction type. The
+seven parameters below are the missing decision. They are recorded here before
+any M3 code, per the M3 instruction to stop until the decision is explicit.
+
+## Decision 10 — User L1 → L2 deposits via burn-to-sink overlay
+
+**Chosen: an ordinary STANDARD L1 payment to a params-derived unspendable sink
+is interpreted by L2 replay as a deposit. No new L1 transaction type; existing
+L1 machinery is unchanged.**
+
+1. **Sink derivation.** `SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]`
+   (`NetworkParams::l2_deposit_sink`). Deterministic per profile, distinct from
+   the escrow identity (different domain tag), holding no key. A different
+   network's sink on this chain is an ordinary burn, never a deposit.
+2. **Recipient derivation.** The common owner of the transaction's inputs, each
+   read as its input key bundle's address. L1 consensus already proves that
+   address equals the spent UTXO's owner (`verify_input` refuses anything
+   else), so replay derives ownership without re-verifying signatures and
+   without UTXO history. Inputs with different owners, and coinbase
+   transactions (unsigned inputs), are **not deposits**: the value stays burned
+   and nothing is credited. No third-party recipient field exists in M3.
+3. **Minimum deposit amount.** 1,000,000 sat (0.01 JNT) per sink output, both
+   profiles (`NetworkParams::l2_deposit_minimum_sat`). Below-minimum sink
+   outputs are burns without credit. Rationale: 50× the largest D3 fee, a
+   dust/bloat floor — every credited deposit leaves permanent unspendable UTXO
+   entries, so crediting dust would let anyone bloat both ledgers for free.
+4. **Maturity rule.** A deposit is *detected* when its block is accepted but
+   *credited* (spendable) only once the carrying block is final by the
+   existing depth rule: `tip_height − deposit_height ≥ finality_depth`
+   (20 on `mini`, 100 on `mainnet`). No new finality mechanism is introduced;
+   the rule reuses the finality depth every node already enforces. Before
+   maturity the deposit is pending (visible, not spendable); a reorg that
+   removes the block removes the deposit by re-derivation.
+5. **Replay identity.** `(txid, output_index)` of the sink output, tracked in a
+   consumed set in `L2State`. The same bytes in two blocks credit once; the
+   second occurrence is refused by name. Restart and reorg re-derive the set
+   from the winning chain, so no persisted record can go stale or duplicate.
+6. **Conservation rule.** Per deposit, exactly 1:1 — credited satoshis equal
+   the sink output's satoshis, no rate, no fee on the credit itself. Globally,
+   `L1 live supply + L2 held − sink-held supply ≤ supply cap`: sink outputs
+   stay in the L1 UTXO set (unspendable), so the M2 joint check grows a sink
+   term rather than breaking. Burns anywhere move the sum down, never up.
+7. **Reorg behavior.** Derived, never undone: the winning chain is replayed and
+   deposits are re-detected, re-matured and re-credited from it. A deposit on
+   the losing branch vanishes; one still present but no longer deep enough
+   returns to pending; one the winner shares is credited exactly once. No
+   phantom, double, or stale credit is representable.
+
+**Explicitly unchanged:** L1 consensus rules, the two L1 transaction types and
+their layouts, the monetary cap and issuance, fee rules, L2 transaction
+semantics, the M2 genesis allocation, finality activation.
+
+**Explicitly deferred (mainnet blocker):** L2→L1 exits. Deposits without exits
+trap user funds in L2, so M3 makes *testnet* deposits functional while mainnet
+still requires a separate exit decision and implementation. No exit decision is
+recorded here.

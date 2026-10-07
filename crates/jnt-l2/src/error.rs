@@ -71,6 +71,10 @@ pub enum L2Error {
     /// A genesis allocation is structurally invalid (duplicate grantee, grant
     /// to the escrow identity). The reason is stated.
     InvalidGenesis(&'static str),
+    /// A deposit `(txid, output_index)` already credited. The same L1 bytes in
+    /// a later block pay once; the second occurrence is refused by name
+    /// (Decision 10 item 5).
+    DuplicateDeposit,
     /// A codec failure raised by `jnt-core`.
     Codec(jnt_core::Error),
 }
@@ -122,6 +126,7 @@ impl fmt::Display for L2Error {
                 write!(f, "l2 genesis allocation already applied")
             }
             L2Error::InvalidGenesis(why) => write!(f, "invalid l2 genesis: {why}"),
+            L2Error::DuplicateDeposit => write!(f, "deposit already credited"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),
         }
     }
