@@ -2758,3 +2758,58 @@ carried from Phase 2), final SPEC reconciliation, mainnet config/launch.
 Binding finality only at the end, per Decision 2. Standing decisions
 unchanged: D3 fees, M1 50/50, §14.6 validator economics, payment as market
 price, no VWC revocation.
+
+# Working memory — session 16: Phase 5 verification and ship confirmation
+
+## 71. What this session was
+
+The user asked to "commit all work and push to git and update Readme, memory
+md" for Phase 5. Phase 5 had already been committed as `c43bdef` ("Phase 5:
+Worker SDK — jnt-worker (SPEC §18)") and pushed in the prior session, and
+README.md / memory.md / docs/status.md / docs/decisions.md were updated inside
+that same commit. So this session was a **verification pass**, not a rebuild —
+the goal was to prove the tree is clean and in sync and that the docs really
+describe Phase 5, and to record that proof.
+
+## 72. Results of the verification
+
+- `git status --short --branch` → `## main...origin/main` with **no** file
+  lines: working tree clean, branch in sync, nothing untracked.
+- `git log --oneline -1 origin/main` → `c43bdef`, i.e. the local tip and the
+  remote tip are the same commit. Nothing was left uncommitted, so there was
+  no new code to push.
+- README.md checked: line 12 (status note naming `jnt-worker`), line 61
+  (Worker SDK roadmap row, Phase 5 shipped), line 63 / 617 / 622 / 626 / 640
+  (fuzzing section now "thirteen targets" including `worker_flows`),
+  lines 144 / 163 (repository and crate layout rows for `crates/jnt-worker`).
+- memory.md checked: session 15 §64–70 present and complete (§64 what it
+  ships, §65 seams-not-sockets, §66 the reconcile bug + product fix, §67 the
+  15-test security suite, §68 the WSL ASan campaign, §69 the verified numbers,
+  §70 next work item = Phase 6).
+- docs/status.md ends with "Phase 5 — Worker SDK: SHIPPED
+  (`crates/jnt-worker`) — 2026-10-07"; docs/decisions.md ends with the
+  Phase-5 status section, Decision 5 (the two node seams instead of an
+  invented wire protocol) and the phase table marking Phase 5 DONE.
+
+## 73. The lesson worth keeping
+
+The request sounded like new work ("commit all work") but the work was
+already shipped. The right move was **not** to invent a change to have
+something to commit, and not to re-run the whole suite against an unchanged
+tree — it was to check the actual state (`git status`, `git log`,
+`git log origin/main`), read the files the user named, and report the truth.
+A commit is only warranted when the tree differs from the remote; when it does
+not, say so. The only edits this session were doc-accuracy ones: this record,
+and replacing "(this change)" in docs/decisions.md with the shipped commit
+`c43bdef`, because "this change" was written to describe an uncommitted diff
+and stopped being accurate the moment the commit landed.
+
+## 74. State after this session
+
+- `main` == `origin/main` == `c43bdef` (plus this documentation commit).
+- 500 workspace tests / 0 failed / 1 ignored; fmt and clippy `-D warnings`
+  clean; release build clean; six sim scripts rc=0; 13 fuzz targets compile.
+- Nothing blocked. Next work item unchanged: **Phase 6** — testnet + the
+  §18.3 seams' real REST/P2P transport + validator testing + chaos + the
+  `AmountTooSmallForFee` open question + mainnet readiness, with binding
+  finality activated only at the end (Decision 2).

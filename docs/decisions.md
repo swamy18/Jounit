@@ -102,6 +102,11 @@ crate tree (`jnt-core`, `jnt-net`, `jnt-store`, `jnt-node` — no `jnt-l2`,
 no `jnt-worker` yet). Verdict per phase, with only genuinely-missing work
 listed as remaining.
 
+> **This section is a dated snapshot — it records what was true on
+> 2026-10-06, and its "NOT STARTED" headings are deliberately left as written.**
+> For the current status of every phase, read the **Implementation status**
+> sections below, the last of which is authoritative.
+
 ## Phase 1 — L1 production-ready (Steps 1+2): **DONE**
 - Mempool (`mempool.rs`): byte-bounded, fee-rate ordered, conflict-checked,
   integrated into `Chain` (`mine_from_pool`, reorg re-admission). 20+ tests.
@@ -237,7 +242,7 @@ existing trait, but no checkpoint finalizes an L1 block.
 | Phase | Status |
 |---|---|
 | 1 — L1 production | DONE |
-| 2 — TaskContract + L2 txs | **DONE** (this change) |
+| 2 — TaskContract + L2 txs | **DONE** (commit `e3c0dab`) |
 | 3 — Dispute engine | NOT STARTED (needs the M3 CPU-reference spec note first) |
 | 4 — VWC issuance | NOT STARTED (needs Phase 3) |
 | 5 — Worker SDK | NOT STARTED (needs Phases 2+4) |
@@ -307,7 +312,7 @@ from elsewhere or the D3 schedule is re-parameterised.
 |---|---|
 | 1 — L1 production | DONE |
 | 2 — TaskContract + L2 txs | DONE |
-| 3 — Dispute engine + M2/M1 | **DONE** (this change) |
+| 3 — Dispute engine + M2/M1 | **DONE** (commit `bce55df`) |
 | 4 — VWC issuance | NOT STARTED (needs Phase 3 — now unblocked) |
 | 5 — Worker SDK | NOT STARTED (needs Phases 2+4) |
 | 6 — Testnet + finality activation | PREPARED, gated on 4–5 |
@@ -369,7 +374,7 @@ economics, binding finality only at the end of Phase 6.
 | 1 — L1 production | DONE |
 | 2 — TaskContract + L2 txs | DONE |
 | 3 — Dispute engine + M2/M1 | DONE |
-| 4 — Verified Work Certificates | **DONE** (this change) |
+| 4 — Verified Work Certificates | **DONE** (commit `64650fe`) |
 | 5 — Worker SDK | NOT STARTED (needs Phases 2+4 — now unblocked) |
 | 6 — Testnet + finality activation | PREPARED, gated on 5 |
 
@@ -424,5 +429,5 @@ above. SPEC.md §18 is the normative worker-facing text.
 | 2 — TaskContract + L2 txs | DONE |
 | 3 — Dispute engine + M2/M1 | DONE |
 | 4 — Verified Work Certificates | DONE |
-| 5 — Worker SDK | **DONE** (this change) |
+| 5 — Worker SDK | **DONE** (commit `c43bdef`) |
 | 6 — Testnet + finality activation | PREPARED, gated on 5 (now unblocked) |
