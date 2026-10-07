@@ -153,6 +153,15 @@ so "finality" today means "100 blocks deep", never "a BLS quorum signed it".
 Reconciling these into one authority (and deciding which one `finalized_height`
 reports) is part of M4. → proposal P3 in §4.
 
+> **M4 resolution (Decision 11).** F4's gap is closed *by scoping*, not by
+> building a stake ledger: with no bond path in Phase 6 (D8), the committee is a
+> fixed genesis list in `NetworkParams`. F5 is closed by `msg_type = 11
+> CHECKPOINT` (protocol v1, §13.5 additive). F6 is closed by making
+> `validators::validate_checkpoint_against_set` the single authority, with
+> `bls_checkpoint::verify_checkpoint` its inner primitive. `finalized_height`
+> deliberately still reports only the depth rule — M4 observes but does not
+> activate, so it must not report a BLS quorum it does not enforce.
+
 ### F7 — There is no testnet network profile  · classification: **config decision, low risk**
 
 `NetworkParams::by_name` accepts `"mainnet"` and `"mini"` and **explicitly
@@ -300,7 +309,7 @@ chronological ledger, so the repair is a pointer, not a rewrite.
 | M1 | L2 in the block pipeline | **DONE** (`SPEC.md` §19.1, commit pending). L2 txs carried per D6 (append-only trailer, absent when empty, so no vector or genesis change); the header's existing `merkle_root` commits to them under a distinct leaf tag, so the existing `MerkleRootMismatch` rule refuses stripped/altered sections and `Chain::submit` learns nothing new; `jnt_l2::replay::ChainL2` rebuilds state by replay (derived, not stored) and the incremental path is asserted equal to it; rejected payloads are skipped **by name** and stay retryable; `mine_block_with_l2` produces such blocks. Acceptance: two independent replays produce **equal `L2State`** (equality derived over all fields); full replay == incremental application; stripped section fails its own header. +13 tests (513 total). **Not** covered, by construction: funded accounts (M2) and validator quorum (M4) — pinned as such instead of pretended. | D6 |
 | M2 | Value bridge + fee accounting | per D7; conservation asserted across L1+L2; `AmountTooSmallForFee` resolved or explicitly re-documented; `split_flat_fee` unchanged | D7, D6 |
 | M3 | Worker↔node transport | per D11; seam conformance tests; auth, malformed-rejection, replay, idempotent retry, stale-state, restart/reconnect; no key material in logs/errors | D11, M1 |
-| M4 | Validator set + finality (non-binding) | per D8 + P2 + P3; set derivation from chain stake state; BLS sign/aggregate/verify; equivocation detection → full-bond M2 slash; persistence across restart; **finality visible but non-binding**; fuzz + chaos before any activation | D8 |
+| M4 | Validator set + finality (non-binding) | **DONE** (Decision 11, `SPEC.md` §14.7). Scoped per D8: no stake ledger, so a fixed genesis committee in `NetworkParams` (`mini` 4 test keys, `mainnet` empty → fail closed) instead of chain-state derivation; `validate_checkpoint_against_set` is the single authority; `FinalityManager` observes and reports; `msg_type = 11 CHECKPOINT` relays complete certificates (protocol v1, unfrozen-additive); bounded `Checkpoint`/`CheckpointPayload` deserialize. **Finality is visible but non-binding** — `Chain::submit`/fork choice untouched, reorg-crosses-checkpoint pinned by test. +13 tests (588 total) + `checkpoint_codec` fuzz target (14). Deferred to mainnet: bonded stake, unbonding, rewards, rotation, equivocation slashing. | D8, D11 |
 | M5 | Multi-node testnet | per P1; ≥3 nodes incl. validators; the 11 STEP-3 scenarios scripted and reproducible; chain sync, restart/recovery, L2 + worker + VWC + dispute flows | M1–M4 |
 | M6 | Adversarial + chaos | node/validator/worker/network attack matrix (STEP 5); every real bug: root cause → minimal fix → regression test → doc note | M5 |
 | M7 | Performance baseline | measured L1/L2/worker/network numbers (STEP 7) before any optimisation; document what is slow and why | M5 |

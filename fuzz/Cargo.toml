@@ -78,6 +78,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "checkpoint_codec"
+path = "fuzz_targets/checkpoint_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "meta_parse"
 path = "fuzz_targets/meta_parse.rs"
 test = false

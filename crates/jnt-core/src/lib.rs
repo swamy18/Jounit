@@ -25,6 +25,7 @@ pub mod compute_ir;
 pub mod difficulty;
 pub mod error;
 pub mod fees;
+pub mod finality;
 pub mod hash;
 pub mod hbm_pow;
 pub mod hexserde;

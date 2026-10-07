@@ -23,6 +23,7 @@ use jnt_core::bls_checkpoint::{
     verify_checkpoint, BlsPublicKey, BlsSignature, Checkpoint, CheckpointChain, CheckpointPayload,
     ValidatorSet,
 };
+use jnt_core::error::Error;
 use jnt_core::hash::sha256;
 
 /// Five fixed seeds; the same values appear in `bls.rs`'s unit tests, so the
@@ -93,7 +94,10 @@ fn quorum_short_by_one_is_rejected() {
     let indices: Vec<usize> = (0..need - 1).collect();
     let cp = signed_checkpoint(&c, payload(100, 10), &indices);
     let err = verify_checkpoint(&cp, &c.set, &RealBls).unwrap_err();
-    assert!(err.contains("signers"), "quorum failure must say so: {err}");
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "quorum failure must say so: {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -143,8 +147,8 @@ fn a_signer_count_that_lies_about_the_bitmap_is_rejected() {
     cp.signer_count = 4; // lie: bitmap says 3
     let err = verify_checkpoint(&cp, &c.set, &RealBls).unwrap_err();
     assert!(
-        err.contains("bitmap yields"),
-        "mismatch must be named: {err}"
+        matches!(err, Error::Malformed(_)),
+        "mismatch must be named: {err:?}"
     );
 }
 
@@ -261,7 +265,10 @@ fn the_same_checkpoint_cannot_be_accepted_twice() {
     let cp = signed_checkpoint(&c, payload(100, 10), &[0, 1, 2]);
     chain.accept(cp.clone(), &c.set, &RealBls).unwrap();
     let err = chain.accept(cp, &c.set, &RealBls).unwrap_err();
-    assert!(err.contains("not beyond"), "replay must be refused: {err}");
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "replay must be refused: {err:?}"
+    );
     assert_eq!(chain.count(), 1);
 }
 

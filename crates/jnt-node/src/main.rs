@@ -1043,6 +1043,10 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // distrust; see `docs/status.md`.
     let mut pool = Mempool::default();
     let mut relay = RelayManager::new();
+    // M4 finality observation (Decision 11). Non-binding: records what the
+    // declared committee signs. On `mainnet` the committee is empty until the
+    // testnet standup, so every checkpoint fails closed.
+    let mut finality = jnt_core::finality::FinalityManager::new(&store.params);
     let mut pool_cursor = chain.height();
     let mut relay_seen = (0u64, 0u64);
     // L2 follows the tip the same way after a restart as on first boot: replay
@@ -1104,6 +1108,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 pool: &mut pool,
                 syncer: &mut syncer,
                 relay: &mut relay,
+                finality: &mut finality,
             },
             Some(now_ms()),
         );

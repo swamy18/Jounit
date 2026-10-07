@@ -1326,3 +1326,52 @@ targets compile; sim suite clean.
 **Still ahead, unchanged:** L2-to-L1 exits (no decision recorded — deposits
 without exits trap funds, so mainnet stays blocked by design), M4 committee +
 finality, M5 testnet. No claim of testnet, finality, or mainnet readiness.
+
+## Phase 6 — M4 validator set + finality foundation (Decision 11, non-binding): SHIPPED — 2026-10-07
+
+M4 was gated on two withheld decisions (stake bonding D8; who the validators
+are), so it began with a full audit that changed no code. The audit found the
+economics unsupported by the tree — no stake ledger, no bond/unbond path, no
+committee in params, two unreconciled checkpoint engines, no checkpoint codec,
+no finality wire message — which is exactly what Decision 8 scoped out of Phase
+6 and gated to mainnet. Decision 11 (recorded before any M4 code) therefore
+scopes rather than invents: it builds the fixed-genesis-committee foundation
+on Decisions 2 + 8 and does **not** activate binding finality.
+
+**The committee.** Explicit BLS keys in `NetworkParams` (`genesis_validators`),
+canonically sorted; `mini` declares four deterministic test keys, `mainnet`
+declares none (every checkpoint fails closed until a committee is decided). No
+stake ledger is added — Phase 6 still has none, as `docs/decisions.md` records.
+`checkpoint_interval_blocks` is 10 on `mini`, 100 on `mainnet`. The genesis
+`EpochSet` is a pure function of params, identical on every node.
+
+**One authority.** `validators::validate_checkpoint_against_set` is the single
+checkpoint authority (six clauses); `bls_checkpoint::verify_checkpoint` stays
+its inner primitive. `finality::FinalityManager` verifies certificates against
+the declared committee and records the highest observed height. `Checkpoint` and
+`CheckpointPayload` gained length-bounded `deserialize`.
+
+**Transport.** `msg_type = 11 CHECKPOINT` (§13.5), relay-only, complete
+certificates — verified on receipt against the local committee and relayed if
+valid; consensus never consults it. Protocol version stays 1 under the §13.5
+freeze rule. New §13.12 vector + independent `sim/net_reference.py` encoder
+agree byte-for-byte.
+
+**Observation, not activation.** `Chain::submit`, fork choice and
+`finalized_height` are untouched. A reorg crossing an observed checkpoint still
+applies; `finality_m4::a_reorg_crossing_an_observed_checkpoint_still_applies`
+pins that, so binding can never slip in silently. L2 `Settle` quorums are
+untouched — task arbitration, not the L1 checkpoint committee.
+
+**Tests:** 13 new (`finality_m4`): committee determinism/hash, mainnet empty
+fail-closed, full-quorum observe, sub-quorum/forged/other-network refusal,
+monotonicity, bounded-codec round-trip and three oversize/count lies, and the
+non-binding reorg proof. Plus a new `checkpoint_codec` fuzz target (14 targets).
+
+**Verified:** 588 workspace tests / 0 failed / 1 ignored (575 + 13); fmt clean;
+clippy clean; release build clean; 14 fuzz targets compile; sim suite clean
+(36 wire values cross-checked).
+
+**Still ahead, unchanged:** bonded stake / unbonding / rewards (mainnet-gated,
+D8), validator rotation, equivocation slashing, L2-to-L1 exits, M5 testnet. No
+claim of testnet, binding finality, or mainnet readiness.

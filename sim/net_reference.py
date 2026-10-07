@@ -44,6 +44,7 @@ MSG_BLOCK = 7
 MSG_GETBLOCKS = 8
 MSG_ADDR = 9
 MSG_TX = 10
+MSG_CHECKPOINT = 11
 
 # --- SPEC.md section 13.3: per-profile identity ---------------------------
 # A new profile MUST pick a magic no existing profile uses.
@@ -228,6 +229,44 @@ def tx_payload(
     return out
 
 
+def checkpoint_payload(
+    height: int, block_hash: bytes, network_id: bytes, epoch: int
+) -> bytes:
+    """CheckpointPayload -- SPEC.md section 14 / M5.
+
+    height(8 LE) | block_hash(32) | id_len(4 LE) | network_id | epoch(8 LE)
+    """
+    if len(block_hash) != 32:
+        raise ValueError("block_hash must be 32 bytes")
+    return (
+        u64le(height)
+        + block_hash
+        + u32le(len(network_id))
+        + network_id
+        + u64le(epoch)
+    )
+
+
+def checkpoint_payload_wire(
+    payload: bytes, aggregate_sig: bytes, bitmap: bytes, signer_count: int
+) -> bytes:
+    """CHECKPOINT -- SPEC.md section 13.5, msg_type = 11.
+
+    payload_len(4 LE) | payload | aggregate_sig(96) |
+    bitmap_len(4 LE) | bitmap | signer_count(4 LE)
+    """
+    if len(aggregate_sig) != 96:
+        raise ValueError("aggregate_sig must be 96 bytes")
+    return (
+        u32le(len(payload))
+        + payload
+        + aggregate_sig
+        + u32le(len(bitmap))
+        + bitmap
+        + u32le(signer_count)
+    )
+
+
 # --- the values net_vectors.json pins -------------------------------------
 
 TIP = bytes([0x5A]) * 32
@@ -257,6 +296,16 @@ def derived_items() -> dict[str, str]:
         inputs=[(bytes([0x77]) * 32, 1, [], [])],
         outputs=[(12_345, bytes([0x88]) * 20)],
     ).hex()
+    # section 13.5 msg_type = 11 (M4). A structural certificate: the payload is
+    # deterministic from the field table, and the aggregate/bitmap are fixed
+    # byte patterns so a second encoder can rebuild the whole message without a
+    # pairing library. Real BLS aggregation is pinned by the Rust M4 tests.
+    cp_payload = checkpoint_payload(
+        100, bytes([0x21]) * 32, NETWORK_ID["mini"], 10
+    )
+    items["msg_checkpoint"] = checkpoint_payload_wire(
+        cp_payload, bytes([0x37]) * 96, bytes([0b0000_0111]), 3
+    ).hex()
     return items
 
 
@@ -280,6 +329,15 @@ def derived_facts() -> dict[str, int]:
         "tx_len": len(
             tx_payload(inputs=[(bytes([0x77]) * 32, 1, [], [])], outputs=[(12_345, bytes([0x88]) * 20)])
         ),
+        "checkpoint_len": len(
+            checkpoint_payload_wire(
+                checkpoint_payload(100, bytes([0x21]) * 32, NETWORK_ID["mini"], 10),
+                bytes([0x37]) * 96,
+                bytes([0b0000_0111]),
+                3,
+            )
+        ),
+        "checkpoint_type_number": MSG_CHECKPOINT,
         "max_frame_payload": MAX_FRAME_BYTES,
         "max_inv_per_msg": MAX_INV_PER_MSG,
         "max_addr_per_msg": MAX_ADDR_PER_MSG,

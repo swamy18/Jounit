@@ -48,6 +48,10 @@ pub enum MessageType {
     /// Added in v0.3 (§13.14). Additive: the freeze rule means a node built
     /// before this existed ignores it rather than disconnecting.
     Tx = 10,
+    /// M4: checkpoint certificate relay (Decision 11, SPEC.md §14).
+    /// Carry the complete certificate; the receiver verifies it against
+    /// its local committee — consensus never consults it.
+    Checkpoint = 11,
 }
 
 impl MessageType {
@@ -63,6 +67,7 @@ impl MessageType {
             8 => MessageType::GetBlocks,
             9 => MessageType::Addr,
             10 => MessageType::Tx,
+            11 => MessageType::Checkpoint,
             _ => return None,
         })
     }
@@ -93,7 +98,12 @@ pub enum Message {
     /// A relayed transaction (§13.14). Boxed because a transaction is by far the
     /// largest variant and every `Message` is cloned once per peer on broadcast.
     Tx(Box<Transaction>),
-    /// An unknown type number — ignored, per the freeze rule. Retained only so
+    /// M4 checkpoint certificate relay (Decision 11). Complete
+    /// certificate — not a proposal/vote, because no BFT round
+    /// protocol exists to give them meaning. Verified on receipt;
+    /// consensus never consults it.
+    Checkpoint(jnt_core::bls_checkpoint::Checkpoint),
+    /// An unknown type number — ignored, per the freeze rule. Retained so
     /// tests can assert that unknown types are dropped without disconnect.
     Unknown {
         ty: u8,
@@ -198,6 +208,9 @@ impl Message {
                 // reserving for it.
                 w.raw(&tx.serialize());
             }
+            Message::Checkpoint(cp) => {
+                w.raw(&cp.serialize());
+            }
             Message::Unknown { raw, .. } => {
                 // `raw` is the payload verbatim as received — decode stores the
                 // whole payload, not a re-framed copy — so encoding is a
@@ -236,6 +249,10 @@ impl Message {
                 Transaction::deserialize(payload)
                     .map_err(|e| NetError::Decode(format!("tx deserialize: {e}")))?,
             )),
+            Some(MessageType::Checkpoint) => Message::Checkpoint(
+                jnt_core::bls_checkpoint::Checkpoint::deserialize(payload)
+                    .map_err(|e| NetError::Decode(format!("checkpoint deserialize: {e}")))?,
+            ),
             None => {
                 // Unknown: preserve the raw payload so callers can log it, but
                 // do not act on it. §13.5 freeze rule.

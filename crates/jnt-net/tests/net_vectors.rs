@@ -47,6 +47,27 @@ type Item = (String, String);
 /// A pinned scalar: `(name, value)`.
 type Fact = (String, u64);
 
+/// A deterministic checkpoint certificate for the vector.
+///
+/// Deliberately *structural*: fixed payload, a fixed byte-pattern aggregate and
+/// a fixed 3-bit bitmap, so a second implementation can rebuild the exact bytes
+/// from §13 prose without a pairing library. Real BLS aggregation is pinned by
+/// the M4 integration tests instead.
+fn checkpoint_vector() -> jnt_core::bls_checkpoint::Checkpoint {
+    use jnt_core::bls_checkpoint::{BlsSignature, Checkpoint, CheckpointPayload};
+    Checkpoint {
+        payload: CheckpointPayload {
+            height: 100,
+            block_hash: [0x21u8; 32],
+            network_id: "jounit/mini".into(),
+            epoch: 10,
+        },
+        aggregate_sig: BlsSignature([0x37u8; 96]),
+        signer_bitmap: vec![0b0000_0111],
+        signer_count: 3,
+    }
+}
+
 /// `(name, hex bytes)` pairs plus scalar facts, written as one JSON document.
 fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
     let mini = NetworkParams::mini();
@@ -178,6 +199,27 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
         facts.push((format!("{name}_len"), enc.len() as u64));
         items.push((format!("msg_{name}"), hex_of(&enc)));
     }
+
+    // --- CHECKPOINT (M4, §13.5 msg_type = 11) ---------------------------
+    // A deterministic, *structural* certificate: fixed payload, a fixed
+    // byte-pattern aggregate and a fixed 3-bit bitmap, so
+    // `sim/net_reference.py` can rebuild the exact bytes from §13 prose
+    // without a pairing library. Real BLS aggregation is pinned by the M4
+    // integration tests, not by a wire vector — a second encoder cannot
+    // reproduce pairing math, and a vector only one implementation can build
+    // would not be the independent check this file exists to provide.
+    let cp = checkpoint_vector();
+    let cp_enc = Message::Checkpoint(cp.clone()).encode();
+    facts.push(("checkpoint_len".into(), cp_enc.len() as u64));
+    items.push(("msg_checkpoint".into(), hex_of(&cp_enc)));
+    match Message::decode(MessageType::Checkpoint as u8, &cp_enc).unwrap() {
+        Message::Checkpoint(decoded) => assert_eq!(decoded, cp),
+        other => panic!("expected Checkpoint, got {other:?}"),
+    }
+    facts.push((
+        "checkpoint_type_number".into(),
+        MessageType::Checkpoint as u64,
+    ));
 
     // --- BLOCK ----------------------------------------------------------
     let mut chain = Chain::new(NetworkParams::mini()).expect("mini chain");

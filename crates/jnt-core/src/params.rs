@@ -4,6 +4,7 @@
 //! with different parameters — never a second codebase. Every consensus constant
 //! therefore lives here, and the mini profile differs only in numbers.
 
+use crate::bls_checkpoint::BlsPublicKey;
 use crate::error::{Error, Result};
 use crate::hash::{Address, Hash};
 
@@ -84,6 +85,36 @@ fn l2_operator_address(seed: u8) -> Address {
         .expect("a wallet always has an address")
 }
 
+/// Deterministic `mini` validator key for `seed`.
+///
+/// Derives a real BLS12-381 public key from the same public test seeds, so
+/// the mini committee is a valid committee and checkpoint verification is
+/// exercisable. The seeds are public test values; `mainnet` carries no
+/// committee. Panics only if `min_pk` rejects a constant seed, which is a
+/// build-time property, not a runtime input.
+fn mini_validator_key(seed: u8) -> BlsPublicKey {
+    mini_validator_secret(seed).public_key()
+}
+
+/// The deterministic `mini` committee secret for `seed`.
+///
+/// Public test material, not a secret in the cryptographic sense: these seeds
+/// are in the source, so anyone can sign as a mini validator — which is
+/// exactly what a permissionless testnet committee means. Exposed so tests
+/// (and mini validator nodes) can produce real checkpoint certificates.
+/// `mainnet` has no committee and therefore no corresponding secrets.
+pub fn mini_validator_secret(seed: u8) -> crate::bls::SecretKey {
+    let mut s = [0u8; 32];
+    s[0] = seed;
+    s[31] = seed;
+    crate::bls::SecretKey::derive(&s).expect("constant seeds are valid scalars")
+}
+
+/// The four `mini` committee secrets, in the same order as the seeds.
+pub fn mini_committee_secrets() -> Vec<crate::bls::SecretKey> {
+    (1u8..=4).map(mini_validator_secret).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkParams {
     pub name: String,
@@ -140,6 +171,17 @@ pub struct NetworkParams {
     /// future network can price its own dust floor without touching code —
     /// but both shipped profiles carry the constant's value.
     pub l2_deposit_minimum_sat: u64,
+    /// Fixed genesis validator committee (Decisions 8 and 11, SPEC.md §14).
+    /// Explicit BLS keys, no stake ledger behind them: Phase 6 has no bonded
+    /// stake, so these keys carry authority by genesis declaration, not by
+    /// bond. `mini` carries deterministic test keys; `mainnet` carries an
+    /// empty list, meaning no committee yet — checkpoints verify against
+    /// nothing and therefore fail closed. Canonically sorted by key bytes at
+    /// construction; every node holding these params derives the same set.
+    pub genesis_validators: Vec<BlsPublicKey>,
+    /// Blocks per checkpoint epoch (Decision 11). `mini` uses 10 so finality
+    /// observation is exercisable in tests; `mainnet` uses 100.
+    pub checkpoint_interval_blocks: u64,
 }
 
 impl NetworkParams {
@@ -246,6 +288,11 @@ impl NetworkParams {
             l2_genesis_escrow_sat: 100_000 * SAT_PER_JNT,
             l2_genesis_grants: Vec::new(),
             l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
+            // No committee yet: mainnet finality observation arrives with the
+            // testnet standup, not as placeholder keys. Empty verifies nothing
+            // (fail closed), which is the honest pre-committee state.
+            genesis_validators: Vec::new(),
+            checkpoint_interval_blocks: 100,
         }
     }
 
@@ -300,6 +347,15 @@ impl NetworkParams {
                 },
             ],
             l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
+            // Test committee (Decision 11, SPEC.md §14): deterministic
+            // BLS keys so mini exercises checkpoint finality end to end.
+            genesis_validators: {
+                let mut v: Vec<BlsPublicKey> = (1u8..=4).map(mini_validator_key).collect();
+                v.sort_by_key(|a| a.0);
+                v.dedup();
+                v
+            },
+            checkpoint_interval_blocks: 10,
         }
     }
 
@@ -379,6 +435,23 @@ impl NetworkParams {
         // and let anyone bloat the UTXO set and L2 state for free.
         if self.l2_deposit_minimum_sat == 0 {
             return Err(Error::Malformed("l2_deposit_minimum_sat must be > 0"));
+        }
+        // Validator committee (Decision 11): no zero keys (which would
+        // silently pass signature verification) and no duplicates.
+        let mut seen_keys: Vec<BlsPublicKey> = Vec::with_capacity(self.genesis_validators.len());
+        for k in &self.genesis_validators {
+            if k.is_zero() {
+                return Err(Error::Malformed("genesis_validators contains a zero key"));
+            }
+            if seen_keys.contains(k) {
+                return Err(Error::Malformed(
+                    "genesis_validators contains duplicate keys",
+                ));
+            }
+            seen_keys.push(*k);
+        }
+        if self.checkpoint_interval_blocks == 0 {
+            return Err(Error::Malformed("checkpoint_interval_blocks must be > 0"));
         }
         Ok(())
     }

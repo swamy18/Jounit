@@ -3075,3 +3075,47 @@ final message instead of a commit.
   the verification run before push).
 - Next: per task order, STOP after M3. Do not start exits, committee,
   finality, testnet, transport, chaos, or performance work.
+
+# Working memory — session 22: Phase 6 M4 validator set + finality foundation (Decision 11)
+
+## 92. Audit first, no code changed
+
+- Full audit before any implementation. Found: no stake ledger/bond/unbond
+  anywhere (D8 scoped it out of Phase 6, mainnet-gated); two unreconciled
+  checkpoint engines (`validators.rs` six-clause vs `bls_checkpoint.rs`
+  `verify_checkpoint`) with no single authority; no checkpoint codec at all
+  (serialize only); no finality wire message (`msg.rs` stopped at Tx=10);
+  `Chain`/`finalized_height` consulted none of it. This matched Decision 8, so
+  the resolution was to **scope, not invent** — no new economics.
+
+## 93. What was built (Decision 11, non-binding)
+
+- Decision 11 recorded before code.
+- `NetworkParams::{genesis_validators, checkpoint_interval_blocks}`; mini = 4
+  deterministic real BLS keys, mainnet = empty (fail closed); intervals 10/100.
+  `mini_validator_secret`/`mini_committee_secrets` exposed as public test keys.
+  `genesis_epoch_set`/`genesis_epoch_set_at` in validators.rs.
+- Bounded `CheckpointPayload::deserialize` + `Checkpoint::deserialize`
+  (`MAX_CHECKPOINT_PAYLOAD_BYTES=256`, `MAX_SIGNER_BITMAP_BYTES=512`,
+  popcount==signer_count). Fixed pre-existing `verify_checkpoint`/
+  `CheckpointChain::accept` to return crate `Error` (they used String).
+- `jnt_core::finality::FinalityManager`: verifies against the declared committee,
+  records highest observed height, cross-network refusal; non-binding.
+- `msg_type = 11 CHECKPOINT` (protocol v1) + `Message::Checkpoint`; `NodeState`
+  gained `finality`; `net.rs` verifies + relays; node/ test call sites updated.
+- §13.12 vector `msg_checkpoint` + independent `sim/net_reference.py` encoder
+  (structural cert — no pairing in Python); new `checkpoint_codec` fuzz target.
+- `crates/jnt-core/tests/finality_m4.rs`: 13 tests, the key one being
+  `a_reorg_crossing_an_observed_checkpoint_still_applies` — pins non-binding.
+
+## 94. State after this session
+
+- 588 workspace tests / 0 failed / 1 ignored (575 + 13); fmt clean; clippy
+  clean; release build clean; 14 fuzz targets compile; sim suite clean (36 wire
+  values cross-checked).
+- Docs: SPEC §13.5 + §14.7, decisions D11, status, phase6-plan, this file.
+- One transient full-suite failure in `tx_relay` (real-TCP port race under
+  parallel load) that passed on rerun and in isolation — pre-existing flake, not
+  caused by this change.
+- Next: per task order, STOP after M4. Do not start M5 testnet, bodies of
+  bonded stake/rotation/slashing, or exits — those need their own decisions.

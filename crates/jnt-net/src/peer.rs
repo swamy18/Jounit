@@ -433,6 +433,7 @@ pub fn spawn_peer(
                 Message::GetBlocks { .. } => MessageType::GetBlocks as u8,
                 Message::Addr(_) => MessageType::Addr as u8,
                 Message::Tx(_) => MessageType::Tx as u8,
+                Message::Checkpoint(_) => MessageType::Checkpoint as u8,
                 Message::Unknown { ty, .. } => *ty,
             };
             let payload = msg.encode();

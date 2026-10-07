@@ -214,6 +214,59 @@ impl EpochSet {
     }
 }
 
+/// Genesis epoch set (Decision 11): one `ValidatorRecord` per declared
+/// key, stake `0`, address `[0; 20]` placeholder (no stake ledger in
+/// Phase 6 — the key carries authority by declaration, not bond).
+///
+/// Deterministic and pure: two nodes with the same key list build the
+/// identical `EpochSet` and the identical `set_hash`. Used as the
+/// committee for checkpoint verification in `FinalityManager`.
+pub fn genesis_epoch_set(keys: &[BlsPublicKey]) -> Result<EpochSet, ValidatorError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut records: Vec<ValidatorRecord> = Vec::with_capacity(keys.len());
+    for k in keys {
+        if k.is_zero() {
+            return Err(ValidatorError::BadKey {
+                address: Address::default(),
+            });
+        }
+        if !seen.insert(k.0) {
+            return Err(ValidatorError::DuplicateKey { key: *k });
+        }
+        if crate::bls::validate_public_key(k).is_err() {
+            return Err(ValidatorError::BadKey {
+                address: Address::default(),
+            });
+        }
+        records.push(ValidatorRecord {
+            stake_address: Address::default(),
+            bls_pk: *k,
+            stake_sat: 0,
+        });
+    }
+    records.sort();
+    let mut set = EpochSet {
+        epoch: 0,
+        validators: records,
+        set_hash: Hash::default(),
+    };
+    set.set_hash = set_hash(&set);
+    Ok(set)
+}
+
+/// The fixed genesis committee as it applies to epoch `epoch`.
+///
+/// Membership is constant across epochs in M4 (Decision 11: no rotation), but
+/// the set hash is epoch-bound, so a checkpoint from epoch `e` must be
+/// verified against the set bearing epoch `e`, not epoch 0. Same keys, same
+/// order, only the epoch field and hash differ.
+pub fn genesis_epoch_set_at(epoch: u64, keys: &[BlsPublicKey]) -> Result<EpochSet, ValidatorError> {
+    let mut set = genesis_epoch_set(keys)?;
+    set.epoch = epoch;
+    set.set_hash = set_hash(&set);
+    Ok(set)
+}
+
 /// Build the epoch set from a candidate list. Fails closed on duplicates and
 /// invalid keys: a key under two addresses, an address with two keys, or an
 /// unparseable key each abort the whole derivation rather than being skipped,

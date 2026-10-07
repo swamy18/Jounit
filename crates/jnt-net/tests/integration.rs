@@ -158,6 +158,10 @@ fn pump(
     relay: &mut RelayManager,
     deadline: std::time::Instant,
 ) {
+    // M4 finality observation is inert here: these tests exercise sync and
+    // fork choice, not the committee. Built from the chain's own params so
+    // the state is always consistent with what `poll_events` expects.
+    let mut finality = jnt_core::finality::FinalityManager::new(chain.params());
     while std::time::Instant::now() < deadline {
         node.poll_events(
             NodeState {
@@ -165,6 +169,7 @@ fn pump(
                 pool,
                 syncer,
                 relay,
+                finality: &mut finality,
             },
             None,
         );
@@ -246,6 +251,7 @@ fn a_node_syncs_a_peer_over_real_sockets() {
     let mut client_syncer = SyncManager::new();
     let mut client_pool = Mempool::default();
     let mut client_relay = RelayManager::new();
+    let mut client_finality = jnt_core::finality::FinalityManager::new(client_chain.params());
     client.connect(addr, &client_chain).unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
@@ -256,6 +262,7 @@ fn a_node_syncs_a_peer_over_real_sockets() {
                 pool: &mut client_pool,
                 syncer: &mut client_syncer,
                 relay: &mut client_relay,
+                finality: &mut client_finality,
             },
             None,
         );

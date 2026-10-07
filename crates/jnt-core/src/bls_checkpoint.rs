@@ -33,8 +33,9 @@
 //!
 //! SPEC.md §M5.
 
+use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Hash};
-use crate::ser::Writer;
+use crate::ser::{Reader, Writer};
 
 /// Checkpoint period: one checkpoint every N blocks.
 /// Production: every 100 blocks (~17 minutes at 10-min block times).
@@ -101,6 +102,11 @@ pub struct CheckpointPayload {
     pub epoch: u64,
 }
 
+/// Maximum serialized checkpoint payload size (covers any realistic network_id).
+pub const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 256;
+/// Maximum signer bitmap size (512 validators × 1 bit = 64 bytes; generous headroom).
+pub const MAX_SIGNER_BITMAP_BYTES: usize = 512;
+
 impl CheckpointPayload {
     /// Canonical serialization for signing.
     pub fn serialize(&self) -> Vec<u8> {
@@ -125,6 +131,29 @@ impl CheckpointPayload {
     /// Epoch number for a given chain height and interval.
     pub fn epoch_for(height: u64, interval: u64) -> u64 {
         height / interval.max(1)
+    }
+
+    /// Bounded deserialize. Fails if any field exceeds its limit or if
+    /// trailing bytes remain.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let height = r.u64le()?;
+        let block_hash: Hash = r.fixed()?;
+        let id_len = r.u32le()? as usize;
+        if id_len > 64 {
+            return Err(Error::Malformed("network_id too long"));
+        }
+        let id_bytes = r.fixed_slice(id_len)?;
+        let network_id = String::from_utf8(id_bytes.to_vec())
+            .map_err(|_| Error::Malformed("network_id is not UTF-8"))?;
+        let epoch = r.u64le()?;
+        r.expect_end()?;
+        Ok(Self {
+            height,
+            block_hash,
+            network_id,
+            epoch,
+        })
     }
 }
 
@@ -226,6 +255,49 @@ impl Checkpoint {
         w.write_u32(self.signer_count);
         w.finish()
     }
+
+    /// Bounded deserialize. Fails if any length field exceeds its limit,
+    /// if the bitmap popcount disagrees with `signer_count`, or if
+    /// trailing bytes remain.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let payload_len = r.u32le()? as usize;
+        if payload_len > MAX_CHECKPOINT_PAYLOAD_BYTES {
+            return Err(Error::Malformed("checkpoint payload too large"));
+        }
+        let payload_bytes = r.fixed_slice(payload_len)?;
+        let payload = CheckpointPayload::deserialize(payload_bytes)?;
+        let aggregate_sig = BlsSignature(r.fixed()?);
+        let bitmap_len = r.u32le()? as usize;
+        if bitmap_len > MAX_SIGNER_BITMAP_BYTES {
+            return Err(Error::Malformed("signer bitmap too large"));
+        }
+        let signer_bitmap = r.fixed_slice(bitmap_len)?.to_vec();
+        let signer_count = r.u32le()?;
+        r.expect_end()?;
+        let s = Self {
+            payload,
+            aggregate_sig,
+            signer_bitmap,
+            signer_count,
+        };
+        s.assert_coherent()?;
+        Ok(s)
+    }
+
+    /// Internal consistency check: bitmap popcount == signer_count, and
+    /// no bits set beyond the validator set size this bitmap can address.
+    fn assert_coherent(&self) -> Result<()> {
+        let popcount = self
+            .signer_bitmap
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>();
+        if popcount != self.signer_count {
+            return Err(Error::Malformed("signer_count does not match bitmap"));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,30 +343,27 @@ pub fn verify_checkpoint(
     checkpoint: &Checkpoint,
     validator_set: &ValidatorSet,
     verifier: &dyn BlsVerifier,
-) -> Result<(), String> {
+) -> Result<()> {
     // 1. Check quorum
     let required = validator_set.quorum_size();
     if !checkpoint.has_quorum(required) {
-        return Err(format!(
-            "checkpoint has {} signers, need {}",
-            checkpoint.signer_count, required
-        ));
+        return Err(Error::Malformed("checkpoint signer count below quorum"));
     }
 
     // 2. Decode signer set from bitmap
     let signers = validator_set.signers_from_bitmap(&checkpoint.signer_bitmap);
     if signers.len() != checkpoint.signer_count as usize {
-        return Err(format!(
-            "bitmap yields {} signers but signer_count says {}",
-            signers.len(),
-            checkpoint.signer_count
+        return Err(Error::Malformed(
+            "bitmap yields a different signer count than signer_count claims",
         ));
     }
 
     // 3. Verify aggregate signature
     let message = checkpoint.payload.signing_hash();
     if !verifier.verify_aggregate(&signers, &message, &checkpoint.aggregate_sig) {
-        return Err("aggregate BLS signature verification failed".into());
+        return Err(Error::Malformed(
+            "aggregate BLS signature verification failed",
+        ));
     }
 
     Ok(())
@@ -325,12 +394,11 @@ impl CheckpointChain {
         checkpoint: Checkpoint,
         validator_set: &ValidatorSet,
         verifier: &dyn BlsVerifier,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         // Must be strictly beyond the current finality tip
         if checkpoint.payload.height <= self.finalized_height {
-            return Err(format!(
-                "checkpoint height {} is not beyond finalized {}",
-                checkpoint.payload.height, self.finalized_height
+            return Err(Error::Malformed(
+                "checkpoint height is not beyond finalized height",
             ));
         }
         verify_checkpoint(&checkpoint, validator_set, verifier)?;

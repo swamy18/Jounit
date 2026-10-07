@@ -640,3 +640,74 @@ semantics, the M2 genesis allocation, finality activation.
 trap user funds in L2, so M3 makes *testnet* deposits functional while mainnet
 still requires a separate exit decision and implementation. No exit decision is
 recorded here.
+
+---
+
+# Implementation status — Phase 6 M4 STEP 0 audit: foundation without activation
+
+The M4 audit (no code changed) re-examined the tree after M3 against STEPS
+1–3 and found: no stake ledger, no bond/unbond path, no committee in params,
+two checkpoint validators with no declared canonical one, no checkpoint codec
+at all (serialize only), no finality wire message, and `Chain` consulting none
+of it. The Decision 2 economics (5,000 JNT bonded, TopN 21, no rewards, no fee
+share, full-bond equivocation burn) therefore have no mechanism to run on —
+which is exactly what Decision 8 scoped out of Phase 6 ("no stake transaction
+type, no bonded-stake ledger, and no unbonding are built in Phase 6", with real
+bonded stake "required for mainnet"). That scoping is honored, not
+re-designed: the items below build only what Decisions 2 (bootstrap mode) and
+8 authorized, and binding finality is explicitly NOT activated. If a future
+milestone wants binding finality, it needs its own decision.
+
+## Decision 11 — Validator set + finality foundation (non-binding)
+
+**Chosen: fixed genesis committee in `NetworkParams`, the six-clause
+validator as the single checkpoint authority, relay-only checkpoint transport,
+observation without activation.**
+
+1. **Economics (STEP 2 verdict).** The implementation does not support bonded
+   stake — no stake fields, no bond ledger, no reward or slash-bond path — and
+   M4 adds none of them. Unchanged and still standing: 5,000 JNT minimum,
+   TopN 21 (reused as the committee-size cap), no validator rewards, no fee
+   share, no issuance from validators, full-bond equivocation burn, L2 dispute
+   slashing untouched. Bonding, unbonding, rewards and bond-slashing arrive
+   with the stake ledger, which is mainnet-gated. Equivocation in M4 is
+   detected and evidenced, not economically punished.
+2. **Set derivation (STEP 3 answers).** (1) Stake lives nowhere in Phase 6.
+   (2–3) No bonding/unbonding exists. (4) N/A. (5) Committee size is capped at
+   21, fixed per profile, not selected. (6) No ties: the committee is an
+   explicit key list, canonically sorted by key bytes. (7) Active from genesis,
+   no rotation in M4. (8) The committee is explicit BLS keys in
+   `NetworkParams` (`mini`: four deterministic test keys; `mainnet`: empty,
+   meaning no committee yet — checkpoints verify against nothing and therefore
+   fail closed). (9) Every node derives the identical `EpochSet` (epoch 0,
+   set-hash bound) as a pure function of params.
+3. **Canonical authority (STEP 5 verdict).** `validators::
+   validate_checkpoint_against_set` (six clauses: epoch, set, bitmap, count,
+   quorum, signature, monotonicity) is the single authority.
+   `bls_checkpoint::verify_checkpoint` remains as its inner signature
+   primitive, not a rival authority. `CheckpointChain` is the monotonic
+   observation log. The payload gains no set-hash field in M4: with no
+   rotation the epoch already scopes every certificate, and payload format
+   changes wait until rotation needs them.
+4. **Transport (STEP 6 verdict).** One relay-only message, `msg_type = 11
+   CHECKPOINT`, carrying complete certificates only — no proposal/vote
+   messages, because no BFT round protocol exists to give them meaning, and no
+   aggregator protocol is built in M4 (test certificates are assembled from
+   test keys). Received certificates are verified against the committee and
+   relayed if valid; consensus never consults them. Protocol version stays 1:
+   the §13.5 freeze rule already covers additive types.
+5. **Non-binding gate (STEP 14).** `Chain::submit`, fork choice and
+   `finalized_height` are untouched. Observed finality is reported
+   (`status`/`verify`) and relayed, never enforced: a reorg crossing an
+   observed checkpoint still applies, and that behavior is pinned by test so
+   binding can never slip in silently. Binding finality requires a future,
+   separately reviewed decision.
+6. **L2 separation (STEP 10 verdict).** No L2 change. L2 `Settle` quorums
+   belong to the task-arbitration domain, not the L1 checkpoint committee;
+   conflating them would authorize settlements with checkpoint keys.
+   `NodeL2` keeps the empty set, deposit maturity keeps `finality_depth`, and
+   replay is untouched.
+7. **Testnet profile (STEP 11 verdict).** No new `NetworkParams` profile in
+   M4 (that is M5's P1 proposal). `mini` carries the test committee and a
+   10-block checkpoint interval; `mainnet` carries an empty committee and a
+   100-block interval. No public testnet starts in M4.

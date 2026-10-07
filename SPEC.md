@@ -732,6 +732,7 @@ without disconnecting, so a later version can add messages safely.
 | `8` | `GETBLOCKS` | `count(2 LE) ‖ locator(count × 32) ‖ stop_hash(32)` |
 | `9` | `ADDR` | `count(2 LE) ‖ count × (port(2 LE) ‖ ip(16))` |
 | `10` | `TX` | `serialize(transaction)` (§3.6) |
+| `11` | `CHECKPOINT` | `payload_len(4 LE) ‖ payload ‖ aggregate_sig(96) ‖ bitmap_len(4 LE) ‖ bitmap ‖ signer_count(4 LE)` |
 
 `kind` is `1` = block and `0` = transaction (§13.14). Transactions were reserved
 here before they existed, precisely so the *announcement* could be added without
@@ -741,6 +742,15 @@ changing `INV`/`GETDATA`'s shape; only delivery needed a new message type.
 above already requires an unknown type to be ignored without disconnecting, so a
 v0.2 node drops `TX` and stays connected. Such a node does not relay transactions,
 which is a peer's choice and not a protocol violation.
+
+`msg_type = 11` was added in v0.4 (Decision 11, §14). It is additive under the
+same rule: a node that predates it drops `CHECKPOINT` and stays connected. It
+carries a complete checkpoint certificate, never a proposal or a vote — no BFT
+round protocol exists in M4 to give those meaning. A receiver verifies the
+certificate against its own local committee and relays it if valid; consensus
+never consults it. The payload is `CheckpointPayload.serialize()` (§14.5), and
+every length field is bounded (`MAX_CHECKPOINT_PAYLOAD_BYTES`,
+`MAX_SIGNER_BITMAP_BYTES`) before allocation, per the rule below.
 
 Every `count` field MUST be bounded by the smallest entry that could follow,
 checked before allocating — `INV` entries are 33 bytes, `ADDR` entries 18,
@@ -1329,9 +1339,6 @@ question). Handover rules:
 
 - It does not wire checkpoints into `Chain::submit`, fork choice, or
   `finalized_height` reporting.
-- It does not define stake accounting, rewards, or slashing amounts.
-- It does not define how checkpoints travel on the wire (that is a §13.5
-  message-type decision, deferred so §13.12 vectors stay stable).
 
 **Implementation note.** `crates/jnt-core/src/validators.rs` implements this
 section as a pure library: `ValidatorRecord`, `SelectionRule::TopN`,
@@ -1339,6 +1346,37 @@ section as a pure library: `ValidatorRecord`, `SelectionRule::TopN`,
 with the grace-period drop), and the checkpoint clause checks as
 `validate_checkpoint_against_set` returning the failed clause. Tests attack
 every clause; none of it is reachable from consensus.
+
+### 14.7 M4 — Validator set + finality foundation (Decision 11, non-binding)
+
+Decision 11 resolves the §14.6 open items for Phase 6 by **scoping, not
+inventing**: the economics (bonded stake, rewards, slashing) remain open and
+mainnet-gated, exactly as Decision 8 set out, and M4 builds only what Decisions
+2 (bootstrap mode) and 8 authorized. Binding finality is explicitly NOT
+activated; a future milestone that wants it needs its own decision.
+
+- **Committee.** The genesis committee is an explicit list of BLS keys in
+  `NetworkParams` (`genesis_validators`), canonically sorted by key bytes.
+  `mini` declares four deterministic test keys; `mainnet` declares none, so
+  every checkpoint fails closed until a committee is decided. There is no stake
+  ledger behind these keys in Phase 6 — they carry authority by genesis
+  declaration, not by bond. `checkpoint_interval_blocks` is `10` on `mini` and
+  `100` on `mainnet`.
+- **One authority.** `validators::validate_checkpoint_against_set` is the single
+  checkpoint authority (the six clauses above). `bls_checkpoint::verify_checkpoint`
+  remains its inner signature primitive, not a rival authority.
+  `CheckpointChain` is a monotonic observation log.
+- **Transport.** `msg_type = 11 CHECKPOINT` (§13.5) carries complete
+  certificates only. A receiver verifies against its local committee and relays
+  if valid; consensus never consults it. `Checkpoint`/`CheckpointPayload`
+  gained bounded `deserialize`.
+- **Observation, not activation.** `jnt_core::finality::FinalityManager` records
+  what the committee signed and reports it. `Chain::submit`, fork choice and
+  `finalized_height` are untouched: a reorg crossing an observed checkpoint
+  still applies, and that is pinned by
+  `finality_m4::a_reorg_crossing_an_observed_checkpoint_still_applies`. L2
+  `Settle` quorums are untouched — they belong to task arbitration, not the L1
+  checkpoint committee.
 
 ---
 
