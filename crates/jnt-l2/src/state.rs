@@ -81,7 +81,13 @@ pub enum L2Effect {
     },
 }
 
-#[derive(Debug, Clone)]
+/// Equality here is *state* equality: two nodes that replayed the same
+/// canonical chain hold equal `L2State`s, which is what Phase 6's replay and
+/// cross-node agreement checks assert (SPEC.md §19.1). It is derived, so it
+/// compares every field — accounts, tasks, the applied-id set, the counters,
+/// the vault and the certificate registry — rather than a hand-picked subset
+/// that could silently stop covering a new one.
+#[derive(Debug, Clone, PartialEq)]
 pub struct L2State {
     config: L2Config,
     accounts: HashMap<Address, u64>,

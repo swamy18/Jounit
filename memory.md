@@ -2759,6 +2759,124 @@ Binding finality only at the end, per Decision 2. Standing decisions
 unchanged: D3 fees, M1 50/50, §14.6 validator economics, payment as market
 price, no VWC revocation.
 
+# Working memory — session 17: Phase 6 STEP 0 audit, then M1 (L2 into blocks)
+
+## 75. The audit found the phase was not what it looked like
+
+The instruction was to integrate finished components. The audit (STEP 0,
+`docs/phase6-plan.md`, commit `f4e9873`) showed the components were not merely
+unwired — L2 was **unreachable from consensus**, and four things the roadmap
+assumed were decided were not:
+
+- `jnt-node` did not depend on `jnt-l2`; `Chain::submit` took only a `Block`;
+  `L2Transaction` appeared nowhere outside `l2.rs` and `fuzz/`. SPEC §15.9 says
+  the reason: "how L2 transactions reach a block" was deliberately left to
+  Phase 6.
+- `L2State` kept a **private balance ledger** whose only entry was a `credit()`
+  seam documented as the Phase 6 bridge and called by nothing in production. L2
+  burns destroyed nothing real.
+- `jnt-l2` had **no serde dependency at all**: L2 state was unrecoverable across
+  a restart.
+- `derive_set` took its candidate list as a parameter; there was **no stake
+  transaction, no bonded-stake ledger, no unbonding**, and `NetworkParams` had
+  none of the fields Decision 2 said the values live in.
+- `jnt-net` had exactly `msg_type 1…10` and zero occurrences of
+  "checkpoint"/"finaliz": finality had no wire at all.
+- The repo had **no HTTP/async stack** (std `TcpListener` only), while roadmap
+  §13 specifies an axum REST API that was unbuilt.
+
+Also found: two unreconciled checkpoint libraries (`bls_checkpoint` vs
+`validators`), neither reachable from `Chain`; `finalized_height()` was purely
+`tip − finality_depth`; no `testnet` network profile; and `docs/status.md`'s
+`## Not done` section was stale enough to contradict the Phase 2–5 SHIPPED
+sections appended below it.
+
+## 76. Four decisions were required, and were made
+
+I stopped and asked rather than inventing them (the instruction was explicit).
+All four came back on the recommended option, and are recorded as Decisions 6–9
+in `docs/decisions.md`:
+
+- **D6:** L2 transactions ride inside L1 blocks; no header change.
+- **D7:** L2 value enters through a **genesis-funded protocol escrow**; user
+  deposits/exits deferred, and explicitly not authorised yet.
+- **D8:** testnet bootstraps from a **fixed genesis committee** — no stake
+  transactions in Phase 6.
+- **D9:** the transport is the **roadmap §13 REST API** (axum + tokio), with
+  additive L2 endpoints specified in SPEC §19.2 rather than by editing the
+  roadmap.
+
+## 77. M1 — L2 in the block pipeline, shipped
+
+The one insight that made this land without touching consensus: the header binds
+the body **only** through `merkle_root`, so putting L2 leaves in that same root
+means the *existing* `MerkleRootMismatch` rule already refuses a block whose L2
+section was stripped or altered. `Chain::submit` learned nothing new.
+
+- **Carriage** (`jnt-core::block`): an append-only trailer
+  `U4LE(l2_count) ‖ (U4LE(len) ‖ bytes) × n`, **absent when empty**. So a block
+  with no L2 transactions encodes byte-for-byte as before — the property that
+  kept every frozen vector and `genesis_block()` unchanged, which I verified
+  rather than assumed (`ser_facts`: the vectors cover input/output/tx/header,
+  not whole blocks).
+- **Commitment**: `merkle_root_with_l2` — L1 leaves (`0x00`) then L2 leaves
+  (`0x02`), folded by the same internal-node rule (`0x01`). An L2 payload can
+  never be read as an L1 leaf.
+- **Canonical encoding**: a present-but-empty section is `Malformed`, so one
+  block keeps one encoding.
+- **Producing them** (`Chain::mine_block_with_l2`): additive; `mine_block`,
+  `mine_block_with` and `mine_from_pool` still mine L1-only, so no existing
+  caller changed.
+- **Replay** (`jnt_l2::replay::{ChainL2, SkippedL2}`): lives in `jnt-l2`
+  because that crate already depends on `jnt-core` — so no new dependency edge
+  and no core→l2 cycle. Order is normative: `advance_block(h)` **then** the
+  block's L2 transactions, in block order. `ChainL2::empty` + `apply_block` is
+  the following-the-tip twin, and a test asserts the two paths agree.
+- **Skipping is named, not silent**: a payload that does not apply is recorded
+  with height, txid and error, is not marked applied (still retryable), and
+  changes no state. That is Decision 6's "L2 validity is not an L1 block rule",
+  made visible instead of swallowed.
+- **Serde for `L2Transaction`** is its canonical binary bytes (hex), added so
+  `Block` can still be JSON-serialized without inventing a second encoding that
+  would drift from the wire one.
+- **`L2State: PartialEq`** (via `SlashVault` gaining a derive), so "two replays
+  agree" is a total comparison over every field instead of a hand-picked digest.
+
+## 78. Tests and numbers, verified
+
+- **513 workspace tests, 0 failed, 1 ignored** (was 500): +6 in
+  `jnt-core::block` and +7 in the new `jnt-l2/tests/replay_flow.rs`.
+- The block tests pin the properties that matter: L2-free encoding identical to
+  the legacy bytes; round trip; the commitment moves; **stripping the section
+  leaves a block its own header rejects**; an empty section is non-canonical; a
+  count cannot outclaim its buffer; every truncation of an L2-bearing block is
+  refused without panicking.
+- The replay tests pin: two replays equal; full replay == incremental
+  application; an L1-only chain replays to the pristine state (no invented
+  money); an unfunded post is skipped **by name** (`InsufficientBalance`) and
+  stays retryable; the block really carries the payload and its header really
+  commits to it.
+- `cargo fmt --all --check` clean; `clippy --workspace --all-targets -D warnings`
+  clean; `cargo build --workspace --release` clean.
+
+## 79. What M1 deliberately does not do, and why that is honest
+
+With no funding bridge (D7) and no genesis committee (D8), every L2 transaction
+replayed from a chain is refused for insufficient balance and no settlement can
+verify. The tests assert **that** rather than pretending otherwise: the L2
+marketplace does not run end to end yet, and the replay machinery is verified
+against a chain that holds no value and no validators. Specified in SPEC §19.3
+so nobody infers more from §19.1 than it claims.
+
+## 80. Next work item
+
+**M2 — the funding bridge and fee accounting** (Decision 7): genesis-funded
+protocol escrow driving `credit`, burns/PSCB reducing real L1 supply, the
+`AmountTooSmallForFee` question, and the L2 endpoints of §19.2. Then M3
+transport, M4 validator set + checkpoints (P1/P2/P3 still undecided), M5
+testnet, M6 adversarial/chaos, M7 performance baseline, M8 SPEC + mainnet
+audit. Standing decisions unchanged; `docs/roadmap.md` untouched.
+
 # Working memory — session 16: Phase 5 verification and ship confirmation
 
 ## 71. What this session was

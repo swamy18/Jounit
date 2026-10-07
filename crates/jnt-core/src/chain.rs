@@ -747,6 +747,7 @@ impl Chain {
         &mut self,
         miner_address: crate::hash::Address,
         body: Vec<Transaction>,
+        l2_txs: Vec<crate::l2::L2Transaction>,
         now_ms: u64,
         difficulty_override: Option<u128>,
         max_attempts: u64,
@@ -806,7 +807,7 @@ impl Chain {
 
         let mut txs = vec![cb_tx];
         txs.extend(body);
-        let merkle = crate::block::merkle_root(&txs);
+        let merkle = crate::block::merkle_root_with_l2(&txs, &l2_txs);
 
         let mut header = Header {
             version: crate::block::BLOCK_VERSION,
@@ -837,6 +838,10 @@ impl Chain {
                     signature: [0u8; 64],
                     signer_pubkey: [0u8; 33],
                     txs,
+                    // Cloned rather than moved: the value is also needed by the
+                    // unmined block below. One clone per *successful* mine, in
+                    // exchange for not threading it through the loop.
+                    l2_txs: l2_txs.clone(),
                 });
             }
             nonce = nonce.wrapping_add(1);
@@ -846,6 +851,9 @@ impl Chain {
             signature: [0u8; 64],
             signer_pubkey: [0u8; 33],
             txs,
+            // Reported through the error's hash, so it must be the block that
+            // would have been produced — L2 payload included.
+            l2_txs,
         };
         Err(Error::PowInvalid {
             hash: crate::hash::hash_to_hex(&unmined.block_hash()),
@@ -877,6 +885,38 @@ impl Chain {
         self.build_block(
             miner_address,
             body,
+            Vec::new(),
+            now_ms,
+            difficulty_override,
+            max_attempts,
+        )
+    }
+
+    /// Mine a block that also carries L2 transactions (Decision 6, SPEC.md §19.1).
+    ///
+    /// Additive rather than a new parameter on `mine_block_with`: every existing
+    /// caller mines L1-only blocks, and threading an empty vector through all of
+    /// them would be churn with no behaviour attached. The block's merkle root
+    /// covers both lists, so the header commits to the L2 payload exactly as it
+    /// commits to the L1 one.
+    ///
+    /// Note what this does *not* do: it does not validate the L2 transactions.
+    /// L2 validity is not an L1 block rule (Decision 6) — the miner is expected
+    /// to have applied them to its own L2 state first, and a peer that disagrees
+    /// still reaches the same L2 state by replaying the same bytes.
+    pub fn mine_block_with_l2(
+        &mut self,
+        miner_address: crate::hash::Address,
+        body: Vec<Transaction>,
+        l2_txs: Vec<crate::l2::L2Transaction>,
+        now_ms: u64,
+        difficulty_override: Option<u128>,
+        max_attempts: u64,
+    ) -> Result<Block> {
+        self.build_block(
+            miner_address,
+            body,
+            l2_txs,
             now_ms,
             difficulty_override,
             max_attempts,
@@ -904,7 +944,16 @@ impl Chain {
     ) -> Result<Block> {
         let cursor = self.height();
         let body = pool.select_for_block(self.params.gas_cap, self.params.max_block_bytes);
-        let block = self.build_block(miner_address, body, now_ms, None, DEFAULT_MAX_ATTEMPTS)?;
+        // Pool mining is L1-only: the mempool holds L1 transactions. L2
+        // transactions are carried by `mine_block_with_l2`.
+        let block = self.build_block(
+            miner_address,
+            body,
+            Vec::new(),
+            now_ms,
+            None,
+            DEFAULT_MAX_ATTEMPTS,
+        )?;
         self.submit_at(block.clone(), Some(now_ms))?;
         // Eviction is derived from the **canonical chain**, never from the fact
         // that we mined something. `reconcile_mempool` evicts what canonical

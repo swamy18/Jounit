@@ -399,6 +399,13 @@ socket found all of the following.
 
 ## Not done
 
+> **Dated section — read the appended phase sections below for current status.**
+> This list was written before Step 2 (transaction relay) and before Phases
+> 2–5 shipped; items below that are now delivered (L2/VWC, coverage-guided
+> fuzzing, transaction relay) have their own SHIPPED sections at the end of
+> this file. It is left as written because this document is a chronological
+> record, not a live summary.
+
 - **Layer 2 / Verified Work Certificates.** The core of the project's premise.
 - **P2P gaps.** Block relay works (verified end to end over real sockets, and
   between two `serve` processes). A bounded, attack-tested mempool now exists,
@@ -1116,3 +1123,52 @@ settle-fee economics question remains open, carried from Phase 2.
 **Still gated:** BLS/M5 L1 finality activation (end of Phase 6). **Now
 unblocked:** Phase 6 (testnet integration, worker↔node transport, chaos
 testing, mainnet readiness).
+
+---
+
+## Phase 6 — STEP 0 audit, then M1 (L2 in the block pipeline): SHIPPED — 2026-10-07
+
+Phase 6 opened with an audit (`docs/phase6-plan.md`) because the phase did not
+turn out to be the one the roadmap describes. The headline finding: L2 was not
+merely unintegrated but **unreachable from consensus** — `jnt-node` did not
+depend on `jnt-l2`, `Chain::submit` took only a `Block`, and `L2State` held a
+private balance ledger whose only entry point (`credit`) no production path
+called. The validator set had no stake ledger to derive from, finality had no
+message type, L2 state was unrecoverable across restart (no serde in `jnt-l2`),
+and the node had no transport at all.
+
+Four decisions were required and made (Decisions 6–9 in `docs/decisions.md`):
+L2 transactions ride inside L1 blocks with no header change; L2 value enters
+through a genesis-funded protocol escrow; testnet bootstraps from a fixed
+genesis committee; the transport is the roadmap §13 REST API.
+
+**M1 shipped** (`SPEC.md` §19.1, normative):
+
+- Blocks carry L2 transactions in an append-only trailer, **absent when empty**,
+  so a block with none encodes byte for byte as before — no version bump and no
+  frozen vector change (`genesis_block()` is unchanged; verified, not assumed).
+- The header's existing `merkle_root` commits to the L2 leaves under a distinct
+  domain tag, so the *existing* `MerkleRootMismatch` rule already refuses a
+  block whose L2 section was stripped or altered. `Chain::submit` was not made
+to know about L2 — no new L1 consensus rule.
+- L2 state is **derived, not stored**: `jnt_l2::replay::ChainL2` rebuilds it by
+  replaying the stored chain (`advance_block(h)` then the block's payloads), so
+  restart recovery and reorg both need no undo bookkeeping. The incremental path
+  (`empty` + `apply_block`) is asserted equal to full replay.
+- A payload that does not apply is skipped **by name** and stays retryable —
+  L2 validity is explicitly not an L1 block rule, so this is visible rather than
+  swallowed.
+- `Chain::mine_block_with_l2` produces such blocks; `mine_block`,
+  `mine_block_with` and `mine_from_pool` are unchanged, so no existing caller
+  moved.
+
+**Verified:** 513 workspace tests / 0 failed / 1 ignored (was 500; +6 block, +7
+replay); fmt clean; `clippy -D warnings` clean workspace-wide; release build
+clean.
+
+**Honest limitation, deliberately pinned by tests:** with no funding bridge
+(Decision 7) and no genesis committee (Decision 8), every L2 transaction
+replayed from a chain is refused for insufficient balance and no settlement can
+verify quorum. The L2 marketplace does **not** yet run end to end; M1's replay
+machinery is verified against a chain holding no value and no validators. SPEC
+§19.3 says so explicitly so §19.1 cannot be over-read.

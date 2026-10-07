@@ -15,9 +15,13 @@
 //!   period).
 //!
 //! What is deliberately *not* here, and why:
-//! - **L1 integration.** How an L2 transaction enters an L1 block is Phase 6.
-//!   Building that now would mean inventing block rules before the state machine
-//!   above them was exercised.
+//! - **L1 block validity.** L2 transactions are carried in L1 blocks and
+//!   committed by each block's merkle root (Decision 6), and L2 state is rebuilt
+//!   from that chain by [`replay::ChainL2`]. What is *not* here is any rule that
+//!   makes an L1 block invalid because of its L2 content: an L2 payload that
+//!   fails to apply is recorded by the replayer and skipped deterministically,
+//!   never turned into a consensus rule. That separation is what keeps this
+//!   integration from touching `Chain::submit`.
 //! - **BLS finality activation.** `Settle` verifies a validator-quorum aggregate
 //!   through the existing `BlsVerifier` trait, but nothing here finalizes an L1
 //!   block. M5 stays inert until the end of the cycle (`docs/decisions.md`).
@@ -34,12 +38,14 @@
 
 pub mod dispute;
 pub mod error;
+pub mod replay;
 pub mod state;
 pub mod task_contract;
 pub mod vwc;
 
 pub use dispute::{Arbiter, DisputeEngine, DisputeEvidence, DisputeVerdict};
 pub use error::{L2Error, L2Result};
+pub use replay::{ChainL2, SkippedL2};
 pub use state::{L2Effect, L2State};
 pub use task_contract::{
     ContractState, DisputeChallenge, ExpiryOutcome, L2Config, SettlementOutcome, TaskContract,

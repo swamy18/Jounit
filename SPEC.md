@@ -2046,3 +2046,119 @@ regression tests assert that over every public error and debug path.
 - No move of consensus logic (task application, dispute resolution, fee
   accounting, settlement) into the SDK. The SDK is a client of an L2 the node
   already runs.
+
+---
+
+## 19. Phase 6: L1↔L2 integration (specified in two parts)
+
+§15.9 left "how L2 transactions reach a block" deliberately unspecified. This
+section specifies it. **§19.1 describes behaviour that is implemented and
+tested; §19.2 and §19.3 are specified but not yet built**, and are marked so
+rather than being folded in with the implemented part.
+
+### 19.1 L2 transactions in L1 blocks — IMPLEMENTED, normative
+
+**Carriage.** A block MAY carry L2 transactions in a trailer after its L1
+transaction list:
+
+```
+serialize(block) = header(145) ‖ signature(64) ‖ signer_pubkey(33)
+                   ‖ U4LE(tx_count) ‖ tx_0 … tx_{n-1}
+                   ‖ U4LE(l2_count) ‖ (U4LE(len) ‖ l2_tx_bytes(len)) × l2_count
+```
+
+1. The trailer is **absent when `l2_count` is zero**. A block whose trailer is
+   present and empty is invalid (`Malformed`): one block has exactly one byte
+   encoding, and a second encoding of a block is a second identity for it.
+2. Consequently a block with no L2 transactions — which is every block that
+   exists before this section — encodes byte for byte as it did in §3.5. No
+   version bump, no frozen vector change, and `genesis_block()` is unchanged.
+3. `l2_count` MUST be bounded by the remaining bytes before any allocation, and
+   each entry's `len` MUST be within the remaining bytes. Both are checked; a
+   count that passes one and fails the other is still rejected without
+   allocating.
+4. Each entry is length-prefixed so it is parsed independently: a malformed entry
+   cannot desynchronise the parse of the entries after it.
+
+**The commitment.** The header's `merkle_root` covers the L1 leaves first, then
+the L2 leaves, in block order. L1 and L2 leaves use **distinct domain tags**
+(`0x00` and `0x02`; internal nodes remain `0x01`), so an L2 payload can never be
+presented as an L1 transaction leaf or vice versa.
+
+This is the rule that makes the carriage safe, and it is worth being precise
+about why: `block_hash = SHA256(DOM_BLOCK ‖ serialize(header))` (§3.4), so the
+header binds the body *only* through `merkle_root`. Committing L2 leaves to that
+same root means the existing `MerkleRootMismatch` rule (§9.1) already refuses a
+block whose L2 section was stripped, reordered or altered — **no new L1 block
+rule is introduced**, and `Chain::submit` is not made to know about L2 at all.
+
+**Application.** L2 state is a pure function of the canonical chain:
+
+    state = fold over heights h = 1..=tip of  ( advance_block(h) ; block(h).l2_txs in order )
+
+The clock advances to the height **first**, then the block's own transactions
+apply in block order. That order is normative because two nodes must agree on
+whether a transaction landing on the same height as an expiry sees the task open
+or expired.
+
+**A failed L2 transaction is not a failed block.** L2 validity is explicitly
+*not* an L1 block-validity rule. A payload that does not apply is refused by
+`L2State::apply`, recorded by the replayer with its height, txid and named
+error, and otherwise ignored: it is **not** marked applied (so the same bytes
+remain retryable, §15.5) and it changes no state. Every node reaches the same
+conclusion, because `apply` is a pure function of state and the rejection is
+deterministic — so a miner that wastes block space on an unapplicable payload
+causes no divergence. Making L2 validity a block rule is a separate change that
+would require `Chain` to consult L2, which the dependency direction
+(`jnt-l2 → jnt-core`) forbids by construction.
+
+**Derivation, not storage.** L2 state is rebuilt by replaying the stored chain,
+not persisted alongside it. A restart therefore cannot recover a *stale* L2
+state — there is none to recover — and a reorg needs no undo bookkeeping: the
+chain that won is replayed. `L2State`'s equality is derived over all of its
+fields, so "two nodes agree" is a total comparison rather than a hand-picked
+summary.
+
+**Implementations.** `jnt_core::block` (carriage, commitment),
+`jnt_core::chain::Chain::mine_block_with_l2` (producing a block that carries
+L2), `jnt_l2::replay::{ChainL2, SkippedL2}` (replay and the incremental path).
+
+### 19.2 Worker↔node transport — SPECIFIED for M3, NOT IMPLEMENTED
+
+Decision 9 selects the roadmap §13 REST API. That document remains the authority
+for its L1 endpoints; this subsection records the additive part the worker SDK
+needs, so §13 itself is not edited.
+
+- The server is `jnt-node`, opt-in via `--api-listen`, disabled by default.
+- The worker SDK's §18.3 seams are implemented as a client of it:
+  `L2NodeView` reads, `L2Broadcaster` writes. The SDK is not modified to
+  accommodate the transport.
+- Endpoints the SDK requires beyond §13's list: L2 task state, open-task
+  enumeration, L2 certificate lookup, and broadcast of an `L2Transaction`
+  (§13's broadcast is L1-shaped).
+- Authentication, replay protection, malformed-message rejection and
+  idempotent retry are required (§18.9, §18.10, §18.11 apply to the transport
+  exactly as they apply to the SDK's own state machines).
+- Binding is loopback by default; exposing it beyond that is an operator
+  decision, and the API is not a consensus surface: nothing it accepts may
+  reach `Chain::submit` except a signed transaction, which is validated as
+  §13.14 requires.
+
+### 19.3 Specified only when its decision lands
+
+Two Phase 6 obligations are **not** specified here, on purpose, because their
+decisions are recorded but their mechanisms are not yet built. Nothing may be
+inferred about them from this section:
+
+- **The L1→L2 funding bridge** (Decision 7): the genesis-funded escrow, and what
+  `L2State::credit` is driven by. Until this exists, no L2 account holds value,
+  so every L2 transaction replayed from a chain is refused for insufficient
+  balance. That is the current, tested behaviour and not a bug (§15.5's
+  conservation invariant holds vacuously).
+- **The genesis validator committee and checkpoints** (Decisions 2 and 8): the
+  fixed genesis set, the checkpoint message type (a §13.5 `msg_type` decision),
+  and which checkpoint validator is authoritative.
+
+Neither is a precondition for §19.1, which is what makes the ordering here safe:
+carriage and replay can be verified against a chain holding no value and no
+validators, and they are.

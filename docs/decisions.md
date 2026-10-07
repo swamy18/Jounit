@@ -431,3 +431,148 @@ above. SPEC.md §18 is the normative worker-facing text.
 | 4 — Verified Work Certificates | DONE |
 | 5 — Worker SDK | **DONE** (commit `c43bdef`) |
 | 6 — Testnet + finality activation | PREPARED, gated on 5 (now unblocked) |
+
+---
+
+# Implementation status — Phase 6 STEP 0 audit, decisions recorded (2026-10-07)
+
+Phase 6 opens with an audit rather than a work list (`docs/phase6-plan.md`,
+commit `f4e9873`). It found that L2 is not merely unintegrated but
+*unreachable* from consensus, and that four things the roadmap assumed were
+decided are not. Those four were put to the protocol owner and decided here.
+**None of them is built yet**; this section records the decisions so the build
+has an authority to check against.
+
+## Decision 6 — L2 transactions ride inside L1 blocks, committed by the existing merkle root
+
+**Chosen: L2 transactions are carried in the L1 block body as an append-only
+trailer, and the block's existing `merkle_root` commits to them. The 145-byte
+header is unchanged and no L1 consensus rule is added.**
+
+Why this shape, and not just "L2 txs in blocks":
+
+- `block_hash = SHA256(DOM_BLOCK ‖ serialize(header))` (§3.4), so the header
+  binds the body **only** through `merkle_root`. If L2 payloads rode in the body
+  outside the merkle tree, two nodes could accept the same header with different
+  L2 payloads and silently diverge in L2 state. Committing them to the merkle
+  root is what makes L2 state a pure function of the canonical chain.
+- Because the root is already covered by the header, `Chain::submit`'s existing
+  merkle check authenticates L2 payloads with **zero new consensus code**. L1
+  block validity is untouched.
+
+**Encoding (append-only, so no frozen vector moves):**
+
+```
+serialize(block) = §3.5 (header ‖ sig ‖ pubkey ‖ U4LE(tx_count) ‖ txs)
+                   ‖ U4LE(l2_count) ‖ serialize(l2_tx_0) …   [section OMITTED when empty]
+```
+
+- The L2 section is **absent** when there are no L2 transactions, so every
+  block that exists today serializes to the same bytes, and `genesis_block()`
+  is bit-identical. This is why the change breaks no §12 vector: the frozen
+  vectors cover input/output/tx/header layouts, not whole blocks.
+- A block whose L2 section is present but empty is **invalid** (non-canonical
+  encoding): one block must have exactly one byte encoding.
+- L2 leaves use a distinct domain tag (`0x02`) from L1 leaves (`0x00`) and
+  internal nodes (`0x01`), so an L2 payload can never be reinterpreted as an L1
+  transaction leaf.
+- `l2_count` is bounded by the remaining bytes before allocation, the same rule
+  §3 and §13.5 already impose on every other count field.
+
+**What this decision does NOT do:** it does not make L2 validity an L1
+block-validity rule. A miner that includes an L2 transaction that fails to apply
+is not (yet) producing an invalid block; the transaction is deterministically
+skipped during replay, so nodes still agree. Recording an invalid L2 payload in
+an L1 block is therefore a waste of block space, not a divergence or a
+consensus break. Tightening this into a block rule is a separate, reviewable
+change (M2/M4), and would require `Chain` to consult L2 — which today's
+dependency direction forbids by design (`jnt-l2` depends on `jnt-core`).
+
+## Decision 7 — L2 value enters through a genesis-funded protocol escrow
+
+**Chosen: a genesis allocation funds an L2 protocol escrow, and only escrow
+movements drive `L2State::credit`. L2 burns and PSCB accrual then correspond to
+real, accountable L1 supply changes. User deposits and exits are deferred.**
+
+Rationale: `L2State` keeps a private balance ledger whose only entry point is
+`credit()`, documented in the code as the Phase 6 bridge seam, and no production
+path calls it. Without a funded, accountable source, L2 burns destroy nothing
+real and `payment_sat` can be set by an unfunded poster — L2 would be a points
+system wearing a currency's notation. A genesis-funded escrow makes
+conservation span both ledgers while needing **no new L1 transaction type**,
+which keeps Phase 6 inside its scope.
+
+**Explicitly unchanged:** the 40M supply cap, issuance paths, block rewards,
+halving schedule, the L1 gas floor, and the D3 L2 fee schedule. The escrow is a
+*reallocation of genesis coins already inside the cap*, not new issuance.
+
+**Deferred, and must be decided before mainnet:** user-facing deposit and exit
+(the L1 lock that funds escrow from a user, and the L2→L1 withdrawal). That is
+a new L1 mechanism and is not authorised by this decision.
+
+## Decision 8 — Testnet bootstraps from a fixed genesis committee, no stake transactions
+
+**Chosen: the testnet validator set is a fixed list in genesis. No stake
+transaction type, no bonded-stake ledger, and no unbonding are built in
+Phase 6.**
+
+This is exactly Decision 2's own bootstrap mode ("a fixed genesis committee of
+the TopN stakers at the genesis epoch is the bootstrap mode; rotation switches
+on only after the chain is stable"). It lets the whole validator/finality path be
+exercised end to end — set derivation, BLS signing and aggregation, quorum,
+checkpoints, equivocation evidence, restart — without inventing the stake
+economics that Decision 2 deliberately left parameterised.
+
+Consequence to be honest about: with no stake ledger, `derive_set` is fed by
+**genesis** rather than by chain state, so "TopN by stake at the seed block" is
+exercised as a pure function over the genesis list, not over live stake. Real
+bonded stake (`min_validator_stake_sat` = 5 000 JNT, unbonding after
+`finality_depth`) remains required for mainnet and is **not** built here.
+
+**Unchanged:** Decision 2's numbers (5 000 JNT, N = 21), no rewards, no fee
+share, no issuance from validators, and equivocation burning the entire bond
+through the existing M2 slash path.
+
+## Decision 9 — The worker↔node transport is the roadmap §13 REST API
+
+**Chosen: build §13's REST API in `jnt-node` (axum + tokio, opt-in via
+`--api-listen`) and implement the Phase 5 seams (`L2NodeView`,
+`L2Broadcaster`) as an HTTP client over it.**
+
+Rationale: §13 is already the roadmap's specified interface and is the
+prerequisite the roadmap names for the entire agent layer (§15 MCP, §16
+ElizaOS, §17 LangChain). Extending the P2P layer instead would put
+client/server query semantics into a consensus-adjacent crate and leave the
+agent layer blocked; a bespoke third protocol would be thrown away when §13
+lands. The cost is real and accepted: this adds the repository's first async
+runtime and HTTP dependency.
+
+**Additive extension required:** §13's broadcast endpoint is L1-shaped
+(`signed_tx_hex`), while the SDK must broadcast `L2Transaction`s. The REST
+surface therefore gains L2 read endpoints (task state, open tasks, VWC,
+earnings inputs) and an L2 broadcast endpoint. That extension is specified in
+`SPEC.md` §19.2, **not** by editing `docs/roadmap.md` (§13 stays as written).
+
+## Pending, to be confirmed at their milestone (not yet decided)
+
+- **P1 (M5):** whether the public testnet gets its own `NetworkParams` profile
+  or runs on `mini`. Note for whoever decides it: genesis is *identical* across
+  profiles today (`genesis_hash_is_identical_across_profiles`), so a profile is
+  not by itself a chain ID — `network_magic`/`network_id` are the
+discriminators.
+- **P2 (M4):** adding frozen `msg_type = 11` for checkpoints, per §13.5's freeze
+  rule and §14.6's statement that checkpoint transport is a §13.5 decision
+  deferred for vector stability.
+- **P3 (M4):** which checkpoint implementation is authoritative once finality is
+  wired — `validators::validate_checkpoint_against_set` (six named clauses, set
+  hash) or `bls_checkpoint::verify_checkpoint` — and what
+  `Chain::finalized_height()` reports after activation.
+
+| Phase | Status |
+|---|---|
+| 1 — L1 production | DONE |
+| 2 — TaskContract + L2 txs | DONE |
+| 3 — Dispute engine + M2/M1 | DONE |
+| 4 — Verified Work Certificates | DONE |
+| 5 — Worker SDK | DONE |
+| 6 — Testnet + finality activation | **IN PROGRESS** — STEP 0 audit done; D6–D9 decided, none built; finality still gated |

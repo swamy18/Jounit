@@ -4,8 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::hash::{sha256, sha256_dom, Hash, DOM_BLOCK};
+use crate::l2::L2Transaction;
 use crate::ser::{Reader, Writer};
 use crate::tx::{Output, Transaction, TX_COINBASE};
+
+/// Smallest byte length an encoded L2 entry can occupy: its 4-byte length
+/// prefix plus the 4-byte version and 1-byte type tag of the payload that
+/// follows. Used only to bound `l2_count` before allocating (SPEC.md §19.1),
+/// the same discipline §3 and §13.5 apply to every other count field.
+const L2_TX_MIN_ENCODED_LEN: usize = 9;
 
 pub const HEADER_SERIALIZED_LEN: usize = 145;
 pub const BLOCK_VERSION: u32 = 1;
@@ -119,6 +126,14 @@ pub struct Block {
     #[serde(with = "crate::hexserde::h33")]
     pub signer_pubkey: [u8; 33],
     pub txs: Vec<Transaction>,
+    /// L2 transactions carried by this block (Decision 6, SPEC.md §19.1).
+    ///
+    /// Empty for every block that predates Phase 6, which is why the field is
+    /// skipped in the JSON form and the binary form omits its section entirely:
+    /// a block with no L2 transactions has exactly one encoding — the original
+    /// one — so no frozen vector and no stored block changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub l2_txs: Vec<L2Transaction>,
 }
 
 impl Block {
@@ -130,6 +145,17 @@ impl Block {
             .u32le(self.txs.len() as u32);
         for tx in &self.txs {
             w.raw(&tx.serialize());
+        }
+        // L2 section (Decision 6). Omitted entirely when empty — see the field
+        // comment: absence is what keeps every pre-Phase-6 block byte-identical.
+        // Each entry is length-prefixed so it can be read back without an L2
+        // reader, and so a malformed entry cannot desynchronise the parse.
+        if !self.l2_txs.is_empty() {
+            w.u32le(self.l2_txs.len() as u32);
+            for tx in &self.l2_txs {
+                let bytes = tx.serialize();
+                w.u32le(bytes.len() as u32).raw(&bytes);
+            }
         }
         w.into_vec()
     }
@@ -153,12 +179,37 @@ impl Block {
             let tx = Transaction::from_reader(&mut r)?;
             txs.push(tx);
         }
+
+        // L2 section (Decision 6). It is present only when non-empty. An empty
+        // section is a *second* encoding of a block that serializes without
+        // one, so it is refused rather than accepted: two encodings for one
+        // block would mean two byte strings claiming the same identity.
+        let mut l2_txs = Vec::new();
+        if r.remaining() > 0 {
+            let m = r.u32le()? as usize;
+            if m == 0 {
+                return Err(Error::Malformed(
+                    "empty L2 section is not a canonical block encoding",
+                ));
+            }
+            if m > r.remaining() / L2_TX_MIN_ENCODED_LEN {
+                return Err(Error::Malformed("l2_tx_count exceeds buffer"));
+            }
+            l2_txs.reserve(m);
+            for _ in 0..m {
+                let len = r.u32le()? as usize;
+                let bytes = r.fixed_slice(len)?;
+                l2_txs.push(L2Transaction::deserialize(bytes)?);
+            }
+        }
+
         r.expect_end()?;
         Ok(Block {
             header,
             signature,
             signer_pubkey,
             txs,
+            l2_txs,
         })
     }
 
@@ -166,8 +217,17 @@ impl Block {
         self.header.block_hash()
     }
 
+    /// The root the header commits to. Covers L1 transactions first, then L2
+    /// transactions (Decision 6) — which is what binds an L2 payload to the
+    /// block hash, so `Chain::submit`'s existing merkle check authenticates L2
+    /// content with no new consensus rule.
     pub fn merkle_root(&self) -> Hash {
-        merkle_root(&self.txs)
+        merkle_root_with_l2(&self.txs, &self.l2_txs)
+    }
+
+    /// Number of L2 transactions carried. Zero for every pre-Phase-6 block.
+    pub fn l2_count(&self) -> usize {
+        self.l2_txs.len()
     }
 
     /// Gas for the whole block.
@@ -184,19 +244,44 @@ impl Block {
 
 const LEAF_TAG: u8 = 0x00;
 const INTERNAL_TAG: u8 = 0x01;
+/// L2 leaves are domain-separated from L1 leaves so an L2 payload can never be
+/// reinterpreted as an L1 transaction leaf (Decision 6, SPEC.md §2 and §19.1).
+const LEAF_TAG_L2: u8 = 0x02;
 
 /// Binary merkle root with domain-separated leaves and internal nodes.
 /// Odd nodes are duplicated, Bitcoin-style. SPEC.md §2.
 pub fn merkle_root(txs: &[Transaction]) -> Hash {
-    if txs.is_empty() {
-        // A valid block always carries a coinbase, so this is unreachable in
-        // consensus; defined anyway so the function is total.
-        return [0u8; 32];
-    }
-    let mut level: Vec<Hash> = txs
+    let leaves: Vec<Hash> = txs
         .iter()
         .map(|t| sha256(&[&[LEAF_TAG], &t.serialize()]))
         .collect();
+    merkle_from_leaves(leaves)
+}
+
+/// Merkle root over a block body that may carry L2 transactions (Decision 6).
+///
+/// L1 leaves come first in block order, then L2 leaves in block order. When
+/// `l2` is empty this is **bit-identical** to `merkle_root(l1)`, which is the
+/// property that keeps `genesis_block()` and every existing block unchanged.
+/// The two leaf kinds use different domain tags, so a body cannot be presented
+/// with an L2 payload where an L1 transaction leaf is expected.
+pub fn merkle_root_with_l2(l1: &[Transaction], l2: &[L2Transaction]) -> Hash {
+    if l2.is_empty() {
+        return merkle_root(l1);
+    }
+    let mut leaves: Vec<Hash> = Vec::with_capacity(l1.len() + l2.len());
+    leaves.extend(l1.iter().map(|t| sha256(&[&[LEAF_TAG], &t.serialize()])));
+    leaves.extend(l2.iter().map(|t| sha256(&[&[LEAF_TAG_L2], &t.serialize()])));
+    merkle_from_leaves(leaves)
+}
+
+/// Fold leaves into a root. Total: an empty block body hashes to all zeroes,
+/// which is unreachable in consensus (every valid block carries a coinbase)
+/// but keeps the function defined for every input.
+fn merkle_from_leaves(mut level: Vec<Hash>) -> Hash {
+    if level.is_empty() {
+        return [0u8; 32];
+    }
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         for pair in level.chunks(2) {
@@ -229,6 +314,7 @@ pub fn genesis_block(difficulty: u128) -> Block {
         signature: [0u8; 64],
         signer_pubkey: [0u8; 33],
         txs: vec![coinbase],
+        l2_txs: Vec::new(),
     }
 }
 
@@ -461,5 +547,164 @@ mod tests {
                 "output value {v} collided with another on the wire"
             );
         }
+    }
+
+    // --- L2 transactions in the block body (Decision 6, SPEC.md §19.1) ------
+
+    fn l2_post() -> L2Transaction {
+        let w = crate::wallet::Wallet::from_private_key_bytes(&[9u8; 32], "block-l2").unwrap();
+        let task = crate::compute_ir::ComputeTask {
+            task_id: [0x11u8; 32],
+            ir_hash: [0x22u8; 32],
+            input_hash: [0x33u8; 32],
+            required_memory_bytes: 4 * 1024 * 1024,
+            backend_hint: crate::compute_ir::ComputeBackend::Gpu,
+            reward_sat: 1_000_000,
+            expiry_height: 500,
+            submit_height: 1,
+        };
+        L2Transaction::new(crate::l2::L2Payload::Post(
+            crate::l2::PostTaskPayload::build(&w, 1, 5_000_000, 500, task).unwrap(),
+        ))
+    }
+
+    /// The property that lets this land without a format fork: a block with no
+    /// L2 transactions encodes to exactly the pre-Phase-6 byte string, with no
+    /// section, no length prefix and no version bump.
+    #[test]
+    fn a_block_without_l2_transactions_encodes_exactly_as_before() {
+        let b = genesis_block(1);
+        assert_eq!(b.l2_count(), 0);
+
+        let mut expected = b.header.serialize();
+        expected.extend_from_slice(&b.signature);
+        expected.extend_from_slice(&b.signer_pubkey);
+        expected.extend_from_slice(&(b.txs.len() as u32).to_le_bytes());
+        for t in &b.txs {
+            expected.extend_from_slice(&t.serialize());
+        }
+        assert_eq!(
+            b.serialize(),
+            expected,
+            "an L2-free block must keep its original encoding byte for byte"
+        );
+    }
+
+    /// An L2 transaction survives the round trip and — the point of the whole
+    /// design — moves the value the header commits to.
+    #[test]
+    fn an_l2_transaction_round_trips_and_moves_the_commitment() {
+        let mut b = genesis_block(1);
+        let root_without = b.merkle_root();
+        let hash_without = b.block_hash();
+
+        // The compatibility direction first: no L2 txs means the same root.
+        assert_eq!(merkle_root_with_l2(&b.txs, &[]), merkle_root(&b.txs));
+
+        b.l2_txs.push(l2_post());
+        let bytes = b.serialize();
+        let back = Block::deserialize(&bytes).unwrap();
+        assert_eq!(back, b, "block with L2 transactions did not round-trip");
+        assert_eq!(back.l2_count(), 1);
+
+        assert_ne!(
+            b.merkle_root(),
+            root_without,
+            "carrying an L2 transaction must change the committed root"
+        );
+        // With the header updated, the block hash moves too — which is what
+        // makes `Chain::submit`'s existing merkle check authenticate L2 content.
+        b.header.merkle_root = b.merkle_root();
+        assert_ne!(b.block_hash(), hash_without);
+    }
+
+    /// The malleability the commitment exists to stop: strip the L2 section from
+    /// a block that has one and you get a decodable block — with a header whose
+    /// merkle root no longer matches, so consensus refuses it.
+    #[test]
+    fn stripping_the_l2_section_leaves_a_block_its_header_rejects() {
+        let mut b = genesis_block(1);
+        b.l2_txs.push(l2_post());
+        b.header.merkle_root = b.merkle_root();
+        let full = b.serialize();
+
+        // Rebuild the same body without the L2 section: a valid encoding of a
+        // *different* block, whose header commitment no longer holds.
+        let stripped = Block {
+            l2_txs: Vec::new(),
+            ..b.clone()
+        };
+        let stripped_bytes = stripped.serialize();
+        assert!(stripped_bytes.len() < full.len());
+        let decoded = Block::deserialize(&stripped_bytes).unwrap();
+        assert_eq!(decoded.l2_count(), 0);
+        assert_ne!(
+            decoded.merkle_root(),
+            decoded.header.merkle_root,
+            "a stripped block must not satisfy its own header commitment"
+        );
+
+        // And the original bytes still decode to the committed content.
+        assert_eq!(Block::deserialize(&full).unwrap(), b);
+    }
+
+    /// One block, one encoding: an empty section is refused rather than
+    /// accepted as a second representation of the same block.
+    #[test]
+    fn an_empty_l2_section_is_rejected_as_non_canonical() {
+        let b = genesis_block(1);
+        let mut bytes = b.serialize();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            Block::deserialize(&bytes),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn an_l2_count_cannot_claim_more_entries_than_the_buffer_holds() {
+        let b = genesis_block(1);
+        let mut bytes = b.serialize();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            Block::deserialize(&bytes),
+            Err(Error::Malformed(_))
+        ));
+
+        // A count that passes the cheap bound but is followed by a length
+        // prefix larger than what remains must also fail, not allocate.
+        let mut bytes = b.serialize();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Block::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn every_truncation_of_an_l2_bearing_block_is_rejected_not_panicked() {
+        let mut b = genesis_block(1);
+        b.l2_txs.push(l2_post());
+        b.header.merkle_root = b.merkle_root();
+        let full = b.serialize();
+
+        let body_end = {
+            let mut no_l2 = b.clone();
+            no_l2.l2_txs.clear();
+            no_l2.serialize().len()
+        };
+
+        // Cuts inside the L2 section must fail. (The cut exactly at `body_end`
+        // is the L2-free encoding, which decodes — and is then rejected by the
+        // header commitment, as the stripping test above pins.)
+        for cut in body_end + 1..full.len() {
+            assert!(
+                Block::deserialize(&full[..cut]).is_err(),
+                "a {cut}-byte prefix of a {}-byte block was accepted",
+                full.len()
+            );
+        }
+        // Trailing junk is still junk.
+        let mut extended = full.clone();
+        extended.push(0xAB);
+        assert!(Block::deserialize(&extended).is_err());
     }
 }

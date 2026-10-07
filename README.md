@@ -12,8 +12,11 @@ without weakening the security a hash chain depends on.
 > Certificates for settled work. The worker SDK (`jnt-worker`, Phase 5):
 > a task-economy client for humans, AI agents and machines — discover,
 > claim, execute, submit, dispute participation, certificate observation,
-> and earnings derived from protocol state. Testnet/finality (Phase 6)
-> remain. Read [Status](#status).
+> and earnings derived from protocol state. Phase 6 (integration + testnet) has
+> begun: L2 transactions now ride inside L1 blocks and L2 state is rebuilt from
+> the chain (**SPEC.md §19.1**), so L2 is no longer only a library. Still ahead:
+> the L1→L2 funding bridge, the worker↔node transport, the genesis validator
+> committee and binding finality. Read [Status](#status).
 
 ---
 

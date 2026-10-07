@@ -95,6 +95,7 @@ fn handcraft(chain: &Chain, miner: Address, body: Vec<Transaction>, height: u64)
         signature: [0u8; 64],
         signer_pubkey: [0u8; 33],
         txs,
+        l2_txs: Vec::new(),
     }
 }
 

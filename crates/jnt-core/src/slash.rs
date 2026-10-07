@@ -117,7 +117,7 @@ impl SlashRecord {
 
 /// The on-chain slash vault. Holds all active `SlashRecord`s and drives
 /// block-by-block vesting payout.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlashVault {
     records: Vec<SlashRecord>,
     /// Running total of all amounts that have been permanently burned via

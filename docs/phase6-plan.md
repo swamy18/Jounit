@@ -218,6 +218,12 @@ chronological ledger, so the repair is a pointer, not a rewrite.
 
 ## 4. Decisions required before implementation (do not invent these)
 
+> **Status: DECIDED (2026-10-07).** All four were put to the protocol owner and
+> came back on the recommended option. They are recorded as **Decisions 6–9 in
+> `docs/decisions.md`**, which is now their authority; the options below are
+> kept as the record of what was chosen *from*. D9 (below, §4 D11) is the
+> transport decision — the question list used its working number.
+
 ### D6 — How L2 transactions reach a block *(blocks M1, and F3's repair)*
 
 - **A (recommended):** L2 transactions are carried **inside L1 blocks** in a
@@ -291,7 +297,7 @@ chronological ledger, so the repair is a pointer, not a rewrite.
 | # | Milestone | Deliverable / acceptance criteria | Gated by |
 |---|---|---|---|
 | M0 | **This audit** | plan doc; no code change | — |
-| M1 | L2 in the block pipeline | L2 txs carried per D6; node holds `Chain` + `L2State`; canonical-order replay; **two independent replays of the same chain produce byte-identical L2 state**; restart → re-sync → identical state; rejected txs leave state untouched; `fuzz_invariants` extended | D6 |
+| M1 | L2 in the block pipeline | **DONE** (`SPEC.md` §19.1, commit pending). L2 txs carried per D6 (append-only trailer, absent when empty, so no vector or genesis change); the header's existing `merkle_root` commits to them under a distinct leaf tag, so the existing `MerkleRootMismatch` rule refuses stripped/altered sections and `Chain::submit` learns nothing new; `jnt_l2::replay::ChainL2` rebuilds state by replay (derived, not stored) and the incremental path is asserted equal to it; rejected payloads are skipped **by name** and stay retryable; `mine_block_with_l2` produces such blocks. Acceptance: two independent replays produce **equal `L2State`** (equality derived over all fields); full replay == incremental application; stripped section fails its own header. +13 tests (513 total). **Not** covered, by construction: funded accounts (M2) and validator quorum (M4) — pinned as such instead of pretended. | D6 |
 | M2 | Value bridge + fee accounting | per D7; conservation asserted across L1+L2; `AmountTooSmallForFee` resolved or explicitly re-documented; `split_flat_fee` unchanged | D7, D6 |
 | M3 | Worker↔node transport | per D11; seam conformance tests; auth, malformed-rejection, replay, idempotent retry, stale-state, restart/reconnect; no key material in logs/errors | D11, M1 |
 | M4 | Validator set + finality (non-binding) | per D8 + P2 + P3; set derivation from chain stake state; BLS sign/aggregate/verify; equivocation detection → full-bond M2 slash; persistence across restart; **finality visible but non-binding**; fuzz + chaos before any activation | D8 |

@@ -805,6 +805,36 @@ impl L2Transaction {
     }
 }
 
+/// Serde identity of an L2 transaction is its **canonical binary encoding**
+/// (Decision 6).
+///
+/// This exists so a whole `Block` can still be serialized, which the node's
+/// chain export needs. Representing the JSON form as the binary bytes keeps a
+/// single authority for what an L2 transaction is: the same encoding `txid`,
+/// the signing hashes and the block-commitment path already use. A
+/// field-by-field serde form would be a second encoding to keep in step with
+/// the first — exactly the drift §15's canonical-encoding rule exists to
+/// prevent. It also means an L2 payload stored in JSON is decoded through
+/// `L2Transaction::deserialize`, so its bounds and validation apply there too.
+impl serde::Serialize for L2Transaction {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(self.serialize()))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for L2Transaction {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        // Fully qualified: this module has its own `Result` alias and its own
+        // `Error`, and both would otherwise shadow what serde's trait wants.
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        let bytes =
+            hex::decode(&s).map_err(|e| <D::Error as serde::de::Error>::custom(e.to_string()))?;
+        // Go through the canonical decoder, so a JSON-supplied L2 transaction
+        // is held to exactly the rules a wire-supplied one is.
+        L2Transaction::deserialize(&bytes).map_err(<D::Error as serde::de::Error>::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
