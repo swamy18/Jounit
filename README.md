@@ -9,8 +9,11 @@ without weakening the security a hash chain depends on.
 > BLS finality gadget), `jnt-net` block relay and sync, and a working Layer 2
 > (`jnt-l2`): task contracts, the five L2 transaction types, D3 fees, a complete
 > dispute engine with M2 slashing and M1 PSCB accounting, and Verified Work
-> Certificates for settled work. The worker SDK (Phase 5) and
-> testnet/finality (Phase 6) remain. Read [Status](#status).
+> Certificates for settled work. The worker SDK (`jnt-worker`, Phase 5):
+> a task-economy client for humans, AI agents and machines — discover,
+> claim, execute, submit, dispute participation, certificate observation,
+> and earnings derived from protocol state. Testnet/finality (Phase 6)
+> remain. Read [Status](#status).
 
 ---
 
@@ -54,9 +57,10 @@ without weakening the security a hash chain depends on.
 
 | | |
 |---|---|
-| Layer 2 — Verified Work Certificates | Phases 2–4 shipped in `crates/jnt-l2`: task contracts and the five L2 tx types (Phase 2), the dispute engine with M2/M1 integration (Phase 3), and Verified Work Certificates (Phase 4) — an automatic, quorum-verifiable receipt for every correctly settled task. The worker SDK (Phase 5) remains. |
+| Layer 2 — Verified Work Certificates | Phases 2–4 shipped in `crates/jnt-l2`: task contracts and the five L2 tx types (Phase 2), the dispute engine with M2/M1 integration (Phase 3), and Verified Work Certificates (Phase 4) — an automatic, quorum-verifiable receipt for every correctly settled task. |
+| Worker SDK | Shipped (Phase 5): [`crates/jnt-worker`](crates/jnt-worker) — a worker-side SDK over two injected node seams (`L2NodeView`/`L2Broadcaster`; no wire protocol invented). `WorkerClient` covers discovery, claim, a pluggable `Executor` (§16 CPU-reference shipped), result submission with M3 attestations, dispute observation/participation, VWC observation+validation, and earnings derived from authoritative state. Idempotent-by-txid restart/timeout flows; 32 SDK tests including a 15-test privilege-escalation/secret-hygiene suite. The transport that implements the seams (REST/P2P) is Phase 6. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
-| Coverage-guided fuzzing | Shipped: twelve cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
+| Coverage-guided fuzzing | Shipped: thirteen cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC + Phase-5 `worker_flows`), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
 | License file | Shipped: dual `LICENSE-MIT` / `LICENSE-APACHE` at the repo root, matching `Cargo.toml`'s `MIT OR Apache-2.0`. |
 
 ---
@@ -137,6 +141,7 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-store/` | 2 200+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
 | `crates/jnt-l2/` | 5 400+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates. |
 | `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
+| `crates/jnt-worker/` | — | Worker SDK (Phase 5, SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, earnings. A minimal secret-free CLI (`jnt-worker address`/`generate`). |
 | `sim/` | 1 609 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
 | [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |
@@ -155,6 +160,7 @@ jnt-core   pure protocol library — no I/O, no clock, no network
 jnt-net    P2P wire protocol, peer state machines, sync and relay
 jnt-store  persistent storage: append-only block log + atomic metadata
 jnt-l2     Layer 2: task contracts, the five L2 transaction types, D3 fees, the dispute engine, VWCs
+jnt-worker worker-side SDK (Phase 5): discovery, claim/execute/submit, disputes, VWC observation, earnings — client only, no consensus
 jnt-node   CLI and node daemon (serve, mine, status, verify)
 ```
 
@@ -608,16 +614,18 @@ merely self-consistent with the code implementing it.
 `.github/workflows/ci.yml` runs on every push and PR: format check, clippy with
 `-D warnings`, the full test suite, a release build, the vector cross-checks, the
 difficulty-attack containment simulation, the supply cross-check, and a
-`fuzz-smoke` job that runs all eleven libFuzzer targets for 20 s each on nightly
+`fuzz-smoke` job that runs all thirteen libFuzzer targets for 20 s each on nightly
 + ASan.
 
 ### Fuzzing and invariants
 
-`fuzz/` is a standalone cargo-fuzz crate with **twelve targets** over the
+`fuzz/` is a standalone cargo-fuzz crate with **thirteen targets** over the
 attacker-controlled boundaries — L1: `tx_decode`, `block_decode`,
 `wire_msg_decode`, `mempool_admit`, `storage_recover`, `checkpoint_validate`,
 `meta_parse`; L2 (Phase 2–4): `l2_payload_decode`, `m3_readers`,
-`dispute_arbitrate`, `l2_state_apply`, `vwc_decode`. They assert capability invariants (exact
+`dispute_arbitrate`, `l2_state_apply`, `vwc_decode`; worker (Phase 5):
+`worker_flows` (plan construction/discovery/reconciliation determinism over
+adversarial inputs). They assert capability invariants (exact
 decode→encode inversion, bounded allocation, value conservation under
 adversarial transaction programs), not merely panic-freedom. Campaign results
 are recorded in [docs/status.md](docs/status.md).
@@ -629,7 +637,7 @@ hostile length fields, forged and lying-count checkpoints, mutated dispute
 evidence — through the same invariants on stable tooling.
 
 ```sh
-cd fuzz && cargo check --bins       # all twelve targets compile
+cd fuzz && cargo check --bins       # all thirteen targets compile
 cargo test -p jnt-l2 --test fuzz_invariants   # L2 invariants on stable
 ```
 

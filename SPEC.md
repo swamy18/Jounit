@@ -1770,3 +1770,279 @@ behaviour.
 - **No on-chain VWC transactions, no transfer semantics, no marketplace.** A
   certificate is a receipt; what third parties do with it is Phase 5+.
 - **No claim of physical execution.** See §17.1.
+
+---
+
+## 18. Worker SDK (Phase 5, `crates/jnt-worker`)
+
+A worker is any actor that claims tasks from the L2 marketplace, executes them,
+and submits results: a human-operated process, an AI agent, an autonomous
+machine. This section is **normative for the worker-facing crate** `jnt-worker`.
+It defines what the SDK MAY do on the protocol's behalf and what it MUST never
+do. Unless stated, failure is always fail-closed: an SDK error never creates a
+protocol effect that the L2 state machine did not authorize.
+
+### 18.1 Boundary: what the SDK is, and is not
+
+- **The SDK is a client, not a validator.** It contains no consensus logic. It
+  does not apply, order or accept transactions; it constructs already-specified
+  payloads ([`jnt_core::l2`](§15)) and reads the authoritative state the
+  protocol produces (§15.3, §17.7).
+- **No second implementation.** TaskContract rules, dispute arbitration,
+  VWC validation, wallet signing, settlement economics and fee routing are
+  reused from `jnt-core` and `jnt-l2` verbatim. The SDK MUST NOT reimplement,
+  re-derive or relax any of them.
+- **No new transaction type, fee, or authorization path.** Every wire artifact
+  the SDK produces is one of the five L2 payloads of §15.1, signed by the
+  §15.2 hybrid `Auth`.
+- **Not a consensus participant.** The SDK never arbitrates, never settles
+  (`Settle` has no single signer, §15.1) and never certifies (§17.4).
+
+### 18.2 Worker identity
+
+- A worker's identity is **its wallet address** (§15.2): the hybrid address of
+  the same `Wallet` an L1 funding account uses. There is no separate worker
+  registration and no worker registry.
+- Authorization for claim, submit and dispute payloads is therefore exactly
+  §15.2's `Auth::verify_as`: possession of the wallet's keys, nothing else.
+- Identity conflict rule: an SDK instance deterministically derives an address
+  from a single `Wallet`. A mismatch between the configured wallet and any
+  external identity reference (attestation `worker_address`, registry account)
+  is reported as `WorkerError::IdentityMismatch` and aborts the operation.
+
+### 18.3 Node connection
+
+- The SDK never decides what the chain is. It reads protocol state through an
+  injected **state view** and hands signed payloads to an injected **broadcaster**:
+  ```rust
+  pub trait L2NodeView {          // read side
+      fn l2_state(&self) -> L2State;   // the authoritative, replicated view
+      fn chain_height(&self) -> u64;
+  }
+  pub trait L2Broadcaster {       // write side
+      fn broadcast(&mut self, tx: &L2Transaction) -> Result<(), BroadcastError>;
+  }
+  ```
+- Rationale: this build has no L2 wire transport yet (`jnt-net` carries only the
+  §13 P2P message set; the roadmap §13 REST API is unbuilt). Defining the seams
+  as traits lets a local node, an embedded `L2State`, or a future REST/WS client
+  implement them without changing the SDK, and keeps every protocol rule
+  testable without a socket.
+- The SDK treats node responses as **untrusted data**: state views it cannot
+  parse are errors, defaults are never guessed, and a malformed or stale view
+  fails closed (§18.11).
+- Connection failure, timeout after broadcast and transport outage are
+  retryable; see §18.10.
+
+### 18.4 Task discovery and filtering
+
+- Discovery is a **pure function of authoritative state** plus the worker's
+  filter configuration. Given the same `L2State` at the same height and the same
+  filter, every call returns the same tasks in the same order (ascending
+  `task_id`); a `HashMap` never decides an outcome (§15.9, §17.9).
+- A task is **available** iff its contract is `Open` (§15.3), its deadline
+  satisfies `current_height <= deadline_height` (§15.3 claim rule), and the
+  worker's balance can cover `worker_deposit_sat + FEE_TX_CLAIM_TASK_SAT` when a
+  deposit is required. Unavailable tasks (claimed, submitted, disputed,
+  settled, expired) are never surfaced.
+- The SDK MUST NOT evaluate task *desirability* (reward, hardware fit) by
+  protocol rule; that is the operator's policy, expressed through the filter
+  configuration (§18.12) or the application's own code over the returned
+  `TaskRef`s.
+- Payment information surfaced per task: `payment_sat` (escrow), the claiming
+  worker's own `worker_deposit_sat` requirement, the D3 fees already fixed by
+  `params.rs`, and `deadline_height`.
+
+### 18.5 Task claiming
+
+- A claim is a §15.1 `ClaimTask` payload built by
+  `ClaimTaskPayload::build(wallet, task_id, backend, worker_deposit_sat)` and
+  wrapped in `L2Transaction::new`. No other construction exists.
+- Claim preconditions checked locally, before broadcast (all fail closed):
+  the task exists; its state is `Open`; `current_height <= deadline_height`;
+  the wallet's balance covers deposit + fee (§18.4); the caller's configured
+  `backend` is recorded in the payload.
+- The final authority is the protocol: a claim the L2 state machine rejects
+  (already claimed, expired, insufficient funds) is reported as
+  `WorkerError::Protocol(L2Error)` from the state view's next observation, never
+  silently retried into a different shape (§18.10).
+- Deposit policy: `worker_deposit_sat` is an economic decision (it is burned on
+  never-delivering, §15.3/§15.4). The SDK proposes values the operator configures;
+  it MUST NOT invent a nonzero deposit to satisfy a failing claim.
+
+### 18.6 Task execution
+
+- Execution is the **.Executor trait seam**:
+  ```rust
+  pub trait Executor {
+      fn capabilities(&self) -> ExecutorCapabilities;
+      fn execute(&self, work: &ExecutionWork) -> Result<ExecutionOutput, ExecError>;
+  }
+  ```
+  with `capabilities()` describing the hardware the operator provisions
+  (backends offered, max memory) and `execute()` producing the result bytes
+  whose SHA-256 is the submission's `result_hash`. The SDK ships only the §16
+  CPU-referencing shape needed by tests and dispute observation; every real
+  executor (CPU, GPU, agent, external service) roots its own `Executor`.
+- The SDK MUST NOT interpret `ir_hash`/`input_hash`: fetching the off-chain IR
+  is the operator's transport (its hashes are the on-chain commitment, §15.1).
+- Execution is isolated from consensus, wallet and settlement state by type: an
+  `Executor` receives `ExecutionWork` (task id, IR/input hashes, backend hint,
+  height) and holds no keys and no state handle.
+
+### 18.7 Result submission
+
+- The submission is a §15.1 `SubmitResult` payload: `result_hash` = SHA-256 of
+  the executor output, attestation = `ComputeAttestation` (M3, §18.8) bound to
+  the same task/worker/result, whole payload signed by the claim wallet's
+  §15.2 `Auth`.
+- Local preconditions, all fail closed: the task is `InProgress` **and claimed
+  by this worker** (identity check §18.2); `current_height <= deadline_height`;
+  `result_hash != [0u8;32]` (the expired placeholder — §17.6's submission rule);
+  the attestation is signed.
+- Duplicate submission is idempotent-by-state: after a successful broadcast the
+  SDK records `task_id → submitted`, and a restart re-derives the same answer
+  from authoritative state (§18.9) rather than rebroadcasting.
+
+### 18.8 Attestation
+
+- The attestation is the existing `ComputeAttestation` (M3), serialized
+  canonically (§15.1/§17.2 rules unchanged). The SDK reuses the type and its
+  codec; no parallel format exists.
+- It signs over `task_id ‖ result_hash ‖ backend ‖ worker_address ‖ height`
+  with the worker's wallet key. `worker_address` MUST be the configured
+  wallet's address (§18.2 identity rule) and MUST equal the enclosing
+  `SubmitResult` actor — the L2 layer already enforces this; the SDK enforces
+  it too before broadcast for a clear, SDK-level error.
+
+### 18.9 Lifecycle, idempotency and replay safety
+
+- Canonical lifecycle (per task, monotonic, driven by observed state):
+  `Discovered(Observable) → Claimed → Executed → Submitted → Settled`
+  with only three exits on the way: `Expired`, `SettledCorrect(worker)`, and
+  `SettledFraudulent(worker)`. The SDK's job is to *observe and act*, never to
+  invent a transition the state machine did not make.
+- **Idempotency rule:** every mutating SDK operation is keyed by an existing
+  protocol identity (task_id, attestation hash, dispute id) so that an
+  operation repeated after
+restart or timeout either (a) finds its effect already recorded in
+authoritative state — done, no second broadcast — or (b) re-broadcasts the
+*same bytes* (same txid) if the effect is not yet visible. The node's replay
+protection (§15.5) makes a duplicate apply impossible; reusing the same payload
+is safe and MUST be preferred over building a variant with new bytes.
+- **Timeout ≠ failure.** After any broadcast failure or timeout, the SDK MUST
+  NOT assume the transaction failed. Reconcile by querying the authoritative
+  view: if the effect is visible, it is done; if not, rebroadcasting the same
+  bytes is safe.
+- Restart-after-claim and restart-after-submit are the primary tested flows:
+  a restarted SDK re-derives the task's state from the `L2NodeView` and either
+  resumes (still `InProgress`/`ResultSubmitted`) or exits cleanly (`Expired`,
+  lost to another claimant, already settled).
+
+### 18.10 Retry, errors and failure classification
+
+- Every SDK failure is one of:
+  - **`Retryable`** — transport/connection failure, timeout, stale view. Safe to
+    retry: the operation re-runs and either completes or observes completion.
+  - **`Protocol`** — a named `L2Error` from the authoritative view (§15's error
+    set). The SDK reports and surfaces; retrying with the same inputs must
+    produce the same error, and the SDK MUST NOT mutate the payload to force a
+    different outcome.
+  - **`Local`** — configuration, identity mismatch (§18.2), executor error,
+    unsupported capability. Never retried without operator input.
+- No error is swallowed; no protocol rejection is converted into fake success;
+  SDK errors name their cause (§18.16 hygiene rules for what must never leak).
+
+### 18.11 Authorization and fail-closed rules (normative security properties)
+
+An actor starting with **zero privilege** MUST NOT be able, through any SDK
+path, to become an authorized worker, claimant, verifier, settler or payment
+recipient. The SDK upholds this by construction; the test suite proves it by
+attack:
+
+- **Claim/submit/dispute authorization is §15.2 auth, full stop.** A wallet
+  that never claimed a task cannot submit its result (`submit_result` actor ==
+  contract worker, §15.3); a wallet that is not the challenger cannot file or
+  read its dispute; a non-validator can never settle (no single-signer settle
+  path exists).
+- **The SDK refuses to construct a payload whose actor differs from its
+  configured wallet** (`WorkerError::IdentityMismatch`), before any broadcast.
+- **Unknown or forged node responses authorize nothing.** An `L2State` view is
+  only an observation surface: crafting a fake view cannot make the SDK
+  broadcast anything unsigned, and the protocol layer still verifies every
+  authorization itself.
+- **No escalation through retry:** every retry re-uses the same payload and
+  identity; no retry path widens the set of actions the SDK will sign.
+- **Fail closed on ambiguity:** unknown task, unknown state shape, zero values
+  where the protocol demands nonzero, ambiguous identity — refuse and report,
+  never guess.
+
+### 18.12 Configuration
+
+Configuration is data the **operator** supplies: worker wallet, backend offered,
+worker deposit (for the next claim), filter (min payment, max deadline
+distance, required memory, allowed backend class), and broadcaster/view wiring.
+The SDK's configuration holds the wallet's private key material only by owning
+the `Wallet`, and §18.16's hygiene rules apply to every place the configuration
+or the SDK could print, log, Debug or serialize it.
+
+### 18.13 Earnings
+
+Earnings are **derived from authoritative state**, never accumulated in a side
+ledger. For the configured wallet address the SDK reports:
+
+- **available balance** — `L2State::balance` (payments credited by settlement
+  §15.4, M2 vesting payouts returned to this address, and explicit credits);
+- **locked/pending** — escrow locked in tasks this worker claimed and not yet
+  settled: the payment owed on a future `Correct` settle, plus the worker's own
+  deposit still at risk while `InProgress`/`ResultSubmitted`;
+- **settled earnings** — for each task this worker claimed and which settled
+  `Correct`: the certificate's `payment_sat` (§17.2), and the total credited
+  (`SettlementOutcome::worker_paid + worker_deposit_returned`), referenced by
+  `task_id`, `vwc_id` and — where one exists — the settle `txid`;
+- **losses** — slashed or burned deposits (`Fraudulent`/`Expired`), by task.
+
+No SDK value is invented: every number traces to a field of `L2State`
+(`balance`, `task`, `vwc`, `SettlementOutcome`) or to a protocol fee constant.
+
+### 18.14 Dispute participation
+
+- **Observation.** The SDK observes a dispute over *its own* submitted result
+  from the task's `Disputed` state (challenger, both results and
+  attestations, deposits, `filed_at`), and watches it resolve through
+  authoritative state: a settle `Settled` outcome or the §15.7 lapse rule.
+- **Participation (the worker as challenger).** Building and broadcasting a
+  §15.1 `Dispute` payload is supported for any task in `ResultSubmitted`, with
+  the challenger's own deposit and counter-attestation.
+- **The SDK cannot arbitrate and MUST NOT try.** Arbitration consumes a
+  reference re-execution hash (§16.4) that only the arbitrator set produces;
+  the SDK reads the resulting verdict from state and reports it.
+- Repeat/dispute-replay protection is §15.5's txid rule (§18.9).
+
+### 18.15 Determinism
+
+Worker-side construction is deterministic wherever protocol encoding requires
+it: payload construction, task-id invocation, attestation serialization, result
+hashing, txid derivation and VWC handling are pure functions of (wallet, task,
+result, heights). No wall clock, no RNG, no map-order dependence (§15.9,
+§17.9). The SDK never introduces `HashMap` iteration anywhere a
+protocol-visible result is produced.
+
+### 18.16 Secret hygiene
+
+The SDK MUST never include private key bytes in any `Debug`/`Display` output it
+constructs, log them, include them in error messages or serialized worker
+telemetry, or write them anywhere an operator did not explicitly configure.
+The SDK's own error and debug output carries no signing material, and its
+regression tests assert that over every public error and debug path.
+
+### 18.17 Non-goals
+
+- No REST/WS transport of its own. When the roadmap §13 REST API exists, it
+  implements §18.3's traits; the SDK itself stays transport-agnostic.
+- No executor implementations beyond the §16 CPU-reference shape used by
+  tests and dispute observation; no scheduler, no ops UI.
+- No worker reputation, scoring or registry beyond the protocol's.
+- No move of consensus logic (task application, dispute resolution, fee
+  accounting, settlement) into the SDK. The SDK is a client of an L2 the node
+  already runs.

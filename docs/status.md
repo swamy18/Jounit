@@ -1050,3 +1050,69 @@ for re-measurement.
 **Still gated:** BLS/M5 L1 finality activation (end of Phase 6). **Now
 unblocked:** Phase 5 (Worker SDK) — task discovery, claim/execute/submit,
 attestation, VWC handling, wallet integration.
+
+## Phase 5 — Worker SDK: SHIPPED (`crates/jnt-worker`) — 2026-10-07
+
+The worker-facing SDK is built on top of Phases 2–4's task, dispute and VWC
+machinery. It adds no consensus logic and no new payment path: it builds the
+*existing* five L2 payload types with the existing wallet, reads the
+authoritative state, and derives every number the worker sees from protocol
+fields. SPEC.md §18 is the normative text (17 subsections).
+
+**Architecture.** Node connection is two injected traits — `L2NodeView`
+(read: `l2_state` + `chain_height`) and `L2Broadcaster` (write: hand over a
+signed `L2Transaction`) — because this build has no L2 wire transport and
+inventing one would be a guess (`jnt-net` carries only the §13 P2P set; the
+roadmap §13 REST API is unbuilt). A future REST/WS client implements the
+traits; nothing in the SDK changes. `WorkerClient` composes the lifecycle:
+discover → claim → execute → submit, plus reconcile/dispute/VWC/earnings
+observation. Execution is one pluggable `Executor` seam; the shipped
+`CpuExecutor` is a deterministic (no-float, no-clock, no-RNG) reference in
+the §16 mold.
+
+**Lifecycle rules (SPEC.md §18.9).** Every mutating operation keys on a
+protocol identity (task id / txid). Timeout ≠ failure: after any broadcast
+failure the SDK reconciles against authoritative state — and if the effect
+is not visible, re-broadcasting the *same bytes* is safe (the protocol's txid
+replay guard makes a second apply impossible). `reconcile_claimed` and
+`reconcile_submitted` re-derive the truth after restarts; the
+restart-after-submit shape (`Submitted` vs `InProgress`) is
+regression-pinned after being caught and fixed pre-push this phase.
+
+**Testing.** 500 workspace tests, 0 failures (was 468):
+- 5 `jnt-worker` unit tests (retry classification, reconciliation totals).
+- 12 `claim_flow` integration tests over a real-BLS single-node harness:
+  full claim→submit→auto/explicit-settle→VWC→earnings chain, discovery
+  filters and financing, restart-after-claim/submit, timeout-then-reconcile,
+  duplicate-claim/submission refusal, byte-deterministic plans across
+  restarts, expiry with burned-deposit accounting, cross-worker refusal.
+- 15 `security` tests: the §18.11 zero-privilege escalation suite (forged
+  identity via config repair, unauthorized claim/submit/dispute by balance,
+  state and identity checks, replayed and byte-mutated payloads failing
+  §15.2 auth, stale-state plans refused by precondition, unknown/ambiguous
+  inputs refused with named errors, forged settle refused by the real BLS
+  verifier) and the §18.16 secret-hygiene suite (every `WorkerError`
+  variant's Display and Debug scanned against the key's hex — never present;
+  plan/config Debug never embeds the wallet; failed-transaction error text
+  carries no signing material).
+- `jnt-l2` gained one additive accessor: `L2State::tasks()` (sorted, mirroring
+  `vwcs()`), the enumeration discovery is defined on.
+
+**Fuzzing.** New target `worker_flows` (13th total): deterministic wallet
+from input bytes, funded state, heights 0/50/u64::MAX, and the four plan
+builders (`claim_plan`/`submit_plan`/`dispute_plan`/`discover_tasks`) each
+run twice per input with determinism asserted as a crash condition;
+`reconcile_*` driven for totality; the whole input also replayed through
+`L2Transaction::deserialize`. WSL campaign (nightly + ASan):
+3111 + 3481 + 1096 + 798 ≈ **8.5k execs, 0 crashes** (crypto-bound like
+`l2_state_apply`). CI's fuzz-smoke loop now runs all 13 targets. There is no
+byte-format worker config to fuzz (typed struct), recorded deliberately.
+
+**Not done, deliberately:** no REST/WS transport (§18.3 traits are the seam
+Phase 6 will implement), no executor beyond the §16-mold CPU reference, and
+no claim that mainnet/Phase-6 items are complete. The `AmountTooSmallForFee`
+settle-fee economics question remains open, carried from Phase 2.
+
+**Still gated:** BLS/M5 L1 finality activation (end of Phase 6). **Now
+unblocked:** Phase 6 (testnet integration, worker↔node transport, chaos
+testing, mainnet readiness).

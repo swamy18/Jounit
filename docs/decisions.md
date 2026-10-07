@@ -372,3 +372,57 @@ economics, binding finality only at the end of Phase 6.
 | 4 — Verified Work Certificates | **DONE** (this change) |
 | 5 — Worker SDK | NOT STARTED (needs Phases 2+4 — now unblocked) |
 | 6 — Testnet + finality activation | PREPARED, gated on 5 |
+
+---
+
+# Implementation status — Phase 5 SHIPPED (2026-10-07)
+
+Phase 5 (Worker SDK) is built as a pure *client* over the Phase-2/3/4 L2
+machinery. **No economic decision changed**: the D3 fee schedule
+(post 5 000 / claim 2 000 / submit 2 000 / dispute 10 000 / settle 20 000
+sats), flat fee = `full_base`, the M1 50/50 burn/PSCB split, the L1 gas
+floor, `payment_jnt` as a market price, the §14.6 validator economics, and
+binding finality only at the end of Phase 6 are all exactly as recorded
+above. SPEC.md §18 is the normative worker-facing text.
+
+## Decision 5 — Worker SDK: transport seams, not a transport
+
+**Chosen, and now normative in SPEC.md §18.3/§18.17:**
+
+1. **The worker SDK defines `L2NodeView`/`L2Broadcaster` traits instead of
+   inventing a wire protocol.** This build has no L2 transport (`jnt-net`
+   carries only the §13 P2P message set; the roadmap §13 REST API is
+   unbuilt). Guessing one would bake in an unreviewed design; traits let a
+   local node, an embedded state, or the Phase-6 REST client implement the
+   seams without changing the SDK. The SDK therefore ships with no socket
+   code, and every SDK rule is testable without one (the integration
+   harness is an embedded single-node network behind the same traits).
+2. **Worker identity is the wallet's hybrid address — there is no worker
+   registration.** Authorization for claim/submit/dispute is exactly
+   §15.2's `Auth::verify_as`; the SDK's identity check derives from the keys
+   and refuses configuration that disagrees (§18.2). No second
+   authorization scheme, no worker registry, no scoring.
+3. **Idempotency by protocol identity, never by SDK bookkeeping.** Every
+   mutating operation keys on task_id/txid; after any timeout the SDK
+   reconciles against authoritative state, and re-broadcasting the *same
+   bytes* is the safe retry (§18.9). The SDK keeps no side ledger that could
+   disagree with the chain.
+4. **Earnings are derived, not accumulated.** `earnings_of` reads only
+   `L2State` fields (balance, task contracts, VWC registry, settle
+   outcomes); the SDK invents no number and holds no account state that
+   could desynchronize (§18.13).
+5. **The executor is the one pluggable seam** (§18.6): hardware/agent
+   engines root their own `Executor` impl; the shipped `CpuExecutor` is a
+   deterministic §16-mold reference, not a production compute engine.
+
+**Explicitly unchanged:** all standing decisions above; the
+`AmountTooSmallForFee` settle-vs-fee open question stays open for Phase 6.
+
+| Phase | Status |
+|---|---|
+| 1 — L1 production | DONE |
+| 2 — TaskContract + L2 txs | DONE |
+| 3 — Dispute engine + M2/M1 | DONE |
+| 4 — Verified Work Certificates | DONE |
+| 5 — Worker SDK | **DONE** (this change) |
+| 6 — Testnet + finality activation | PREPARED, gated on 5 (now unblocked) |

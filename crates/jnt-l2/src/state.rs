@@ -179,6 +179,16 @@ impl L2State {
         self.tasks.len()
     }
 
+    /// Every task, sorted by task id. Enumeration is never `HashMap` order, so
+    /// two nodes holding the same state list the same contracts in the same
+    /// order — the property task discovery (Phase 5's worker SDK, SPEC.md
+    /// §18.4) is defined on.
+    pub fn tasks(&self) -> Vec<&TaskContract> {
+        let mut ids: Vec<Hash> = self.tasks.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|id| &self.tasks[&id]).collect()
+    }
+
     pub fn applied_count(&self) -> usize {
         self.applied.len()
     }

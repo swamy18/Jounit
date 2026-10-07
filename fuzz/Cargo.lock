@@ -265,6 +265,7 @@ dependencies = [
  "jnt-l2",
  "jnt-net",
  "jnt-store",
+ "jnt-worker",
  "libfuzzer-sys",
 ]
 
@@ -287,6 +288,16 @@ name = "jnt-store"
 version = "0.1.0"
 dependencies = [
  "jnt-core",
+]
+
+[[package]]
+name = "jnt-worker"
+version = "0.1.0"
+dependencies = [
+ "jnt-core",
+ "jnt-l2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

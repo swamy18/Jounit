@@ -2595,3 +2595,166 @@ earnings, dispute participation; CLI (`jnt-worker run/status/earnings`) +
 `WorkerClient`. The standing open question carried to Phase 6: tasks whose
 escrow/deposit is smaller than the 20 000 sat settle fee fail closed
 (`AmountTooSmallForFee`).
+
+# Working memory — session 15: Phase 5 (Worker SDK)
+
+## 64. What Phase 5 ships
+
+**File suppressor:** none of the following existed at session 15's start; all
+are new in this phase:
+
+- **SPEC.md §18** — the worker-facing normative section (17 subsections):
+  the SDK is a *client*, not a validator; identity is the wallet's hybrid
+  address (§18.2); node connection is two injected traits (`L2NodeView` read,
+  `L2Broadcaster` write — no wire protocol invented, §18.3); discovery is a
+  pure function of authoritative state + operator filter (§18.4); claim /
+  submit / dispute are the *existing* §15.1 payload builders behind local
+  fail-closed preconditions (§18.5, §18.7, §18.14); execution is one pluggable
+  `Executor` seam with the §16 CPU reference shipped (§18.6); VWC handling is
+  observation + registry validation, never claim/issuance (§18 and §17);
+  idempotency rule = every mutating operation keyed by a protocol identity
+  (task_id/txid), timeout ≠ failure, reconcile by state, re-broadcast the same
+  bytes (§18.9); failure taxonomy Retryable/Protocol/Local (§18.10); the
+  zero-privilege escalation rule (§18.11); earnings derived from `L2State`
+  fields only (§18.13); secret hygiene (§18.16).
+
+- **`crates/jnt-worker`** (v0.1.0, workspace member):
+  - `node.rs` — `L2NodeView` / `L2Broadcaster` / `BroadcastError` / `Host`.
+  - `discovery.rs` — `discover_tasks` + `TaskRef` + the `available`
+    predicate (state==Open, deadline, operator filter, financing).
+  - `claim.rs` — `claim_plan`/`claim_task`/`reconcile_claimed`
+    (`ClaimedState`: InProgress/Submitted/Expired/ClaimedByOther).
+  - `submit.rs` — `submit_plan`/`submit_result`/`reconcile_submitted`
+    (`SubmittedState` incl. AwaitingSubmission — the timeout-but-not-landed
+    answer). Bundles an M3 `ComputeAttestation`; refuses the all-zero
+    result hash before signing.
+  - `executor.rs` — `Executor` trait + `CpuExecutor` (deterministic KECCAK-
+    style permutation over the task's own commitment hashes; no float, no
+    clock, no RNG) + `result_hash_of`.
+  - `dispute.rs` — `dispute_of_task`/`dispute_resolution`/`dispute_plan`/
+    `file_dispute`; reuses `DisputeEvidence::validate` verbatim.
+  - `vwc.rs` — `observe_certificate` (validated against the registry via
+    `L2State::validate_vwc`), `certificates_for_worker`,
+    `is_offline_verifiable`.
+  - `client.rs` — `WorkerClient` facade + `earnings_of`/`Earnings`
+    (available / pending / deposits-at-risk / settled / lost — all protocol
+    fields, nothing accumulated).
+  - `config.rs` / `error.rs` (`WorkerError`, `is_retryable`) /
+    `bin/main.rs` (secret-free CLI: `address`, `generate`; prints only the
+    path, never a key).
+
+- **`jnt-l2` one-token addition:** `L2State::tasks()` — every contract sorted
+  by task id, the enumeration discovery is defined on (mirrors `vwcs()`).
+
+**Reused, never reimplemented:** the five §15.1 payload builders and their
+hybrid `Auth` signing, `TaskContract` transitions, `DisputeEngine`/evidence,
+`VerifiedWorkCertificate` validation, `split_flat_fee`/D3 fees, the wallet,
+the M3 attestation codec, and §16's CPU-reference determinism discipline.
+
+## 65. The design decision that shaped it: seams, not sockets
+
+This build has no L2 wire transport (`jnt-net` carries only §13 P2P; roadmap
+§13 REST is unbuilt). Instead of guessing a protocol, the crate defines the
+§18.3 traits and records in §18.17 that a future REST/WS client *implements*
+them. Everything testable without a socket stayed testable: the integration
+harness (`tests/common/mod.rs`) is a 140-line "single-node network" — an
+`L2State` + height + real-BLS apply — behind exactly those traits. The fuzzer
+embeds the same shape.
+
+## 66. Bugs found this phase — and the one product fix
+
+1. **Product/API fix (self-caught, pre-push):** the SDK's reconcile surfaces
+   initially mapped `ResultSubmitted` to `ClaimedState::InProgress` for a
+   restart-after-submit flow, so a restarted worker could not tell "my claim
+   stands, go execute" from "my result is already on record, go watch" — the
+   exact confusion §18.9 forbids inventing. Fixed by making
+   `reconcile_claimed` distinguish `InProgress` / `Submitted`
+   (`claim.rs`), with `claim_flow.rs::restart_after_submission...` pinning it.
+2. **Harness note (not a product bug):** several early integration failures
+   were test-side (post-tx id capture, mini-window settle heights, earnings
+   arithmetic including the returned deposit). The SDK assertions were
+   tightened, never weakened; the arithmetic errors were in the tests, and
+   `earnings_of` itself matched protocol fields throughout.
+3. **Security suite corrections:** the zero-balance attacker hits the
+   financing rejection inside `available` (so the named error may be either
+   `InsufficientBalance` or `TaskNotAvailable`) — the test asserts
+   fail-closed, not a specific variant; the second-dispute escalation is
+   refused SDK-side (`Disputed` state) before any broadcast, which is the
+   stronger guarantee, so the test was aligned to that rather than waiting
+   for a protocol rejection.
+
+## 67. Security: privilege-escalation and secret-hygiene suites
+
+`tests/security.rs`, 15 tests, attack-first style:
+
+- **Zero-privilege wallet** (seed 9, no credit, no registration): claim,
+  plan-build, apply, execute, submit — every path refuses; the hand-forged
+  claim that *can* be built is refused at apply by balance.
+- **Forged identity by configuration:** `with_config` repairs a config whose
+  address disagrees with its wallet — identity derives from keys, never from
+  configuration (§18.2), so "sign as someone else" is impossible.
+- **Unauthorized submission:** `submit_plan` for a non-claimant is
+  `IdentityMismatch` (SDK-level); a hand-built impersonated attestation
+  (worker field = victim, signature = attacker's key) is refused by the
+  protocol; a mutated post-signature payload fails `Auth` verification.
+- **Dispute paths:** agreeing counter-result refused; second dispute over a
+  `Disputed` task refused before broadcast; involvement reporting says
+  the attacker's submission is not what's contested.
+- **Replay:** a captured legitimate claim re-applied is refused by the txid
+  guard; the task stays with its claimant exactly once.
+- **Retry escalation:** byte-mutated retry fails §15.2 authorization.
+- **State desync:** a plan built against a stale state (task already
+  claimed) is refused by precondition, not applied and then discovered.
+- **Unknown everything:** unknown task across claim/submit/dispute/reconcile/
+  view/certificate — each a named error; empty result; expired placeholder
+  (all-zero) hash rule mirrored before signing; Open-state submit and
+  ResultSubmitted-state claim refused; dispute of an Open task refused.
+- **Settler/verifier privilege:** a zero-aggregate settle payload is refused
+  by the real BLS verifier; no cert exists for the task; no SDK surface can
+  even express "settle as worker X" (no worker field exists on the wire).
+- **Secret hygiene:** every `WorkerError` variant (including the
+  protocol-carried one) scanned via Display and Debug against the victim
+  key's hex — never present; plan/config Debug never contains the key; the
+  client's Debug excludes the wallet; failed-transaction error strings
+  (apply-refusal text from the harness, the shape a real node returns) never
+  contain key material. `Wallet` itself is never embedded in SDK-owned types.
+
+## 68. Fuzz campaign, Phase 5 (WSL nightly + ASan, target `worker_flows`)
+
+New target: `worker_flows` — the SDK's adversary-reachable boundaries:
+deterministic wallet from the input's first 32 bytes; a partially funded
+state; heights past/at u64::MAX; `claim_plan` / `submit_plan` /
+`dispute_plan` / `discover_tasks` each run twice over the same state and
+compared for determinism; `reconcile_claimed` / `reconcile_submitted`
+driven for totality; the whole input replayed through
+`L2Transaction::deserialize` (the broadcast-echo path). Determinism is a
+crash if violated — not just panic-freedom.
+
+Campaigns: 3111 + 3481 + 1096 + 798 execs ≈ **8.5k runs over ~13 minutes,
+0 crashes, 0 panics.** Slow exec/s (~5–14) is expected: every input runs
+256k1 signing and BLS-set operations, the same crypto-bound profile
+as `l2_state_apply` (12,630 in Phase 3). A worker-config parser does not
+exist to fuzz (config is a typed Rust struct, not bytes) — recorded as the
+reason `worker_flows` is the phase's single target. CI's fuzz-smoke loop now
+runs 13 targets.
+
+## 69. Numbers, verified
+
+- **500 workspace tests passing, 0 failed** (was 468): +5 SDK unit,
+  +12 `claim_flow` integration, +15 `security`.
+- fmt clean; clippy `-D warnings` clean workspace-wide (all targets).
+- Release build clean; all six sim scripts rc=0 (difficulty, reference, net,
+  puzzle, supply, vectors).
+- 13 fuzz targets compile (`cargo check --bins` RC=0); `worker_flows`
+  campaign RC=0, 0 crashes.
+
+## 70. Next work item
+
+**Phase 6 — Testnet + finality + mainnet** and only that: L1↔L2 integration
+(the L2-in-L1 block/relay story), worker↔node transport (the §18.3 traits'
+REST/P2P implementation), validator testing, chaos/stress, long-running
+testnet, the settled-vs-fee open question (`AmountTooSmallForFee`,
+carried from Phase 2), final SPEC reconciliation, mainnet config/launch.
+Binding finality only at the end, per Decision 2. Standing decisions
+unchanged: D3 fees, M1 50/50, §14.6 validator economics, payment as market
+price, no VWC revocation.

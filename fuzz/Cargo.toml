@@ -26,6 +26,9 @@ path = "../crates/jnt-store"
 [dependencies.jnt-net]
 path = "../crates/jnt-net"
 
+[dependencies.jnt-worker]
+path = "../crates/jnt-worker"
+
 # Avoid the fuzz binary inheriting the workspace's panic="abort" release
 # profile, which is incompatible with libFuzzer's crash handlers.
 [profile.release]
@@ -112,6 +115,13 @@ bench = false
 [[bin]]
 name = "vwc_decode"
 path = "fuzz_targets/vwc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "worker_flows"
+path = "fuzz_targets/worker_flows.rs"
 test = false
 doc = false
 bench = false
