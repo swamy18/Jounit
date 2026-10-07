@@ -15,9 +15,12 @@ without weakening the security a hash chain depends on.
 > and earnings derived from protocol state. Phase 6 (integration + testnet) has
 > begun: L2 transactions now ride inside L1 blocks and L2 state is rebuilt from
 > the chain (**SPEC.md §19.1**), and the node replays it on every accepted
-> block (`status`/`verify` surface it). Still ahead:
-> the L1→L2 funding bridge, the worker↔node transport, the genesis validator
-> committee and binding finality. Read [Status](#status).
+> block (`status`/`verify` surface it). M2 funds L2 from a genesis escrow
+> (**SPEC.md §19.4**): `mini` grants three operator identities, the remainder
+> parks with a derived protocol escrow, and `verify` proves joint L1+L2 supply
+> stays under the cap. Still ahead:
+> user deposits and L2-to-L1 exits, the worker-node transport, the genesis
+> validator committee and binding finality. Read [Status](#status).
 
 ---
 

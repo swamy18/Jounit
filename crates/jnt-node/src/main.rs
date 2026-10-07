@@ -455,9 +455,9 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
     let mut store = Store::open(args)?;
     let mut chain = store.load_chain()?;
     // The L2 view starts from replaying what is stored, then follows the tip
-    // as blocks are mined below. Until the M2 funding bridge exists every
-    // replayed payload is an expected `InsufficientBalance` skip, not an
-    // error — the view still advances and still names what it refused.
+    // as blocks are mined below. Genesis-funded accounts apply; genuinely
+    // unfunded payloads are expected `InsufficientBalance` skips, not errors
+    // — the view still advances and still names what it refused.
     let mut l2 = NodeL2::replay_from(&chain, &store.params);
     let wallets = store.load_wallets()?;
     if wallets.is_empty() {
@@ -797,6 +797,28 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         a.height(),
         a.applied_count(),
         a.skipped().len()
+    );
+    // Joint conservation (Decision 7, SPEC.md §19.4): L2 holds at most its
+    // genesis escrow, and L1 live supply plus everything L2 ever held stays
+    // under the cap. Both are cheap, both are exact, and either failing means
+    // value was created — which must never print "ok".
+    if !a.state().check_conservation() {
+        return Err("l2 conservation broken: released value exceeds value in the system".into());
+    }
+    if a.state().funded_total() != a.genesis().escrow_total_sat {
+        return Err("l2 funding anomaly: released value differs from the genesis escrow".into());
+    }
+    let joint = chain
+        .utxo()
+        .total_value()
+        .saturating_add(a.state().conservation_total());
+    if joint > chain.params().supply_cap_sat {
+        return Err("joint supply exceeds the cap: L1 live plus L2 held is inflation".into());
+    }
+    println!(
+        "ok: joint supply conserved (l1 live + l2 held = {} sat of {} cap)",
+        joint,
+        chain.params().supply_cap_sat
     );
     for s in a.skipped().iter().take(10) {
         println!(

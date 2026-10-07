@@ -32,11 +32,11 @@
 //!
 //! # What this deliberately does not do
 //!
-//! - **No funding bridge.** The L2 accounts start empty and no production path
-//!   calls `credit` (Decision 7). Until the M2 escrow exists, replayed payloads
-//!   are refused with `InsufficientBalance` and recorded as skipped — the same
-//!   behaviour the `jnt-l2` replay tests pin, preserved here and asserted by the
-//!   node integration tests.
+//! - **No post-genesis funding.** The accounts start funded exactly once, from
+//!   the profile's genesis allocation (Decision 7, SPEC.md §19.4), and no
+//!   production path calls `credit` after that — user deposits are deferred.
+//!   Payloads from genuinely unfunded accounts are still refused with
+//!   `InsufficientBalance` and recorded as skipped.
 //! - **No validator set yet.** Settlements are checked against an empty set
 //!   with the production [`RealBls`] verifier, so any `Settle` payload is
 //!   refused with `BadQuorum` deterministically. The fixed genesis committee
@@ -52,7 +52,7 @@ use jnt_core::bls_checkpoint::ValidatorSet;
 use jnt_core::chain::Chain;
 use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
-use jnt_l2::{ChainL2, L2Config, L2State, SkippedL2};
+use jnt_l2::{ChainL2, L2Config, L2Genesis, L2State, SkippedL2};
 
 /// L2 dispute-window parameters follow the L1 network profile: `mini` gets the
 /// short test window, every other profile gets production values. The bounty
@@ -121,37 +121,44 @@ pub struct SyncReport {
 pub struct NodeL2 {
     inner: ChainL2,
     config: L2Config,
+    genesis: L2Genesis,
     synced_tip: Option<Hash>,
     synced_height: u64,
 }
 
 impl NodeL2 {
     /// An empty view for `params` — the state a node holds before it has
-    /// synced anything. The first `sync` against a non-empty chain takes the
-    /// full-replay arm, so this and [`Self::replay_from`] converge by
-    /// construction.
+    /// synced anything. Genesis funding is already applied (L2 height 0 holds
+    /// the allocation), so the first `sync` against a non-empty chain takes
+    /// the full-replay arm and converges by construction.
     pub fn fresh(params: &NetworkParams) -> Self {
         let config = config_for(params);
+        let genesis = L2Genesis::for_params(params);
         NodeL2 {
-            inner: ChainL2::empty(config),
+            inner: ChainL2::empty(config, &genesis),
             config,
+            genesis,
             synced_tip: None,
             synced_height: 0,
         }
     }
 
     /// Rebuild the view from the whole chain — the restart path. Nothing about
-    /// L2 is read from disk: the blocks the store already holds are the only
-    /// input, so a restarted node reaches exactly the state its pre-shutdown
-    /// self would reach by replaying the same blocks.
+    /// L2 is read from disk: the blocks the store already holds plus the
+    /// profile's genesis allocation are the only inputs, so a restarted node
+    /// reaches exactly the state its pre-shutdown self held. Funding exists
+    /// exactly once because genesis is applied once per construction, never
+    /// replayed from blocks.
     pub fn replay_from(chain: &Chain, params: &NetworkParams) -> Self {
         let config = config_for(params);
-        let inner = ChainL2::replay(chain, config, &validator_set(), &RealBls);
+        let genesis = L2Genesis::for_params(params);
+        let inner = ChainL2::replay(chain, config, &genesis, &validator_set(), &RealBls);
         let synced_height = inner.height();
         let synced_tip = Some(chain.tip_hash());
         NodeL2 {
             inner,
             config,
+            genesis,
             synced_tip,
             synced_height,
         }
@@ -188,6 +195,9 @@ impl NodeL2 {
         let can_extend = self.synced_tip.is_some()
             && tip_height > self.synced_height
             && chain.block_hash_at(self.synced_height) == self.synced_tip;
+        // Cloned, not borrowed: both replay arms replace `self.inner` while
+        // naming the allocation to rebuild from.
+        let genesis = self.genesis.clone();
 
         let outcome = if can_extend {
             let from = self.synced_height + 1;
@@ -206,7 +216,8 @@ impl NodeL2 {
                 // height it has no block for). Incremental application would
                 // silently skip the hole, so fall back to replay, which fails
                 // loudly on the same inconsistency instead of papering over it.
-                self.inner = ChainL2::replay(chain, self.config, &validator_set(), &RealBls);
+                self.inner =
+                    ChainL2::replay(chain, self.config, &genesis, &validator_set(), &RealBls);
                 SyncOutcome::FullReplay { blocks: tip_height }
             } else {
                 SyncOutcome::Incremental {
@@ -214,7 +225,7 @@ impl NodeL2 {
                 }
             }
         } else {
-            self.inner = ChainL2::replay(chain, self.config, &validator_set(), &RealBls);
+            self.inner = ChainL2::replay(chain, self.config, &genesis, &validator_set(), &RealBls);
             SyncOutcome::FullReplay { blocks: tip_height }
         };
 
@@ -237,10 +248,17 @@ impl NodeL2 {
         self.inner.state()
     }
 
-    /// Mutable access, for the funding bridge (Decision 7) and nothing else.
-    /// Replay on its own never needs it.
+    /// Mutable access. Unit tests use this for custom-funded states; production
+    /// never funds post-genesis (Decision 7 defers deposits), so a production
+    /// state whose `funded_total` exceeds its genesis total proves an
+    /// unauthorized funding happened — and `verify` checks exactly that.
     pub fn state_mut(&mut self) -> &mut L2State {
         self.inner.state_mut()
+    }
+
+    /// The genesis allocation this view was built from.
+    pub fn genesis(&self) -> &L2Genesis {
+        &self.genesis
     }
 
     /// L2 height replayed to — always a chain height, never ahead of it.

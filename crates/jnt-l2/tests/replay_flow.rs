@@ -16,7 +16,7 @@ use jnt_core::params::NetworkParams;
 use jnt_core::wallet::Wallet;
 use jnt_core::Address;
 
-use jnt_l2::{ChainL2, L2Config, L2Error, L2State};
+use jnt_l2::{ChainL2, L2Config, L2Error, L2Genesis, L2State};
 
 const MAX_ATTEMPTS: u64 = 4_000_000;
 
@@ -96,7 +96,16 @@ fn empty_set() -> (ValidatorSet, MockBls) {
 
 fn replay(chain: &Chain) -> ChainL2 {
     let (set, verifier) = empty_set();
-    ChainL2::replay(chain, L2Config::mini(), &set, &verifier)
+    // Empty genesis, deliberately: these tests pin the M1 unfunded behaviour
+    // (every payload refused for insufficient balance). Funded replay is
+    // covered by `genesis_funding.rs` and the node integration tests.
+    ChainL2::replay(
+        chain,
+        L2Config::mini(),
+        &L2Genesis::empty(),
+        &set,
+        &verifier,
+    )
 }
 
 #[test]
@@ -121,7 +130,7 @@ fn full_replay_equals_incremental_application() {
     let full = replay(&chain);
 
     let (set, verifier) = empty_set();
-    let mut incremental = ChainL2::empty(L2Config::mini());
+    let mut incremental = ChainL2::empty(L2Config::mini(), &L2Genesis::empty());
     for h in 1..=chain.height() {
         let block = chain.block_at(h).unwrap();
         incremental.apply_block(block, &set, &verifier);
@@ -147,7 +156,9 @@ fn a_chain_with_no_l2_transactions_replays_clean() {
     assert!(l2.is_clean());
     // Nothing was applied, so the state is the pristine one — and in particular
     // replaying an L1-only chain invents no L2 money.
-    assert_eq!(l2.state(), &L2State::new(L2Config::mini()));
+    let mut pristine = L2State::new(L2Config::mini());
+    pristine.apply_genesis(&L2Genesis::empty()).unwrap();
+    assert_eq!(l2.state(), &pristine);
 }
 
 #[test]

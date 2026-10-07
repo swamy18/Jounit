@@ -2049,12 +2049,12 @@ regression tests assert that over every public error and debug path.
 
 ---
 
-## 19. Phase 6: L1↔L2 integration (specified in two parts)
+## 19. Phase 6: L1↔L2 integration (specified in three parts)
 
 §15.9 left "how L2 transactions reach a block" deliberately unspecified. This
-section specifies it. **§19.1 describes behaviour that is implemented and
-tested; §19.2 and §19.3 are specified but not yet built**, and are marked so
-rather than being folded in with the implemented part.
+section specifies it. **§19.1 and §19.4 describe behaviour that is implemented
+and tested; §19.2 and §19.3 are specified but not yet built**, and are marked
+so rather than being folded in with the implemented part.
 
 ### 19.1 L2 transactions in L1 blocks — IMPLEMENTED, normative
 
@@ -2152,19 +2152,73 @@ needs, so §13 itself is not edited.
 
 ### 19.3 Specified only when its decision lands
 
-Two Phase 6 obligations are **not** specified here, on purpose, because their
-decisions are recorded but their mechanisms are not yet built. Nothing may be
-inferred about them from this section:
+One Phase 6 obligation is **not** specified here, on purpose, because its
+decision is recorded but its mechanism is not yet built. Nothing may be
+inferred about it from this section:
 
-- **The L1→L2 funding bridge** (Decision 7): the genesis-funded escrow, and what
-  `L2State::credit` is driven by. Until this exists, no L2 account holds value,
-  so every L2 transaction replayed from a chain is refused for insufficient
-  balance. That is the current, tested behaviour and not a bug (§15.5's
-  conservation invariant holds vacuously).
 - **The genesis validator committee and checkpoints** (Decisions 2 and 8): the
   fixed genesis set, the checkpoint message type (a §13.5 `msg_type` decision),
   and which checkpoint validator is authoritative.
 
-Neither is a precondition for §19.1, which is what makes the ordering here safe:
-carriage and replay can be verified against a chain holding no value and no
-validators, and they are.
+It is not a precondition for §19.1 or §19.4, which is what makes the ordering
+here safe: carriage, replay and funding can be verified against a chain with
+no validators, and they are.
+
+### 19.4 L2 genesis funding (Decision 7) — IMPLEMENTED, normative
+
+L2 value enters through a genesis-funded protocol escrow. There is no deposit
+transaction, no lock transaction, and no new L1 transaction type: user-facing
+deposits and L2→L1 exits are deferred past M2, and building either needs its
+own decision. What exists is the one production funding event, at L2 genesis.
+
+**The allocation.** Two `NetworkParams` fields fix it per profile:
+
+- `l2_genesis_escrow_sat`: the total L2 genesis allocation. `mini` allocates
+  10 JNT; `mainnet` allocates 100,000 JNT and no grants.
+- `l2_genesis_grants`: named `(address, amount)` balances released at genesis.
+  `mini` grants 1 JNT each to three deterministic operator identities; an
+  empty list is legal (that is mainnet today).
+
+The remainder (`escrow − grants`) parks with the protocol escrow identity:
+`SHA256("jounit/l2-escrow/v1" ‖ network_id)[..20]`, derived per network, holding
+no key. It is inert in M2 — no disbursement rule exists for it yet — which is
+stated so its balance cannot be misread as spendable supply.
+
+**The backing rule.** The escrow must fit in the sats the L1 ladder can never
+mint: `l2_genesis_escrow_sat ≤ supply_cap_sat − max_issuance_sat`, enforced by
+`NetworkParams::validate`. Both profiles satisfy it with wide margins (mini:
+10 of 6,000 JNT; mainnet: 100,000 of 788,400 JNT). Because L1 can never hold
+more than the ladder's reachable maximum and L2 can never hold more than its
+escrow total, combined L1 + L2 money can never exceed the cap — with zero
+change to any L1 consensus rule, issuance path, reward, halving schedule, fee
+rule, or the genesis block itself (which still mints nothing). `validate`
+additionally refuses a zero escrow, zero grants, duplicate grantees, grants
+naming the escrow identity, and grants summing above the total.
+
+**Application.** `L2State::apply_genesis` releases the allocation once, to a
+freshly constructed state, before any block is replayed: L2 height 0 holds the
+funding and block 1 is the first that can spend it. A second application is
+refused (`GenesisAlreadyApplied`) rather than double-funding. Every `ChainL2`
+constructor applies it, so full replay, incremental sync, restart recovery and
+reorg replay all derive identical funding with no persisted funding record and
+no block-carried funding to replay twice.
+
+**Conservation.** `L2State::funded_total` counts every satoshi ever released
+(genesis, or a unit-test credit); `conservation_total` counts every satoshi
+still in the system. Their equality is checked after every transition: fees,
+burns, slashes, bounties and refunds move value between buckets but never
+change the sum. `jnt-node verify` additionally asserts `funded_total` equals
+the profile's escrow total (no unauthorized funding happened) and that live L1
+supply plus L2 held stays under the cap.
+
+**Failure behaviour.** A payload from an unfunded account is still refused with
+`InsufficientBalance`, recorded as skipped, and retryable — unchanged from M1.
+A funded account's valid `PostTask` applies through the normal replay path. No
+L2 validity rule became an L1 block rule: funding changes what applies, never
+what is accepted.
+
+**Implementations.** `NetworkParams::{l2_genesis_escrow_sat, l2_genesis_grants,
+l2_escrow_address}` + `validate` (gap-fit and shape rules),
+`jnt_l2::genesis::L2Genesis` (allocation view), `L2State::{apply_genesis,
+funded_total, check_conservation}`, `ChainL2::{empty, replay}` (genesis-first
+construction), `jnt-node verify` (joint conservation checks).

@@ -7,9 +7,11 @@
 //! Three rules define the model:
 //!
 //! 1. **Accounts, not UTXOs.** L2 carries a simple account balance per address.
-//!    Funding is explicit ([`L2State::credit`]) because the bridge that turns L1
-//!    UTXOs into L2 balances is Phase 6 work, not something to invent here. What
-//!    is real today is the accounting below it.
+//!    Funding is genesis-explicit ([`L2State::apply_genesis`], SPEC.md §19.4):
+//!    the profile's escrow total is released once — grants to named accounts,
+//!    remainder to the protocol escrow identity — and no production path funds
+//!    after that. User deposits and exits are deferred past M2. What is real
+//!    today is the accounting below it.
 //! 2. **Every explicit transaction pays its D3 flat fee**, split 50/50
 //!    burned/PSCB through `fees::split_flat_fee` — the unchanged M1 rule. Implicit
 //!    transitions (a deadline passing, a dispute window closing) cost nothing,
@@ -36,6 +38,7 @@ use jnt_core::l2::{
 use jnt_core::slash::SlashVault;
 
 use crate::error::{L2Error, L2Result};
+use crate::genesis::L2Genesis;
 use crate::task_contract::{L2Config, SettlementOutcome, TaskContract};
 use crate::vwc::{VerifiedWorkCertificate, VwcVerification};
 
@@ -94,6 +97,17 @@ pub struct L2State {
     tasks: HashMap<Hash, TaskContract>,
     /// Transaction ids that have been applied. Replay protection.
     applied: HashSet<Hash>,
+    /// Every satoshi ever released into L2: genesis allocation plus test
+    /// credits. Append-only. `conservation_total() == funded_total()` is the
+    /// M2 invariant — value is moved, never created — and a production state
+    /// whose `funded_total` exceeds its profile's escrow total proves an
+    /// unauthorized funding happened.
+    funded_total: u64,
+    /// Whether the genesis allocation was applied to this state. Exactly-once
+    /// by construction (only the constructors apply it, to fresh state) and
+    /// enforced by flag: a second application is refused rather than
+    /// double-funding every grant.
+    genesis_applied: bool,
     /// Permanently destroyed satoshis (fees + failed-challenge and expiry burns).
     pub burned: u64,
     /// Protocol Security & Compute Buffer accrual from L2 fees (M1).
@@ -112,11 +126,42 @@ impl L2State {
             accounts: HashMap::new(),
             tasks: HashMap::new(),
             applied: HashSet::new(),
+            funded_total: 0,
+            genesis_applied: false,
             burned: 0,
             pscb: 0,
             slash_vault: SlashVault::new(),
             vwcs: HashMap::new(),
         }
+    }
+
+    /// Release the genesis allocation into this state: grants to named
+    /// accounts, remainder to the protocol escrow identity (SPEC.md §19.4).
+    ///
+    /// Only for freshly constructed states, exactly once. Replay, restart and
+    /// reorg all rebuild through constructors that call this once, which is
+    /// what makes funding exist exactly once in every derived state without a
+    /// persisted funding record.
+    pub fn apply_genesis(&mut self, genesis: &L2Genesis) -> L2Result<()> {
+        if self.genesis_applied {
+            return Err(L2Error::GenesisAlreadyApplied);
+        }
+        genesis.validate()?;
+        for (addr, amount) in &genesis.grants {
+            self.credit(*addr, *amount)?;
+        }
+        let remainder = genesis.escrow_remainder()?;
+        if remainder > 0 {
+            self.credit(genesis.escrow_id, remainder)?;
+        }
+        self.genesis_applied = true;
+        Ok(())
+    }
+
+    /// Whether this state's funding came from genesis (production) rather than
+    /// ad-hoc credits (unit tests).
+    pub fn has_genesis(&self) -> bool {
+        self.genesis_applied
     }
 
     pub fn config(&self) -> L2Config {
@@ -125,15 +170,32 @@ impl L2State {
 
     // --- accounts ------------------------------------------------------
 
-    /// Add free balance to an address. The L1→L2 funding bridge is Phase 6; this
-    /// is the seam it will call.
+    /// Add free balance to an address.
+    ///
+    /// Production calls this only through [`Self::apply_genesis`]: the
+    /// Decision 7 bridge funds L2 exactly once, at genesis, and user deposits
+    /// are deferred — so any post-genesis production credit would be invented
+    /// money. Direct calls are the unit-test seam (custom-funded states) and
+    /// the future deposit mechanism's entry point, not a funding source the
+    /// node may invoke on its own.
     pub fn credit(&mut self, addr: Address, amount: u64) -> L2Result<()> {
         let next = self
             .balance(&addr)
             .checked_add(amount)
             .ok_or(L2Error::Overflow)?;
         self.accounts.insert(addr, next);
+        self.funded_total = self
+            .funded_total
+            .checked_add(amount)
+            .ok_or(L2Error::Overflow)?;
         Ok(())
+    }
+
+    /// Every satoshi ever released into this state. In production this equals
+    /// the profile's escrow total forever — anything else proves an
+    /// unauthorized funding happened.
+    pub fn funded_total(&self) -> u64 {
+        self.funded_total
     }
 
     pub fn balance(&self, addr: &Address) -> u64 {
@@ -634,5 +696,12 @@ impl L2State {
             .saturating_add(self.total_burned())
             .saturating_add(self.pscb)
             .saturating_add(self.vault_remaining())
+    }
+
+    /// The M2 invariant, self-checked: everything ever released is still
+    /// somewhere in the system. Burns and PSCB accrual move value between
+    /// buckets; they must never change the sum.
+    pub fn check_conservation(&self) -> bool {
+        self.conservation_total() == self.funded_total
     }
 }

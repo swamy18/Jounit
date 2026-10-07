@@ -5,8 +5,15 @@
 //! therefore lives here, and the mini profile differs only in numbers.
 
 use crate::error::{Error, Result};
+use crate::hash::{Address, Hash};
 
 pub const SAT_PER_JNT: u64 = 100_000_000;
+
+/// Domain tag for the L2 protocol-escrow identity (Decision 7, SPEC.md §19.4).
+/// The escrow address is `SHA256(tag ‖ network_id)[..20]`: deterministic per
+/// network, consensus-visible, and holding no key — value parked there moves
+/// only by protocol rule, never by signature.
+pub const DOM_L2_ESCROW: &[u8] = b"jounit/l2-escrow/v1";
 
 /// Flat fee per L2 transaction type, in satoshis (decision D3).
 ///
@@ -38,6 +45,33 @@ pub const L2_FEE_SCHEDULE: &[(&str, u64)] = &[
     ("TxDispute", FEE_TX_DISPUTE_SAT),
     ("TxSettle", FEE_TX_SETTLE_SAT),
 ];
+
+/// One genesis-funded L2 balance (Decision 7, SPEC.md §19.4).
+///
+/// The address is a plain L2 account address; the amount is satoshis released
+/// to it once, at L2 genesis, out of the profile's escrow total. Mainnet
+/// carries no grants (real allocation arrives with the deposit mechanism, and
+/// inventing mainnet beneficiaries here would be inventing economics); `mini`
+/// grants three deterministic operator identities so the funded flow is
+/// exercisable end to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L2GenesisGrant {
+    pub address: Address,
+    pub amount_sat: u64,
+}
+
+/// Address of the deterministic `mini` operator identity for `seed`.
+///
+/// The same derivation the integration tests use for their wallets
+/// (`Wallet::from_private_key_bytes(&[seed; 32])`), so the genesis grants name
+/// accounts the tests can actually sign for. Seeds are public test values, not
+/// secrets: `mini` is the integration profile, and mainnet carries no grants.
+fn l2_operator_address(seed: u8) -> Address {
+    crate::wallet::Wallet::from_private_key_bytes(&[seed; 32], "l2-genesis-operator")
+        .expect("constant seeds are valid scalars")
+        .address()
+        .expect("a wallet always has an address")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkParams {
@@ -82,6 +116,14 @@ pub struct NetworkParams {
     /// Human-readable network tag exchanged in the handshake (§13.4). Also
     /// distinguishes profiles when a magic collision is ever introduced.
     pub network_id: String,
+    /// Total L2 genesis allocation in satoshis (Decision 7, SPEC.md §19.4).
+    /// Released once, at L2 genesis: the grants below plus the remainder to
+    /// the protocol escrow identity. Must fit in the sats the L1 ladder can
+    /// never mint (`supply_cap_sat - max_issuance_sat`), so combined L1 + L2
+    /// money can never exceed the cap with zero L1 consensus change.
+    pub l2_genesis_escrow_sat: u64,
+    /// Genesis-funded L2 accounts, paid out of `l2_genesis_escrow_sat`.
+    pub l2_genesis_grants: Vec<L2GenesisGrant>,
 }
 
 impl NetworkParams {
@@ -95,6 +137,33 @@ impl NetworkParams {
 
     pub fn supply_cap_jnt(&self) -> u64 {
         self.supply_cap_sat / SAT_PER_JNT
+    }
+
+    /// The protocol escrow identity holding the un-granted remainder of the L2
+    /// genesis allocation (Decision 7, SPEC.md §19.4).
+    ///
+    /// Derived, not stored: `SHA256(DOM_L2_ESCROW ‖ network_id)[..20]`. Every
+    /// node holding these params derives the same address, and no wallet can
+    /// hold its key — the remainder is inert until a later milestone authorises
+    /// a disbursement rule for it.
+    pub fn l2_escrow_address(&self) -> Address {
+        let digest: Hash = crate::hash::sha256_dom(DOM_L2_ESCROW, &[self.network_id.as_bytes()]);
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&digest[..20]);
+        out
+    }
+
+    /// Satoshis granted to named accounts at L2 genesis. Checked, not summed
+    /// with `+`: a crafted params value overflowing here would understate the
+    /// allocation and admit funding above the escrow total.
+    pub fn l2_granted_sat(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for g in &self.l2_genesis_grants {
+            total = total
+                .checked_add(g.amount_sat)
+                .ok_or(Error::Malformed("l2 genesis grants overflow"))?;
+        }
+        Ok(total)
     }
 
     pub fn start_reward_jnt(&self) -> u64 {
@@ -138,6 +207,12 @@ impl NetworkParams {
             require_hybrid_signatures: false,
             network_magic: [0x6A, 0x4E, 0x54, 0x01],
             network_id: "jounit/mainnet".into(),
+            // The L2 genesis escrow (Decision 7): 100,000 JNT of the 788,400
+            // JNT the ladder can never mint, held entirely by the protocol
+            // escrow identity. No mainnet grants — real beneficiaries arrive
+            // with the deposit mechanism, not as hard-coded allocations.
+            l2_genesis_escrow_sat: 100_000 * SAT_PER_JNT,
+            l2_genesis_grants: Vec::new(),
         }
     }
 
@@ -173,6 +248,24 @@ impl NetworkParams {
             // identical, hence the identical genesis hash.
             network_magic: [0x6A, 0x4E, 0x54, 0x02],
             network_id: "jounit/mini".into(),
+            // 10 JNT of the 6,000 JNT gap: 3 × 1 JNT to deterministic operator
+            // identities (seeds 1–3, whose keys the integration tests hold),
+            // 7 JNT remainder to the protocol escrow identity.
+            l2_genesis_escrow_sat: 10 * SAT_PER_JNT,
+            l2_genesis_grants: vec![
+                L2GenesisGrant {
+                    address: l2_operator_address(1),
+                    amount_sat: SAT_PER_JNT,
+                },
+                L2GenesisGrant {
+                    address: l2_operator_address(2),
+                    amount_sat: SAT_PER_JNT,
+                },
+                L2GenesisGrant {
+                    address: l2_operator_address(3),
+                    amount_sat: SAT_PER_JNT,
+                },
+            ],
         }
     }
 
@@ -207,6 +300,46 @@ impl NetworkParams {
         }
         if self.network_id.is_empty() {
             return Err(Error::Malformed("network_id must be non-empty"));
+        }
+        // L2 genesis escrow (Decision 7, SPEC.md §19.4). Every rule here is a
+        // conservation rule: together they prove combined L1 + L2 money can
+        // never exceed the cap (see the module docs on `l2_genesis_escrow_sat`).
+        if self.l2_genesis_escrow_sat == 0 {
+            return Err(Error::Malformed("l2_genesis_escrow_sat must be > 0"));
+        }
+        let escrow = self.l2_escrow_address();
+        let mut seen: Vec<Address> = Vec::with_capacity(self.l2_genesis_grants.len());
+        for g in &self.l2_genesis_grants {
+            if g.amount_sat == 0 {
+                return Err(Error::Malformed("l2 genesis grant must be > 0"));
+            }
+            if g.address == escrow {
+                return Err(Error::Malformed(
+                    "l2 genesis grant must not name the escrow identity",
+                ));
+            }
+            if seen.contains(&g.address) {
+                return Err(Error::Malformed("duplicate l2 genesis grant address"));
+            }
+            seen.push(g.address);
+        }
+        let granted = self.l2_granted_sat()?;
+        if granted > self.l2_genesis_escrow_sat {
+            return Err(Error::Malformed(
+                "l2 genesis grants exceed the escrow total",
+            ));
+        }
+        // Gap-fit: the escrow must fit in the sats the L1 ladder can never
+        // mint. `max_issuance_sat` is the most L1 can ever hold and the escrow
+        // is the most L2 can ever hold; both maxima fitting under the cap is
+        // what makes the joint invariant hold with no L1 rule change.
+        let gap = self
+            .supply_cap_sat
+            .saturating_sub(crate::supply::max_issuance_sat(self));
+        if self.l2_genesis_escrow_sat > gap {
+            return Err(Error::Malformed(
+                "l2 genesis escrow exceeds the unmintable supply gap",
+            ));
         }
         Ok(())
     }
@@ -327,5 +460,104 @@ mod tests {
                 assert_eq!(split.pscb, *fee / 2);
             }
         }
+    }
+
+    // --- L2 genesis escrow (Decision 7, SPEC.md §19.4) -----------------------
+
+    #[test]
+    fn l2_genesis_escrow_fits_the_unmintable_gap_on_both_profiles() {
+        // The joint conservation invariant as an executable check: the most
+        // L1 can ever mint plus the most L2 can ever hold stays under the cap,
+        // with no L1 rule change. If this fails, the escrow does not fit and
+        // M2's funding model is inflationary.
+        for p in [NetworkParams::mainnet(), NetworkParams::mini()] {
+            p.validate().unwrap();
+            let reachable = crate::supply::max_issuance_sat(&p);
+            assert!(
+                reachable + p.l2_genesis_escrow_sat <= p.supply_cap_sat,
+                "{}: L1 reachable {} + L2 escrow {} exceeds cap {}",
+                p.name,
+                reachable,
+                p.l2_genesis_escrow_sat,
+                p.supply_cap_sat
+            );
+        }
+        // Pin the gaps literally, so a halving-schedule change that shrinks
+        // one is noticed here rather than as a far-away funding failure.
+        assert_eq!(
+            NetworkParams::mainnet().supply_cap_sat
+                - crate::supply::max_issuance_sat(&NetworkParams::mainnet()),
+            788_400 * SAT_PER_JNT
+        );
+        assert_eq!(
+            NetworkParams::mini().supply_cap_sat
+                - crate::supply::max_issuance_sat(&NetworkParams::mini()),
+            6_000 * SAT_PER_JNT
+        );
+    }
+
+    #[test]
+    fn l2_escrow_identity_is_deterministic_and_network_bound() {
+        let mini = NetworkParams::mini();
+        let main = NetworkParams::mainnet();
+        assert_eq!(mini.l2_escrow_address(), mini.l2_escrow_address());
+        // Bound to the network: sharing an escrow identity across profiles
+        // would let a mini replay claim mainnet backing.
+        assert_ne!(mini.l2_escrow_address(), main.l2_escrow_address());
+        assert_ne!(mini.l2_escrow_address(), [0u8; 20]);
+        // No grant may collide with it.
+        for g in &mini.l2_genesis_grants {
+            assert_ne!(g.address, mini.l2_escrow_address());
+        }
+    }
+
+    #[test]
+    fn mini_grants_name_signable_operator_identities_and_sum_to_escrow() {
+        let p = NetworkParams::mini();
+        p.validate().unwrap();
+        assert_eq!(p.l2_genesis_grants.len(), 3);
+        for (i, g) in p.l2_genesis_grants.iter().enumerate() {
+            // The tests hold these keys: seed i+1 must derive this address, or
+            // the grant names an account nobody can operate.
+            let w = crate::wallet::Wallet::from_private_key_bytes(
+                &[(i + 1) as u8; 32],
+                "l2-genesis-operator",
+            )
+            .unwrap();
+            assert_eq!(g.address, w.address().unwrap());
+            assert_eq!(g.amount_sat, SAT_PER_JNT);
+        }
+        assert_eq!(p.l2_granted_sat().unwrap(), 3 * SAT_PER_JNT);
+        assert_eq!(p.l2_genesis_escrow_sat, 10 * SAT_PER_JNT);
+        assert!(NetworkParams::mainnet().l2_genesis_grants.is_empty());
+    }
+
+    #[test]
+    fn malformed_l2_genesis_params_are_rejected() {
+        let good = NetworkParams::mini();
+        // Zero escrow funds nothing: not a bridge.
+        let mut p = good.clone();
+        p.l2_genesis_escrow_sat = 0;
+        assert!(p.validate().is_err());
+        // Grants above the total invent value.
+        let mut p = good.clone();
+        p.l2_genesis_escrow_sat = 1;
+        assert!(p.validate().is_err());
+        // Zero-amount grant.
+        let mut p = good.clone();
+        p.l2_genesis_grants[0].amount_sat = 0;
+        assert!(p.validate().is_err());
+        // Duplicate address pays twice.
+        let mut p = good.clone();
+        p.l2_genesis_grants[1].address = p.l2_genesis_grants[0].address;
+        assert!(p.validate().is_err());
+        // Grant to the escrow identity blurs backing and remainder.
+        let mut p = good.clone();
+        p.l2_genesis_grants[0].address = p.l2_escrow_address();
+        assert!(p.validate().is_err());
+        // Escrow above the gap is inflation against the cap.
+        let mut p = good.clone();
+        p.l2_genesis_escrow_sat = p.supply_cap_sat;
+        assert!(p.validate().is_err());
     }
 }

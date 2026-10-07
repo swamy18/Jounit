@@ -64,6 +64,13 @@ pub enum L2Error {
     AmountTooSmallForFee { available: u64, fee: u64 },
     /// A numeric total did not fit.
     Overflow,
+    /// The L2 genesis allocation was applied twice. Genesis funding happens
+    /// exactly once per state construction (SPEC.md §19.4); a second
+    /// application would duplicate every grant, so it is refused by name.
+    GenesisAlreadyApplied,
+    /// A genesis allocation is structurally invalid (duplicate grantee, grant
+    /// to the escrow identity). The reason is stated.
+    InvalidGenesis(&'static str),
     /// A codec failure raised by `jnt-core`.
     Codec(jnt_core::Error),
 }
@@ -111,6 +118,10 @@ impl fmt::Display for L2Error {
                 "held amount {available} cannot cover the {fee} sat settle fee"
             ),
             L2Error::Overflow => write!(f, "arithmetic overflow"),
+            L2Error::GenesisAlreadyApplied => {
+                write!(f, "l2 genesis allocation already applied")
+            }
+            L2Error::InvalidGenesis(why) => write!(f, "invalid l2 genesis: {why}"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),
         }
     }

@@ -38,6 +38,7 @@ use jnt_core::l2::L2Transaction;
 use jnt_core::Hash;
 
 use crate::error::L2Error;
+use crate::genesis::L2Genesis;
 use crate::state::L2State;
 use crate::task_contract::L2Config;
 
@@ -67,12 +68,21 @@ impl ChainL2 {
     /// A view with no history yet — the state a node starts from before it has
     /// applied anything, so it can follow the tip with [`Self::apply_block`].
     ///
+    /// Genesis funding is applied here, before any block: L2 height 0 holds
+    /// the allocation, and block 1 is the first that can spend it. Recovery
+    /// (`replay`) builds through this same constructor, so "start empty, then
+    /// apply each block" and full replay cannot disagree about funding.
+    ///
     /// This is also the second half of the recovery story: `replay` and
     /// "start empty, then apply each block" must reach the same state, and a
     /// test asserts exactly that.
-    pub fn empty(config: L2Config) -> Self {
+    pub fn empty(config: L2Config, genesis: &L2Genesis) -> Self {
+        let mut state = L2State::new(config);
+        state
+            .apply_genesis(genesis)
+            .expect("genesis validated by NetworkParams::validate");
         ChainL2 {
-            state: L2State::new(config),
+            state,
             height: 0,
             applied: 0,
             skipped: Vec::new(),
@@ -88,15 +98,11 @@ impl ChainL2 {
     pub fn replay(
         chain: &Chain,
         config: L2Config,
+        genesis: &L2Genesis,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) -> Self {
-        let mut l2 = ChainL2 {
-            state: L2State::new(config),
-            height: 0,
-            applied: 0,
-            skipped: Vec::new(),
-        };
+        let mut l2 = ChainL2::empty(config, genesis);
         for height in 1..=chain.height() {
             // `block_at` is total over 1..=height on a canonical chain. A
             // missing block would mean the chain is internally inconsistent,

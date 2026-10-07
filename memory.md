@@ -2972,3 +2972,48 @@ unchanged), no `docs/roadmap.md` change, no new decision in
   `-D warnings`, release build, 13 fuzz targets, sim suite — all clean
   (counts confirmed in the verification run before push).
 - Next: M2 funding bridge per Decision 7. Stop — do not start it automatically.
+
+# Working memory — session 19: Phase 6 M2 funding bridge
+
+## 85. Step 0 audit verdict
+
+Decision 7 is sufficient — no missing decision, nothing invented. It mandates:
+genesis-funded protocol escrow, only escrow movements drive `credit`, no new
+L1 transaction type, reallocation inside the cap, deposits/exits deferred. Two
+audit findings shaped the implementation: (1) the L1 genesis block is frozen
+(0% premine, identical hash across profiles) so the escrow cannot live there —
+it lives in `NetworkParams` + L2 genesis state; (2) both profiles have a
+provable unmintable gap (mini 6,000 JNT, mainnet 788,400 JNT), so sizing the
+escrow inside the gap makes joint L1+L2 supply stay under the cap with zero L1
+consensus change. `credit()` had no production callers (tests only) — kept
+that way.
+
+## 86. What was built
+
+- `NetworkParams`: `l2_genesis_escrow_sat` (mini 10 JNT, mainnet 100,000 JNT),
+  `l2_genesis_grants` (mini 3x1 JNT to seed-1/2/3 operator identities, mainnet
+  none), `l2_escrow_address()` derived per network, `validate()` enforcing
+  gap-fit plus grant shape rules (nonzero, no dups, not to escrow, sum within
+  total).
+- `jnt-l2::genesis::L2Genesis` (allocation view + structural validate),
+  `L2State::{apply_genesis (exactly-once), funded_total, check_conservation}`,
+  new `L2Error::{GenesisAlreadyApplied, InvalidGenesis}`.
+  `ChainL2::{empty, replay}` construct genesis-first.
+- `NodeL2` carries the genesis; `verify` asserts conservation,
+  funded-equals-escrow, and joint supply under the cap.
+- Tests: 4 params + 9 L2 genesis + 7 node funding (STEP 9 e2e, unfunded-closed,
+  double-apply, restart-once, reorg-once, A/B determinism, joint cap). M1 node
+  tests updated for funded seeds 1-3 (unfunded cases use seed 9; ad-hoc credit
+  replaced by grants except one seam test proving replay drops ad-hoc credit).
+- Fuzz: `l2_state_apply` target asserts the funded-total invariant per op (no
+  new target — no new parser boundary).
+- Docs: SPEC §19.4 normative + §19.3 trimmed to the committee item; status.md
+  M2 section; README status line. No `docs/roadmap.md` change, no new decision.
+
+## 87. State after this session
+
+- 553 workspace tests / 0 failed / 1 ignored (was 533; +4 params, +9 genesis,
+  +7 funding); fmt, clippy `-D warnings`, release build, 13 fuzz targets, sim
+  suite — all clean (counts confirmed in the verification run before push).
+- Next: M3 worker-node transport per Decision 9. Stop — do not start it
+  automatically.

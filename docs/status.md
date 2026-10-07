@@ -1175,19 +1175,19 @@ machinery is verified against a chain holding no value and no validators. SPEC
 
 ---
 
-## Phase 6 — M1 node integration: SHIPPED — 2026-10-07
+## Phase 6 ï¿½ M1 node integration: SHIPPED ï¿½ 2026-10-07
 
 M1 carriage/replay (above) left L2 unreachable from the running node:
 `jnt-node` did not depend on `jnt-l2` and no production path replayed a block.
 That gap is now closed. **No L1 consensus rule changed, no wire format changed,
 no L2 semantic changed.**
 
-**What was added** (`crates/jnt-node/src/l2.rs`, `SPEC.md §19.1`):
+**What was added** (`crates/jnt-node/src/l2.rs`, `SPEC.md ï¿½19.1`):
 
 - `jnt-node` depends on `jnt-l2` and consumes `ChainL2` through a thin `NodeL2`
   wrapper. The node holds no second state machine: every payload is applied by
   `L2State::apply`.
-- Sync rule, called after every batch of accepted blocks (mined or received —
+- Sync rule, called after every batch of accepted blocks (mined or received ï¿½
   both move the same tip through the same `submit`): tip unchanged ? no-op;
   tip extended ? incremental `apply_block`; history rewritten or first sync
   after startup ? full `ChainL2::replay` of the winning chain. Reorg therefore
@@ -1196,7 +1196,7 @@ no L2 semantic changed.**
 - L2 state is **not persisted**. Restart replays the blocks the store already
   holds; there is no second source of truth to go stale.
 - Settlements verify against the empty validator set with the production
-  `RealBls` verifier until the M4 genesis committee exists — fail closed with
+  `RealBls` verifier until the M4 genesis committee exists ï¿½ fail closed with
   a named refusal, never applied without authority. `L2Config` follows the
   network profile (`mini` ? short window, else production).
 - Observability (M1 minimum): `status` prints L2 height/applied/skipped;
@@ -1210,15 +1210,63 @@ no-op / sequential incremental / two-view determinism / restart through a real
 `BlockStore` / duplicate+orphan rejection / no-partial-write / reorg replay /
 credit-seam-funded apply + restart reset / funded-claim-UnknownTask /
 config-per-profile / status observability. One real bug caught pre-push: the
-sync delta underflowed when a reorg dropped recorded skips — now saturating
+sync delta underflowed when a reorg dropped recorded skips ï¿½ now saturating
 deltas plus exact totals, with a regression test.
 
 **Verified:** 533 workspace tests / 0 failed / 1 ignored (was 513; +20 node);
 fmt clean; `clippy -D warnings` clean workspace-wide; release build clean;
-13 fuzz targets compile (no new target: the integration adds no new parser —
+13 fuzz targets compile (no new target: the integration adds no new parser ï¿½
 `Block`/`L2Transaction` decode is unchanged); sim suite clean.
 
-**Still ahead, unchanged:** M2 funding bridge (every replayed payload is still
-an expected `InsufficientBalance` skip until the escrow exists — pinned, not
+**Still ahead after M1, unchanged:** M2 funding bridge (every replayed payload is still
+an expected `InsufficientBalance` skip until the escrow exists - pinned, not
 worked around), M3 transport, M4 committee + finality, M5 testnet. No claim of
 testnet, finality, or mainnet readiness.
+
+---
+
+## Phase 6 â€” M2 funding bridge (genesis-funded escrow): SHIPPED â€” 2026-10-07
+
+M2 makes the L2 economy usable without touching L1 consensus, issuance, rewards,
+fees, the money cap, or the genesis block. **No new transaction type (L1 or L2).
+No new decision** â€” this builds Decision 7 exactly as recorded; the escrow
+amounts and grantees are parameters under that decision, listed below.
+
+**The model.** The escrow fits in the sats the L1 ladder provably can never
+mint (the unmintable gap: 6,000 JNT on `mini`, 788,400 JNT on `mainnet`).
+`NetworkParams` fixes per profile: `l2_genesis_escrow_sat` (`mini` 10 JNT,
+`mainnet` 100,000 JNT, no mainnet grants) and `l2_genesis_grants` (`mini`:
+1 JNT each to three deterministic operator identities, seeds 1â€“3). The 7 JNT
+remainder parks with the derived protocol escrow identity
+(`SHA256("jounit/l2-escrow/v1" â€– network_id)[..20]`), inert until a later
+milestone authorises disbursement. `validate()` refuses zero/over-total/
+duplicate/escrow-named/zero grants and any escrow above the gap â€” so combined
+L1 + L2 money can never exceed the cap, with zero L1 rule change.
+
+**Application.** `L2State::apply_genesis` releases the allocation once per
+fresh state (grants + remainder), before any block replays; a second call is
+refused (`GenesisAlreadyApplied`). All `ChainL2` constructors build through it,
+so replay, incremental sync, restart and reorg derive identical funding with no
+persisted record. `funded_total` (append-only, counted by every credit) plus
+`conservation_total` make conservation self-checking; `verify` asserts
+`funded_total` equals the escrow total and L1-live-plus-L2-held stays under
+the cap. `credit()` stays public but production never calls it post-genesis â€”
+only unit tests (custom states) do.
+
+**Proven by tests.** Funded `PostTask` flows through the real node path (task
+appears, balance drops by exactly payment + fee); unfunded accounts still fail
+closed; same bytes in two blocks apply once (`Replay` refusal); restart and
+reorg keep funding exactly once with no kept losing history; two independent
+replays agree on balances, escrow, tasks, funding and skip records;
+incremental agrees with replay; joint supply stays under the cap while mining.
+The `l2_state_apply` fuzz target additionally asserts the funded-total
+invariant per operation (no new target: no new parser boundary).
+
+**Verified:** 553 workspace tests / 0 failed / 1 ignored (was 533; +4 params,
++9 L2 genesis, +7 node funding); fmt clean; `clippy -D warnings` clean
+workspace-wide; release build clean; 13 fuzz targets compile; sim suite clean.
+
+**Still ahead, unchanged:** user deposits and L2-to-L1 exits (deferred by
+Decision 7 â€” needs its own decision before mainnet), M3 transport, M4
+committee + finality, M5 testnet. No claim of testnet, finality, or mainnet
+readiness.

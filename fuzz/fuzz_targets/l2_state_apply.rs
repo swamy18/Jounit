@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// Invariant fuzzer over L2 state transitions (Phase 3).
+// Invariant fuzzer over L2 state transitions (Phase 3, extended in Phase 6 M2).
 //
 // This is the strongest of the four new targets: rather than checking that a
 // decoder agrees with itself, it drives real, *validly signed* transactions
@@ -10,10 +10,13 @@ use libfuzzer_sys::fuzz_target;
 //
 //     accounts + locked + burned + PSCB + vault_remaining == total credited
 //
-// after every single step. A bug that drops an escrow refund, double-counts a
-// fee, mints a bounty out of nothing, or slashes a deposit twice shows up here
-// as a conservation failure rather than as subtle accounting drift. This check
-// is exactly what caught the missing submitter refund in Phase 2.
+// after every single step, plus the M2 self-check `check_conservation()` (the
+// same sum against the state's own append-only `funded_total`, which is what
+// catches a credit path that invents value outside the tracked constant).
+// A bug that drops an escrow refund, double-counts a fee, mints a bounty out of
+// nothing, or slashes a deposit twice shows up here as a conservation failure
+// rather than as subtle accounting drift. This check is exactly what caught
+// the missing submitter refund in Phase 2.
 //
 // Inputs are structure-aware: three deterministic wallets come from the first
 // 96 bytes, and the rest is a program of operations (post / claim / submit /
@@ -192,6 +195,10 @@ fuzz_target!(|data: &[u8]| {
             state.conservation_total(),
             credited,
             "L2 value conservation broke after op {op}"
+        );
+        assert!(
+            state.check_conservation(),
+            "L2 funded-total invariant broke after op {op}"
         );
     }
 });

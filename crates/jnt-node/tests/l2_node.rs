@@ -148,8 +148,12 @@ fn block_with_no_l2_syncs_clean() {
 
 #[test]
 fn block_with_valid_l2_is_carried_committed_and_skipped_by_name() {
+    // Seed 9 holds no genesis grant: well-formed but unfunded, so replay
+    // refuses it with `InsufficientBalance` — the M1 behaviour preserved for
+    // genuinely unfunded accounts. (Seed 1–3 are granted; their funded flow
+    // is covered by `l2_funding.rs`.)
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
-    let expected = post(1, 2, 200);
+    let expected = post(9, 2, 200);
     let h = chain.height() + 1;
     let block = chain
         .mine_block_with_l2(
@@ -182,8 +186,8 @@ fn block_with_valid_l2_is_carried_committed_and_skipped_by_name() {
 #[test]
 fn block_with_multiple_l2_transactions_skips_each_by_name() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
-    let a = post(1, 10, 200);
-    let b = post(1, 11, 200);
+    let a = post(9, 10, 200);
+    let b = post(9, 11, 200);
     mine_and_submit(&mut chain, vec![a.clone(), b.clone()]);
 
     let mut view = NodeL2::fresh(chain.params());
@@ -309,7 +313,7 @@ fn modified_l2_payload_is_rejected_and_l2_state_is_untouched() {
 #[test]
 fn replaying_the_same_tip_is_a_noop() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
-    mine_and_submit(&mut chain, vec![post(1, 2, 200)]);
+    mine_and_submit(&mut chain, vec![post(9, 2, 200)]);
     let mut view = NodeL2::fresh(chain.params());
     view.sync(&chain);
     let applied = view.applied_count();
@@ -339,7 +343,9 @@ fn sequential_blocks_advance_incrementally() {
     assert_eq!(second.from_height, 1);
     assert_eq!(second.to_height, 3);
     assert_eq!(view.height(), 3);
-    assert_eq!(view.skipped().len(), 2);
+    // Seed 1 is genesis-funded: both posts apply through the incremental path.
+    assert_eq!(view.applied_count(), 2);
+    assert!(view.is_clean());
     // Incremental and full replay are the same state machine: assert it here,
     // at the node level, not just in `jnt-l2`.
     let full = NodeL2::replay_from(&chain, chain.params());
@@ -427,15 +433,11 @@ fn restart_reconstructs_identical_l2_state_from_persisted_blocks() {
     assert_eq!(recovered.skipped(), live_again.skipped());
     assert_eq!(recovered.applied_count(), live_again.applied_count());
     assert_eq!(recovered.height(), 3);
-    assert_eq!(recovered.skipped().len(), 3);
-    assert!(recovered
-        .skipped()
-        .iter()
-        .any(|s| is_insufficient(&s.error)));
-    assert!(recovered
-        .skipped()
-        .iter()
-        .any(|s| s.error == L2Error::BadAuthorization));
+    // Seed 1 is funded: two posts apply, the bad-auth payload is refused.
+    assert_eq!(recovered.applied_count(), 2);
+    assert_eq!(recovered.skipped().len(), 1);
+    assert_eq!(recovered.skipped()[0].error, L2Error::BadAuthorization);
+    assert!(recovered.state().check_conservation());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -458,7 +460,10 @@ fn l1_invalid_block_does_not_mutate_l2_state() {
 
     assert_eq!(view.sync(&chain).outcome, SyncOutcome::Unchanged);
     assert_eq!(view.height(), 1);
-    assert_eq!(view.skipped().len(), 1);
+    // The one carried post applied (seed 1 is funded); the rejections above
+    // added nothing and removed nothing.
+    assert_eq!(view.applied_count(), 1);
+    assert_eq!(view.skipped().len(), 0);
 }
 
 #[test]
@@ -509,8 +514,9 @@ fn reorg_replays_the_winning_chain_with_no_silent_divergence() {
         mine_and_submit(&mut chain, vec![post(1, h, 200)]);
     }
     let mut view = NodeL2::replay_from(&chain, chain.params());
-    let main_skipped: Vec<_> = view.skipped().to_vec();
-    assert_eq!(main_skipped.len(), 3);
+    // Seed 1 is funded: all three main-branch posts apply.
+    assert_eq!(view.applied_count(), 3);
+    assert!(view.is_clean());
 
     // Rival: a separate chain forking genesis (its h1 already differs by
     // miner), h1..h4 with different L2 content. Longer at equal difficulty =
@@ -558,53 +564,44 @@ fn reorg_replays_the_winning_chain_with_no_silent_divergence() {
     assert_eq!(view.skipped(), fresh.skipped());
     assert_eq!(report.skipped_total, 1);
     assert_eq!(report.applied_total, 0);
-    assert!(
-        !view.skipped().iter().any(|s| main_skipped.contains(s)),
-        "losing-branch payloads must be gone after the reorg"
-    );
+    // The losing branch's three applications are gone: the reorg did not keep
+    // them and did not duplicate the funding — the winner's single refusal is
+    // all that remains.
+    assert_eq!(view.applied_count(), 0);
     assert_eq!(view.skipped().len(), 1);
     assert_eq!(view.skipped()[0].error, L2Error::BadAuthorization);
+    assert!(view.state().check_conservation());
+    assert_eq!(view.state().funded_total(), view.genesis().escrow_total_sat);
 }
 
-// --- funding seam (Decision 7 not built) -------------------------------------
+// --- funding (Decision 7 built: genesis escrow) ------------------------------
 
 #[test]
-fn credit_seam_still_funds_and_replay_still_derives() {
-    // The two halves of the M1 contract: `credit` (the bridge seam) makes a
-    // payload applicable, and replay derives state from blocks alone — so a
-    // restart deterministically returns to the unfunded skip.
+fn adhoc_credit_does_not_survive_replay() {
+    // The M2 contract: genesis funds once per construction, and replay derives
+    // from blocks plus genesis alone. An ad-hoc credit on a live view inflates
+    // its `funded_total` — and the next replay drops it deterministically,
+    // proving replay never consults ambient state.
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, vec![post(3, 1, 200)]);
     let mut view = NodeL2::fresh(chain.params());
     view.sync(&chain);
-    assert_eq!(view.skipped().len(), 1);
+    // Seed 3 is genesis-funded: the post applies with no seam involved.
+    assert_eq!(view.applied_count(), 1);
+    assert!(view.is_clean());
 
-    // Fund the submitter through the seam and apply the same bytes directly:
-    // retryable means applicable once the precondition holds.
-    let funded_post = post(3, 1, 200);
-    let actor = match &funded_post.payload {
-        L2Payload::Post(p) => p.submitter,
-        _ => unreachable!(),
-    };
-    view.state_mut().credit(actor, 10_000_000).unwrap();
-    let (set, verifier) = (
-        jnt_core::bls_checkpoint::ValidatorSet::new(Vec::new()),
-        jnt_core::bls_checkpoint::MockBls,
-    );
-    view.state_mut()
-        .apply(&funded_post, 1, &set, &verifier)
-        .expect("a funded post must apply");
-    assert!(view
-        .state()
-        .task(&funded_post_task_id(&funded_post))
-        .is_some());
+    view.state_mut().credit([0x77u8; 20], 10_000_000).unwrap();
+    assert!(view.state().funded_total() > view.genesis().escrow_total_sat);
 
-    // Restart: replay derives from blocks only, so the funding is gone and the
-    // skip is back — deterministically, not as corruption.
+    // Restart: replay derives from blocks plus genesis only, so the ad-hoc
+    // credit is gone and funding is exactly the escrow total again.
     let again = NodeL2::replay_from(&chain, chain.params());
-    assert_eq!(again.applied_count(), 0);
-    assert_eq!(again.skipped().len(), 1);
-    assert!(is_insufficient(&again.skipped()[0].error));
+    assert_eq!(again.applied_count(), 1);
+    assert!(again.is_clean());
+    assert_eq!(
+        again.state().funded_total(),
+        again.genesis().escrow_total_sat
+    );
 }
 
 fn funded_post_task_id(tx: &L2Transaction) -> [u8; 32] {
@@ -618,17 +615,13 @@ fn funded_post_task_id(tx: &L2Transaction) -> [u8; 32] {
 fn funded_claim_for_unknown_task_is_skipped_without_partial_write() {
     // A funded worker claiming a task that was never posted: the balance check
     // passes, so the refusal names the missing precondition (`UnknownTask`).
+    // Seed 2 holds a genesis grant — no seam involved.
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, Vec::new());
     let mut view = NodeL2::fresh(chain.params());
     view.sync(&chain);
 
-    let claim = claim_unknown_task(5);
-    let worker = match &claim.payload {
-        L2Payload::Claim(p) => p.worker,
-        _ => unreachable!(),
-    };
-    view.state_mut().credit(worker, 10_000_000).unwrap();
+    let claim = claim_unknown_task(2);
     let h = chain.height() + 1;
     let block = chain
         .mine_block_with_l2(
@@ -651,19 +644,14 @@ fn funded_claim_for_unknown_task_is_skipped_without_partial_write() {
 
 #[test]
 fn funded_post_applies_through_incremental_sync() {
-    // The valid path through the real node flow: fund via the seam, mine a
-    // block carrying the post, sync incrementally — it applies.
+    // The valid path through the real node flow: a genesis-funded account
+    // posts, the block is mined and accepted, incremental sync applies it.
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, Vec::new());
     let mut view = NodeL2::fresh(chain.params());
     view.sync(&chain);
 
-    let tx = post(4, 1, 200);
-    let actor = match &tx.payload {
-        L2Payload::Post(p) => p.submitter,
-        _ => unreachable!(),
-    };
-    view.state_mut().credit(actor, 10_000_000).unwrap();
+    let tx = post(2, 1, 200);
     let h = chain.height() + 1;
     let block = chain
         .mine_block_with_l2(
@@ -699,7 +687,7 @@ fn l2_config_follows_the_network_profile() {
 #[test]
 fn node_reports_enough_to_verify_processing_happened() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
-    mine_and_submit(&mut chain, vec![post(1, 1, 200)]);
+    mine_and_submit(&mut chain, vec![post(9, 1, 200)]);
     mine_and_submit(&mut chain, Vec::new());
     let view = NodeL2::replay_from(&chain, chain.params());
     let s = view.status(chain.height());
