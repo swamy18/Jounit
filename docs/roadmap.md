@@ -1198,3 +1198,78 @@ Notable for planning what comes next:
 - Two nodes now demonstrably exchange a wallet-signed transaction. That makes
   step 3 (persistent storage) the next real constraint, because the pool is still
   in-memory and a restart loses everything it held.
+
+---
+
+## 21. Integrated sprint status matrix (measured, appended)
+
+Appended 2026-10-07 against HEAD `bb69eaa`. Nothing above this line was edited.
+Every row below was verified by inspecting the tree in this session; where a row
+says NOT STARTED it means no module, type or test exists, not that it was
+judged unnecessary.
+
+Measured baseline: 625 tests passing / 0 failed / 1 ignored (40 test binaries),
+6 crates, 14 fuzz targets (all compile), `fmt`/`clippy -D warnings`/release build
+clean, no `benches/`, no HTTP server, no `jnt-mcp`/`jnt-elizaos-plugin`/
+`jnt-langchain`, zero exit/withdraw types in any crate.
+
+| # | Item | Status | Evidence / remaining work |
+|---|---|---|---|
+| 1 | Security hardening | **L1 DONE, L2 NOT STARTED** | 11 red-team + 18 BLS-attack + 10 mempool attack tests exist for L1. No adversarial suite covers L2 state, deposits, VWC or worker authorize paths. |
+| 2 | Bridge Layer | **NOT STARTED** | No bridge module, no payer/service identity type. |
+| 3 | Machine wallets | **SHIPPED (policy layer)** | `crates/jnt-core/src/agent.rs` (Decision 16): machine identity + owner-signed spending policy + bounded accounting. Human wallets unchanged; no key handling, no consensus change. |
+| 4 | AI-agent identity | **SHIPPED** | `derive_agent_id(network, role, owner)` — deterministic, network-bound, role-separated; `validate()` re-derives it, so a policy cannot claim another agent's identity. |
+| 5 | Micropayments | **NOT STARTED** | L1 fee floor `GAS_TX_BASE=16000` swamps dust; no dust/zombie rules; L2 flat schedule recorded only. |
+| 6 | Autonomous payments | **SHIPPED (authorization)** | Autonomous spend is authorized under an explicit policy: per-tx limit, tumbling cumulative window, recipient/service allow lists, validity range, revoke flag. Consensus wiring still deferred (needs its own decision). |
+| 7 | Machine-to-machine | **NOT STARTED** | Depends on 6 + 11. |
+| 8 | Agent-to-agent | **NOT STARTED** | Depends on 2 + 4. |
+| 9 | Reputation | **NOT STARTED** | No reputation module or accumulator. |
+| 10 | Spending limits/authorization | **SHIPPED** | Per-transaction + cumulative limits, window, recipient/service restriction, expiry, emergency revoke, rotation-by-new-policy. Privilege-escalation suite in `tests/agent_policy.rs`. |
+| 11 | Agent machine tx standard | **NOT STARTED** | No new payload type; `tx.rs` carries standard/coinbase only. |
+| 12 | Service receipts | **NOT STARTED** | VWC exists as an L2 derived receipt (`jnt-l2/src/vwc.rs`); no generic offline-verifiable service receipt. |
+| 13 | VWC integration | **PARTIAL** | `vwc.rs` + worker `vwc.rs` + `vwc_decode` fuzz target exist; not wired through a production service-payment path. |
+| 14 | Proof-of-service | **PARTIAL** | `task_contract.rs`, `dispute.rs`, worker `claim/submit/dispute/executor` exist; escrow→VWC→settlement→receipt end-to-end not verified in one scenario. |
+| 15 | L2 production integration | **PARTIAL** | `jnt-node` now depends on `jnt-l2`; deposits+finality integration tested; task lifecycle/persistence reconstruction not integrated. |
+| 16 | Service-payment API | **NOT STARTED** | No HTTP/API crate. |
+| 17 | AI/compute/data/MCP payments | **NOT STARTED** | Depends on 16. |
+| 18 | One economy | **DONE (by design)** | Single issuance schedule, single UTXO + L2 ledger; no second currency exists. |
+| 19 | Remove/rework 40M cap | **BLOCKED — needs sign-off** | SPEC.md §7 cap + `supply_schedule_sim.py` + `supply_vectors.json` pin the current schedule. Replacing it is a consensus monetary change; must not be done silently. |
+| 20 | Predictable issuance | **DONE** | SPEC.md §7 ladder, `supply.rs`, simulation and pinned vectors agree. |
+| 21 | Machine-friendly fees | **PARTIAL** | D3 flat L2 schedule in `params.rs`; no dust/batching rules; L1 floor unchanged. |
+| 22 | Human+machine economics | **NOT STARTED** | Only the supply simulation exists; no frequency/fee economic model. |
+| 23 | Validator lifecycle | **DECIDED, NOT IMPLEMENTED** | Decisions 2 and 11 record stake/bond/rotation as deliberately deferred; no stake ledger exists. |
+| 24 | BLS/finality activation | **DONE** | Binding on `testnet` (`finality_activation_height=20`), observation-only on `mini`, fail-closed on `mainnet`; restart/reorg tests in `m5_finality.rs`, `m5_node_finality.rs`, `m5_deposit_finality.rs`. |
+| 25 | Mainnet security campaign | **L1 DONE, L2 PENDING** | Same as item 1: L2/worker/receipt attack surface not yet exercised. |
+| 26 | Network stress/chaos | **NOT STARTED** | No chaos or stress harness; peer churn measured only at unit level. |
+| 27 | Performance benchmarks | **NOT STARTED** | No `benches/` directory; zero measurements recorded. |
+| 28 | SPEC ↔ implementation reconciliation | **PARTIAL** | SPEC.md normative through §14 for M1–M5; L2 sections defer to this document; this matrix replaces the stale §19/§20 "Not started" list. |
+| 29 | Mainnet readiness | **NOT STARTED** | No bootstrap/monitoring/health/backup/versioning/upgrade/disclosure artifacts. |
+| — | L2 → L1 exits | **BLOCKED — needs a decision** | Decision 10 item 1 makes the deposit sink unspendable and holding no key. Releasing L1 value on exit therefore requires either (a) a new L1 withdrawal transaction type authorized by the committee, or (b) replacing the unspendable sink with a claimable reserve. Both are L1 consensus/monetary decisions. Implementing (c) "L2-only burn" would destroy user value, so the safe state is: testnet deposits stay functional, mainnet stays blocked, decision recorded as pending below. |
+| — | Validator economics | **DEFERRED BY DECISION** | Recorded in Decision 2 (§14.6) and Decision 11; deliberately not implemented because staking needs economics this protocol cannot yet support safely. |
+
+Honest completion count after sprint step 1: **done 7 (18, 20, 24, 3, 4, 6, 10),
+partial 6 (item 1/25 for L1 only, 13, 14, 15, 21, 28), not started 13, blocked 3 (19, 29, exits).**
+
+## 22. Sprint step 1 shipped — machine/agent layer (2026-10-07)
+
+`crates/jnt-core/src/agent.rs` + `crates/jnt-core/tests/agent_policy.rs`
+(Decision 16). 24 new tests (8 unit, 16 integration); workspace total **650
+passing, 0 failed, 1 ignored**. `clippy -D warnings` and `fmt --check` clean.
+
+What landed: deterministic network-bound agent identity (`derive_agent_id`),
+owner-signed bounded `SpendPolicy` whose signing hash provably covers every
+field, fail-closed allow lists (empty means *nothing*), strictly increasing
+nonce anti-replay, tumbling-window cumulative limits, rotation keyed by policy
+hash, a bounded `PolicyBook`, and offline-verifiable `Authorization`s through
+the existing §1 signature path.
+
+What deliberately did **not** land, and why:
+
+- **Policy enforcement in consensus.** Wiring a policy into `submit_at` or L2
+  validation is a consensus change and needs its own recorded decision; doing it
+  silently would be the "guess the rules in code" failure this repo has avoided
+  since M2.
+- **Service receipts (item 12) and the canonical agent payment format (item
+  11).** `Authorization` is the seam they build on; they are the next step.
+- **Bridge (item 2), reputation (item 9), API/MCP integrations (items 16-17).**
+  Each is a new surface with its own decision.

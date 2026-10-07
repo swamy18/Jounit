@@ -29,7 +29,7 @@ rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — **347 tests pass (current count; older sections of
+- `cargo test --workspace` — **650 tests pass (current count; older sections of
   this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):**
   - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite,, the 30-test real-BLS suite in
@@ -45,12 +45,23 @@ rules in code would have been the wrong order.
     tx-relay socket tests), including a real-socket end-to-end sync between
     two `P2pNode`s
   - 2 wire-vector tests in `crates/jnt-net/tests/net_vectors.rs`
+  - 24 tests for the machine/agent authorization layer
+    (`src/agent.rs` unit suite + `tests/agent_policy.rs`): policy encoding,
+    identity binding, per-transaction and cumulative limits, tumbling window
+    rollover, replay-refusing nonces, revocation, rotation independence,
+    bounded policy book, and offline authorization verification
 - **Persistent storage is implemented** (`crates/jnt-store`, appendix below):
   append-only checksummed block log, atomic metadata, crash-safe reopen;
   replaces the old whole-chain JSON rewrite.
 - **P2P transaction relay is implemented** (SPEC.md §13.14): wallet → mempool →
   peer relay → remote pool → mining → confirmation was verified end to end
   with three real processes.
+- **The machine/agent authorization layer is implemented** (`src/agent.rs`,
+  Decision 16): deterministic network-bound agent identity, owner-signed
+  bounded spending policies, fail-closed allow lists, strictly increasing
+  nonce anti-replay, tumbling-window cumulative limits, rotation/revocation,
+  and offline-verifiable authorizations. It is **non-consensus**: no block,
+  transaction, UTXO, supply or finality rule changed, and it holds no key.
 - **Real BLS cryptography is implemented** (`bls.rs` over `blst`): derive,
   sign, aggregate, one-pairing aggregate-verify, deterministic fixtures.
   `verify_checkpoint` with `RealBls` rejects forgeries `MockBls` accepts. This

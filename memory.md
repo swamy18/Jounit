@@ -3179,3 +3179,51 @@ final message instead of a commit.
 - Next per task order: STOP after M5. Staking/bonding/rotation/rewards/
   slashing, exits, public testnet launch, monetary redesign, Bridge Layer all
   remain deferred to their own milestones and decisions.
+
+---
+
+# Working memory — integrated sprint step 1 (2026-10-07)
+
+**HEAD:** `bb69eaa` (M5). **Scope:** finish the 29-item roadmap in one integrated
+sprint; this step ships the machine/agent layer and publishes the measured
+status matrix.
+
+## Measured before writing code
+
+The repo is **not** "29 items done". Measured: 6 crates, 625 tests passing,
+14 fuzz targets (all compile), no `benches/`, no HTTP server, no
+`jnt-mcp`/`jnt-elizaos-plugin`/`jnt-langchain`, zero exit/withdraw types, no
+machine-wallet/agent/reputation/bridge module. Honest count was 4 done, 5
+partial, 17 not started, 3 blocked. That matrix is now `docs/roadmap.md` §21, so
+the roadmap no longer claims L2 is entirely unstarted.
+
+## The blocking finding that must not be faked
+
+**L2 to L1 exits cannot be implemented under Decision 10 as written.** The
+deposit sink is `SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]` and
+holds no key, so nothing can spend those L1 UTXOs. An exit needs either (a) a new
+L1 withdrawal transaction type authorized by the committee, or (b) replacing the
+unspendable sink with a claimable reserve. Both are L1 consensus/monetary
+changes. Option (c) — burning L2 balances with no L1 release — destroys user
+value and was rejected. Recorded as blocked with the reason, not as done.
+
+## What shipped
+
+`crates/jnt-core/src/agent.rs` (Decision 16) + `tests/agent_policy.rs`.
+Identity `SHA256(DOM_AGENT_ID ‖ network_id ‖ role ‖ owner)[..20]`. Policy:
+owner-signed, bounded encoding, version 1, <=64 recipients, <=64 services,
+tumbling window, revoke flag, every field inside the signing hash (asserted
+field-by-field). `PolicyBook::authorize` has a documented check order and
+**mutates nothing on any error path**, so a refusal cannot consume budget.
+
+Two test defects were found by the tests and fixed: a hand-built "lying bytes"
+case used the wrong network-id length (now derived from a real encoding), and a
+recipient-cap case forgot the base policy already held two recipients. Both were
+test bugs — the module refused correctly in each case.
+
+## Next, in order
+
+Item 11 (canonical agent payment format) -> item 12 (service receipts) -> items
+1/25 (L2 adversarial suite) -> then the decision-blocked items: monetary
+redesign (item 19), exits, validator economics. Items 16-17 (API + MCP/agent
+integrations) are new-surface work with their own decision.

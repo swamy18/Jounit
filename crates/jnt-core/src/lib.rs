@@ -16,7 +16,11 @@
 //! - M3: Hardware-agnostic compute IR (`compute_ir.rs`)
 //! - M4: Memory-bound HBM scratchpad PoW (`hbm_pow.rs`)
 //! - M5: Sovereign BLS finality gadget  (`bls_checkpoint.rs`)
+//!
+//! Machine/agent layer (roadmap items 3, 4, 6, 10 — policy, not consensus):
+//! - deterministic agent identity + reusable authorization policies (`agent.rs`)
 
+pub mod agent;
 pub mod block;
 pub mod bls;
 pub mod bls_checkpoint;

@@ -775,3 +775,70 @@ because depth is satisfied if the canonical history at that height is not
 finalized. L2 does not grow a second finality system. `Settle`/VWC keep their
 existing verification semantics but use the declared committee; a profile with
 an intentionally empty committee (mainnet) continues to fail closed.
+
+---
+
+# Implementation status — integrated sprint 1 (2026-10-07): machine/agent layer shipped
+
+## Decision 16 — Machine/agent identity + authorization policy (roadmap items 3, 4, 6, 10)
+
+**Chosen: a deterministic, non-consensus policy library, `crates/jnt-core/src/agent.rs`.
+No consensus rule changes; until a later decision wires it into `submit_at`, it
+cannot move a coin.**
+
+1. **Identity is derived, never assigned.**
+   `agent_id = SHA256("jounit/agent-id/v1" ‖ network_id ‖ role ‖ owner)[..20]`,
+   where `owner` is an ordinary §1 address derived from the owner's key bundle.
+   The identity is therefore cryptographically owned (only the key holder can
+   produce `owner`), network-bound (a testnet identity is not a mini identity)
+   and role-separated (`Human`, `Machine`, `Service`) without creating a second
+   address space. `SpendPolicy::validate` *re-derives* it and refuses a policy
+   whose `agent_id` does not belong to its `owner`, so a policy cannot claim
+   someone else's agent (`PolicyError::IdentityMismatch`).
+2. **One economy.** Machine and human wallets both spend ordinary §1 UTXOs under
+   the existing issuance schedule. No second currency, no second ledger, no
+   parallel monetary base (roadmap item 18).
+3. **Policy is owner-signed and total.** `SpendPolicy::signing_hash` is
+   domain-separated (`jounit/agent-policy/v1`) over a bounded canonical
+   encoding: version `1`, network id ≤ 64 bytes, ≤ 64 recipients, ≤ 64 service
+   tags, explicit per-transaction limit, tumbling window length, cumulative
+   limit, validity range, and a revoke flag. The test suite mutates **every**
+   field and asserts the hash changes, so no field is outside the signature.
+4. **Fail-closed default.** An **empty** recipient list authorizes nothing (not
+   "anything"); an **empty** service list authorizes no service-tagged payment;
+   a policy that names services refuses an untagged payment. Zero amounts,
+   zero window, zero per-transaction limit, and `expires_at <= not_before` are
+   refused at `validate`, before any authorization is attempted.
+5. **Tumbling window, not sliding.** The cumulative limit resets every
+   `window_blocks` measured from the window's own start height, so accounting is
+   reproducible from `(window_start_height, height)` alone and needs no
+   unbounded authorization history (a sliding window would be a
+   resource-exhaustion surface). "Many small payments" therefore cannot bypass
+   the per-transaction limit: the suite drives 400+400 and shows the third 400
+   refused at 1 200 > 1 000 with the budget untouched by the refusal.
+6. **Anti-replay.** Each authorization carries a nonce that must **strictly
+   increase**, so a captured authorization cannot be re-submitted.
+7. **Rotation and revocation.** Spend accounting is keyed by policy hash, not by
+   agent id: a rotated-in policy starts with a fresh window and cannot inherit
+   the old policy's spend, and a rotated-out policy is refused by the owner's
+   `revoked` flag. `PolicyBook` is bounded (`DEFAULT_MAX_POLICIES`) and refuses
+   a new policy rather than grow without limit.
+8. **Offline verification.** `Authorization` has its own domain-separated
+   signing hash (`jounit/agent-auth/v1`) and `verify_authorization` checks it
+   against public key bundles through the existing §1 signature path
+   (`sig::verify_bundle`). A third party — a service, a bridge — verifies with
+   public material only: no policy, no network, no private key. Mutating the
+   amount breaks verification, so the authorization is tamper-evident.
+9. **No key material.** Nothing in the module reads, stores or emits a private
+   key; `SpendPolicy` discloses rules, never keys.
+
+**Explicitly unchanged:** L1 consensus, transaction/block layout, UTXO and
+supply rules, fee rules, finality activation, L2 semantics, the M1–M5
+mechanisms. SPEC.md gains no section for this layer because SPEC's scope is the
+base-layer consensus rules; the layer is tracked in `docs/roadmap.md` §21–§22.
+
+**Explicitly deferred:** (a) enforcing a policy inside L1/L2 transaction
+validation (that would be a consensus change and needs its own decision);
+(b) the canonical agent service-payment format (item 11); (c) service receipts
+(item 12); (d) bridge and reputation layers. The `Authorization` type is the
+seam they will build on.
