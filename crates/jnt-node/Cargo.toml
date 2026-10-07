@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 jnt-core.workspace = true
+jnt-l2.workspace = true
 jnt-net.workspace = true
 jnt-store.workspace = true
 serde.workspace = true

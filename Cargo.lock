@@ -259,6 +259,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "jnt-core",
+ "jnt-l2",
  "jnt-net",
  "jnt-store",
  "rand",

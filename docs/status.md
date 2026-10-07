@@ -1172,3 +1172,53 @@ replayed from a chain is refused for insufficient balance and no settlement can
 verify quorum. The L2 marketplace does **not** yet run end to end; M1's replay
 machinery is verified against a chain holding no value and no validators. SPEC
 Â§19.3 says so explicitly so Â§19.1 cannot be over-read.
+
+---
+
+## Phase 6 — M1 node integration: SHIPPED — 2026-10-07
+
+M1 carriage/replay (above) left L2 unreachable from the running node:
+`jnt-node` did not depend on `jnt-l2` and no production path replayed a block.
+That gap is now closed. **No L1 consensus rule changed, no wire format changed,
+no L2 semantic changed.**
+
+**What was added** (`crates/jnt-node/src/l2.rs`, `SPEC.md §19.1`):
+
+- `jnt-node` depends on `jnt-l2` and consumes `ChainL2` through a thin `NodeL2`
+  wrapper. The node holds no second state machine: every payload is applied by
+  `L2State::apply`.
+- Sync rule, called after every batch of accepted blocks (mined or received —
+  both move the same tip through the same `submit`): tip unchanged ? no-op;
+  tip extended ? incremental `apply_block`; history rewritten or first sync
+  after startup ? full `ChainL2::replay` of the winning chain. Reorg therefore
+  needs no undo bookkeeping, and a rejected L1 block (no tip movement) cannot
+  mutate L2 state.
+- L2 state is **not persisted**. Restart replays the blocks the store already
+  holds; there is no second source of truth to go stale.
+- Settlements verify against the empty validator set with the production
+  `RealBls` verifier until the M4 genesis committee exists — fail closed with
+  a named refusal, never applied without authority. `L2Config` follows the
+  network profile (`mini` ? short window, else production).
+- Observability (M1 minimum): `status` prints L2 height/applied/skipped;
+  `verify` asserts replay determinism (two replays agree, incremental agrees
+  with replay) and names each skipped payload with height, txid and reason.
+
+**Tests:** 20 node integration tests (`crates/jnt-node/tests/l2_node.rs`):
+no-L2 / valid-unfunded / multiple / bad-auth / no-quorum-settle /
+present-but-empty trailer / stripped trailer / modified payload / double-sync
+no-op / sequential incremental / two-view determinism / restart through a real
+`BlockStore` / duplicate+orphan rejection / no-partial-write / reorg replay /
+credit-seam-funded apply + restart reset / funded-claim-UnknownTask /
+config-per-profile / status observability. One real bug caught pre-push: the
+sync delta underflowed when a reorg dropped recorded skips — now saturating
+deltas plus exact totals, with a regression test.
+
+**Verified:** 533 workspace tests / 0 failed / 1 ignored (was 513; +20 node);
+fmt clean; `clippy -D warnings` clean workspace-wide; release build clean;
+13 fuzz targets compile (no new target: the integration adds no new parser —
+`Block`/`L2Transaction` decode is unchanged); sim suite clean.
+
+**Still ahead, unchanged:** M2 funding bridge (every replayed payload is still
+an expected `InsufficientBalance` skip until the escrow exists — pinned, not
+worked around), M3 transport, M4 committee + finality, M5 testnet. No claim of
+testnet, finality, or mainnet readiness.

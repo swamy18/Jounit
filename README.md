@@ -14,7 +14,8 @@ without weakening the security a hash chain depends on.
 > claim, execute, submit, dispute participation, certificate observation,
 > and earnings derived from protocol state. Phase 6 (integration + testnet) has
 > begun: L2 transactions now ride inside L1 blocks and L2 state is rebuilt from
-> the chain (**SPEC.md §19.1**), so L2 is no longer only a library. Still ahead:
+> the chain (**SPEC.md §19.1**), and the node replays it on every accepted
+> block (`status`/`verify` surface it). Still ahead:
 > the L1→L2 funding bridge, the worker↔node transport, the genesis validator
 > committee and binding finality. Read [Status](#status).
 
@@ -143,7 +144,7 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
 | `crates/jnt-store/` | 2 200+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
 | `crates/jnt-l2/` | 5 400+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates. |
-| `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`). |
+| `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`) with the L2 replay view over accepted blocks. |
 | `crates/jnt-worker/` | — | Worker SDK (Phase 5, SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, earnings. A minimal secret-free CLI (`jnt-worker address`/`generate`). |
 | `sim/` | 1 609 | Python: independent protocol reference plus attack and supply simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |

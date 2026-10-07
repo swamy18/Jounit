@@ -2928,6 +2928,47 @@ and stopped being accurate the moment the commit landed.
 - 500 workspace tests / 0 failed / 1 ignored; fmt and clippy `-D warnings`
   clean; release build clean; six sim scripts rc=0; 13 fuzz targets compile.
 - Nothing blocked. Next work item unchanged: **Phase 6** — testnet + the
-  §18.3 seams' real REST/P2P transport + validator testing + chaos + the
+  A§18.3 seams' real REST/P2P transport + validator testing + chaos + the
   `AmountTooSmallForFee` open question + mainnet readiness, with binding
   finality activated only at the end (Decision 2).
+
+# Working memory — session 18: Phase 6 M1 node integration
+
+## 81. What this session was
+
+Finish **M1 only**: connect `jnt-node` to `jnt-l2` so L2 is reachable from the
+production node. No M2/M3/finality/testnet/monetary/performance work.
+
+## 82. What was built
+
+- `crates/jnt-node/src/l2.rs` (`NodeL2`): the node's L2 view over `ChainL2`.
+  Sync rule — tip unchanged: no-op; tip extended: incremental `apply_block`;
+  history rewritten or first sync: full `ChainL2::replay`. L2 state is derived,
+  never persisted. Settlements check against the empty set with `RealBls`
+  (fail closed) until the M4 committee. `L2Config` follows the profile.
+- `crates/jnt-node/src/lib.rs` (new): exposes `l2` so integration tests drive
+  the accepted-block path without a subprocess. `main.rs` uses it in
+  mine/send/serve/status/verify. `Cargo.toml` gains the `jnt-l2` dep.
+- Observability (M1 minimum): `status` prints L2 height/applied/skipped;
+  `verify` asserts determinism (two replays agree, incremental == replay) and
+  names skips with height/txid/reason. The serve loop syncs after mining and
+  after each P2P batch, logging only on full replay or new skips.
+- `crates/jnt-node/tests/l2_node.rs`: 20 tests (list in docs/status.md).
+- One real bug caught pre-push: sync skip/applied deltas underflowed when a
+  reorg dropped recorded skips. Fixed with saturating deltas plus exact totals
+  in `SyncReport`, regression-tested by the reorg test.
+
+## 83. What was deliberately not built
+
+No funding bridge (`credit` seam preserved; `InsufficientBalance` pinned, not
+worked around), no REST API, no committee/stake ledger, no checkpoint message,
+no new fuzz target (no new parser boundary — `Block`/`L2Transaction` decode is
+unchanged), no `docs/roadmap.md` change, no new decision in
+`docs/decisions.md` (Decisions 6–9 already authorize this shape).
+
+## 84. State after this session
+
+- 533 workspace tests / 0 failed / 1 ignored (was 513; +20 node); fmt, clippy
+  `-D warnings`, release build, 13 fuzz targets, sim suite — all clean
+  (counts confirmed in the verification run before push).
+- Next: M2 funding bridge per Decision 7. Stop — do not start it automatically.

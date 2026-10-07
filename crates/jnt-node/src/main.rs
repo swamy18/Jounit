@@ -40,6 +40,7 @@ use jnt_net::net::{NodeState, P2pConfig, P2pNode};
 use jnt_net::peer::{perform_handshake, HandshakeConfig};
 use jnt_net::relay::RelayManager;
 use jnt_net::syncer::SyncManager;
+use jnt_node::l2::NodeL2;
 use jnt_store::{AppendOutcome, BlockStore};
 
 const USAGE: &str = "\
@@ -361,6 +362,23 @@ fn jnt(sat: u64) -> String {
     format!("{}.{:08}", sat / SAT_PER_JNT, sat % SAT_PER_JNT)
 }
 
+/// One-line L2 summary shared by every command that moves the tip.
+///
+/// This is the whole of the node's L2 observability for M1: which height was
+/// replayed to, how many payloads applied, how many were refused. The reasons
+/// for each refusal live in `NodeL2::skipped` (height, txid, named error); a
+/// full REST surface for them belongs to the M3 transport milestone, not here.
+fn print_l2_summary(l2: &NodeL2, chain: &Chain) {
+    let s = l2.status(chain.height());
+    println!(
+        "l2             height {}  applied {}  skipped {}{}",
+        s.l2_height,
+        s.applied,
+        s.skipped,
+        if s.clean { "" } else { " (see verify)" }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -436,6 +454,11 @@ fn cmd_init(args: &Args) -> Result<(), String> {
 fn cmd_mine(args: &Args) -> Result<(), String> {
     let mut store = Store::open(args)?;
     let mut chain = store.load_chain()?;
+    // The L2 view starts from replaying what is stored, then follows the tip
+    // as blocks are mined below. Until the M2 funding bridge exists every
+    // replayed payload is an expected `InsufficientBalance` skip, not an
+    // error — the view still advances and still names what it refused.
+    let mut l2 = NodeL2::replay_from(&chain, &store.params);
     let wallets = store.load_wallets()?;
     if wallets.is_empty() {
         return Err("no wallet in this data dir".into());
@@ -458,6 +481,11 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
         let height = block.header.height;
         let difficulty = block.header.difficulty;
         chain.submit(block).map_err(|e| e.to_string())?;
+        // `submit` accepted the block, so the L2 view follows it. A block the
+        // L1 layer rejects never moves the tip and therefore never reaches the
+        // view — that ordering is what keeps rejected blocks from mutating L2
+        // state.
+        l2.sync(&chain);
         println!(
             "height {:>6}  diff {:>10}  reward {:>12} JNT  {}",
             height,
@@ -473,6 +501,7 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
     store.save_chain(&chain)?;
     store.write_meta(&chain)?;
     println!("mined {mined} block(s); tip height {}", chain.height());
+    print_l2_summary(&l2, &chain);
     Ok(())
 }
 
@@ -594,6 +623,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     let height = block.header.height;
     let burned = block.header.base_fee_sat * block.txs[1].gas_used();
     chain.submit(block).map_err(|e| e.to_string())?;
+    let l2 = NodeL2::replay_from(&chain, &store.params);
     store.save_chain(&chain)?;
     store.write_meta(&chain)?;
 
@@ -602,6 +632,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     println!("amount  {} JNT", jnt(amount));
     println!("fee     {} JNT", jnt(fee));
     println!("burned  {} JNT (base fee, destroyed)", jnt(burned));
+    print_l2_summary(&l2, &chain);
     Ok(())
 }
 
@@ -692,6 +723,21 @@ fn cmd_status(args: &Args) -> Result<(), String> {
         jnt(report.cap_sat - report.reachable_sat)
     );
 
+    // L2 is derived from the stored chain, so `status` reconstructs it the
+    // same way a restart does: replay, no persisted L2 state to go stale.
+    let l2 = NodeL2::replay_from(&chain, &store.params);
+    let ls = l2.status(chain.height());
+    println!();
+    println!(
+        "l2 height      {} (chain {})",
+        ls.l2_height, ls.chain_height
+    );
+    println!("l2 applied     {}", ls.applied);
+    println!("l2 skipped     {}", ls.skipped);
+    if !ls.clean {
+        println!("l2 replay      not clean (run verify for the named refusals)");
+    }
+
     let wallets = store.load_wallets()?;
     if !wallets.is_empty() {
         println!();
@@ -726,6 +772,43 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         "ok: replayed {} block(s) from genesis, UTXO and supply match",
         chain.height() + 1
     );
+    // L2 determinism: two independent replays of the same stored blocks must
+    // hold equal state, and the incremental following-the-tip path must agree
+    // with full replay. Equality is total (`L2State` derives `PartialEq` over
+    // all fields), so this is agreement on every L2 fact, not a summary.
+    let params = store.params.clone();
+    let a = NodeL2::replay_from(&chain, &params);
+    let b = NodeL2::replay_from(&chain, &params);
+    if a.state() != b.state() || a.skipped() != b.skipped() {
+        return Err("l2 replay diverged: two replays of the same chain disagree".into());
+    }
+    let mut inc = NodeL2::fresh(&params);
+    inc.sync(&chain);
+    if inc.state() != a.state()
+        || inc.applied_count() != a.applied_count()
+        || inc.skipped() != a.skipped()
+    {
+        return Err(
+            "l2 replay diverged: incremental application disagrees with full replay".into(),
+        );
+    }
+    println!(
+        "ok: l2 replay deterministic to height {} (applied {}, skipped {})",
+        a.height(),
+        a.applied_count(),
+        a.skipped().len()
+    );
+    for s in a.skipped().iter().take(10) {
+        println!(
+            "  skipped height {:>6}  {}  {}",
+            s.height,
+            &hash_to_hex(&s.txid)[..16],
+            s.error
+        );
+    }
+    if a.skipped().len() > 10 {
+        println!("  ... and {} more", a.skipped().len() - 10);
+    }
     Ok(())
 }
 
@@ -889,6 +972,12 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let mut relay = RelayManager::new();
     let mut pool_cursor = chain.height();
     let mut relay_seen = (0u64, 0u64);
+    // L2 follows the tip the same way after a restart as on first boot: replay
+    // what is stored. No L2 state is persisted, so there is nothing stale to
+    // recover — and a reorg is answered by replaying the winning chain, with
+    // no undo bookkeeping (see `jnt_node::l2`).
+    let mut l2 = NodeL2::replay_from(&chain, &store.params);
+    let mut l2_skipped_seen = l2.skipped().len();
 
     println!("network        {}", store.params.name);
     println!("height         {}", chain.height());
@@ -945,6 +1034,37 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             },
             Some(now_ms()),
         );
+
+        // Keep the L2 view on the tip after both paths above: a locally mined
+        // block and a block that arrived from a peer move the same tip through
+        // the same `submit`, so one `sync` covers both. A reorg that rewrote
+        // history takes the full-replay arm inside `sync`; a side block that
+        // lost fork choice leaves the tip (and the view) untouched.
+        let report = l2.sync(&chain);
+        match report.outcome {
+            jnt_node::l2::SyncOutcome::FullReplay { .. }
+                if report.to_height != report.from_height =>
+            {
+                println!(
+                    "l2             full replay to height {} (applied {}, skipped {})",
+                    report.to_height,
+                    l2.applied_count(),
+                    l2.skipped().len()
+                );
+                l2_skipped_seen = l2.skipped().len();
+            }
+            _ => {
+                if l2.skipped().len() != l2_skipped_seen {
+                    println!(
+                        "l2             height {} applied {} skipped {}",
+                        l2.height(),
+                        l2.applied_count(),
+                        l2.skipped().len()
+                    );
+                    l2_skipped_seen = l2.skipped().len();
+                }
+            }
+        }
 
         // Reconciliation is unconditional, deliberately not gated on the height
         // having changed. A reorg can land at the *same* height, and gating on

@@ -2121,7 +2121,13 @@ summary.
 
 **Implementations.** `jnt_core::block` (carriage, commitment),
 `jnt_core::chain::Chain::mine_block_with_l2` (producing a block that carries
-L2), `jnt_l2::replay::{ChainL2, SkippedL2}` (replay and the incremental path).
+L2), `jnt_l2::replay::{ChainL2, SkippedL2}` (replay and the incremental path),
+`jnt_node::l2::NodeL2` (the node's view: replay on startup, incremental while
+the tip extends, full replay when history is rewritten; settlements checked
+against the empty set with the production BLS verifier until the M4 genesis
+committee exists). `jnt-node status` reports L2 height/applied/skipped;
+`jnt-node verify` asserts replay determinism (two replays agree, incremental
+agrees with replay) and names the skipped payloads.
 
 ### 19.2 Worker↔node transport — SPECIFIED for M3, NOT IMPLEMENTED
 
