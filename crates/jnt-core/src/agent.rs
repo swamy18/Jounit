@@ -581,6 +581,56 @@ impl Authorization {
         w.u64le(self.height).u64le(self.nonce);
         w.into_vec()
     }
+
+    /// Decode the canonical encoding produced by [`Authorization::serialize`].
+    ///
+    /// The exact inverse of `serialize`, so the bytes `/v1/authorize` returns
+    /// can be consumed by the payment layer that produced them. Strict and
+    /// fail-closed: a short buffer, an unknown version, a trailing byte or an
+    /// out-of-range service tag is refused by name rather than partially read.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, PolicyError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| PolicyError::Malformed("version"))?;
+        if version != POLICY_VERSION {
+            return Err(PolicyError::UnsupportedVersion(version));
+        }
+        let policy_hash = r
+            .fixed::<32>()
+            .map_err(|_| PolicyError::Malformed("policy hash"))?;
+        let agent_id = r
+            .fixed::<20>()
+            .map_err(|_| PolicyError::Malformed("agent id"))?;
+        let owner = r
+            .fixed::<20>()
+            .map_err(|_| PolicyError::Malformed("owner"))?;
+        let recipient = r
+            .fixed::<20>()
+            .map_err(|_| PolicyError::Malformed("recipient"))?;
+        let amount_sat = r.u64le().map_err(|_| PolicyError::Malformed("amount"))?;
+        let service = match r.u8().map_err(|_| PolicyError::Malformed("service tag"))? {
+            0 => None,
+            1 => Some(
+                r.fixed::<32>()
+                    .map_err(|_| PolicyError::Malformed("service id"))?,
+            ),
+            _ => return Err(PolicyError::Malformed("service tag out of range")),
+        };
+        let height = r.u64le().map_err(|_| PolicyError::Malformed("height"))?;
+        let nonce = r.u64le().map_err(|_| PolicyError::Malformed("nonce"))?;
+        r.expect_end()
+            .map_err(|_| PolicyError::Malformed("trailing bytes"))?;
+        Ok(Authorization {
+            version,
+            policy_hash,
+            agent_id,
+            owner,
+            recipient,
+            amount_sat,
+            service,
+            height,
+            nonce,
+        })
+    }
 }
 
 /// Check an authorization's signature against public key bundles.
@@ -1010,6 +1060,47 @@ mod tests {
                 got: 60_000,
                 cap: MAX_POLICY_RECIPIENTS
             }
+        );
+    }
+
+    fn granted_authorization() -> Authorization {
+        let mut p = policy("jounit/testnet");
+        // Exercise the tagged branch: an authorization that names a service.
+        p.allowed_services = vec![[0x5Au8; 32]];
+        let mut book = PolicyBook::default();
+        let mut r = req(p.agent_id, [1u8; 20], 400, 5, 1);
+        r.service = Some([0x5Au8; 32]);
+        book.authorize(&p, "jounit/testnet", &r)
+            .expect("inside the policy")
+    }
+
+    #[test]
+    fn an_authorization_round_trips_through_its_canonical_encoding() {
+        let a = granted_authorization();
+        let bytes = a.serialize();
+        let back =
+            Authorization::deserialize(&bytes).expect("the inverse must decode its own bytes");
+        assert_eq!(back, a);
+        // The signing hash is a function of the encoding, so a decoder that
+        // dropped or reordered a field would fail here rather than verify.
+        assert_eq!(back.signing_hash(), a.signing_hash());
+        assert!(
+            a.service.is_some(),
+            "the fixture exercises the tagged branch"
+        );
+    }
+
+    #[test]
+    fn a_truncated_lengthened_or_unknown_authorization_is_refused() {
+        let a = granted_authorization();
+        let bytes = a.serialize();
+        assert!(Authorization::deserialize(&bytes[..bytes.len() - 1]).is_err());
+        assert!(Authorization::deserialize(&[bytes.clone(), vec![0u8]].concat()).is_err());
+        let mut wrong = bytes.clone();
+        wrong[0] = 0xFF;
+        assert_eq!(
+            Authorization::deserialize(&wrong).unwrap_err(),
+            PolicyError::UnsupportedVersion(0xFF)
         );
     }
 }
