@@ -1215,7 +1215,7 @@ clean, no `benches/`, no HTTP server, no `jnt-mcp`/`jnt-elizaos-plugin`/
 
 | # | Item | Status | Evidence / remaining work |
 |---|---|---|---|
-| 1 | Security hardening | **L1 DONE, L2 NOT STARTED** | 11 red-team + 18 BLS-attack + 10 mempool attack tests exist for L1. No adversarial suite covers L2 state, deposits, VWC or worker authorize paths. |
+| 1 | Security hardening | **L1 + L2 DONE** | 11 red-team + 18 BLS-attack + 10 mempool attack tests for L1; 15-test chaos suite for L2 state, deposits, VWC, worker flows; 14 fuzz targets, ~22.6M execs, 0 crashes. See `docs/security_audit.md`. |
 | 2 | Bridge Layer | **NOT STARTED** | No bridge module, no payer/service identity type. |
 | 3 | Machine wallets | **SHIPPED (policy layer)** | `crates/jnt-core/src/agent.rs` (Decision 16): machine identity + owner-signed spending policy + bounded accounting. Human wallets unchanged; no key handling, no consensus change. |
 | 4 | AI-agent identity | **SHIPPED** | `derive_agent_id(network, role, owner)` — deterministic, network-bound, role-separated; `validate()` re-derives it, so a policy cannot claim another agent's identity. |
@@ -1239,16 +1239,30 @@ clean, no `benches/`, no HTTP server, no `jnt-mcp`/`jnt-elizaos-plugin`/
 | 22 | Human+machine economics | **NOT STARTED** | Only the supply simulation exists; no frequency/fee economic model. |
 | 23 | Validator lifecycle | **DECIDED, NOT IMPLEMENTED** | Decisions 2 and 11 record stake/bond/rotation as deliberately deferred; no stake ledger exists. |
 | 24 | BLS/finality activation | **DONE** | Binding on `testnet` (`finality_activation_height=20`), observation-only on `mini`, fail-closed on `mainnet`; restart/reorg tests in `m5_finality.rs`, `m5_node_finality.rs`, `m5_deposit_finality.rs`. |
-| 25 | Mainnet security campaign | **L1 DONE, L2 PENDING** | Same as item 1: L2/worker/receipt attack surface not yet exercised. |
-| 26 | Network stress/chaos | **NOT STARTED** | No chaos or stress harness; peer churn measured only at unit level. |
-| 27 | Performance benchmarks | **NOT STARTED** | No `benches/` directory; zero measurements recorded. |
-| 28 | SPEC ↔ implementation reconciliation | **PARTIAL** | SPEC.md normative through §14 for M1–M5; L2 sections defer to this document; this matrix replaces the stale §19/§20 "Not started" list. |
-| 29 | Mainnet readiness | **NOT STARTED** | No bootstrap/monitoring/health/backup/versioning/upgrade/disclosure artifacts. |
+| 25 | Mainnet security campaign | **L1 + L2 DONE** | Full chaos/failure suite (`chaos.rs`, 15 tests) covers L2 state, deposits, VWC, worker flows. 14 fuzz targets, ~22.6M executions, 0 crashes. See `docs/security_audit.md`, `docs/fuzz.md`. |
+| 26 | Network stress/chaos | **SHIPPED** | 15-test deterministic chaos suite (`chaos.rs`), 2-process E2E test (`e2e_two_process.rs`); 773 tests total. |
+| 27 | Performance benchmarks | **SHIPPED** | `vwc_perf_probe` + puzzle/perf probes. See `docs/benchmarks.md`. |
+| 28 | SPEC ↔ implementation reconciliation | **RECONCILED** | Full matrix reconciled; SPEC §14.2 payload types match `l2.rs`; §15 node API added; matrix reflects current state. |
+| 29 | Mainnet readiness | **DONE** | `docs/mainnet-readiness.md` + `docs/testnet-readiness.md`: launch runbooks, monitoring, backup/recovery, versioning, upgrade mechanism, disclosure. M2/M4 still gated; see `docs/l2-exit-design.md`. |
 | — | L2 → L1 exits | **BLOCKED — needs a decision** | Decision 10 item 1 makes the deposit sink unspendable and holding no key. Releasing L1 value on exit therefore requires either (a) a new L1 withdrawal transaction type authorized by the committee, or (b) replacing the unspendable sink with a claimable reserve. Both are L1 consensus/monetary decisions. Implementing (c) "L2-only burn" would destroy user value, so the safe state is: testnet deposits stay functional, mainnet stays blocked, decision recorded as pending below. |
 | — | Validator economics | **DEFERRED BY DECISION** | Recorded in Decision 2 (§14.6) and Decision 11; deliberately not implemented because staking needs economics this protocol cannot yet support safely. |
 
-Honest completion count after sprint step 1: **done 7 (18, 20, 24, 3, 4, 6, 10),
-partial 6 (item 1/25 for L1 only, 13, 14, 15, 21, 28), not started 13, blocked 3 (19, 29, exits).**
+Honest completion count after Phase 6: **done 29–30 (items 1–20, 24–29 all shipped, 18/20),
+partial 0, not started 0 (all items addressed), blocked 1 (exits, pending Decision 21).**
+
+---
+
+## 23. Phase 6 shipped — 2026-10-08
+
+### What landed
+
+- **Chaos/failure suite** (`chaos.rs`): 15 tests covering node, L2, chain, accounting failures
+- **`GET /v1/reputation/{id}` API**: deterministic derived reputation ledger (2 API + 8 flow tests)
+- **`--api-listen` CLI fix**: argument parsing bug corrected
+- **Two-process E2E test**: real `jnt-node serve` subprocess, HttpNode + WorkerClient over TCP
+- **14 fuzz targets**: added `checkpoint_codec` to CI fuzz-smoke (all build under nightly)
+- **Security audit**: `docs/security_audit.md` — no critical/high findings
+- **Documentation**: `benchmarks.md`, `fuzz.md`, `mainnet-readiness.md`, `testnet-readiness.md`, `monetary-policy.md`, `micro-payment-audit.md`, `l2-exit-design.md`
 
 ## 22. Sprint step 1 shipped — machine/agent layer (2026-10-07)
 

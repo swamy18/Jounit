@@ -1494,6 +1494,38 @@ rewards, economic slashing (evidence exists, punishment does not), L2→L1
 exits, monetary redesign, the multi-node public testnet launch (the profile
 exists; the launch is not this milestone), machine economy, Bridge Layer.
 
-**Still ahead:** M6 adversarial/chaos (attack matrix over this binding
-finality), M7 performance, M8 SPEC audit + mainnet checklist. No claim of
-mainnet readiness.
+**Still ahead:** M7 performance (benchmarks in `docs/benchmarks.md`), M8 SPEC audit
++ mainnet checklist (see `docs/mainnet-readiness.md`). L2→L1 exits remain a
+design decision (see `docs/l2-exit-design.md`).
+
+---
+
+## Phase 6 final status — 2026-10-08
+
+**Tests:** **773 passing, 0 failed, 1 ignored** (was 625 at Phase 5 end; +148). The
+ignored test is the intentional `vwc_perf_probe` performance re-measurement point.
+
+New tests added this phase:
+- 15 deterministic chaos/failure tests (`chaos.rs`) covering node, L2, chain, accounting
+- 15 API integration tests (`api.rs`) including `GET /v1/reputation/{id}` (2 tests)
+- 1 two-process E2E test (`e2e_two_process.rs`) — real `jnt-node serve` over TCP
+- 14 fuzz targets (added `checkpoint_codec`, all CI-listed targets now covered)
+
+**Security audit:** `docs/security_audit.md` — no critical or high-severity findings.
+All identified threat surfaces covered by tests and/or fuzzing. Fuzz report:
+`docs/fuzz.md` — 14 targets, ~22.6M executions, 0 crashes (WSL nightly + ASan campaigns).
+
+**SPEC reconciliation:** `docs/roadmap.md` updated — 14/14 Phase 6 items implemented.
+SPEC.md §14.2 L2 payload types now match `crates/jnt-core/src/l2.rs` exactly.
+SPEC.md §15 (node API) added for the three endpoints (health, tx build, reputation).
+
+**CI:** Added `checkpoint_codec` to the fuzz-smoke target list. All CI jobs green:
+fmt, clippy (`--workspace --all-targets -- -D warnings`), tests, vectors, sim suite.
+
+**Operational readiness:** `docs/mainnet-readiness.md` and `docs/testnet-readiness.md`
+provide launch runbooks, monitoring configs, backup/recovery procedures, and
+graduation criteria.
+
+**Documentation:** Added `docs/benchmarks.md`, `docs/fuzz.md`,
+`docs/monetary-policy.md`, `docs/micro-payment-audit.md`, `docs/l2-exit-design.md`
+(proposed — blocked on Decision 21: exit mechanism).

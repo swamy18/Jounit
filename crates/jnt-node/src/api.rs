@@ -45,6 +45,7 @@
 //! GET  /v1/task/{task_id}      task state
 //! GET  /v1/l2/state            canonical L2 state (§19.2 wire encoding)
 //! GET  /v1/vwc/{task_id}       verified work certificate
+//! GET  /v1/reputation/{id}      derived reputation score for a worker address
 //! POST /v1/authorize           policy + payer-signed request -> authorization
 //! POST /v1/payment/submit      verify + record a machine payment
 //! GET  /v1/payment/{id}        recorded payment
@@ -64,6 +65,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use jnt_core::agent::{derive_agent_id, AgentRole};
 use jnt_core::chain::Chain;
 use jnt_core::fees;
 use jnt_core::hash::{address_from_hex, address_to_hex, hash_from_hex, hash_to_hex, Address, Hash};
@@ -74,6 +76,7 @@ use jnt_core::payment::{MachinePayment, PaymentTracker};
 use jnt_core::receipt::{ReceiptBook, ReceiptOutcome};
 use jnt_core::service::{authorize_request, SessionError};
 use jnt_core::tx::{Transaction, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
+use jnt_l2::reputation::ledger_from_state;
 use jnt_l2::task_contract::{ContractState, TaskContract};
 
 use crate::l2::NodeL2;
@@ -483,6 +486,72 @@ async fn l2_state(State(state): State<ApiState>) -> ApiResult {
     })
 }
 
+/// Derived reputation for a worker, computed from canonical L2 state.
+///
+/// The `{id}` is the worker's **address**; the node derives the machine
+/// `AgentId` from it (same derivation every identity uses) and then builds the
+/// reputation ledger from the L2 state the same way a node derives L2 itself.
+/// A worker that has never had a verified-work certificate or a settled dispute
+/// reads as a zero score — that is genuine standing, not an error.
+///
+/// This is read-only, derived, and non-consensus: it cannot fork the chain, and
+/// the derivation rules are the same as the ones a peer running this code
+/// independently would apply.
+async fn reputation_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    let address = decode_address(&id)?;
+    with_shared(&state, |sh| {
+        let params = sh.chain.params();
+        let network_id = &params.network_id;
+        let subject = derive_agent_id(network_id, AgentRole::Machine, &address);
+        let ledger = ledger_from_state(sh.l2.state(), network_id)
+            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+        let mut score_obj = match ledger.score(&subject) {
+            Some(s) => json!({
+                "score": s.score,
+                "events": s.events,
+                "by_kind": {
+                    "service_completed": s.by_kind[0],
+                    "payment_completed": s.by_kind[1],
+                    "verified_work": s.by_kind[2],
+                    "dispute_won": s.by_kind[3],
+                    "dispute_lost": s.by_kind[4],
+                },
+                "last_height": s.last_height,
+                "accumulator": hash_to_hex(&s.accumulator),
+                "subjects_tracked": ledger.subjects(),
+            }),
+            None => json!({
+                "score": 0,
+                "events": 0,
+                "by_kind": {
+                    "service_completed": 0,
+                    "payment_completed": 0,
+                    "verified_work": 0,
+                    "dispute_won": 0,
+                    "dispute_lost": 0,
+                },
+                "last_height": 0,
+                "accumulator": hash_to_hex(&Hash::default()),
+                "subjects_tracked": ledger.subjects(),
+            }),
+        };
+        score_obj["worker_address"] = json!(address_to_hex(&address));
+        score_obj["agent_id"] = json!(address_to_hex(&subject));
+        score_obj["network_id"] = json!(network_id);
+        Ok(Json(json!({
+            "worker_address": address_to_hex(&address),
+            "agent_id": address_to_hex(&subject),
+            "network_id": network_id,
+            "score": score_obj["score"],
+            "events": score_obj["events"],
+            "by_kind": score_obj["by_kind"],
+            "last_height": score_obj["last_height"],
+            "accumulator": score_obj["accumulator"],
+            "subjects_tracked": score_obj["subjects_tracked"],
+        })))
+    })?
+}
+
 async fn payment_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     let id = decode_hash(&id)?;
     with_shared(&state, |sh| {
@@ -843,6 +912,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/task/{task_id}", get(task_by_id))
         .route("/v1/l2/state", get(l2_state))
         .route("/v1/vwc/{task_id}", get(vwc_by_task))
+        .route("/v1/reputation/{id}", get(reputation_get))
         .route("/v1/authorize", post(authorize))
         .route("/v1/payment/submit", post(payment_submit))
         .route("/v1/payment/{payment_id}", get(payment_get))

@@ -141,6 +141,7 @@ impl Args {
                         | "interval"
                         | "fee"
                         | "listen"
+                        | "api-listen"
                         | "connect"
                         | "peers"
                         | "relay"

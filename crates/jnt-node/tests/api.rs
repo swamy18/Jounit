@@ -240,6 +240,31 @@ fn unknown_hashes_are_404_never_500() {
 }
 
 // ---------------------------------------------------------------------------
+// Reputation (derived, non-consensus)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reputation_reads_zero_for_an_address_with_no_history() {
+    let node = start();
+    let addr = wallet(31, "reputee").address().unwrap();
+
+    let (s, body) = get(&node, &format!("/v1/reputation/{}", address_to_hex(&addr)));
+    assert_eq!(s, 200);
+    assert_eq!(body["score"], 0);
+    assert_eq!(body["events"], 0);
+    assert_eq!(body["worker_address"], address_to_hex(&addr));
+    let expected_agent = derive_agent_id(NET, AgentRole::Machine, &addr);
+    assert_eq!(body["agent_id"], address_to_hex(&expected_agent));
+}
+
+#[test]
+fn reputation_rejects_a_malformed_address() {
+    let node = start();
+    let (s, _) = get(&node, "/v1/reputation/not-an-address");
+    assert_eq!(s, 400);
+}
+
+// ---------------------------------------------------------------------------
 // L1 transaction paths
 // ---------------------------------------------------------------------------
 
