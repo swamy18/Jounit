@@ -422,6 +422,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jnt-mcp"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "jnt-core",
+ "jnt-l2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jnt-net"
 version = "0.1.0"
 dependencies = [
