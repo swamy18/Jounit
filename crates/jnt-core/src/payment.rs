@@ -103,6 +103,9 @@ pub enum PaymentError {
     AlreadySeen,
     /// Payment does not say what its authorization granted.
     NotLinkedToAuthorization(&'static str),
+    /// A batch contains payments from different payers (one signer, one
+    /// settlement).
+    MixedPayers,
 }
 
 impl fmt::Display for PaymentError {
@@ -151,6 +154,9 @@ impl fmt::Display for PaymentError {
             PaymentError::AlreadySeen => write!(f, "payment was already accepted"),
             PaymentError::NotLinkedToAuthorization(w) => {
                 write!(f, "payment does not match its authorization: {w}")
+            }
+            PaymentError::MixedPayers => {
+                write!(f, "batch contains payments from different payers")
             }
         }
     }
@@ -471,6 +477,54 @@ pub fn build_signed_payment(
     payment.sigs = Auth::sigs_for(wallet, &msg)?;
     payment.verify(network_id, expires_at_height.saturating_sub(1))?;
     payment.linked_to(auth)?;
+    Ok(payment)
+}
+
+/// Everything but the key that builds a direct (policy-less) payment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectPaymentSpec {
+    pub network_id: String,
+    pub recipient: Address,
+    pub service: Option<[u8; 32]>,
+    pub amount_sat: u64,
+    pub fee_sat: u64,
+    pub nonce: u64,
+    pub expires_at_height: u64,
+    pub reference: Hash,
+}
+
+/// Build a direct, policy-less payment — the human → machine/service path.
+///
+/// Machine and service payers cannot use this to route around their policy:
+/// the payer type is fixed to `Human` here, and a session against a
+/// policy-governed request refuses a payment whose `policy_hash` disagrees
+/// with the request's (see `service::Session::verify`).
+pub fn build_direct_payment(
+    wallet: &Wallet,
+    spec: DirectPaymentSpec,
+) -> Result<MachinePayment, PaymentError> {
+    let payer = wallet.address()?;
+    let mut payment = MachinePayment {
+        version: PAYMENT_VERSION,
+        network_id: spec.network_id.clone(),
+        payer_type: AgentRole::Human,
+        payer,
+        agent_id: derive_agent_id(&spec.network_id, AgentRole::Human, &payer),
+        recipient: spec.recipient,
+        service: spec.service,
+        amount_sat: spec.amount_sat,
+        fee_sat: spec.fee_sat,
+        nonce: spec.nonce,
+        policy_hash: [0u8; 32],
+        expires_at_height: spec.expires_at_height,
+        reference: spec.reference,
+        keys: Auth::keys_for(wallet)?,
+        sigs: Bundle::default(),
+    };
+    payment.validate()?;
+    let msg = payment.signing_hash();
+    payment.sigs = Auth::sigs_for(wallet, &msg)?;
+    payment.verify(&spec.network_id, spec.expires_at_height.saturating_sub(1))?;
     Ok(payment)
 }
 

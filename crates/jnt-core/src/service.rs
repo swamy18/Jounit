@@ -1,0 +1,912 @@
+//! The Jounit service/payment bridge (roadmap items 2, 6, 5, 7, 8).
+//!
+//! The bridge is the protocol-neutral layer that turns the pieces shipped by
+//! Decision 16 and items 11/12 into one **coherent, testable flow**:
+//!
+//! ```text
+//! Agent ──(1) PaymentRequest──▶ SpendPolicy ──(2) Authorization
+//!        ──(3) MachinePayment──▶ Service ──(4) ServiceReceipt
+//! ```
+//!
+//! ```text
+//! AI Agent → Service/API → JNT Payment → Service Execution → Cryptographic Receipt
+//! ```
+//!
+//! It is **not** a Stripe clone and not a second payment system: every step
+//! uses the existing primitives — `agent.rs` for identity and policy,
+//! `payment.rs` for the machine payment, `receipt.rs` for the receipt — and
+//! the coin itself still moves through the ordinary §1 UTXO transaction (or
+//! the L2 task escrow). This module adds the glue:
+//!
+//! - [`derive_service_id`] — deterministic, network-bound **service
+//!   identity** derived from a provider address and a name;
+//! - [`PaymentRequest`] — the payer-signed intent naming the service, the
+//!   recipient, and the **maximum authorized amount**;
+//! - [`authorize_request`] — the only path from a request to an
+//!   [`Authorization`]; it delegates every budget rule to `PolicyBook`, so
+//!   there is exactly one authorization engine;
+//! - [`verify_session`] — offline verification of whichever stages exist,
+//!   each bound to the stage before it;
+//! - [`aggregate_payments`] — batching many machine payments into one
+//!   settlement's worth of outputs (the safe, consensus-free micropayment
+//!   primitive: one `GAS_TX_BASE` for N payments);
+//! - [`parse_amount_sat`] / [`format_amount_sat`] — exact integer
+//!   denomination handling with **no floating point anywhere**, so machines
+//!   quote, sign and verify the same number a human reads.
+//!
+//! # Fail-closed rules (locked)
+//!
+//! - a machine/service payer's request must name its governing policy
+//!   (zero policy hash only for `Human` payers);
+//! - a machine payment presented inside a session **must** present its
+//!   authorization: no privileged path skips the policy;
+//! - a receipt without a payment, or a receipt/payment that disagrees with
+//!   the request on payer, recipient, service, amount or network, is refused
+//!   by name — a forged service response can never authorize payment,
+//!   because `authorize_request` does not take a receipt as input at all;
+//! - `verify_session` verifies **only** what it is given and refuses
+//!   contradictory stage orderings; nothing it says overrides a refusal by a
+//!   lower layer.
+
+use crate::agent::{
+    derive_agent_id, verify_authorization, AgentId, AgentRole, Authorization, AuthorizationRequest,
+    PolicyBook, PolicyError, SpendPolicy,
+};
+use crate::hash::{sha256_dom, Address, Hash};
+use crate::payment::{MachinePayment, PaymentError};
+use crate::receipt::ServiceReceipt;
+use crate::ser::{Reader, Writer};
+use crate::sig::Bundle;
+use crate::wallet::Wallet;
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// Request encoding version. A future format MUST use a new value.
+pub const REQUEST_VERSION: u8 = 1;
+/// Domain tag for a derived service identity.
+pub const DOM_SERVICE_ID: &[u8] = b"jounit/service-id/v1";
+/// Domain tag for the payment-request signing hash.
+pub const DOM_SERVICE_REQUEST: &[u8] = b"jounit/service-request/v1";
+/// Domain tag for a service result hash.
+pub const DOM_SERVICE_RESULT: &[u8] = b"jounit/service-result/v1";
+/// Longest accepted network id (bytes).
+pub const MAX_REQUEST_NETWORK_ID_LEN: usize = 64;
+/// Decimal places in one JNT (satoshis per JNT is 10^9).
+pub const SAT_DECIMALS: u32 = 9;
+
+/// Why a bridge step was refused. Named and `PartialEq`, so tests can assert
+/// the exact clause. The inner families are the ones the lower layers own —
+/// this module never reinterprets them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionError {
+    /// A payment/request-level refusal (structure, network, signature,
+    /// expiry, policy presence).
+    Payment(PaymentError),
+    /// A receipt-level refusal.
+    Receipt(crate::receipt::ReceiptError),
+    /// A policy-engine refusal (budget, nonce, allow lists).
+    Policy(PolicyError),
+    /// Two stages of the session disagree.
+    Binding(&'static str),
+    /// An amount string is not an exact decimal number of satoshis.
+    BadAmount(&'static str),
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionError::Payment(e) => write!(f, "payment layer: {e}"),
+            SessionError::Receipt(e) => write!(f, "receipt layer: {e}"),
+            SessionError::Policy(e) => write!(f, "policy layer: {e}"),
+            SessionError::Binding(w) => write!(f, "session binding failed: {w}"),
+            SessionError::BadAmount(w) => write!(f, "bad amount: {w}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+impl From<PaymentError> for SessionError {
+    fn from(e: PaymentError) -> Self {
+        SessionError::Payment(e)
+    }
+}
+impl From<crate::receipt::ReceiptError> for SessionError {
+    fn from(e: crate::receipt::ReceiptError) -> Self {
+        SessionError::Receipt(e)
+    }
+}
+impl From<PolicyError> for SessionError {
+    fn from(e: PolicyError) -> Self {
+        SessionError::Policy(e)
+    }
+}
+impl From<crate::error::Error> for SessionError {
+    fn from(e: crate::error::Error) -> Self {
+        SessionError::Payment(PaymentError::from(e))
+    }
+}
+
+/// Deterministic, network-bound **service identity**:
+/// `SHA256("jounit/service-id/v1" ‖ network_id ‖ provider ‖ name)[..32]`.
+///
+/// The provider's address is inside the derivation, so a service id cannot
+/// claim another provider's payout address, and the network is inside, so a
+/// `mini` service id is not a `testnet` service id. The result doubles as the
+/// tag a `SpendPolicy` puts on its service allow list.
+pub fn derive_service_id(network_id: &str, provider: &Address, name: &[u8]) -> [u8; 32] {
+    sha256_dom(DOM_SERVICE_ID, &[network_id.as_bytes(), provider, name])
+}
+
+/// Hash of a service's raw result bytes. This is what a receipt carries as
+/// `result_hash`, so "what was delivered" is committed without transporting
+/// the result itself.
+pub fn result_hash_of(result_bytes: &[u8]) -> Hash {
+    sha256_dom(DOM_SERVICE_RESULT, &[result_bytes])
+}
+
+/// A payer-signed intent to buy a named service from a named provider, up to
+/// a maximum authorized amount. The bridge's entry point: everything after
+/// this is verification and bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentRequest {
+    pub version: u8,
+    /// Network binding, ≤ [`MAX_REQUEST_NETWORK_ID_LEN`] bytes.
+    pub network_id: String,
+    /// Payer's ordinary §1 address; the signature must match it.
+    pub payer: Address,
+    /// Who is paying: human, machine or service.
+    pub payer_type: AgentRole,
+    /// `derive_agent_id(network_id, payer_type, payer)`.
+    pub agent_id: AgentId,
+    /// Which service is being bought (see [`derive_service_id`]).
+    pub service_id: [u8; 32],
+    /// Provider payout address.
+    pub recipient: Address,
+    /// The requested service's price ceiling: the maximum authorized amount.
+    pub max_amount_sat: u64,
+    /// Last height at which the request is acceptable (exclusive).
+    pub expires_at_height: u64,
+    /// Governing `SpendPolicy::hash()`. Zero only for human payers.
+    pub policy_hash: Hash,
+    /// Payer keys (hybrid bundle).
+    pub keys: Bundle,
+    /// Payer signatures over [`PaymentRequest::signing_hash`].
+    pub sigs: Bundle,
+}
+
+impl PaymentRequest {
+    /// Canonical body: every field, no signatures.
+    pub fn body(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(160);
+        w.u8(self.version)
+            .u16le(self.network_id.len() as u16)
+            .raw(self.network_id.as_bytes())
+            .fixed(&self.payer)
+            .u8(self.payer_type.as_u8())
+            .fixed(&self.agent_id)
+            .fixed(&self.service_id)
+            .fixed(&self.recipient)
+            .u64le(self.max_amount_sat)
+            .u64le(self.expires_at_height)
+            .fixed(&self.policy_hash);
+        w.into_vec()
+    }
+
+    /// Domain-separated hash of the body; doubles as the request id.
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_SERVICE_REQUEST, &[&self.body()])
+    }
+
+    /// The deterministic request/intent id.
+    pub fn request_id(&self) -> Hash {
+        self.signing_hash()
+    }
+
+    /// Canonical wire encoding: `body ‖ keys ‖ sigs`.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = self.body();
+        out.extend_from_slice(&self.keys.to_bytes());
+        out.extend_from_slice(&self.sigs.to_bytes());
+        out
+    }
+
+    /// Bounded decode; the exact inverse of [`PaymentRequest::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, PaymentError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
+        if version != REQUEST_VERSION {
+            return Err(PaymentError::UnsupportedVersion(version));
+        }
+        let net_len = r
+            .u16le()
+            .map_err(|_| PaymentError::Malformed("network len"))? as usize;
+        if net_len == 0 {
+            return Err(PaymentError::EmptyNetworkId);
+        }
+        if net_len > MAX_REQUEST_NETWORK_ID_LEN {
+            return Err(PaymentError::NetworkIdTooLong(net_len));
+        }
+        let net_bytes = r
+            .fixed_slice(net_len)
+            .map_err(|_| PaymentError::Malformed("network id"))?;
+        let network_id = std::str::from_utf8(net_bytes)
+            .map_err(|_| PaymentError::Malformed("network id is not utf-8"))?
+            .to_string();
+        let payer = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("payer"))?;
+        let payer_type_raw = r.u8().map_err(|_| PaymentError::Malformed("payer type"))?;
+        let payer_type = AgentRole::from_u8(payer_type_raw)
+            .ok_or(PaymentError::Malformed("payer type out of range"))?;
+        let agent_id = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("agent id"))?;
+        let service_id = r
+            .fixed::<32>()
+            .map_err(|_| PaymentError::Malformed("service id"))?;
+        let recipient = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("recipient"))?;
+        let max_amount_sat = r
+            .u64le()
+            .map_err(|_| PaymentError::Malformed("max amount"))?;
+        let expires_at_height = r
+            .u64le()
+            .map_err(|_| PaymentError::Malformed("expires_at"))?;
+        let policy_hash = r
+            .fixed::<32>()
+            .map_err(|_| PaymentError::Malformed("policy hash"))?;
+        let keys = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
+        let sigs = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
+        r.expect_end()
+            .map_err(|_| PaymentError::Malformed("trailing bytes"))?;
+
+        let request = PaymentRequest {
+            version,
+            network_id,
+            payer,
+            payer_type,
+            agent_id,
+            service_id,
+            recipient,
+            max_amount_sat,
+            expires_at_height,
+            policy_hash,
+            keys,
+            sigs,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Structural self-consistency (no signature work).
+    pub fn validate(&self) -> Result<(), PaymentError> {
+        if self.version != REQUEST_VERSION {
+            return Err(PaymentError::UnsupportedVersion(self.version));
+        }
+        if self.network_id.is_empty() {
+            return Err(PaymentError::EmptyNetworkId);
+        }
+        if self.network_id.len() > MAX_REQUEST_NETWORK_ID_LEN {
+            return Err(PaymentError::NetworkIdTooLong(self.network_id.len()));
+        }
+        if self.max_amount_sat == 0 {
+            return Err(PaymentError::ZeroAmount);
+        }
+        if self.expires_at_height == 0 {
+            return Err(PaymentError::NoExpiry);
+        }
+        let expected = derive_agent_id(&self.network_id, self.payer_type, &self.payer);
+        if expected != self.agent_id {
+            return Err(PaymentError::IdentityMismatch);
+        }
+        if self.payer_type != AgentRole::Human && self.policy_hash == [0u8; 32] {
+            return Err(PaymentError::PolicyRequired);
+        }
+        Ok(())
+    }
+
+    /// Offline verification: structure, network, expiry at `height`,
+    /// payer-address binding and every signature component.
+    pub fn verify(&self, network_id: &str, height: u64) -> Result<(), PaymentError> {
+        if self.network_id != network_id {
+            return Err(PaymentError::WrongNetwork {
+                expected: self.network_id.clone(),
+                got: network_id.to_string(),
+            });
+        }
+        self.validate()?;
+        if height >= self.expires_at_height {
+            return Err(PaymentError::Expired {
+                expires_at: self.expires_at_height,
+                height,
+            });
+        }
+        let signer = self.keys.address()?;
+        if signer != self.payer {
+            return Err(PaymentError::SignerNotPayer {
+                signer,
+                payer: self.payer,
+            });
+        }
+        let msg = self.signing_hash();
+        crate::sig::verify_bundle(&self.sigs, &self.keys, &msg)?;
+        Ok(())
+    }
+}
+
+/// Everything but the key that builds a payment request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestSpec {
+    pub network_id: String,
+    pub payer_type: AgentRole,
+    /// Which service is being bought (see [`derive_service_id`]).
+    pub service_id: [u8; 32],
+    pub recipient: Address,
+    /// The price ceiling: the maximum authorized amount.
+    pub max_amount_sat: u64,
+    pub expires_at_height: u64,
+    /// Governing `SpendPolicy::hash()`; zero only for human payers.
+    pub policy_hash: Hash,
+}
+
+/// Build and sign a payment request with the payer's wallet. The wallet is
+/// passed in and never stored — the bridge holds no key material.
+pub fn build_signed_request(
+    wallet: &Wallet,
+    spec: RequestSpec,
+) -> Result<PaymentRequest, PaymentError> {
+    let payer = wallet.address()?;
+    let mut request = PaymentRequest {
+        version: REQUEST_VERSION,
+        network_id: spec.network_id.clone(),
+        payer,
+        payer_type: spec.payer_type,
+        agent_id: derive_agent_id(&spec.network_id, spec.payer_type, &payer),
+        service_id: spec.service_id,
+        recipient: spec.recipient,
+        max_amount_sat: spec.max_amount_sat,
+        expires_at_height: spec.expires_at_height,
+        policy_hash: spec.policy_hash,
+        keys: crate::l2::Auth::keys_for(wallet)?,
+        sigs: Bundle::default(),
+    };
+    if spec.payer_type != AgentRole::Human && spec.policy_hash == [0u8; 32] {
+        return Err(PaymentError::PolicyRequired);
+    }
+    request.validate()?;
+    let msg = request.signing_hash();
+    request.sigs = crate::l2::Auth::sigs_for(wallet, &msg)?;
+    request.verify(&spec.network_id, spec.expires_at_height.saturating_sub(1))?;
+    Ok(request)
+}
+
+/// The **only** path from a payment request to an authorization.
+///
+/// Every budget rule stays inside `PolicyBook` — per-transaction limit,
+/// tumbling cumulative window, recipient/service allow lists, validity
+/// window, strictly increasing nonce, revocation. This function adds only
+/// the bridge-specific bindings: the request must self-verify (payer-signed,
+/// unexpired, network-bound, identity-re-derived) and must name exactly the
+/// policy presented. A receipt or any service response is **not** an input
+/// here, by type: a forged service response cannot authorize payment.
+pub fn authorize_request(
+    book: &mut PolicyBook,
+    policy: &SpendPolicy,
+    network_id: &str,
+    request: &PaymentRequest,
+    height: u64,
+    nonce: u64,
+) -> Result<Authorization, SessionError> {
+    request.verify(network_id, height)?;
+    if request.policy_hash != policy.hash() {
+        return Err(SessionError::Binding("request names a different policy"));
+    }
+    let areq = AuthorizationRequest {
+        agent_id: request.agent_id,
+        recipient: request.recipient,
+        amount_sat: request.max_amount_sat,
+        service: Some(request.service_id),
+        height,
+        nonce,
+    };
+    Ok(book.authorize(policy, network_id, &areq)?)
+}
+
+/// A granted authorization plus the signature material that proves the owner
+/// issued it, as presented by a session verifier.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthPresentation<'a> {
+    pub auth: &'a Authorization,
+    pub sigs: &'a Bundle,
+    pub keys: &'a Bundle,
+}
+
+/// The stages of a bridge session. Every stage after the request is
+/// optional — whatever exists must verify and must bind to the stage before
+/// it. Stage *order* is enforced: a receipt requires a payment, and a
+/// machine payment (policy-governed request) requires its authorization.
+#[derive(Debug, Clone, Copy)]
+pub struct Session<'a> {
+    pub request: &'a PaymentRequest,
+    pub authorization: Option<AuthPresentation<'a>>,
+    pub payment: Option<&'a MachinePayment>,
+    pub receipt: Option<&'a ServiceReceipt>,
+}
+
+impl<'a> Session<'a> {
+    pub fn new(request: &'a PaymentRequest) -> Self {
+        Session {
+            request,
+            authorization: None,
+            payment: None,
+            receipt: None,
+        }
+    }
+
+    pub fn with_authorization(
+        mut self,
+        auth: &'a Authorization,
+        sigs: &'a Bundle,
+        keys: &'a Bundle,
+    ) -> Self {
+        self.authorization = Some(AuthPresentation { auth, sigs, keys });
+        self
+    }
+
+    pub fn with_payment(mut self, payment: &'a MachinePayment) -> Self {
+        self.payment = Some(payment);
+        self
+    }
+
+    pub fn with_receipt(mut self, receipt: &'a ServiceReceipt) -> Self {
+        self.receipt = Some(receipt);
+        self
+    }
+
+    /// Offline verification of the whole chain, at `height`, on
+    /// `network_id`. Every refusal is a named [`SessionError`]; nothing is
+    /// mutated because nothing is owned.
+    pub fn verify(&self, network_id: &str, height: u64) -> Result<(), SessionError> {
+        self.request.verify(network_id, height)?;
+
+        // Authorization stage: offline-verifiable and bound to the request.
+        if let Some(presented) = self.authorization {
+            verify_authorization(presented.sigs, presented.keys, presented.auth)?;
+            let auth = presented.auth;
+            if auth.owner != self.request.payer {
+                return Err(SessionError::Binding("authorization owner"));
+            }
+            if auth.agent_id != self.request.agent_id {
+                return Err(SessionError::Binding("authorization agent"));
+            }
+            if auth.recipient != self.request.recipient {
+                return Err(SessionError::Binding("authorization recipient"));
+            }
+            if auth.amount_sat != self.request.max_amount_sat {
+                return Err(SessionError::Binding("authorization amount"));
+            }
+            if auth.service != Some(self.request.service_id) {
+                return Err(SessionError::Binding("authorization service"));
+            }
+            if auth.policy_hash != self.request.policy_hash {
+                return Err(SessionError::Binding("authorization policy"));
+            }
+        }
+
+        // Payment stage.
+        if let Some(payment) = self.payment {
+            payment.verify(network_id, height)?;
+            if payment.reference != self.request.request_id() {
+                return Err(SessionError::Binding("payment reference"));
+            }
+            if payment.payer != self.request.payer
+                || payment.agent_id != self.request.agent_id
+                || payment.recipient != self.request.recipient
+                || payment.amount_sat != self.request.max_amount_sat
+                || payment.service != Some(self.request.service_id)
+                || payment.policy_hash != self.request.policy_hash
+            {
+                return Err(SessionError::Binding("payment disagrees with request"));
+            }
+            match self.authorization {
+                Some(presented) => payment.linked_to(presented.auth)?,
+                None => {
+                    // No privileged path: a policy-governed request may not
+                    // be settled by a payment that never showed its grant.
+                    if self.request.policy_hash != [0u8; 32] {
+                        return Err(SessionError::Binding(
+                            "machine payment presented without its authorization",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Receipt stage: requires a payment and must agree with it.
+        if let Some(receipt) = self.receipt {
+            let payment = self
+                .payment
+                .ok_or(SessionError::Binding("receipt without payment"))?;
+            receipt.verify(network_id)?;
+            receipt.verify_binding(payment)?;
+            if receipt.request_id != self.request.request_id() {
+                return Err(SessionError::Binding("receipt request"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// One settlement's worth of payments: per-recipient outputs with the shared
+/// payer, so N machine payments ride one L1 transaction and pay `GAS_TX_BASE`
+/// once instead of N times. This is the safe micropayment primitive — it
+/// changes no consensus rule, it just stops paying the base fee N times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentBatch {
+    /// Every payment must come from this payer (one signer, one transaction).
+    pub payer: Address,
+    /// Payment ids, in input order.
+    pub payment_ids: Vec<Hash>,
+    /// Net amounts per distinct recipient, ordered by recipient address
+    /// (deterministic between two nodes batching the same set).
+    pub outputs: Vec<(Address, u64)>,
+    pub total_amount_sat: u64,
+    /// Sum of the payments' declared fees; the transaction's actual fee is
+    /// set by whoever builds it.
+    pub declared_fee_sat: u64,
+}
+
+impl PaymentBatch {
+    pub fn output_count(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Gas this settlement's transaction would consume, given how many
+    /// inputs fund it. Uses the existing `GAS_TX_*` constants unchanged.
+    pub fn gas_used(&self, input_count: usize) -> u64 {
+        crate::tx::GAS_TX_BASE
+            .saturating_add(crate::tx::GAS_PER_INPUT.saturating_mul(input_count as u64))
+            .saturating_add(crate::tx::GAS_PER_OUTPUT.saturating_mul(self.output_count() as u64))
+    }
+
+    /// The base-fee obligation for this settlement at `base_fee` sat/gas.
+    pub fn required_fee(&self, base_fee: u64, input_count: usize) -> u64 {
+        crate::fees::required_fee(base_fee, self.gas_used(input_count))
+    }
+}
+
+/// Verify a set of machine payments and merge them into one settlement.
+/// Refuses anything a single payment would refuse, plus payments from
+/// different payers (they could not share one signed transaction) and any
+/// arithmetic overflow.
+pub fn aggregate_payments(
+    payments: &[MachinePayment],
+    network_id: &str,
+    height: u64,
+) -> Result<PaymentBatch, PaymentError> {
+    if payments.is_empty() {
+        return Err(PaymentError::Malformed("empty payment batch"));
+    }
+    let payer = payments[0].payer;
+    let mut per_recipient: BTreeMap<Address, u64> = BTreeMap::new();
+    let mut payment_ids = Vec::with_capacity(payments.len());
+    let mut total_amount_sat: u64 = 0;
+    let mut declared_fee_sat: u64 = 0;
+    for p in payments {
+        p.verify(network_id, height)?;
+        if p.payer != payer {
+            return Err(PaymentError::MixedPayers);
+        }
+        payment_ids.push(p.signing_hash());
+        total_amount_sat = total_amount_sat
+            .checked_add(p.amount_sat)
+            .ok_or(PaymentError::Overflow)?;
+        declared_fee_sat = declared_fee_sat
+            .checked_add(p.fee_sat)
+            .ok_or(PaymentError::Overflow)?;
+        let slot = per_recipient.entry(p.recipient).or_insert(0);
+        *slot = slot
+            .checked_add(p.amount_sat)
+            .ok_or(PaymentError::Overflow)?;
+    }
+    Ok(PaymentBatch {
+        payer,
+        payment_ids,
+        outputs: per_recipient.into_iter().collect(),
+        total_amount_sat,
+        declared_fee_sat,
+    })
+}
+
+/// Parse an exact decimal JNT amount into satoshis. **No floating point**:
+/// the string is consumed digit by digit, at most [`SAT_DECIMALS`] decimals
+/// are accepted (anything finer would round, and a machine payment must
+/// never round), and a value above `u64::MAX` satoshis is refused.
+///
+/// ```
+/// # use jnt_core::service::parse_amount_sat;
+/// assert_eq!(parse_amount_sat("1.5").unwrap(), 1_500_000_000);
+/// assert_eq!(parse_amount_sat("0.000000001").unwrap(), 1);
+/// assert!(parse_amount_sat("1.0000000001").is_err()); // 10 decimals
+/// assert!(parse_amount_sat("-1").is_err());
+/// ```
+pub fn parse_amount_sat(s: &str) -> Result<u64, SessionError> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return Err(SessionError::BadAmount("empty"));
+    }
+    if bytes[0] == b'-' || bytes[0] == b'+' {
+        return Err(SessionError::BadAmount("sign not allowed"));
+    }
+    let dot = bytes.iter().position(|&b| b == b'.');
+    let (int_part, frac_part) = match dot {
+        Some(i) => (&bytes[..i], &bytes[i + 1..]),
+        None => (bytes, &bytes[bytes.len()..]),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(SessionError::BadAmount("no digits"));
+    }
+    if frac_part.len() as u32 > SAT_DECIMALS {
+        return Err(SessionError::BadAmount("finer than one satoshi"));
+    }
+    let mut total: u64 = 0;
+    for &b in int_part {
+        if !b.is_ascii_digit() {
+            return Err(SessionError::BadAmount("non-digit"));
+        }
+        total = total
+            .checked_mul(10)
+            .and_then(|t| t.checked_add((b - b'0') as u64))
+            .ok_or(SessionError::BadAmount("integer overflow"))?;
+    }
+    let mut scale: u64 = 10u64.pow(SAT_DECIMALS);
+    let mut frac: u64 = 0;
+    for &b in frac_part {
+        if !b.is_ascii_digit() {
+            return Err(SessionError::BadAmount("non-digit"));
+        }
+        scale /= 10;
+        frac = frac
+            .checked_mul(10)
+            .and_then(|f| f.checked_add((b - b'0') as u64))
+            .ok_or(SessionError::BadAmount("fraction overflow"))?;
+    }
+    let whole = total
+        .checked_mul(10u64.pow(SAT_DECIMALS))
+        .ok_or(SessionError::BadAmount("overflow"))?;
+    let frac = frac
+        .checked_mul(scale)
+        .ok_or(SessionError::BadAmount("overflow"))?;
+    whole
+        .checked_add(frac)
+        .ok_or(SessionError::BadAmount("overflow"))
+}
+
+/// Exact inverse of [`parse_amount_sat`]: always [`SAT_DECIMALS`] decimals,
+/// no thousands separators, no exponent, no float. `parse(format(x)) == x`
+/// for every `x`.
+pub fn format_amount_sat(sat: u64) -> String {
+    let unit = 10u64.pow(SAT_DECIMALS);
+    let whole = sat / unit;
+    let frac = sat % unit;
+    format!("{whole}.{frac:09}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NET: &str = "jounit/testnet";
+
+    fn wallet() -> Wallet {
+        Wallet::from_private_key_bytes(&[31u8; 32], "payer").expect("valid key")
+    }
+
+    fn service_wallet() -> Wallet {
+        Wallet::from_private_key_bytes(&[32u8; 32], "provider").expect("valid key")
+    }
+
+    fn machine_policy(owner: Address, service: [u8; 32]) -> SpendPolicy {
+        SpendPolicy {
+            version: crate::agent::POLICY_VERSION,
+            network_id: NET.to_string(),
+            agent_id: derive_agent_id(NET, AgentRole::Machine, &owner),
+            owner,
+            role: AgentRole::Machine,
+            per_tx_max_sat: 600,
+            window_blocks: 10,
+            cumulative_max_sat: 1_000,
+            allowed_recipients: vec![service_wallet().address().unwrap()],
+            allowed_services: vec![service],
+            not_before_height: 0,
+            expires_at_height: 10_000,
+            revoked: false,
+        }
+    }
+
+    #[test]
+    fn service_ids_are_deterministic_network_bound_and_provider_bound() {
+        let provider = [9u8; 20];
+        let a = derive_service_id(NET, &provider, b"jounit-llm");
+        let b = derive_service_id(NET, &provider, b"jounit-llm");
+        assert_eq!(a, b);
+        assert_ne!(
+            a,
+            derive_service_id("jounit/mini", &provider, b"jounit-llm")
+        );
+        assert_ne!(a, derive_service_id(NET, &[8u8; 20], b"jounit-llm"));
+        assert_ne!(a, derive_service_id(NET, &provider, b"other"));
+    }
+
+    #[test]
+    fn amounts_parse_and_format_exactly_without_floats() {
+        assert_eq!(parse_amount_sat("1").unwrap(), 1_000_000_000);
+        assert_eq!(parse_amount_sat("1.5").unwrap(), 1_500_000_000);
+        assert_eq!(parse_amount_sat(".5").unwrap(), 500_000_000);
+        assert_eq!(parse_amount_sat("0.000000001").unwrap(), 1);
+        assert_eq!(parse_amount_sat("0").unwrap(), 0);
+        assert!(parse_amount_sat("").is_err());
+        assert!(parse_amount_sat("-1").is_err());
+        assert!(parse_amount_sat("+1").is_err());
+        assert!(parse_amount_sat("1.0000000001").is_err());
+        assert!(parse_amount_sat("1e9").is_err());
+        assert!(parse_amount_sat(".").is_err());
+        assert!(parse_amount_sat("abc").is_err());
+        for v in [0u64, 1, 999_999_999, 1_000_000_000, u64::MAX] {
+            assert_eq!(parse_amount_sat(&format_amount_sat(v)).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn a_request_round_trips_and_verifies_offline() {
+        let w = wallet();
+        let provider = service_wallet().address().unwrap();
+        let service = derive_service_id(NET, &provider, b"svc");
+        let policy = machine_policy(w.address().unwrap(), service);
+        let req = build_signed_request(
+            &w,
+            RequestSpec {
+                network_id: NET.to_string(),
+                payer_type: AgentRole::Machine,
+                service_id: service,
+                recipient: provider,
+                max_amount_sat: 500,
+                expires_at_height: 9_000,
+                policy_hash: policy.hash(),
+            },
+        )
+        .expect("request builds");
+        req.verify(NET, 100).expect("verifies");
+        let bytes = req.serialize();
+        let back = PaymentRequest::deserialize(&bytes).expect("decode");
+        assert_eq!(back, req);
+        assert_eq!(back.serialize(), bytes);
+
+        let mut wrong_net = req.clone();
+        wrong_net.network_id = "jounit/mini".into();
+        assert!(wrong_net.verify(NET, 100).is_err());
+    }
+
+    #[test]
+    fn aggregate_merges_recipients_and_refuses_mixed_payers() {
+        let w = wallet();
+        let provider = service_wallet().address().unwrap();
+        let service = derive_service_id(NET, &provider, b"svc");
+        let policy = machine_policy(w.address().unwrap(), service);
+        let mut book = PolicyBook::default();
+        let mut payments = Vec::new();
+        // Three in-policy grants: 300 + 300 + 400 = 1000 = the window cap.
+        for (i, amount) in [300u64, 300, 400].into_iter().enumerate() {
+            let p = machine_policy(w.address().unwrap(), service);
+            let req = build_signed_request(
+                &w,
+                RequestSpec {
+                    network_id: NET.to_string(),
+                    payer_type: AgentRole::Machine,
+                    service_id: service,
+                    recipient: provider,
+                    max_amount_sat: amount,
+                    expires_at_height: 9_000,
+                    policy_hash: p.hash(),
+                },
+            )
+            .unwrap();
+            let auth = authorize_request(&mut book, &p, NET, &req, 100, (i + 1) as u64).unwrap();
+            payments.push(
+                crate::payment::build_signed_payment(
+                    &w,
+                    &auth,
+                    NET,
+                    AgentRole::Machine,
+                    0,
+                    9_000,
+                    req.request_id(),
+                )
+                .unwrap(),
+            );
+        }
+        // A fourth recipient under a second policy to exercise grouping.
+        let other_recipient = [7u8; 20];
+        {
+            let mut p = policy.clone();
+            p.allowed_recipients = vec![other_recipient];
+            let req = build_signed_request(
+                &w,
+                RequestSpec {
+                    network_id: NET.to_string(),
+                    payer_type: AgentRole::Machine,
+                    service_id: service,
+                    recipient: other_recipient,
+                    max_amount_sat: 100,
+                    expires_at_height: 9_000,
+                    policy_hash: p.hash(),
+                },
+            )
+            .unwrap();
+            let auth = authorize_request(&mut book, &p, NET, &req, 100, 100).unwrap();
+            payments.push(
+                crate::payment::build_signed_payment(
+                    &w,
+                    &auth,
+                    NET,
+                    AgentRole::Machine,
+                    0,
+                    9_000,
+                    req.request_id(),
+                )
+                .unwrap(),
+            );
+        }
+
+        let batch = aggregate_payments(&payments, NET, 100).expect("aggregates");
+        assert_eq!(batch.payer, w.address().unwrap());
+        assert_eq!(batch.total_amount_sat, 1_100);
+        assert_eq!(batch.output_count(), 2, "same recipient must merge");
+        assert_eq!(batch.outputs[0].1 + batch.outputs[1].1, 1_100);
+        assert_eq!(batch.payment_ids.len(), 4);
+        // One settlement costs one base: 2 outputs, 1 input at 100 sat/gas.
+        assert_eq!(batch.gas_used(1), crate::tx::GAS_TX_BASE + 1_000 + 500);
+        assert_eq!(
+            batch.required_fee(100, 1),
+            100 * (crate::tx::GAS_TX_BASE + 1_000 + 500)
+        );
+
+        // Mixed payers cannot share one signed transaction: a *second*,
+        // fully valid payer joins the batch and the merge refuses by name.
+        let w2 = Wallet::from_private_key_bytes(&[41u8; 32], "payer2").expect("valid key");
+        let p2 = machine_policy(w2.address().unwrap(), service);
+        let req2 = build_signed_request(
+            &w2,
+            RequestSpec {
+                network_id: NET.to_string(),
+                payer_type: AgentRole::Machine,
+                service_id: service,
+                recipient: provider,
+                max_amount_sat: 100,
+                expires_at_height: 9_000,
+                policy_hash: p2.hash(),
+            },
+        )
+        .unwrap();
+        let auth2 = authorize_request(&mut book, &p2, NET, &req2, 100, 1).unwrap();
+        let payment2 = crate::payment::build_signed_payment(
+            &w2,
+            &auth2,
+            NET,
+            AgentRole::Machine,
+            0,
+            9_000,
+            req2.request_id(),
+        )
+        .unwrap();
+        let mut mixed = payments.clone();
+        mixed.push(payment2);
+        assert_eq!(
+            aggregate_payments(&mixed, NET, 100),
+            Err(PaymentError::MixedPayers)
+        );
+    }
+}
