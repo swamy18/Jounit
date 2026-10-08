@@ -4,4 +4,5 @@
 //! view. Everything else lives in the binary (`main.rs`). The split exists so
 //! integration tests can drive the accepted-block path without spawning a
 //! process.
+pub mod api;
 pub mod l2;

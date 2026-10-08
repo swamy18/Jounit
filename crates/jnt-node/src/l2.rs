@@ -328,6 +328,26 @@ impl NodeL2 {
         self.inner.state_mut()
     }
 
+    /// Dry-run one L2 transaction against a **clone** of the current state.
+    ///
+    /// The API's L2-broadcast endpoint calls this so a malformed payload or one
+    /// whose preconditions already fail is refused by name *before* it waits in
+    /// the mining queue. The real state is deliberately untouched: L2 state is
+    /// derived from canonical blocks alone (SPEC.md §19.1), and applying a
+    /// payload here — outside a block — would fork this node's view from every
+    /// peer's replay. Replay remains the only authority that applies; this is a
+    /// pre-check whose verdict is advisory, and a payload whose preconditions
+    /// change before inclusion is skipped by replay like any other.
+    pub fn check(
+        &self,
+        tx: &jnt_core::l2::L2Transaction,
+        at_height: u64,
+    ) -> jnt_l2::error::L2Result<()> {
+        let mut probe = self.state().clone();
+        probe.apply(tx, at_height, &self.validators, &RealBls)?;
+        Ok(())
+    }
+
     /// The genesis allocation this view was built from.
     pub fn genesis(&self) -> &L2Genesis {
         &self.genesis

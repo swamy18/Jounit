@@ -24,12 +24,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
-use jnt_core::hash::{address_from_hex, address_to_hex, hash_to_hex};
-use jnt_core::mempool::Mempool;
+use jnt_core::hash::{address_from_hex, address_to_hex, hash_to_hex, Hash};
 use jnt_core::params::{NetworkParams, SAT_PER_JNT};
 use jnt_core::supply::{block_reward_sat, cumulative_supply_sat, halvings, max_issuance_sat};
 use jnt_core::tx::{OutPoint, Output, Transaction};
@@ -76,6 +77,8 @@ COMMON OPTIONS:
 
 SERVE OPTIONS:
   --listen <host:port>       TCP address to accept inbound peers (optional)
+  --api-listen <host:port>   Start the opt-in REST service API (disabled by
+                             default; loopback expected — see SPEC.md §19.2)
   --connect <host:port>      Dial an outbound peer (repeatable via CSV)
   --peers <n>                Max total peers (default: 125)
   --interval <ms>            Serve loop period (default: 250)
@@ -1035,7 +1038,7 @@ fn cmd_export(args: &Args) -> Result<(), String> {
 
 fn cmd_serve(args: &Args) -> Result<(), String> {
     let mut store = Store::open(args)?;
-    let mut chain = store.load_chain()?;
+    let chain = store.load_chain()?;
     let wallets = store.load_wallets()?;
 
     let listen_addr: Option<std::net::SocketAddr> = args
@@ -1058,35 +1061,32 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         .unwrap_or_default();
 
     let max_peers = args.num("peers", 125)? as usize;
-    // A relay-only node: it validates, relays and syncs, but does not mine. This
-    // is what a follower, a seed or a wallet's server looks like, and it is also
-    // the only way to observe relay without a second miner racing it for every
-    // block.
+    // A relay-only node: it validates, relays and syncs, but does not mine.
     let no_mine = args.has("no-mine");
     let mut config = P2pConfig::new(store.params.clone(), listen_addr);
     config.max_peers = max_peers;
     // Loop period. Without one the loop mined as fast as the CPU allowed and
-    // rewrote the whole chain file each time: a `serve` node pegged a core,
-    // spent its time on O(n) JSON writes (SPEC.md §13.10 item 4), and had
-    // almost no budget left to drain inbound peer events.
+    // rewrote the whole chain file each time (SPEC.md §13.10 item 4).
     let interval_ms = args.num("interval", 250)?;
+
+    // Opt-in service API (Decision 9): absent unless --api-listen is given,
+    // so the default `serve` is exactly the P2P node it always was.
+    let api_listen: Option<std::net::SocketAddr> = args
+        .str("api-listen")
+        .map(|s| s.parse().map_err(|e| format!("--api-listen: {e}")))
+        .transpose()?;
 
     let node =
         P2pNode::start(config, chain.height(), chain.tip_hash()).map_err(|e| e.to_string())?;
 
     let mut syncer = SyncManager::new();
-    // The mempool is in-memory only, so a restart begins with an empty pool and a
-    // cursor at the tip. There is nothing to recover and nothing stale to
-    // distrust; see `docs/status.md`.
-    let mut pool = Mempool::default();
+    // The mempool is in-memory only: a restart begins with an empty pool
+    // (see `docs/status.md`).
     let mut relay = RelayManager::new();
     let mut pool_cursor = chain.height();
     let mut relay_seen = (0u64, 0u64);
-    // L2 follows the tip the same way after a restart as on first boot: replay
-    // what is stored. No L2 state is persisted, so there is nothing stale to
-    // recover — and a reorg is answered by replaying the winning chain, with
-    // no undo bookkeeping (see `jnt_node::l2`).
-    let mut l2 = NodeL2::replay_from(&chain, &store.params);
+    // L2 follows the tip by replay; nothing L2 is persisted.
+    let l2 = NodeL2::replay_from(&chain, &store.params);
     let mut l2_skipped_seen = l2.skipped().len();
 
     println!("network        {}", store.params.name);
@@ -1096,16 +1096,34 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         println!("listening      {addr}");
     }
 
-    // Dial configured outbound peers
+    // Everything mutable now lives behind one lock shared with the API
+    // thread: the serve loop takes it once per iteration, handlers take it
+    // per request, and no handler holds it across an await (they do not
+    // await). The P2P node, the store and the relay cursors stay loop-local:
+    // the API must not reach the network or the disk on its own.
+    let peers = Arc::new(AtomicUsize::new(0));
+    let shared = Arc::new(Mutex::new(jnt_node::api::SharedNode::new(chain, l2)));
+    if let Some(api_addr) = api_listen {
+        let bound = jnt_node::api::spawn(Arc::clone(&shared), Arc::clone(&peers), api_addr)?;
+        println!("api            {bound}");
+    }
+
+    // Dial configured outbound peers.
     for addr in &connect_peers {
-        match node.connect(*addr, &chain) {
+        let dialed = {
+            let sh = shared
+                .lock()
+                .map_err(|_| "state lock poisoned".to_string())?;
+            node.connect(*addr, &sh.chain)
+        };
+        match dialed {
             Ok(id) => println!("connected peer {id} -> {addr}"),
             Err(e) => eprintln!("warn: connect {addr}: {e}"),
         }
     }
 
-    // Pick miner address if a wallet exists. `--no-mine` keeps the wallet — it is
-    // still the address the node reports balances for — and only stops it mining.
+    // Pick miner address if a wallet exists. `--no-mine` keeps the wallet —
+    // it is still the address the node reports balances for.
     let miner_addr = if no_mine {
         None
     } else {
@@ -1116,41 +1134,56 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
 
     // Chain thread: mine + relay loop
     loop {
-        // Mine one block if we have a miner wallet
+        // Bind through one `&mut` so the loop's field accesses are disjoint
+        // borrows of the shared state rather than repeated reborrows of the
+        // guard (which the borrow checker rejects for `chain` + `pool`).
+        let mut guard = shared
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        let sh = &mut *guard;
+
+        // What the API accepted since the last iteration. Relayed after the
+        // lock drops: announcing needs the P2P node, not the state.
+        let relay_now: Vec<Hash> = std::mem::take(&mut sh.tx_to_relay);
+
+        // Mine one block if we have a miner wallet. `mine_from_pool` selects
+        // from the pool and evicts what the *canonical* chain confirms; the
+        // L2 queue only matters when the API has actually received L2
+        // transactions, because inclusion in a block is the only way L2
+        // state changes (SPEC.md §19.1).
         if let Some(addr) = miner_addr {
-            // Mine from the pool rather than from an empty body. A node that only
-            // ever mines empty blocks never confirms a relayed transaction, which
-            // is the entire point of having a pool (§13.14). `mine_from_pool`
-            // submits the block itself and then evicts what the *canonical* chain
-            // confirms, so nothing here has to remember to do either.
-            if let Ok(block) = chain.mine_from_pool(&mut pool, addr, now_ms()) {
+            let l2_queue = std::mem::take(&mut sh.l2_to_include);
+            let mined = if l2_queue.is_empty() {
+                sh.chain.mine_from_pool(&mut sh.pool, addr, now_ms())
+            } else {
+                sh.chain
+                    .mine_from_pool_with_l2(&mut sh.pool, addr, now_ms(), l2_queue)
+            };
+            if let Ok(block) = mined {
                 let hash = block.block_hash();
                 let height = block.header.height;
-                store.save_chain(&chain).ok();
-                store.write_meta(&chain).ok();
+                store.save_chain(&sh.chain).ok();
+                store.write_meta(&sh.chain).ok();
                 println!("mined height {height}  {}", &hash_to_hex(&hash)[..16]);
                 node.broadcast_block(hash, None);
             }
         }
 
         // Drain inbound P2P events and apply to chain.
-        let before = chain.height();
+        let before = sh.chain.height();
         node.poll_events(
             NodeState {
-                chain: &mut chain,
-                pool: &mut pool,
+                chain: &mut sh.chain,
+                pool: &mut sh.pool,
                 syncer: &mut syncer,
                 relay: &mut relay,
             },
             Some(now_ms()),
         );
 
-        // Keep the L2 view on the tip after both paths above: a locally mined
-        // block and a block that arrived from a peer move the same tip through
-        // the same `submit`, so one `sync` covers both. A reorg that rewrote
-        // history takes the full-replay arm inside `sync`; a side block that
-        // lost fork choice leaves the tip (and the view) untouched.
-        let report = l2.sync(&chain);
+        // Keep the L2 view on the tip after both paths above. A reorg that
+        // rewrote history takes the full-replay arm inside `sync`.
+        let report = sh.l2.sync(&sh.chain);
         match report.outcome {
             jnt_node::l2::SyncOutcome::FullReplay { .. }
                 if report.to_height != report.from_height =>
@@ -1158,70 +1191,69 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 println!(
                     "l2             full replay to height {} (applied {}, skipped {})",
                     report.to_height,
-                    l2.applied_count(),
-                    l2.skipped().len()
+                    sh.l2.applied_count(),
+                    sh.l2.skipped().len()
                 );
-                l2_skipped_seen = l2.skipped().len();
+                l2_skipped_seen = sh.l2.skipped().len();
             }
             _ => {
-                if l2.skipped().len() != l2_skipped_seen {
+                if sh.l2.skipped().len() != l2_skipped_seen {
                     println!(
                         "l2             height {} applied {} skipped {}",
-                        l2.height(),
-                        l2.applied_count(),
-                        l2.skipped().len()
+                        sh.l2.height(),
+                        sh.l2.applied_count(),
+                        sh.l2.skipped().len()
                     );
-                    l2_skipped_seen = l2.skipped().len();
+                    l2_skipped_seen = sh.l2.skipped().len();
                 }
             }
         }
 
-        // Reconciliation is unconditional, deliberately not gated on the height
-        // having changed. A reorg can land at the *same* height, and gating on
-        // height would skip exactly the case where the pool most needs updating:
-        // re-admitting the transactions the reorg un-confirmed. When nothing has
-        // changed this is a bounds check over an empty range.
-        let (cursor, report) = chain.reconcile_mempool(&mut pool, pool_cursor);
+        // Reconciliation is unconditional: a reorg can land at the same
+        // height, and gating on height would skip exactly the case where the
+        // pool most needs updating.
+        let (cursor, mreport) = sh.chain.reconcile_mempool(&mut sh.pool, pool_cursor);
         pool_cursor = cursor;
-        if report.evicted > 0 || report.readmitted > 0 || report.refused > 0 {
+        if mreport.evicted > 0 || mreport.readmitted > 0 || mreport.refused > 0 {
             println!(
                 "mempool        evicted {} re-admitted {} refused {}",
-                report.evicted, report.readmitted, report.refused
+                mreport.evicted, mreport.readmitted, mreport.refused
             );
         }
 
-        // Relay outcomes, printed on change. A transaction refused from a peer is
-        // otherwise silent — it is not relayed, there is no acknowledgement, and
-        // the sender sees only that nothing happened. Without this, "the network
-        // is dropping my payments" and "a peer is sending junk" are the same
-        // observation.
+        // Relay outcomes, printed on change.
         let (accepted, refused) = (relay.accepted_count(), relay.refused_count());
         if accepted != relay_seen.0 || refused != relay_seen.1 {
             if accepted > relay_seen.0 || refused > relay_seen.1 {
                 println!(
                     "relay          accepted {accepted} refused {refused} (pool holds {})",
-                    pool.len()
+                    sh.pool.len()
                 );
             }
             relay_seen = (accepted, refused);
         }
 
-        // Blocks that arrived *from peers* have to be persisted too. Saving
-        // only on the mining path meant a node that synchronised 500 blocks
-        // wrote none of them: a restart replayed genesis and threw the whole
-        // sync away. `save_chain` is O(n) per call (§13.10 item 4), so this is
-        // deliberately once per batch that changed the chain, not once per
-        // event.
-        if chain.height() != before {
-            store.save_chain(&chain).ok();
-            store.write_meta(&chain).ok();
+        // Blocks from peers are persisted per batch, not per event.
+        if sh.chain.height() != before {
+            store.save_chain(&sh.chain).ok();
+            store.write_meta(&sh.chain).ok();
         }
-        // Binding finality can advance without a height change (a certificate
-        // over a height the chain already holds), so it persists on its own
-        // condition. Silent on failure like the writes above: this is a
-        // durability optimization — consensus state lives in memory — and a
-        // lost write means a restart re-derives less finality, never more.
-        store.persist_finality(&chain).ok();
+        // Binding finality can advance without a height change.
+        store.persist_finality(&sh.chain).ok();
+
+        // Monitors read this through the API; a plain counter, never a
+        // consensus input.
+        peers.store(node.peer_count(), Ordering::Relaxed);
+        drop(guard);
+
+        // Announce API-accepted transactions to peers. The pool already
+        // holds them, so GETDATA is answerable.
+        if !relay_now.is_empty() {
+            for txid in &relay_now {
+                relay.mark_known(*txid);
+            }
+            node.broadcast_tx(&relay_now, None);
+        }
 
         if interval_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));

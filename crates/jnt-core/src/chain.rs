@@ -1013,14 +1013,33 @@ impl Chain {
         miner_address: crate::hash::Address,
         now_ms: u64,
     ) -> Result<Block> {
+        self.mine_from_pool_with_l2(pool, miner_address, now_ms, Vec::new())
+    }
+
+    /// [`mine_from_pool`] that also carries queued L2 transactions in the
+    /// block's trailer (Decision 6, SPEC.md §19.1).
+    ///
+    /// This is the node's L2 ingress: an L2 transaction accepted over the API
+    /// waits in a queue until a block carries it, because L2 state is derived
+    /// from canonical blocks alone — there is no path that applies an L2
+    /// transaction *outside* a block, and inventing one would fork this node's
+    /// view from every peer's replay. Selection, submission and eviction are
+    /// exactly `mine_from_pool`'s; the only difference is the trailer.
+    pub fn mine_from_pool_with_l2(
+        &mut self,
+        pool: &mut Mempool,
+        miner_address: crate::hash::Address,
+        now_ms: u64,
+        l2_txs: Vec<crate::l2::L2Transaction>,
+    ) -> Result<Block> {
         let cursor = self.height();
         let body = pool.select_for_block(self.params.gas_cap, self.params.max_block_bytes);
         // Pool mining is L1-only: the mempool holds L1 transactions. L2
-        // transactions are carried by `mine_block_with_l2`.
+        // transactions arrive through the caller's queue.
         let block = self.build_block(
             miner_address,
             body,
-            Vec::new(),
+            l2_txs,
             now_ms,
             None,
             DEFAULT_MAX_ATTEMPTS,

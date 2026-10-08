@@ -155,6 +155,13 @@ impl Mempool {
         self.max_bytes
     }
 
+    /// Iterate the pool in txid order — the same order on any two nodes
+    /// holding the same set (a `BTreeMap`, never hashed iteration). The
+    /// service API reads the pool through this.
+    pub fn entries(&self) -> impl Iterator<Item = (&Hash, &MempoolEntry)> {
+        self.entries.iter()
+    }
+
     pub fn contains(&self, txid: &Hash) -> bool {
         self.entries.contains_key(txid)
     }

@@ -42,6 +42,7 @@ pub mod puzzle;
 pub mod receipt;
 pub mod reputation;
 pub mod ser;
+pub mod service;
 pub mod sig;
 pub mod slash;
 pub mod supply;
