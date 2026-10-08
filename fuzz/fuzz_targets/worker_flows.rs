@@ -109,10 +109,10 @@ struct EmbeddedView {
 }
 
 impl jnt_worker::L2NodeView for EmbeddedView {
-    fn l2_state(&self) -> jnt_l2::L2State {
-        self.state.clone()
+    fn l2_state(&self) -> jnt_worker::WorkerResult<jnt_l2::L2State> {
+        Ok(self.state.clone())
     }
-    fn chain_height(&self) -> u64 {
-        self.height
+    fn chain_height(&self) -> jnt_worker::WorkerResult<u64> {
+        Ok(self.height)
     }
 }
