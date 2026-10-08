@@ -588,11 +588,22 @@ impl Authorization {
 /// This is the offline path: the holder of the signed authorization presents
 /// `sigs`/`keys` and any third party verifies without the network, without the
 /// policy, and without any private key.
+///
+/// **The keys must be the owner's.** `keys.address()` is checked against
+/// `auth.owner` before the signature is looked at, so a third party cannot
+/// mint its own "authorization", sign it with its own key and hand over its
+/// own public keys as evidence — the signature would verify while proving
+/// nothing about the owner's grant. Without this binding, offline
+/// verification was only as trustworthy as the caller's key hygiene; with it,
+/// the object authenticates itself.
 pub fn verify_authorization(
     sigs: &crate::sig::Bundle,
     keys: &crate::sig::Bundle,
     auth: &Authorization,
 ) -> Result<(), crate::error::Error> {
+    if keys.address()? != auth.owner {
+        return Err(crate::error::Error::WrongAddress);
+    }
     let msg = auth.signing_hash();
     crate::sig::verify_bundle(sigs, keys, &msg)
 }

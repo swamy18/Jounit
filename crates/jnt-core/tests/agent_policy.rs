@@ -13,7 +13,7 @@ use jnt_core::agent::{
     POLICY_VERSION,
 };
 use jnt_core::hash::Address;
-use jnt_core::sig::Bundle;
+use jnt_core::l2::Auth;
 use jnt_core::wallet::Wallet;
 
 const NET: &str = "jounit/testnet";
@@ -375,7 +375,13 @@ fn encoding_rejects_oversized_lists_and_unknown_versions() {
 
 #[test]
 fn authorization_is_offline_verifiable_and_tamper_evident() {
-    let p = machine_policy();
+    // The owner's wallet *is* the policy's owner: verification binds the
+    // presented keys to `auth.owner`, so the grant authenticates itself.
+    let wallet = Wallet::new_random("agent-owner");
+    let owner = wallet.address().expect("wallet address");
+    let mut p = machine_policy();
+    p.owner = owner;
+    p.agent_id = derive_agent_id(NET, p.role, &owner);
     let mut book = PolicyBook::default();
     let auth = book
         .authorize(&p, NET, &ask(&p, [1u8; 20], 250, 6, 1))
@@ -383,11 +389,11 @@ fn authorization_is_offline_verifiable_and_tamper_evident() {
 
     // The owner signs the authorization's signing hash; a third party verifies
     // it with public key material only — no policy, no network, no secret.
-    let wallet = Wallet::new_random("agent-owner");
+    // Hybrid bundles, because `Wallet::address()` is the hybrid address and
+    // verification now binds the presented keys to `auth.owner`.
     let digest = auth.signing_hash();
-    let sig = wallet.sign_digest(&digest).expect("signing must succeed");
-    let sigs = Bundle::single(1, sig.to_vec());
-    let keys = Bundle::single(1, wallet.pubkey().unwrap().to_vec());
+    let sigs = Auth::sigs_for(&wallet, &digest).expect("signing must succeed");
+    let keys = Auth::keys_for(&wallet).expect("key bundle");
 
     verify_authorization(&sigs, &keys, &auth).expect("a valid authorization must verify");
 
@@ -399,9 +405,10 @@ fn authorization_is_offline_verifiable_and_tamper_evident() {
         "a mutated authorization verified"
     );
 
-    // A different key must not verify the original.
+    // A different key must not verify the original: its address is not the
+    // owner's, so it is refused before the signature is even considered.
     let other = Wallet::new_random("attacker");
-    let other_keys = Bundle::single(1, other.pubkey().unwrap().to_vec());
+    let other_keys = Auth::keys_for(&other).expect("key bundle");
     assert!(verify_authorization(&sigs, &other_keys, &auth).is_err());
 
     // And the receipt round-trips through its canonical encoding.
@@ -411,6 +418,35 @@ fn authorization_is_offline_verifiable_and_tamper_evident() {
         ..auth.clone()
     };
     assert_eq!(decoded.signing_hash(), auth.signing_hash());
+}
+
+#[test]
+fn an_authorization_signed_by_any_key_but_the_owner_is_refused() {
+    // Regression (sprint 2 audit): `verify_authorization` used to verify
+    // whatever keys the *caller* supplied, so an attacker could mint a
+    // mutated authorization, sign it with their own key and present their own
+    // public keys as evidence. The signature verified while proving nothing
+    // about the owner's grant. The keys are now bound to `auth.owner`.
+    let owner_wallet = Wallet::new_random("owner");
+    let owner = owner_wallet.address().expect("wallet address");
+    let mut p = machine_policy();
+    p.owner = owner;
+    p.agent_id = derive_agent_id(NET, p.role, &owner);
+    let mut book = PolicyBook::default();
+    let auth = book
+        .authorize(&p, NET, &ask(&p, [1u8; 20], 250, 6, 1))
+        .unwrap();
+
+    let attacker = Wallet::new_random("attacker");
+    let digest = auth.signing_hash();
+    // The attacker signs the *owner's* authorization hash with their own key
+    // and presents their own (valid, hybrid) public keys as evidence.
+    let sigs = Auth::sigs_for(&attacker, &digest).expect("signing must succeed");
+    let keys = Auth::keys_for(&attacker).expect("key bundle");
+    assert!(
+        verify_authorization(&sigs, &keys, &auth).is_err(),
+        "an authorization signed by a non-owner key verified"
+    );
 }
 
 #[test]
