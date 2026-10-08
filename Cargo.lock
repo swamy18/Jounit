@@ -450,6 +450,7 @@ dependencies = [
  "jnt-l2",
  "jnt-net",
  "jnt-store",
+ "jnt-worker",
  "rand",
  "serde",
  "serde_json",
