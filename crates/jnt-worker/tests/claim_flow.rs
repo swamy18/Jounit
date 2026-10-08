@@ -186,7 +186,7 @@ fn claim_then_submit_then_auto_settle_then_vwc_then_earnings() {
     assert_eq!(cert.worker, worker_addr);
     assert_eq!(cert.payment_sat, ESCROW); // implicit settle: no fee
 
-    let e = w.earnings();
+    let e = w.earnings().unwrap();
     assert_eq!(e.settled_sat, ESCROW + 100_000); // no fee on implicit settle; deposit returned
     assert_eq!(
         e.available_sat,
@@ -222,7 +222,7 @@ fn explicit_settle_credits_exactly_escrow_minus_fee() {
 
     let cert = w.certificate(&id).unwrap().unwrap();
     assert_eq!(cert.payment_sat, ESCROW - 20_000);
-    let e = w.earnings();
+    let e = w.earnings().unwrap();
     // settled includes the returned deposit (worker_paid + deposit_returned).
     assert_eq!(e.settled_sat, ESCROW - 20_000 + 100_000);
     assert_eq!(
@@ -367,7 +367,7 @@ fn expired_task_after_claim_reports_expired_and_burned_deposit() {
 
     let w = client_for(&core, 2);
     assert_eq!(w.reconcile_claim(&id).unwrap(), ClaimedState::Expired);
-    let e = w.earnings();
+    let e = w.earnings().unwrap();
     assert_eq!(e.lost_sat, 100_000, "the deposit burned in full");
     assert_eq!(w.certificate(&id).unwrap(), None, "expiry never certifies");
 }

@@ -35,6 +35,7 @@ use jnt_core::l2::{
     ClaimTaskPayload, DisputePayload, L2Payload, L2Transaction, PostTaskPayload, SettlePayload,
     SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
 };
+use jnt_core::ser::{Reader, Writer};
 use jnt_core::slash::SlashVault;
 
 use crate::error::{L2Error, L2Result};
@@ -755,5 +756,266 @@ impl L2State {
     /// buckets; they must never change the sum.
     pub fn check_conservation(&self) -> bool {
         self.conservation_total() == self.funded_total
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire encoding (SPEC.md §19.6): the state a node serves a remote observer
+// ---------------------------------------------------------------------------
+
+/// The only state-transport version this build writes *and* reads. A blob
+/// carrying another version is refused, never guessed at.
+pub const L2_STATE_WIRE_VERSION: u8 = 1;
+
+/// Smallest possible encoded account entry: `20` address + `8` balance.
+const WIRE_ACCOUNT_MIN: usize = 28;
+/// Smallest possible encoded applied-id entry.
+const WIRE_HASH_MIN: usize = 32;
+/// Smallest possible encoded deposit identity: `32` txid + `4` output index.
+const WIRE_DEPOSIT_MIN: usize = 36;
+/// Smallest possible encoded length-prefixed entry.
+const WIRE_PREFIX_MIN: usize = 4;
+
+fn codec_err(what: &'static str) -> L2Error {
+    L2Error::Codec(jnt_core::Error::Malformed(what))
+}
+
+/// Counted section bound: a declared count can never exceed the bytes that
+/// remain divided by the smallest entry it can encode, so a four-byte lie
+/// cannot drive an allocation.
+fn bounded_count(
+    r: &Reader<'_>,
+    declared: u64,
+    min_entry: usize,
+    what: &'static str,
+) -> L2Result<usize> {
+    let n = declared as usize;
+    if declared > u64::try_from(usize::MAX).unwrap_or(u64::MAX) || n > r.remaining() / min_entry {
+        return Err(codec_err(what));
+    }
+    Ok(n)
+}
+
+impl L2State {
+    /// Canonical wire encoding of the whole state.
+    ///
+    /// Deterministic: every map is written in sorted key order, so two nodes
+    /// holding equal states produce byte-identical blobs and a client can hash
+    /// one for comparison. Nothing here is signed — a state is derived data,
+    /// and the node's canonical blocks are what give it authority; this is only
+    /// a transport (SPEC.md §19.6).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(
+            128 + self.accounts.len() * WIRE_ACCOUNT_MIN + self.tasks.len() * 256,
+        );
+        w.u8(L2_STATE_WIRE_VERSION)
+            .u64le(self.config.dispute_window)
+            .u64le(self.config.vesting_period)
+            .u64le(self.config.whistleblower_bounty_percent)
+            .u8(u8::from(self.genesis_applied))
+            .u64le(self.funded_total)
+            .u64le(self.deposited_total)
+            .u64le(self.burned)
+            .u64le(self.pscb);
+
+        let mut accounts: Vec<(&Address, &u64)> = self.accounts.iter().collect();
+        accounts.sort_by_key(|(a, _)| **a);
+        w.u64le(accounts.len() as u64);
+        for (a, bal) in accounts {
+            w.fixed(a).u64le(*bal);
+        }
+
+        let mut tasks: Vec<(&Hash, &TaskContract)> = self.tasks.iter().collect();
+        tasks.sort_by_key(|(id, _)| **id);
+        w.u64le(tasks.len() as u64);
+        for (id, contract) in tasks {
+            let bytes = contract.encode();
+            w.fixed(id).u32le(bytes.len() as u32).raw(&bytes);
+        }
+
+        let mut applied: Vec<&Hash> = self.applied.iter().collect();
+        applied.sort();
+        w.u64le(applied.len() as u64);
+        for id in applied {
+            w.fixed(id);
+        }
+
+        let mut deposits: Vec<&(Hash, u32)> = self.deposits.iter().collect();
+        deposits.sort_by_key(|d| d.0);
+        w.u64le(deposits.len() as u64);
+        for d in deposits {
+            w.fixed(&d.0).u32le(d.1);
+        }
+
+        let mut vwcs: Vec<(&Hash, &VerifiedWorkCertificate)> = self.vwcs.iter().collect();
+        vwcs.sort_by_key(|(id, _)| **id);
+        w.u64le(vwcs.len() as u64);
+        for (task_id, cert) in vwcs {
+            let bytes = cert.encode();
+            w.fixed(task_id).u32le(bytes.len() as u32).raw(&bytes);
+        }
+
+        w.raw(&self.slash_vault.encode());
+        w.into_vec()
+    }
+
+    /// Decode [`L2State::encode`]: bounded, self-validating, fail-closed.
+    ///
+    /// A refusal yields no state at all — never a partially populated one. On
+    /// top of the structural checks (version, counts, duplicate keys, unknown
+    /// tags, trailing bytes) this runs the protocol's own invariant
+    /// ([`L2State::check_conservation`]), so a blob whose counters do not add
+    /// up is rejected here rather than handed to a worker that would act on it.
+    pub fn decode(bytes: &[u8]) -> L2Result<Self> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| codec_err("state version"))?;
+        if version != L2_STATE_WIRE_VERSION {
+            return Err(L2Error::Codec(jnt_core::Error::Malformed(match version {
+                v if v > L2_STATE_WIRE_VERSION => "state version ahead of this build",
+                _ => "state version not supported",
+            })));
+        }
+        let config = L2Config {
+            dispute_window: r.u64le().map_err(|_| codec_err("dispute window"))?,
+            vesting_period: r.u64le().map_err(|_| codec_err("vesting period"))?,
+            whistleblower_bounty_percent: r.u64le().map_err(|_| codec_err("bounty percent"))?,
+        };
+        let genesis_applied = match r.u8().map_err(|_| codec_err("genesis flag"))? {
+            0 => false,
+            1 => true,
+            _ => return Err(codec_err("genesis flag out of range")),
+        };
+        let funded_total = r.u64le().map_err(|_| codec_err("funded total"))?;
+        let deposited_total = r.u64le().map_err(|_| codec_err("deposited total"))?;
+        let burned = r.u64le().map_err(|_| codec_err("burned"))?;
+        let pscb = r.u64le().map_err(|_| codec_err("pscb"))?;
+
+        let declared_accounts = r.u64le().map_err(|_| codec_err("account count"))?;
+        let n_accounts = bounded_count(
+            &r,
+            declared_accounts,
+            WIRE_ACCOUNT_MIN,
+            "account count exceeds buffer",
+        )?;
+        let mut accounts = HashMap::with_capacity(n_accounts);
+        for _ in 0..n_accounts {
+            let a: Address = r.fixed().map_err(|_| codec_err("account address"))?;
+            let bal = r.u64le().map_err(|_| codec_err("account balance"))?;
+            if accounts.insert(a, bal).is_some() {
+                return Err(codec_err("duplicate account in state"));
+            }
+        }
+
+        let declared_tasks = r.u64le().map_err(|_| codec_err("task count"))?;
+        let n_tasks = bounded_count(
+            &r,
+            declared_tasks,
+            WIRE_PREFIX_MIN,
+            "task count exceeds buffer",
+        )?;
+        let mut tasks = HashMap::with_capacity(n_tasks);
+        for _ in 0..n_tasks {
+            let id: Hash = r.fixed().map_err(|_| codec_err("task id"))?;
+            let len = r.u32le().map_err(|_| codec_err("task length"))? as usize;
+            if len > r.remaining() {
+                return Err(codec_err("task length exceeds buffer"));
+            }
+            let raw = r.fixed_slice(len).map_err(|_| codec_err("task bytes"))?;
+            let contract = {
+                let mut sub = Reader::new(raw);
+                let c = TaskContract::decode(&mut sub)?;
+                sub.expect_end()
+                    .map_err(|_| codec_err("task has trailing bytes"))?;
+                c
+            };
+            if contract.task_id != id {
+                return Err(codec_err("task id disagrees with its contract"));
+            }
+            if tasks.insert(id, contract).is_some() {
+                return Err(codec_err("duplicate task in state"));
+            }
+        }
+
+        let declared_applied = r.u64le().map_err(|_| codec_err("applied count"))?;
+        let n_applied = bounded_count(
+            &r,
+            declared_applied,
+            WIRE_HASH_MIN,
+            "applied count exceeds buffer",
+        )?;
+        let mut applied = HashSet::with_capacity(n_applied);
+        for _ in 0..n_applied {
+            let id: Hash = r.fixed().map_err(|_| codec_err("applied id"))?;
+            if !applied.insert(id) {
+                return Err(codec_err("duplicate applied id"));
+            }
+        }
+
+        let declared_deposits = r.u64le().map_err(|_| codec_err("deposit count"))?;
+        let n_deposits = bounded_count(
+            &r,
+            declared_deposits,
+            WIRE_DEPOSIT_MIN,
+            "deposit count exceeds buffer",
+        )?;
+        let mut deposits = HashSet::with_capacity(n_deposits);
+        for _ in 0..n_deposits {
+            let txid: Hash = r.fixed().map_err(|_| codec_err("deposit txid"))?;
+            let idx = r.u32le().map_err(|_| codec_err("deposit index"))?;
+            if !deposits.insert((txid, idx)) {
+                return Err(codec_err("duplicate deposit identity"));
+            }
+        }
+
+        let declared_vwcs = r.u64le().map_err(|_| codec_err("certificate count"))?;
+        let n_vwcs = bounded_count(
+            &r,
+            declared_vwcs,
+            WIRE_PREFIX_MIN,
+            "certificate count exceeds buffer",
+        )?;
+        let mut vwcs = HashMap::with_capacity(n_vwcs);
+        for _ in 0..n_vwcs {
+            let task_id: Hash = r.fixed().map_err(|_| codec_err("certificate task id"))?;
+            let len = r.u32le().map_err(|_| codec_err("certificate length"))? as usize;
+            if len > r.remaining() {
+                return Err(codec_err("certificate length exceeds buffer"));
+            }
+            let raw = r
+                .fixed_slice(len)
+                .map_err(|_| codec_err("certificate bytes"))?;
+            let cert = VerifiedWorkCertificate::decode(raw)?;
+            if cert.task_id != task_id {
+                return Err(codec_err("certificate names another task"));
+            }
+            if vwcs.insert(task_id, cert).is_some() {
+                return Err(codec_err("duplicate certificate in state"));
+            }
+        }
+
+        let slash_vault = SlashVault::decode(&mut r)?;
+        r.expect_end()
+            .map_err(|_| codec_err("state has trailing bytes"))?;
+
+        let state = L2State {
+            config,
+            accounts,
+            tasks,
+            applied,
+            funded_total,
+            genesis_applied,
+            deposits,
+            deposited_total,
+            burned,
+            pscb,
+            slash_vault,
+            vwcs,
+        };
+        // The protocol's own invariant. A state that does not conserve is not
+        // a valid observation of the chain, whatever its structure said.
+        if !state.check_conservation() {
+            return Err(codec_err("decoded state fails the conservation invariant"));
+        }
+        Ok(state)
     }
 }

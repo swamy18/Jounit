@@ -95,8 +95,8 @@ pub fn claim_task<V: L2NodeView, B: L2Broadcaster>(
         wallet,
         config,
         task_id,
-        &host.l2_state(),
-        host.chain_height(),
+        &host.l2_state()?,
+        host.chain_height()?,
     )?;
     host.broadcast(&plan.tx).map_err(WorkerError::from)?;
     Ok(plan)

@@ -29,6 +29,8 @@ use jnt_core::l2::{
 };
 use jnt_core::slash::VESTING_BLOCKS_MAINNET;
 
+use jnt_core::ser::{Reader, Writer};
+
 use crate::error::{L2Error, L2Result};
 
 /// Protocol parameters for the L2 task layer.
@@ -577,6 +579,278 @@ impl TaskContract {
             state: self.state.name(),
             action,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire encoding (SPEC.md §19.6): what a node hands a remote observer
+// ---------------------------------------------------------------------------
+
+/// `ContractState` tags on the wire. Total: a byte outside this range is
+/// refused rather than coerced into some other state.
+const WIRE_OPEN: u8 = 0;
+const WIRE_IN_PROGRESS: u8 = 1;
+const WIRE_RESULT_SUBMITTED: u8 = 2;
+const WIRE_DISPUTED: u8 = 3;
+const WIRE_SETTLED: u8 = 4;
+const WIRE_EXPIRED: u8 = 5;
+
+impl DisputeChallenge {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        w.fixed(&self.challenger)
+            .fixed(&self.against_result)
+            .raw(&self.against_attestation.serialize())
+            .fixed(&self.counter_result)
+            .raw(&self.counter_attestation.serialize())
+            .u64le(self.deposit_sat)
+            .u64le(self.filed_at);
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>, task_id: &Hash) -> L2Result<Self> {
+        let challenger = r.fixed().map_err(L2Error::Codec)?;
+        let against_result: Hash = r.fixed().map_err(L2Error::Codec)?;
+        let against_attestation = ComputeAttestation::from_reader(r).map_err(L2Error::Codec)?;
+        let counter_result: Hash = r.fixed().map_err(L2Error::Codec)?;
+        let counter_attestation = ComputeAttestation::from_reader(r).map_err(L2Error::Codec)?;
+        let deposit_sat = r.u64le().map_err(L2Error::Codec)?;
+        let filed_at = r.u64le().map_err(L2Error::Codec)?;
+        // The protocol only ever writes a challenge whose evidence names this
+        // task (both attestations are checked at filing), so a blob that
+        // disagrees was not produced by a node.
+        if against_attestation.task_id != *task_id {
+            return Err(L2Error::BadAttestation(
+                "wire: challenged attestation names another task",
+            ));
+        }
+        if counter_attestation.task_id != *task_id {
+            return Err(L2Error::BadAttestation(
+                "wire: counter attestation names another task",
+            ));
+        }
+        Ok(DisputeChallenge {
+            challenger,
+            against_result,
+            against_attestation,
+            counter_result,
+            counter_attestation,
+            deposit_sat,
+            filed_at,
+        })
+    }
+}
+
+impl SettlementOutcome {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        w.u8(self.verdict.to_wire())
+            .u64le(self.worker_paid)
+            .u64le(self.worker_deposit_returned)
+            .u64le(self.worker_deposit_slashed)
+            .u64le(self.submitter_refunded)
+            .u64le(self.challenger_refunded)
+            .u64le(self.challenger_deposit_burned)
+            .u64le(self.worker_deposit_burned)
+            .u64le(self.fee_burned)
+            .u64le(self.fee_pscb)
+            .u64le(self.at_height);
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> L2Result<Self> {
+        let verdict =
+            Verdict::from_wire(r.u8().map_err(L2Error::Codec)?).map_err(L2Error::Codec)?;
+        Ok(SettlementOutcome {
+            verdict,
+            worker_paid: r.u64le().map_err(L2Error::Codec)?,
+            worker_deposit_returned: r.u64le().map_err(L2Error::Codec)?,
+            worker_deposit_slashed: r.u64le().map_err(L2Error::Codec)?,
+            submitter_refunded: r.u64le().map_err(L2Error::Codec)?,
+            challenger_refunded: r.u64le().map_err(L2Error::Codec)?,
+            challenger_deposit_burned: r.u64le().map_err(L2Error::Codec)?,
+            worker_deposit_burned: r.u64le().map_err(L2Error::Codec)?,
+            fee_burned: r.u64le().map_err(L2Error::Codec)?,
+            fee_pscb: r.u64le().map_err(L2Error::Codec)?,
+            at_height: r.u64le().map_err(L2Error::Codec)?,
+        })
+    }
+}
+
+impl ExpiryOutcome {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        w.u64le(self.submitter_refunded)
+            .u64le(self.worker_deposit_burned)
+            .u64le(self.at_height);
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> L2Result<Self> {
+        Ok(ExpiryOutcome {
+            submitter_refunded: r.u64le().map_err(L2Error::Codec)?,
+            worker_deposit_burned: r.u64le().map_err(L2Error::Codec)?,
+            at_height: r.u64le().map_err(L2Error::Codec)?,
+        })
+    }
+}
+
+impl TaskContract {
+    /// Canonical wire encoding of a whole contract.
+    ///
+    /// Self-delimiting: every nested piece is either fixed-size or written by
+    /// its own decoder (`ComputeAttestation`), so `decode` never has to guess
+    /// where a field ends. This is the transport a node serves a remote worker
+    /// (SPEC.md §19.6); it carries no signature material of its own — a
+    /// contract is state, not an actor's claim, so nothing here is signed.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(256);
+        w.fixed(&self.task_id).fixed(&self.submitter);
+        match self.worker {
+            Some(a) => {
+                w.u8(1).fixed(&a);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
+        w.raw(&self.compute_task.serialize())
+            .u64le(self.payment_sat)
+            .u64le(self.worker_deposit_sat)
+            .u64le(self.deadline_height)
+            .u64le(self.dispute_window)
+            .u64le(self.nonce);
+        match &self.state {
+            ContractState::Open => {
+                w.u8(WIRE_OPEN);
+            }
+            ContractState::InProgress { claimed_at } => {
+                w.u8(WIRE_IN_PROGRESS).u64le(*claimed_at);
+            }
+            ContractState::ResultSubmitted {
+                result_hash,
+                submitted_at,
+                attestation,
+            } => {
+                w.u8(WIRE_RESULT_SUBMITTED)
+                    .fixed(result_hash)
+                    .u64le(*submitted_at)
+                    .raw(&attestation.serialize());
+            }
+            ContractState::Disputed(c) => {
+                w.u8(WIRE_DISPUTED);
+                c.encode(&mut w);
+            }
+            ContractState::Settled(o) => {
+                w.u8(WIRE_SETTLED);
+                o.encode(&mut w);
+            }
+            ContractState::Expired(o) => {
+                w.u8(WIRE_EXPIRED);
+                o.encode(&mut w);
+            }
+        }
+        w.into_vec()
+    }
+
+    /// Decode [`TaskContract::encode`]. Bounded and fail-closed: an unknown
+    /// state tag, a truncated field, trailing bytes, or an invariant the
+    /// protocol itself enforces on every path that *writes* a contract (the
+    /// attestation must name this task and this worker) is refused by name.
+    /// A refusal produces no contract at all.
+    pub fn decode(r: &mut Reader<'_>) -> L2Result<Self> {
+        let task_id: Hash = r.fixed().map_err(L2Error::Codec)?;
+        let submitter: Address = r.fixed().map_err(L2Error::Codec)?;
+        let worker = match r.u8().map_err(L2Error::Codec)? {
+            0 => None,
+            1 => Some(r.fixed().map_err(L2Error::Codec)?),
+            _ => return Err(L2Error::Codec(jnt_core::Error::Malformed("worker flag"))),
+        };
+        let compute_task = ComputeTask::from_reader(r)?;
+        let payment_sat = r.u64le().map_err(L2Error::Codec)?;
+        let worker_deposit_sat = r.u64le().map_err(L2Error::Codec)?;
+        let deadline_height = r.u64le().map_err(L2Error::Codec)?;
+        let dispute_window = r.u64le().map_err(L2Error::Codec)?;
+        let nonce = r.u64le().map_err(L2Error::Codec)?;
+
+        let tag = r.u8().map_err(L2Error::Codec)?;
+        let state = match tag {
+            WIRE_OPEN => ContractState::Open,
+            WIRE_IN_PROGRESS => ContractState::InProgress {
+                claimed_at: r.u64le().map_err(L2Error::Codec)?,
+            },
+            WIRE_RESULT_SUBMITTED => {
+                let result_hash: Hash = r.fixed().map_err(L2Error::Codec)?;
+                let submitted_at = r.u64le().map_err(L2Error::Codec)?;
+                let attestation = ComputeAttestation::from_reader(r).map_err(L2Error::Codec)?;
+                if attestation.task_id != task_id {
+                    return Err(L2Error::BadAttestation(
+                        "wire: submitted attestation names another task",
+                    ));
+                }
+                ContractState::ResultSubmitted {
+                    result_hash,
+                    submitted_at,
+                    attestation,
+                }
+            }
+            WIRE_DISPUTED => ContractState::Disputed(DisputeChallenge::decode(r, &task_id)?),
+            WIRE_SETTLED => ContractState::Settled(SettlementOutcome::decode(r)?),
+            WIRE_EXPIRED => ContractState::Expired(ExpiryOutcome::decode(r)?),
+            other => {
+                return Err(L2Error::Codec(jnt_core::Error::Malformed(
+                    if other <= WIRE_EXPIRED {
+                        "unknown contract state tag"
+                    } else {
+                        "contract state tag out of range"
+                    },
+                )))
+            }
+        };
+
+        // The invariant every write path holds: only `Open` has no worker, and
+        // a submitted result is always attested by the contract's own worker.
+        if matches!(state, ContractState::Open) && worker.is_some() {
+            return Err(L2Error::Codec(jnt_core::Error::Malformed(
+                "wire: an open contract names a worker",
+            )));
+        }
+        if matches!(
+            state,
+            ContractState::InProgress { .. } | ContractState::ResultSubmitted { .. }
+        ) && worker.is_none()
+        {
+            return Err(L2Error::Codec(jnt_core::Error::Malformed(
+                "wire: a claimed contract names no worker",
+            )));
+        }
+        if let ContractState::ResultSubmitted {
+            result_hash,
+            attestation,
+            ..
+        } = &state
+        {
+            let expected = worker.ok_or(L2Error::Codec(jnt_core::Error::Malformed(
+                "wire: unattested submission",
+            )))?;
+            if attestation.worker_address != expected {
+                return Err(L2Error::BadAttestation(
+                    "wire: attestation is by someone other than the worker",
+                ));
+            }
+            if attestation.result_hash != *result_hash {
+                return Err(L2Error::BadAttestation(
+                    "wire: attestation disagrees with the submitted result",
+                ));
+            }
+        }
+
+        Ok(TaskContract {
+            task_id,
+            submitter,
+            worker,
+            compute_task,
+            payment_sat,
+            worker_deposit_sat,
+            deadline_height,
+            dispute_window,
+            nonce,
+            state,
+        })
     }
 }
 

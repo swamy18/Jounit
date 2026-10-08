@@ -10,6 +10,7 @@
 //!
 //! Module map:
 //! - [`node`] — the `L2NodeView`/`L2Broadcaster` seams (§18.3)
+//! - [`http`] — the node transport over the §19.2 REST API (§18.3)
 //! - [`discovery`] — task discovery and filtering over authoritative state (§18.4)
 //! - [`claim`] / [`submit`] — the two worker-side transaction flows (§18.5, §18.7)
 //! - [`executor`] — the execution seam the operator plugs its engine into (§18.6)
@@ -26,6 +27,7 @@ pub mod discovery;
 pub mod dispute;
 pub mod error;
 pub mod executor;
+pub mod http;
 pub mod node;
 pub mod submit;
 pub mod vwc;
@@ -43,6 +45,7 @@ pub use executor::{
     execute_task, result_hash_of, CpuExecutor, ExecError, ExecutionOutput, ExecutionWork, Executor,
     ExecutorCapabilities,
 };
+pub use http::HttpNode;
 pub use node::{BroadcastError, L2Broadcaster, L2NodeView};
 pub use submit::{reconcile_submitted, submit_plan, submit_result, SubmitPlan, SubmittedState};
 pub use vwc::{certificates_for_worker, is_offline_verifiable, observe_certificate};

@@ -36,6 +36,13 @@ pub enum WorkerError {
     },
     /// A transport/broadcast failure: retryable, timeout-safe per §18.9.
     BroadcastUnavailable(&'static str),
+    /// The node could not be reached, or answered with a status that carries
+    /// no observation (5xx, timeout, refused connect). The *reading* seam's
+    /// counterpart to `BroadcastUnavailable`: nothing was observed, so the
+    /// caller must not act — and this is a different fact from "the
+    /// observation arrived and cannot be trusted", which is
+    /// `ObservationMalformed`. Both are retryable (§18.10).
+    ObservationUnavailable(&'static str),
     /// The observation seam returned malformed or missing data.
     ObservationMalformed(&'static str),
     /// A result claimed by the caller carries no bytes.
@@ -59,6 +66,7 @@ impl fmt::Display for WorkerError {
                 write!(f, "execution failed on {backend}: {reason}")
             }
             WorkerError::BroadcastUnavailable(why) => write!(f, "broadcast unavailable: {why}"),
+            WorkerError::ObservationUnavailable(why) => write!(f, "observation unavailable: {why}"),
             WorkerError::ObservationMalformed(why) => write!(f, "malformed observation: {why}"),
             WorkerError::EmptyResult => write!(f, "executor produced no result bytes"),
         }
@@ -97,6 +105,7 @@ impl From<jnt_core::Error> for WorkerError {
 pub fn is_retryable(err: &WorkerError) -> bool {
     match err {
         WorkerError::BroadcastUnavailable(_) | WorkerError::ObservationMalformed(_) => true,
+        WorkerError::ObservationUnavailable(_) => true,
         // A timeout can leave a protocol error *behind* a broadcast that landed;
         // §18.9 reconciliation (same txid) is how a caller finds out.
         WorkerError::Protocol(_) | WorkerError::UnknownTask | WorkerError::TaskExpired => false,
@@ -118,6 +127,9 @@ mod tests {
             "socket closed"
         )));
         assert!(is_retryable(&WorkerError::ObservationMalformed("bad view")));
+        assert!(is_retryable(&WorkerError::ObservationUnavailable(
+            "connect failed"
+        )));
 
         assert!(!is_retryable(&WorkerError::Protocol(L2Error::Replay)));
         assert!(!is_retryable(&WorkerError::IdentityMismatch));

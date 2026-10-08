@@ -4,9 +4,11 @@
 //! own. Protocol state arrives through [`L2NodeView`]; signed transactions
 //! leave through [`L2Broadcaster`]. That split is deliberate:
 //!
-//! - This build has no L2 wire transport yet (`jnt-net` carries only the §13
-//!   P2P message set; the roadmap §13 REST API is unbuilt). Wire-neutral
-//!   traits are the only shape that is not a guess.
+//! - The seams are wire-neutral: [`crate::HttpNode`] implements both over the
+//!   node's §19.2 REST API (the worker needs no key to read, and broadcasts
+//!   only bytes it already signed), while an embedded `L2State` behind the
+//!   same traits exercises exactly the code a connected node would run. One
+//!   trait, two transports, no protocol rule duplicated in either.
 //! - Every protocol rule stays testable without a socket: an embedded
 //!   `L2State` behind these traits exercises exactly the code a connected
 //!   node would run.
@@ -15,19 +17,28 @@
 //!   SDK produces (§18.11), and observation treats a view it cannot read as
 //!   an error, never as an empty answer.
 //!
+//! The read side is fallible by design (`WorkerResult`), because over a
+//! transport a node can be *unreachable* as well as *wrong*, and the SDK must
+//! refuse to act on a state it did not actually receive. An in-process view
+//! that cannot fail returns `Ok` in the infallible case; a transport that can
+//! fail reports it. Nothing downstream has to change shape to know the
+//! difference: the error propagates the same way a protocol refusal does.
+//!
 //! A combined host (`view + broadcaster` in one object) implements both
 //! traits and is passed to `WorkerClient::new` as its `&mut` pair via
 //! [`Host`], which exists so a single node process can be one argument.
 
 use jnt_l2::L2State;
 
-use crate::error::WorkerError;
+use crate::error::{WorkerError, WorkerResult};
 
 /// Read side: the authoritative, replicated view of L2 protocol state.
 pub trait L2NodeView {
-    fn l2_state(&self) -> L2State;
-    /// The height the state reflects.
-    fn chain_height(&self) -> u64;
+    /// The state as of the node's current tip, or the reason it could not be
+    /// read. Never an empty stand-in for a failed read.
+    fn l2_state(&self) -> WorkerResult<L2State>;
+    /// The height the state reflects, or the reason it could not be read.
+    fn chain_height(&self) -> WorkerResult<u64>;
 }
 
 /// A failure the write side reported. `Retryable` marks transport trouble
@@ -87,10 +98,10 @@ impl<V, B> Host<V, B> {
 }
 
 impl<V: L2NodeView, B: L2Broadcaster> L2NodeView for Host<V, B> {
-    fn l2_state(&self) -> L2State {
+    fn l2_state(&self) -> WorkerResult<L2State> {
         self.view.l2_state()
     }
-    fn chain_height(&self) -> u64 {
+    fn chain_height(&self) -> WorkerResult<u64> {
         self.view.chain_height()
     }
 }

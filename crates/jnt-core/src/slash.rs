@@ -22,7 +22,9 @@
 //!
 //! SPEC.md §M2.
 
+use crate::error::{Error, Result};
 use crate::hash::Hash;
+use crate::ser::{Reader, Writer};
 
 /// Blocks over which slashed stake vests on mainnet (365 days × 144 blocks/day).
 pub const VESTING_BLOCKS_MAINNET: u64 = 365 * 144;
@@ -176,6 +178,97 @@ impl SlashVault {
     /// Iterate over all active records (read-only).
     pub fn records(&self) -> &[SlashRecord] {
         &self.records
+    }
+
+    /// Rebuild a vault from decoded records — the codec entry point used by
+    /// `L2State::decode` (SPEC.md §19.6 state transport).
+    ///
+    /// Structural only: it re-derives no protocol rule. `total_burned` is
+    /// carried as data because it is an accumulator the state owns, not a sum
+    /// this function is entitled to recompute from records (records are pruned
+    /// once exhausted, so the two would disagree).
+    pub fn with_records(records: Vec<SlashRecord>, total_burned: u64) -> Self {
+        SlashVault {
+            records,
+            total_burned,
+        }
+    }
+}
+
+/// Fixed wire size of one [`SlashRecord`]: `32 + 6·8 + 20`.
+const SLASH_RECORD_WIRE_LEN: usize = 32 + 6 * 8 + 20;
+
+impl SlashRecord {
+    /// Canonical wire encoding: every field, no signatures. Fixed size.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(SLASH_RECORD_WIRE_LEN);
+        w.fixed(&self.slash_id)
+            .u64le(self.slash_height)
+            .u64le(self.unlock_height)
+            .u64le(self.vest_total)
+            .u64le(self.remaining_vest)
+            .u64le(self.vest_per_block)
+            .u64le(self.burned)
+            .fixed(&self.validator_address);
+        w.into_vec()
+    }
+
+    /// Decode [`SlashRecord::encode`]: the exact inverse, bounded and
+    /// fail-closed on a truncated or over-long buffer.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        let slash_id = r.fixed::<32>().map_err(|_| Error::Malformed("slash id"))?;
+        let slash_height = r.u64le().map_err(|_| Error::Malformed("slash height"))?;
+        let unlock_height = r.u64le().map_err(|_| Error::Malformed("unlock height"))?;
+        let vest_total = r.u64le().map_err(|_| Error::Malformed("vest total"))?;
+        let remaining_vest = r.u64le().map_err(|_| Error::Malformed("remaining vest"))?;
+        let vest_per_block = r.u64le().map_err(|_| Error::Malformed("vest per block"))?;
+        let burned = r.u64le().map_err(|_| Error::Malformed("burned"))?;
+        let validator_address = r
+            .fixed::<20>()
+            .map_err(|_| Error::Malformed("validator address"))?;
+        Ok(SlashRecord {
+            slash_id,
+            slash_height,
+            unlock_height,
+            vest_total,
+            remaining_vest,
+            vest_per_block,
+            burned,
+            validator_address,
+        })
+    }
+}
+
+impl SlashVault {
+    /// Canonical wire encoding: `total_burned ‖ count ‖ records…`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(16 + self.records.len() * SLASH_RECORD_WIRE_LEN);
+        w.u64le(self.total_burned).u64le(self.records.len() as u64);
+        for r in &self.records {
+            w.raw(&r.encode());
+        }
+        w.into_vec()
+    }
+
+    /// Decode [`SlashVault::encode`]. The declared record count is checked
+    /// against the bytes actually remaining *before* the `Vec` is built, so a
+    /// four-byte lie cannot reserve memory.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        let total_burned = r
+            .u64le()
+            .map_err(|_| Error::Malformed("vault total burned"))?;
+        let count = r.u64le().map_err(|_| Error::Malformed("vault count"))? as usize;
+        if count > r.remaining() / SLASH_RECORD_WIRE_LEN {
+            return Err(Error::Malformed("vault record count exceeds buffer"));
+        }
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            records.push(SlashRecord::decode(r)?);
+        }
+        Ok(SlashVault {
+            records,
+            total_burned,
+        })
     }
 }
 

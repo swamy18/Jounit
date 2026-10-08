@@ -43,6 +43,7 @@
 //! POST /v1/l2/broadcast        signed L2 tx -> dry-run -> include queue
 //! GET  /v1/tasks/open          claimable tasks
 //! GET  /v1/task/{task_id}      task state
+//! GET  /v1/l2/state            canonical L2 state (§19.6 wire encoding)
 //! GET  /v1/vwc/{task_id}       verified work certificate
 //! POST /v1/authorize           policy + payer-signed request -> authorization
 //! POST /v1/payment/submit      verify + record a machine payment
@@ -446,8 +447,40 @@ async fn vwc_by_task(State(state): State<ApiState>, Path(id): Path<String>) -> A
             "result_hash": hash_to_hex(&cert.result_hash),
             "settled_height": cert.settled_height,
             "payment_sat": cert.payment_sat,
+            // The certificate's own canonical encoding, so a relying party can
+            // verify it offline against the validator set instead of trusting
+            // this summary (SPEC.md §17.6).
+            "vwc_hex": hex::encode(cert.encode()),
+            "verification": match &cert.verification {
+                jnt_l2::VwcVerification::Quorum { signer_count, .. } => {
+                    json!({ "kind": "quorum", "signer_count": signer_count })
+                }
+                jnt_l2::VwcVerification::WindowElapsed => json!({ "kind": "window_elapsed" }),
+            },
         })))
     })?
+}
+
+/// The canonical L2 state, in the §19.6 wire encoding.
+///
+/// This is the one endpoint a worker SDK needs that a task-shaped summary
+/// cannot serve: `L2NodeView` hands the SDK an `L2State`, so a remote view has
+/// to carry the whole state or duplicate the protocol's own rules. The bytes
+/// are the node's *derived* state — replaying the canonical blocks produces
+/// exactly this — so the client decodes and then checks the conservation
+/// invariant itself before it believes a single balance. No signature
+/// material is in here: a state is not an actor's claim.
+async fn l2_state(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let l2 = sh.l2.state();
+        Json(json!({
+            "network_id": sh.chain.params().network_id,
+            "height": sh.chain.height(),
+            "tasks": l2.task_count(),
+            "certificates": l2.vwc_count(),
+            "state_hex": hex::encode(l2.encode()),
+        }))
+    })
 }
 
 async fn payment_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
@@ -808,6 +841,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/l2/broadcast", post(l2_broadcast))
         .route("/v1/tasks/open", get(tasks_open))
         .route("/v1/task/{task_id}", get(task_by_id))
+        .route("/v1/l2/state", get(l2_state))
         .route("/v1/vwc/{task_id}", get(vwc_by_task))
         .route("/v1/authorize", post(authorize))
         .route("/v1/payment/submit", post(payment_submit))

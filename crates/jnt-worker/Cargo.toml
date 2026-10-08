@@ -10,6 +10,7 @@ description = "Worker SDK for the Jounit L2 task marketplace (SPEC.md §18)"
 [dependencies]
 jnt-core = { path = "../jnt-core" }
 jnt-l2 = { path = "../jnt-l2" }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

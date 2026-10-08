@@ -85,7 +85,7 @@ use jnt_l2::{ContractState, L2Config, L2State, VwcVerification};
 use jnt_node::l2::NodeL2;
 use jnt_store::BlockStore;
 use jnt_worker::node::{BroadcastError, Host, L2Broadcaster, L2NodeView};
-use jnt_worker::{CpuExecutor, WorkerClient, WorkerConfig};
+use jnt_worker::{CpuExecutor, WorkerClient, WorkerConfig, WorkerResult};
 
 const MAX_ATTEMPTS: u64 = 4_000_000;
 /// What the service charges the agent, in satoshis.
@@ -208,11 +208,11 @@ fn ts(height: u64) -> u64 {
 struct View(Rc<RefCell<Node>>);
 
 impl L2NodeView for View {
-    fn l2_state(&self) -> L2State {
-        self.0.borrow().view.state().clone()
+    fn l2_state(&self) -> WorkerResult<L2State> {
+        Ok(self.0.borrow().view.state().clone())
     }
-    fn chain_height(&self) -> u64 {
-        self.0.borrow().chain.height()
+    fn chain_height(&self) -> WorkerResult<u64> {
+        Ok(self.0.borrow().chain.height())
     }
 }
 
@@ -531,7 +531,7 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
 
     // The worker was right: it is paid, its deposit returns, and the baseless
     // challenge costs the challenger its whole deposit.
-    let e = client.earnings();
+    let e = client.earnings().expect("the node's state is readable");
     assert_eq!(
         e.settled_sat,
         COMPUTE_ESCROW_SAT - 20_000 + WORKER_DEPOSIT_SAT
@@ -758,7 +758,7 @@ fn the_undisputed_path_pays_through_the_windows_own_settlement() {
         submitted_at + L2Config::mini().dispute_window + 1
     );
 
-    let e = client.earnings();
+    let e = client.earnings().expect("the node's state is readable");
     assert_eq!(e.settled_sat, COMPUTE_ESCROW_SAT + WORKER_DEPOSIT_SAT);
     assert_eq!(e.lost_sat, 0);
     assert!(node.borrow().view.state().check_conservation());

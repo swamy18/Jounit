@@ -97,8 +97,8 @@ pub fn submit_result<V: L2NodeView, B: L2Broadcaster, E: Executor>(
     task_id: Hash,
     executor: &E,
 ) -> WorkerResult<SubmitPlan> {
-    let state = host.l2_state();
-    let height = host.chain_height();
+    let state = host.l2_state()?;
+    let height = host.chain_height()?;
     let contract = state.task(&task_id).ok_or(WorkerError::UnknownTask)?;
     let work = crate::executor::ExecutionWork::from_contract(contract, height)?;
     let out = crate::executor::execute_task(executor, &work)?;

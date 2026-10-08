@@ -74,7 +74,7 @@ fn a_zero_balance_stranger_cannot_claim_claim_execute_or_submit_anything() {
 
     // The attacker is a fresh key: no balance, no registration, no history.
     let mut attacker = client_for(&core, 9);
-    assert_eq!(attacker.earnings().available_sat, 0);
+    assert_eq!(attacker.earnings().unwrap().available_sat, 0);
 
     // Claim: refused before broadcast — the financing precondition inside
     // discovery/`available` sees a zero balance and the SDK-level check fires.
@@ -266,11 +266,11 @@ fn earnings_have_no_privilege_gate_to_attack() {
     let core = Rc::new(std::cell::RefCell::new(Core::new(CREDITED)));
     let w = client_for(&core, 2);
     // The client derives earnings from its configured address only.
-    assert_eq!(w.earnings().available_sat, CREDITED);
+    assert_eq!(w.earnings().unwrap().available_sat, CREDITED);
     // The pure function is state-readable (it is an accounting view, not a
     // spend path); no SDK function moves value.
     let stranger = client_for(&core, 9);
-    assert_eq!(stranger.earnings().available_sat, 0);
+    assert_eq!(stranger.earnings().unwrap().available_sat, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -99,11 +99,11 @@ impl TestView {
 }
 
 impl L2NodeView for TestView {
-    fn l2_state(&self) -> L2State {
-        self.0.borrow().state.clone()
+    fn l2_state(&self) -> jnt_worker::WorkerResult<L2State> {
+        Ok(self.0.borrow().state.clone())
     }
-    fn chain_height(&self) -> u64 {
-        self.0.borrow().height
+    fn chain_height(&self) -> jnt_worker::WorkerResult<u64> {
+        Ok(self.0.borrow().height)
     }
 }
 

@@ -207,8 +207,8 @@ pub fn file_dispute<V: L2NodeView, B: L2Broadcaster>(
     task_id: Hash,
     counter_result: Hash,
 ) -> WorkerResult<DisputePlan> {
-    let state = host.l2_state();
-    let height = host.chain_height();
+    let state = host.l2_state()?;
+    let height = host.chain_height()?;
     let addr = wallet
         .address()
         .map_err(|_| WorkerError::IdentityMismatch)?;

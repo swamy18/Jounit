@@ -96,8 +96,8 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
             &self.wallet,
             &self.config,
             task_id,
-            &self.l2_state(),
-            self.height(),
+            &self.l2_state()?,
+            self.height()?,
         )
     }
 
@@ -106,7 +106,7 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
         &self,
         task_id: jnt_core::hash::Hash,
     ) -> WorkerResult<crate::executor::ExecutionOutput> {
-        let state = self.l2_state();
+        let state = self.l2_state()?;
         let contract = state.task(&task_id).ok_or(WorkerError::UnknownTask)?;
         if contract.worker.as_ref() != Some(&self.config.address) {
             // Executing unclaimed work burns nothing on-chain but would
@@ -114,7 +114,7 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
             // here where the cause is clear (§18.11).
             return Err(WorkerError::IdentityMismatch);
         }
-        let work = ExecutionWork::from_contract(contract, self.height())?;
+        let work = ExecutionWork::from_contract(contract, self.height()?)?;
         execute_task(&self.executor, &work)
     }
 
@@ -138,8 +138,8 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
             task_id,
             output_bytes,
             backend,
-            &self.l2_state(),
-            self.height(),
+            &self.l2_state()?,
+            self.height()?,
         )
     }
 
@@ -162,8 +162,8 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
             &self.wallet,
             task_id,
             counter_result,
-            &self.l2_state(),
-            self.height(),
+            &self.l2_state()?,
+            self.height()?,
         )
     }
 
@@ -171,7 +171,7 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
 
     /// §18.9: after a claim timeout/restart, what does the protocol say?
     pub fn reconcile_claim(&self, task_id: &jnt_core::hash::Hash) -> WorkerResult<ClaimedState> {
-        reconcile_claimed(&self.l2_state(), &self.config.address, task_id)
+        reconcile_claimed(&self.l2_state()?, &self.config.address, task_id)
     }
 
     /// §18.9: after a submit timeout/restart, what does the protocol say?
@@ -179,7 +179,7 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
         &self,
         task_id: &jnt_core::hash::Hash,
     ) -> WorkerResult<SubmittedState> {
-        reconcile_submitted(&self.l2_state(), &self.config.address, task_id)
+        reconcile_submitted(&self.l2_state()?, &self.config.address, task_id)
     }
 
     /// §18.14: observe a dispute over a task, and whether it involves this
@@ -188,17 +188,20 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
         &self,
         task_id: &jnt_core::hash::Hash,
     ) -> WorkerResult<Option<(DisputeView, bool)>> {
-        dispute_of_task(&self.l2_state(), task_id, &self.config.address)
+        dispute_of_task(&self.l2_state()?, task_id, &self.config.address)
     }
 
     /// §18.14: what did the protocol decide about a disputed task?
-    pub fn dispute_outcome(&self, task_id: &jnt_core::hash::Hash) -> DisputeResolution {
-        dispute_resolution(&self.l2_state(), task_id)
+    pub fn dispute_outcome(
+        &self,
+        task_id: &jnt_core::hash::Hash,
+    ) -> WorkerResult<DisputeResolution> {
+        Ok(dispute_resolution(&self.l2_state()?, task_id))
     }
 
     /// §18.13: earnings derived from authoritative state.
-    pub fn earnings(&self) -> Earnings {
-        earnings_of(&self.l2_state(), &self.config.address)
+    pub fn earnings(&self) -> WorkerResult<Earnings> {
+        Ok(earnings_of(&self.l2_state()?, &self.config.address))
     }
 
     /// §18 (VWC observation): the certificate for a task, validated against
@@ -207,22 +210,24 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
         &self,
         task_id: &jnt_core::hash::Hash,
     ) -> WorkerResult<Option<jnt_l2::vwc::VerifiedWorkCertificate>> {
-        observe_certificate(&self.l2_state(), task_id, &self.validators, self.verifier)
+        observe_certificate(&self.l2_state()?, task_id, &self.validators, self.verifier)
     }
 
     /// §18.13: every certificate naming this worker, sorted by task id.
-    pub fn certificates(&self) -> Vec<jnt_l2::vwc::VerifiedWorkCertificate> {
-        certificates_for_worker(&self.l2_state(), &self.config.address)
-            .into_iter()
-            .cloned()
-            .collect()
+    pub fn certificates(&self) -> WorkerResult<Vec<jnt_l2::vwc::VerifiedWorkCertificate>> {
+        Ok(
+            certificates_for_worker(&self.l2_state()?, &self.config.address)
+                .into_iter()
+                .cloned()
+                .collect(),
+        )
     }
 
-    fn l2_state(&self) -> L2State {
+    fn l2_state(&self) -> WorkerResult<L2State> {
         self.host.l2_state()
     }
 
-    fn height(&self) -> u64 {
+    fn height(&self) -> WorkerResult<u64> {
         self.host.chain_height()
     }
 }
