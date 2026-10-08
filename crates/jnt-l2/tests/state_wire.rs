@@ -1,4 +1,4 @@
-//! The L2 state wire codec (SPEC.md §19.6) — the transport between a node and
+//! The L2 state wire codec (SPEC.md §19.2) — the transport between a node and
 //! a remote worker.
 //!
 //! Two properties are under attack here, because both decide whether a worker

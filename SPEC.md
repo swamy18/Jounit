@@ -2213,9 +2213,9 @@ regression tests assert that over every public error and debug path.
 ## 19. Phase 6: L1↔L2 integration (specified in four parts)
 
 §15.9 left "how L2 transactions reach a block" deliberately unspecified. This
-section specifies it. **§19.1, §19.4 and §19.5 describe behaviour that is
-implemented and tested; §19.2 and §19.3 are specified but not yet built**, and
-are marked so rather than being folded in with the implemented part.
+section specifies it. **§19.1, §19.2, §19.4 and §19.5 describe behaviour that
+is implemented and tested; §19.3 is specified but not yet built**, and is
+marked so rather than being folded in with the implemented part.
 
 ### 19.1 L2 transactions in L1 blocks — IMPLEMENTED, normative
 
@@ -2290,7 +2290,7 @@ committee exists). `jnt-node status` reports L2 height/applied/skipped;
 `jnt-node verify` asserts replay determinism (two replays agree, incremental
 agrees with replay) and names the skipped payloads.
 
-### 19.2 Worker↔node transport — SPECIFIED for M3, NOT IMPLEMENTED
+### 19.2 Worker↔node transport — IMPLEMENTED (reads + broadcast), loopback-bound
 
 Decision 9 selects the roadmap §13 REST API. That document remains the authority
 for its L1 endpoints; this subsection records the additive part the worker SDK
@@ -2310,6 +2310,32 @@ needs, so §13 itself is not edited.
   decision, and the API is not a consensus surface: nothing it accepts may
   reach `Chain::submit` except a signed transaction, which is validated as
   §13.14 requires.
+
+**Implemented (measured).** The node serves the L2 additions above at `GET
+/v1/l2/state` (canonical state as `state_hex`), `GET /v1/task/{task_id}`,
+`GET /v1/tasks/open`, `GET /v1/vwc/{task_id}` (the certificate plus its
+`vwc_hex`) and `POST /v1/l2/broadcast`; `jnt-worker::HttpNode` is a client of
+it that implements both §18.3 seams, `L2NodeView` (reads) and `L2Broadcaster`
+(writes). The state a node hands a remote observer is a **versioned,
+deterministic encoding** (`L2_STATE_WIRE_VERSION = 1`): sorted maps so two
+nodes agree byte-for-byte, each declared count bounded by the bytes actually
+remaining before anything is allocated, duplicate keys and trailing bytes
+refused, and `check_conservation` re-run on decode, so a peer cannot hand the
+SDK a state that does not balance. The SDK's read seam is **fallible**: an
+unreachable or undecodable node is an error naming the reason
+(`ObservationUnavailable` / `ObservationMalformed`), never an empty view — a
+silently empty state would let a worker build a claim against nothing.
+Client-side bounds are one response cap (16 MiB default), one header cap
+(16 KiB), a connect timeout and a read timeout; plain `http://` only, with
+HTTPS refused by name rather than downgraded.
+
+**Not implemented.** Transport authentication. The API is an *unauthenticated*
+loopback surface: binding to a non-loopback address prints a warning and is
+left to the operator, and replay/idempotence for writes rests on the node's
+existing L2 dedup and mempool rules rather than on a transport nonce or
+credential. This bullet of §19.2 is therefore satisfied by the operator's
+binding choice alone, and a non-loopback deployment is not authenticated by
+this specification.
 
 ### 19.3 Specified only when its decision lands
 

@@ -18,19 +18,26 @@ bottom. Nothing here overrides the historical records in `docs/status.md`,
 | `3d9ed13` | API integration tests (13) + `Authorization::deserialize` (2 tests) |
 | `b800b26` | `jnt-mcp`: keyless MCP surface over the payment layer (9 tests) |
 | `6187fec` | Item 9 completion: VWC/dispute-backed reputation derivation (8 tests) |
+| `e362dce` | Item 2: scripted end-to-end journey through the running node (`e2e_journey.rs`, 3 tests) |
+| `55bdaa5` | Lock the `jnt-node` dev-dependency on `jnt-worker` (test-only, keeps the workspace buildable) |
+| `df52637` | Item 3: worker↔node HTTP transport and a fail-closed L2 state wire (26 tests) |
 
-## Measured verification (this session)
+## Measured verification (final, at `df52637`)
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | **726 passed, 0 failed** (40 test binaries plus 7 doc-test targets) |
+| `cargo test --workspace` | **755 passed, 0 failed** (43 test binaries plus 7 doc-test targets) |
 | `cargo fmt --check` | clean |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
 | `cargo build --release --workspace` | succeeded (optimized, 1m32s) |
 
-Baseline at `a8679de` was 650 passing tests; this sprint added **76** tests.
-Test-count claims in the commit table were re-counted from the files:
-`bridge_session.rs` 17, `api.rs` 13, `mcp.rs` 9, `reputation_flow.rs` 8.
+Baseline at `a8679de` was 650 passing tests. The seven commits through
+`6187fec` added **76** of them; the two integration commits that followed
+(`e362dce`, `df52637`) added **29** more (3 journey + 12 state-wire + 11
+transport + 3 `http.rs` unit), for **105** added and 755 total. Test-count
+claims were re-counted from the files: `bridge_session.rs` 17, `api.rs` 13,
+`mcp.rs` 9, `reputation_flow.rs` 8, `e2e_journey.rs` 3, `state_wire.rs` 12,
+`worker_transport.rs` 11, `http.rs` 3.
 
 > Note: `0072a7d` added `crates/jnt-core/src/service.rs` but did not declare
 > `pub mod service;` in `lib.rs`, so that commit did not compile in isolation.
@@ -55,7 +62,8 @@ requires a decision not yet recorded. **NOT STARTED** = no work.
 | 16 | Service API | **DONE** | `jnt-node/src/api.rs`; opt-in `--api-listen`, loopback default, not a consensus surface; `tests/api.rs` (13) |
 | 17 | AI/compute/data payment surface | **DONE** | Payment/authorize/receipt endpoints + `jnt-mcp`; L2 broadcast dry-run only (state changes only via canonical replay) |
 | MCP | `jnt-mcp` agent integration | **DONE** | `crates/jnt-mcp`; keyless dispatcher, 8 ops, node transport over the loopback API; `tests/mcp.rs` (9) |
-| 13/14 | End-to-end worker/agent flows | **PARTIAL** | Worker SDK paths are covered by `jnt-worker` tests and the L2/node suites; a single scripted human→agent→service→receipt→reputation journey through the running node is **not** written |
+| 13/14 | End-to-end worker/agent flows | **DONE** | `crates/jnt-node/tests/e2e_journey.rs` drives one scripted journey through the real node path — mined blocks → `Chain::submit` → `NodeL2::sync` — and the real `WorkerClient` over the §18.3 seams: identity → policy → request → authorization → L2 post → claim → execute → submit → dispute → quorum settle → Quorum VWC → payment → receipt → reputation → conservation → finality → persist → restart → byte-identical state. A second test covers the undisputed path (WindowElapsed VWC) and a third a forged claim refused by name with the task untouched |
+| §19.2 | Worker↔node HTTP transport | **DONE** | `jnt-worker/src/http.rs` (`HttpNode`) implements both §18.3 seams over the node's opt-in REST API; `GET /v1/l2/state` serves a versioned deterministic state blob (`state_wire.rs`, 12 tests) and `worker_transport.rs` exercises discover→claim→broadcast over a live socket plus the failure paths. Transport **authentication** is not implemented — the API is an unauthenticated loopback surface by design — see "Gaps" |
 | 15 | L2 production gaps | **PARTIAL** | Deposits, funding, finality and replay are complete and tested; **exits are blocked** (Decision 10) |
 | 25 | Adversarial suites | **PARTIAL** | Existing `redteam.rs`, `bls_checkpoint_attack.rs`, per-crate `fuzz_invariants.rs` and the 17-test bridge attack suite pass; no *new* adversarial suite was added this sprint |
 | 26 | Chaos harness | **NOT STARTED** | — |
@@ -117,7 +125,17 @@ invented here.
   modules, and `jnt-l2` gained `reputation`. All are additive; no existing
   encoding, hashing or state-transition rule changed.
 - `docs/status.md` still quotes 650 tests and older counts. That is left as
-  history; the current measured count is 726 (this file).
+  history; the current measured count is 755 (this file).
+- **Repointed a dangling reference.** The item-3 code cited `SPEC.md §19.6` for
+  the state wire encoding, but **§19.6 does not exist** — the spec's Phase 6
+  material ends at §19.5. All nine code and test references now cite `§19.2`,
+  the subsection that actually specifies the worker↔node transport.
+- **`SPEC.md §19.2` status corrected.** It was headed "SPECIFIED for M3, NOT
+  IMPLEMENTED" while the transport is now built. The heading and the Phase 6
+  preamble now mark §19.2 implemented, and §19.2 gained a measured
+  "Implemented" / "Not implemented" pair so its authentication gap is recorded
+  in the spec of record rather than only in this file. No consensus rule,
+  encoding, fee or finality rule was touched by any of this.
 
 ## Mainnet readiness (item 29)
 
@@ -139,21 +157,30 @@ blocker 1 alone (no exits) prevents a functional economy.
 - Reputation scores are derived in `jnt-l2` but are **not exposed** over the
   node API or MCP yet (a `GET /v1/reputation/{id}` would be the natural next
   step).
-- The worker SDK's `L2NodeView` trait returns a full `L2State`, which has no wire
-  encoding, so the worker↔node HTTP transport (Decision 9's other half) is still
-  unimplemented; the API exists but nothing in `jnt-worker` consumes it.
+- The worker↔node transport has **no authentication**: the API is an
+  unauthenticated service surface, loopback binding is the only control, and a
+  non-loopback bind prints a warning rather than enforcing a credential. §19.2's
+  authentication bullet is therefore satisfied by the operator's binding choice
+  alone, and this is stated in `SPEC.md §19.2` rather than papered over.
+- The transport is also **unexercised against a real remote node process**: the
+  tests drive a live socket against an in-process server, which is a genuine
+  transport test but not a two-process deployment test.
 - No benchmarks exist, so no performance claim is made anywhere in this sprint.
+- `jnt-worker`'s CLI (`address`, `generate`) still exposes no claim/submit/status
+  verb, so the transport is reachable from the SDK and its tests but not yet from
+  the shipped binary surface.
 
 ## Commands behind the numbers
 
 ```
-cargo test --workspace                                   # 726 passed, 0 failed
+cargo test --workspace                                   # 755 passed, 0 failed
 cargo fmt --check                                        # clean
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # clean
 cargo build --release --workspace                        # see note below
 ```
 
-The release build finished successfully in 1m32s on 2026-10-08.
+The release build finished successfully on 2026-10-08: 1m32s measured at
+`6187fec`, and 1m56s re-measured at `df52637` on the same machine, both warm.
 
 Local fuzz *execution* was not run (no ASan runtime for the MSVC target in this
 environment); the fuzz targets compile as part of `--all-targets`. No performance

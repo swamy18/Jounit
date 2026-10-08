@@ -5,7 +5,7 @@
 //! node to see the chain. What it is, precisely:
 //!
 //! - **A transport, not a protocol.** Every rule still lives in `jnt-l2` and in
-//!   the node. The client fetches the node's *canonical* state (the §19.6 wire
+//!   the node. The client fetches the node's *canonical* state (the §19.2 wire
 //!   encoding), decodes it with the same codec the node encodes with, and lets
 //!   the protocol's own checks — replay, balances, conservation — decide. It
 //!   never re-implements a rule, never invents a state, and never holds a key:

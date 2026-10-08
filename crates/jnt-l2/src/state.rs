@@ -760,7 +760,7 @@ impl L2State {
 }
 
 // ---------------------------------------------------------------------------
-// Wire encoding (SPEC.md §19.6): the state a node serves a remote observer
+// Wire encoding (SPEC.md §19.2): the state a node serves a remote observer
 // ---------------------------------------------------------------------------
 
 /// The only state-transport version this build writes *and* reads. A blob
@@ -803,7 +803,7 @@ impl L2State {
     /// holding equal states produce byte-identical blobs and a client can hash
     /// one for comparison. Nothing here is signed — a state is derived data,
     /// and the node's canonical blocks are what give it authority; this is only
-    /// a transport (SPEC.md §19.6).
+    /// a transport (SPEC.md §19.2).
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(
             128 + self.accounts.len() * WIRE_ACCOUNT_MIN + self.tasks.len() * 256,

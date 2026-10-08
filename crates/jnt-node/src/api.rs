@@ -43,7 +43,7 @@
 //! POST /v1/l2/broadcast        signed L2 tx -> dry-run -> include queue
 //! GET  /v1/tasks/open          claimable tasks
 //! GET  /v1/task/{task_id}      task state
-//! GET  /v1/l2/state            canonical L2 state (§19.6 wire encoding)
+//! GET  /v1/l2/state            canonical L2 state (§19.2 wire encoding)
 //! GET  /v1/vwc/{task_id}       verified work certificate
 //! POST /v1/authorize           policy + payer-signed request -> authorization
 //! POST /v1/payment/submit      verify + record a machine payment
@@ -461,7 +461,7 @@ async fn vwc_by_task(State(state): State<ApiState>, Path(id): Path<String>) -> A
     })?
 }
 
-/// The canonical L2 state, in the §19.6 wire encoding.
+/// The canonical L2 state, in the §19.2 wire encoding.
 ///
 /// This is the one endpoint a worker SDK needs that a task-shaped summary
 /// cannot serve: `L2NodeView` hands the SDK an `L2State`, so a remote view has

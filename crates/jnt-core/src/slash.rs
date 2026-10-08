@@ -181,7 +181,7 @@ impl SlashVault {
     }
 
     /// Rebuild a vault from decoded records — the codec entry point used by
-    /// `L2State::decode` (SPEC.md §19.6 state transport).
+    /// `L2State::decode` (SPEC.md §19.2 state transport).
     ///
     /// Structural only: it re-derives no protocol rule. `total_burned` is
     /// carried as data because it is an accumulator the state owns, not a sum

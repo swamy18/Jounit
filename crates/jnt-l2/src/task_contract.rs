@@ -583,7 +583,7 @@ impl TaskContract {
 }
 
 // ---------------------------------------------------------------------------
-// Wire encoding (SPEC.md §19.6): what a node hands a remote observer
+// Wire encoding (SPEC.md §19.2): what a node hands a remote observer
 // ---------------------------------------------------------------------------
 
 /// `ContractState` tags on the wire. Total: a byte outside this range is
@@ -695,7 +695,7 @@ impl TaskContract {
     /// Self-delimiting: every nested piece is either fixed-size or written by
     /// its own decoder (`ComputeAttestation`), so `decode` never has to guess
     /// where a field ends. This is the transport a node serves a remote worker
-    /// (SPEC.md §19.6); it carries no signature material of its own — a
+    /// (SPEC.md §19.2); it carries no signature material of its own — a
     /// contract is state, not an actor's claim, so nothing here is signed.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(256);
