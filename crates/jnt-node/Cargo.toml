@@ -18,3 +18,8 @@ hex.workspace = true
 rand.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+# The worker SDK, so the end-to-end journey can drive the real worker client
+# against the real node path (`tests/e2e_journey.rs`).
+jnt-worker = { path = "../jnt-worker" }
