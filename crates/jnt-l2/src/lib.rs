@@ -41,6 +41,7 @@ pub mod dispute;
 pub mod error;
 pub mod genesis;
 pub mod replay;
+pub mod reputation;
 pub mod state;
 pub mod task_contract;
 pub mod vwc;

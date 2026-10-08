@@ -77,6 +77,9 @@ pub enum L2Error {
     DuplicateDeposit,
     /// A codec failure raised by `jnt-core`.
     Codec(jnt_core::Error),
+    /// A reputation derivation refused a canonical artifact (roadmap item 9).
+    /// The reason is the underlying ledger clause, stated.
+    Reputation(String),
 }
 
 impl fmt::Display for L2Error {
@@ -128,6 +131,7 @@ impl fmt::Display for L2Error {
             L2Error::InvalidGenesis(why) => write!(f, "invalid l2 genesis: {why}"),
             L2Error::DuplicateDeposit => write!(f, "deposit already credited"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),
+            L2Error::Reputation(w) => write!(f, "reputation: {w}"),
         }
     }
 }
