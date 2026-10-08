@@ -12,7 +12,7 @@ bottom. Nothing here overrides the historical records in `docs/status.md`,
 | Commit | Contents |
 |---|---|
 | `b209a31` | Bind offline authorization verification to the owner's address (+ regression test) |
-| `2120f47` | Items 11/12/9 primitives: machine payment, service receipt, reputation ledger (22 tests) |
+| `2120f47` | Items 11/12/9 primitives: machine payment, service receipt, reputation ledger (21 unit tests across the three modules) |
 | `0072a7d` | Items 2/6/5/7/8: service bridge, autonomous payments, batching (`bridge_session.rs`, 17 tests) |
 | `f6e2c99` | Items 16/17: opt-in REST service API (Decision 9, SPEC §19.2) |
 | `3d9ed13` | API integration tests (13) + `Authorization::deserialize` (2 tests) |
@@ -23,12 +23,14 @@ bottom. Nothing here overrides the historical records in `docs/status.md`,
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | **726 passed, 0 failed** (44 test binaries) |
+| `cargo test --workspace` | **726 passed, 0 failed** (40 test binaries plus 7 doc-test targets) |
 | `cargo fmt --check` | clean |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
 | `cargo build --release --workspace` | succeeded (optimized, 1m32s) |
 
 Baseline at `a8679de` was 650 passing tests; this sprint added **76** tests.
+Test-count claims in the commit table were re-counted from the files:
+`bridge_session.rs` 17, `api.rs` 13, `mcp.rs` 9, `reputation_flow.rs` 8.
 
 > Note: `0072a7d` added `crates/jnt-core/src/service.rs` but did not declare
 > `pub mod service;` in `lib.rs`, so that commit did not compile in isolation.
