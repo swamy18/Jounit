@@ -340,7 +340,7 @@ impl NetworkParams {
             require_hybrid_signatures: false,
             network_magic: [0x6A, 0x4E, 0x54, 0x01],
             network_id: "jounit/mainnet".into(),
-            // The L2 genesis escrow (Decision 7): 100,000 JNT of the 788,400
+            // The L2 genesis escrow (Decision 7): 100,000 JNT of the 788,476
             // JNT the ladder can never mint, held entirely by the protocol
             // escrow identity. No mainnet grants — real beneficiaries arrive
             // with the deposit mechanism, not as hard-coded allocations.
