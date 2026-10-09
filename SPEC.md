@@ -394,17 +394,22 @@ Per Section 16. `SAT_PER_JNT = 100_000_000`.
 |---|---|
 | `halving_period` | `262 800` blocks (5 years at 10 min) |
 | `start_reward` | `76 JNT` = `7_600_000_000 sat` |
-| `supply_cap` | `39 945_600 JNT` = `3_994_560_000_000_000 sat` |
+| `supply_cap` | `39 945 600 JNT` = `3_994_560_000_000_000 sat` |
 | `tail_emission` | `0` (v0.1; Section 11 notes tail emission as an option) |
 
 ```
 halvings  = height / halving_period
-reward(h) = (start_reward_sat >> halvings)       // 0 once halvings ≥ 7
+reward(h) = (start_reward_jnt >> halvings) * SAT_PER_JNT   // whole-JNT halving; 0 once halvings ≥ 7
+
+// The ladder is halved in **whole JNT**, not by shifting satoshis:
+// `start_reward_sat >> halvings` would pay 9.5 JNT at halving 3 and
+// contradict the ladder below. Shifting whole JNT keeps every rung a
+// whole number of JNT and keeps the cap arithmetic exact.
 ```
 
 Reward ladder: `76, 38, 19, 9, 4, 2, 1, 0`.
 
-**Cap invariant (hard, enforced in code):** minting must never raise total issued above `supply_cap`. Because rewards are floor-divided, issued supply converges to `149 × 262 800 = 39 157 200 JNT`; the remaining `787 400 JNT` is **permanently unmintable**, not merely "reserved". `sim/supply_schedule_sim.py` regenerates these numbers and `tests/vectors/supply_vectors.json` pins them.
+**Cap invariant (hard, enforced in code):** minting must never raise total issued above `supply_cap`. Because rewards are floor-divided, issued supply converges to `149 × 262 800 = 39 157 200 JNT`; the remaining `788 400 JNT` (39 945 600 − 39 157 200) is **permanently unmintable**, not merely "reserved". `sim/supply_schedule_sim.py` regenerates these numbers and `tests/vectors/supply_vectors.json` pins them.
 
 If a block reward would cross the cap, the coinbase collects the tips only and the surplus is unrecoverable (provable, not burned-from-circulation).
 
@@ -447,7 +452,8 @@ gas_per_tx  = 16 000 + 1 000 × input_count + 250 × output_count
 gas_cap     = 2 000 000 per block
 
 base_fee_next = base_fee + base_fee × (gas_used − gas_cap) / (gas_cap × 8)
-               // clamped to [BASE_FEE_MIN = 100 sat, BASE_FEE_MAX]
+               // clamped to [base_fee_min_sat, base_fee_max_sat] (profile: 100/50_000_000 on
+               // mainnet, 10/1_000_000 on mini and testnet — SPEC.md §10)
                // when gas_used == gas_cap the fee rises by 1/512 per block
 ```
 
@@ -514,6 +520,8 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `finality_depth` | `100` | `20` | `20` |
 | `gas_cap` | `2 000 000` | `2 000 000` | `2 000 000` |
 | `base_fee_initial_sat` | `1 000` | `100` | `100` |
+| `base_fee_min_sat` | `100` | `10` | `10` |
+| `base_fee_max_sat` | `50 000 000` | `1 000 000` | `1 000 000` |
 | `nn_epoch_blocks` | `50 000` | `2 000` | `2 000` |
 | `puzzle_id` | `1` | `1` | `1` |
 | `network_id` | `jounit/mainnet` | `jounit/mini` | `jounit/testnet` |
