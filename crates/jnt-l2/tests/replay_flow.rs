@@ -64,17 +64,41 @@ fn post(seed: u8, nonce: u64, deadline: u64) -> L2Transaction {
 ///
 /// Mining only *builds* a block — submission is a separate step — so both calls
 /// are needed for these to become canonical history.
+///
+/// Every L2-bearing block commits the root a replay derives (approved P1):
+/// a scratch L2 view advances alongside mining, applying each trailer
+/// transaction exactly as replay does — including skipping the unfunded posts
+/// (this file's whole point is unfunded behaviour), so the committed root is
+/// the skipped outcome replay recomputes.
 fn chain_with_l2(l2_at: &[u64], n: u64) -> Chain {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+    let (set, verifier) = empty_set();
+    let mut sim = L2State::new(L2Config::mini());
     for h in 1..=n {
         let l2 = if l2_at.contains(&h) {
             vec![post(1, h, 200)]
         } else {
             Vec::new()
         };
-        let block = chain
-            .mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-            .unwrap();
+        sim.advance_block(h);
+        for tx in &l2 {
+            let _ = sim.apply(tx, h, &set, &verifier);
+        }
+        let block = if l2.is_empty() {
+            chain.mine_block(addr(1), Vec::new(), ts(h)).unwrap()
+        } else {
+            chain
+                .mine_block_with_l2_root(
+                    addr(1),
+                    Vec::new(),
+                    l2,
+                    sim.committed_root(),
+                    ts(h),
+                    None,
+                    MAX_ATTEMPTS,
+                )
+                .unwrap()
+        };
         chain
             .submit_at(block, Some(ts(h)))
             .expect("a block we just mined must be accepted");

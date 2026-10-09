@@ -94,7 +94,7 @@ fn fee_for(chain: &Chain, n_in: usize, n_out: usize) -> u64 {
 /// L2 view that credited it. Returns `(chain, miner, deposit_height)`.
 fn deposited_world() -> (Chain, Wallet, u64) {
     let params = NetworkParams::mini();
-    let miner = wallet(1);
+    let miner = wallet(9);
     let me = addr(&miner);
     let mut chain = Chain::new(params.clone()).unwrap();
     mine_empty_to(&mut chain, me, 12);
@@ -176,6 +176,10 @@ fn queue_exit(
         Some(root),
         "the queue block must commit the simulated root"
     );
+    // Bring the caller's view forward past the queue block it just mined:
+    // the simulation above ran on a clone, so without this the view would
+    // stay stale at the pre-queue height and its balances would lie.
+    *l2 = l2view(chain);
     (q, sim)
 }
 
@@ -230,7 +234,7 @@ fn build_claim(
 fn exit_claim_releases_exactly_once_and_conserves() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     assert_eq!(l2.state().balance(&me), SINK_VALUE);
 
@@ -311,7 +315,7 @@ fn exit_claim_releases_exactly_once_and_conserves() {
 fn exit_before_finality_is_refused_by_name() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     assert_eq!(chain.expected_base_fee_for_next_block(), 10);
     let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
@@ -336,7 +340,7 @@ fn exit_before_finality_is_refused_by_name() {
 fn exit_replay_is_refused_by_name() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
     let amount = SINK_VALUE - EXIT_FEE - l1_fee;
@@ -363,7 +367,7 @@ fn exit_replay_is_refused_by_name() {
 fn exit_with_forged_proof_is_refused() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
     let amount = SINK_VALUE - EXIT_FEE - l1_fee;
@@ -387,7 +391,7 @@ fn exit_with_forged_proof_is_refused() {
 fn exit_consuming_a_non_sink_input_is_refused() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
     let amount = SINK_VALUE - EXIT_FEE - l1_fee;
@@ -419,7 +423,7 @@ fn exit_consuming_a_non_sink_input_is_refused() {
 fn exit_with_inexact_funding_is_refused() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
     // Queue 1,000 sat short of exact: the proof is valid for this record, but
@@ -464,7 +468,7 @@ fn exit_with_inexact_funding_is_refused() {
 fn pre_activation_claim_is_refused() {
     let params = NetworkParams::mainnet();
     assert_eq!(params.exit_activation_height, 0);
-    let miner = wallet(1);
+    let miner = wallet(9);
     let me = addr(&miner);
     let mut chain = Chain::new(params).unwrap();
     mine_empty_to(&mut chain, me, 3);
@@ -498,14 +502,14 @@ fn pre_activation_claim_is_refused() {
 }
 
 fn dest_of() -> Address {
-    addr(&wallet(2))
+    addr(&wallet(8))
 }
 
 /// At and after activation, L2 transactions without a committed root are
 /// refused: a queue in such a block could never be proven.
 #[test]
 fn post_activation_l2_without_root_is_refused() {
-    let miner = wallet(1);
+    let miner = wallet(9);
     let me = addr(&miner);
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_empty_to(&mut chain, me, 2);
@@ -541,7 +545,7 @@ fn post_activation_l2_without_root_is_refused() {
 fn reorg_of_the_claim_block_unwinds_the_release() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
     let amount = SINK_VALUE - EXIT_FEE - l1_fee;
@@ -593,13 +597,15 @@ fn reorg_of_the_claim_block_unwinds_the_release() {
     chain.verify_canonical_chain().unwrap();
 }
 
-/// Two identical claims in one block share a claim id: refused as a
-/// duplicate, not applied twice.
+/// Two identical claims in one block spend the same sink output twice: the
+/// miner's probe admits the first and the second finds its input gone — the
+/// same double-spend refusal two L1 transactions spending one input get
+/// (`UnknownOutPoint`), not a second release.
 #[test]
 fn duplicate_claims_in_one_block_are_refused() {
     let (mut chain, miner, _d) = deposited_world();
     let me = addr(&miner);
-    let dest = addr(&wallet(2));
+    let dest = addr(&wallet(8));
     let mut l2 = l2view(&chain);
     let l1_fee = 10 * (16_000 + 1_000 + 2 * 250);
     let amount = SINK_VALUE - EXIT_FEE - l1_fee;
@@ -617,8 +623,8 @@ fn duplicate_claims_in_one_block_are_refused() {
         None,
     );
     assert!(
-        matches!(&res, Err(e) if e.to_string().contains("uplicate")),
-        "duplicate claims must be refused, got {res:?}"
+        matches!(&res, Err(jnt_core::error::Error::UnknownOutPoint)),
+        "duplicate claims must be refused as a double-spend, got {res:?}"
     );
     assert!(!chain.exit_released(&me, 1));
 }

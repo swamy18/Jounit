@@ -930,10 +930,12 @@ impl Chain {
             return;
         };
         if let Some(undo) = self.undo.get(hash).cloned() {
-            // Reverse the body first, then drop the coinbase output.
-            for tx in block.txs[1..].iter().rev() {
-                self.utxo.undo_tx(tx, &undo);
-            }
+            // Undo the whole record once: it covers body transactions AND
+            // exit claims, which share the record but have no body transaction
+            // to loop over. Looping per body transaction never ran for a
+            // body-empty claim block, so its writes survived the rollback —
+            // found by the exit reorg test, fixed by undoing unconditionally.
+            self.utxo.undo(&undo);
             // Identify the coinbase output directly rather than by its position
             // at the end of `undo.created`: a zero-value coinbase is never
             // recorded there, so position was not a reliable handle.

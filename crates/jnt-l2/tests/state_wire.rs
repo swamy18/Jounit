@@ -411,8 +411,9 @@ fn an_inflated_account_count_is_refused_before_it_allocates() {
     let (state, _) = fully_populated_state();
     let mut bytes = state.encode();
     // The account count sits right after the fixed header:
-    // version(1) + 3·u64 config + flag(1) + 4·u64 counters = 50 bytes.
-    let count_at = 50;
+    // version(1) + 4·u64 config (including `exit_activation_height`)
+    // + flag(1) + 5·u64 counters (including `exited_total`) = 74 bytes.
+    let count_at = 74;
     bytes[count_at..count_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(L2State::decode(&bytes).is_err());
 }
@@ -422,8 +423,8 @@ fn a_tampered_counter_that_breaks_conservation_is_refused() {
     let (state, _) = fully_populated_state();
     let mut bytes = state.encode();
     // The funded_total field sits after version + config + flag:
-    // 1 + 24 + 1 = 26.
-    let funded_at = 26;
+    // 1 + 32 + 1 = 34.
+    let funded_at = 34;
     let current = u64::from_le_bytes(bytes[funded_at..funded_at + 8].try_into().unwrap());
     bytes[funded_at..funded_at + 8].copy_from_slice(&(current + 1).to_le_bytes());
     let err = L2State::decode(&bytes).expect_err("inflated funding must be refused");
