@@ -16,7 +16,14 @@
 | Persistent storage | Corruption / torn writes | `jnt-store` (30 tests) + `fuzz_invariants.rs` (4 storage tests) |
 | Wallet / signing | Signature forgery / replay | `sig.rs` (30 tests), `payment.rs` (8 tests), `agent.rs` (24 tests) |
 
-## Findings: No critical or high-severity issues. All mitigations implemented and tested.
+## Findings
+
+**No critical or high-severity issue was found by the methods used** — threat-model
+review, the adversarial test suites, and a coverage-guided fuzz campaign over the
+parser/decoder surfaces. That is a statement about coverage, not a proof of
+safety: the audit is a self-review, there is no third-party audit on record, and
+the surfaces it does *not* cover are named under *Attack Surface* below. Treat
+"no findings" as "none found", not "none exist".
 
 ### 1. Integer overflow in difficulty target arithmetic
 
@@ -99,13 +106,17 @@ Fourteen fuzz targets cover the most dangerous parser surfaces. CI fuzz-smoke ru
 | Policy / auth | `m3_readers.rs` (fuzz) | Offline verification, bounded policy book |
 | L2 execution | `l2_state_apply.rs` (fuzz) | Atomic application, skip-by-name, no partial writes |
 | Storage recovery | `storage_recover.rs` (fuzz) | Torn-tail detection, checksum refusal |
-| Dispute arbitr | `dispute_arbitrate.rs` (fuzz) | Deterministic arbitration function |
+| Dispute arbitration | `dispute_arbitrate.rs` (fuzz) | Deterministic arbitration function |
 | VWC | `vwc_decode.rs` (fuzz) | Exact round-trip, id stability |
 
 ## Recommendations
 
-1. **No open issues.** All identified threat surfaces are covered by tests and/or fuzzing.
-2. **Before mainnet:** enable M2 (Anti-Collusion Slash Vault) rules per Decision 10 — currently inactive
-because no rule defines what constitutes fraudulent compute output.
-3. **Before mainnet:** enable M4 (HBM scratchpad) as a registered `puzzle_id` per Decision 11 — currently
-unused; chain security relies on the §5 puzzle.
+1. **No open high-severity issue** in the reviewed surfaces. This is a self-review; a third-party audit is
+still required before mainnet.
+2. **Before mainnet:** specify M2 (Anti-Collusion Slash Vault) activation rules — currently inactive because
+no rule defines what constitutes fraudulent compute output (noted in `docs/decisions.md`; the M2 vault,
+`slash.rs`, exists but nothing triggers it).
+3. **Before mainnet:** register M4 (HBM scratchpad) as a live `puzzle_id` — currently unused; chain security
+relies on the §5 puzzle (`docs/decisions.md`, M4 audit).
+4. **Before mainnet:** the L2→L1 exit path is undefined (`docs/l2-exit-design.md`); deposits are one-way and
+the sink is unspendable, so this is a fund-safety blocker rather than a classic vulnerability.

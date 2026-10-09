@@ -1,102 +1,160 @@
 # Testnet Readiness
 
-## Launch Runbook
+**Status: prepared, not launched.** Every command below is the real CLI as
+implemented in `crates/jnt-node` and `crates/jnt-worker` (hand-rolled argument
+parsing, `--name value`). An earlier revision of this file documented flags
+that do not exist (`--bootnode`, `--network` on the worker, a `config.toml`
+that nothing reads) and a `/metrics` endpoint and a `/health` route that were
+never implemented. Those have been removed; what is here is what runs. Where a
+piece of the runbook names something that is *documented but not implemented*,
+it says so explicitly.
 
-### Phase 0: Pre-launch (24h before)
+## What exists today
 
-1. **Seed peers:** Ensure 3 bootnodes are running:
+| Capability | State |
+|---|---|
+| `testnet` network profile | **Implemented** — `NetworkParams::testnet()`: unique `network_magic`/`network_id` (`jounit/testnet`), four deterministic genesis BLS validators, `checkpoint_interval_blocks = 10`, `finality_activation_height = 20` (Decision 13) |
+| Binding finality (M5) on testnet | **Implemented** — real `blst` verification; once height 20 is finalized a reorg crossing it is refused (Decision 12) |
+| L1 node (`jnt-node`) with P2P | **Implemented** — `serve` with `--listen`, `--connect`, `--no-mine`, `--api-listen` |
+| L1 transaction relay over P2P | **Implemented** (SPEC §13.14, `msg_type = 10`) |
+| L2 deposits | **Implemented** — burn-to-sink, maturity by depth **and** binding finality (Decisions 10/15) |
+| L2 exits | **NOT implemented** — blocked on a recorded decision (`docs/l2-exit-design.md`). Testnet value is intentionally not withdrawable. |
+| L2 task lifecycle / VWC / reputation | **Implemented** — driven by L2 replay; exercised by `crates/jnt-node/tests/e2e_journey.rs` |
+| Opt-in REST API | **Implemented** — `--api-listen`; loopback by default; **unauthenticated** |
+| `jnt-worker` run loop | **NOT implemented as a binary** — `jnt-worker` ships `address` and `generate` only; the worker SDK's claim/execute/submit loop exists as a library over the `L2NodeView`/`L2Broadcaster` seams and is exercised by tests, but there is no operational worker daemon to launch |
+| `/metrics` (Prometheus) | **NOT implemented** — no metrics endpoint exists; monitor via `/v1/status` polling and logs |
+| Node config file | **NOT implemented** — the node is CLI-flags-only; no `config.toml` is read |
+
+## Launch runbook (real commands)
+
+Default network is `mini` and default data dir is `chain`; both are overridden
+per command. `--network` accepts `mainnet`, `testnet`, `mini`.
+
+### Phase 0 — pre-launch (24 h before)
+
+1. **Bootstrap nodes.** A "bootnode" is not a flag: it is an ordinary `serve`
+   node started with `--listen` that other nodes dial with `--connect`. Start
+   three on distinct hosts:
    ```
-   jnt-node serve --network testnet --bootnode
+   jnt-node init  --network testnet --data-dir /var/lib/jnt
+   jnt-node serve --network testnet --data-dir /var/lib/jnt \
+                  --listen 0.0.0.0:9333
    ```
-2. **Committee keys:** Generate 4 BLS keys, publish to a sealed
-   `committee.json` (quorum = 3). Keys must be from different operators.
-3. **Verify genesis:**
-   ```python
+2. **Committee keys.** The testnet committee is **deterministic** (derived from
+   public test seeds by `testnet_validator_key(seed)`, seeds 1..4). There is
+   no key-generation ceremony and no sealed `committee.json`; two independently
+   built `testnet` profiles are byte-identical. Quorum is the §14.7
+   `ceil(n × 6667 / 10000)` = 3 of 4.
+3. **Verify vectors and genesis:**
+   ```
    python sim/verify_vectors.py --check
+   python sim/supply_schedule_sim.py
    ```
-4. **Final CI:** Run `cargo test --workspace` and monitor for flakes.
+4. **Final CI:** `cargo test --workspace` and `cargo fmt --all --check`,
+   `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 
-### Phase 1: Boot (T+0)
+### Phase 1 — boot (T+0)
 
-1. Start all 3 bootnodes with `--network testnet`.
-2. Bootnodes must be reachable on port 9333 (main) and 9334 (API).
-3. First validator connects within 30s; sync should complete in <2 min.
-
-### Phase 2: Join (T+1h)
-
-1. **Node operators:** Run:
+1. Start the three bootstrap nodes as above (they begin mining by default).
+2. Joiners connect to any bootstrap node:
    ```
-   jnt-node init --network testnet
-   jnt-node serve --network testnet --api-listen 0.0.0.0:9334
+   jnt-node init  --network testnet --data-dir /var/lib/jnt
+   jnt-node serve --network testnet --data-dir /var/lib/jnt \
+                  --connect <bootnode-host>:9333 --no-mine
    ```
-2. **Workers:** Run worker against any node:
-   ```
-   jnt-worker --network testnet --node http://localhost:9334
-   ```
+   `--connect` takes a comma-separated list; `--no-mine` makes a
+   validate/relay/sync-only node.
+3. Confirm sync by polling status (see Monitoring).
 
-### Phase 3: Validate (T+6h)
+### Phase 2 — service node (T+1 h)
 
-1. Mine at least 50 blocks (2+ finality windows on mini profile).
-2. Confirm L2 tasks are being created, claimed, settled with VWCs.
-3. Confirm `/v1/reputation/{address}` returns a derived ledger.
-4. Check `/metrics` for expected counters.
-
-## Configuration (`config.toml`)
-
-```toml
-network = "testnet"
-listen = "0.0.0.0:9333"
-api_listen = "0.0.0.0:9334"
-
-[storage]
-dir = "/var/lib/jnt"
-max_block_bytes = 1048576
-
-[sync]
-max_peers = 100
-sync_timeout_ms = 30000
-
-[finality]
-# M5 binding on testnet: committee of 4, quorum 3, activation at block 20
-# (see SPEC.md §14.8, Decision 12)
-activation_height = 20
+To expose the opt-in REST API (needed by the worker SDK / MCP surface):
 ```
-
-## Known Limitations (Testnet)
-
-| Issue | Workaround |
-|---|---|
-| M2 (Anti-Collusion) inactive | Slashing vault exists but no rule triggers. Manual slashing via governance. |
-| M4 (HBM scratchpad) inactive | Chain security is from §5 double-PoW only. |
-| No fee market dynamics yet | Base fee is flat per `fees.rs` schedule; congestion model arrives in v0.3.0. |
-| Transaction relay not yet on L1 wire | Txs broadcast via API; P2P tx relay (§13.13) is post-testnet. |
-
-## Monitoring During Testnet
-
-### Health check
-
-```bash
-curl -s http://localhost:9334/health | jq .
+jnt-node serve --network testnet --data-dir /var/lib/jnt \
+               --listen 0.0.0.0:9333 --api-listen 127.0.0.1:9334
 ```
-Expected: `{"status": "ok", "height": <N>, "peers": <N>}`
+The API is **unauthenticated**; bind it to loopback or a trusted network only.
 
-### Alert thresholds (testnet)
+### Phase 3 — validate (T+6 h)
 
-| Metric | Alert if |
+1. Mine past height 20 and confirm `finalized_height` advances in
+   `/v1/status` (binding finality activates at 20 on testnet).
+2. Confirm L2 replay reports no skipped payloads and the deposit pipeline is
+   live (`/v1/status` carries the L2 block).
+3. Drive an L2 task lifecycle through the test suite path
+   (`cargo test -p jnt-node --test e2e_journey`) or the API, and confirm a VWC
+   and a derived reputation appear at `/v1/vwc/{task_id}` and
+   `/v1/reputation/{id}`.
+
+## Configuration
+
+There is no config file. All configuration is command-line flags. The relevant
+`testnet` parameters are fixed in `NetworkParams::testnet()` and are **not**
+operator-tunable:
+
+| Parameter | testnet value |
 |---|---|
-| `jnt_blocks_seen_total` | No new block for 2 × `target_block_time` (20s on testnet) |
-| `jnt_peer_count` | Drops below 2 |
-| `jnt_rejected_blocks_total` | > 10 rejections in 5 min |
-| `jnt_l2_skipped_total` | > 5 skips in 10 blocks |
+| `network_id` | `jounit/testnet` |
+| `finality_depth` | 20 |
+| `finality_activation_height` | 20 |
+| `checkpoint_interval_blocks` | 10 |
+| `genesis_validators` | 4 deterministic keys (quorum 3) |
+| `supply_cap_sat` | 304,000 JNT (shared with `mini`) |
+| `base_fee_initial_sat` / `min` / `max` | 100 / 10 / 1,000,000 |
 
-## Graduation Criteria
+Node flags that exist: `--network`, `--data-dir`, `--listen`, `--connect`,
+`--peers`, `--no-mine`, `--interval`, `--api-listen` (serve); `--network`,
+`--data-dir`, `--blocks`, `--wallet`, `--to`, `--amount`, `--fee`, `--relay`,
+`--label`, `--address`, `--height`, `--out` (other commands). Anything else is
+rejected as an unexpected argument.
 
-Testnet → Mainnet when all of:
+## Known limitations (testnet)
 
-1. No consensus-critical bugs in 14 days of continuous operation
-2. ≥20 independent nodes have synced
-3. ≥500 L2 tasks created/settled with VWCs
-4. Checkpoint finality is verified on 3 independent sync restarts
-5. Fuzz smoke has 0 crashes for 72h continuous
-6. Security team sign-off on the attack-surface review
-7. Community audit window open + response period ended
+| Issue | Consequence / workaround |
+|---|---|
+| L2 → L1 exits are not implemented | Deposited L2 value cannot be withdrawn on testnet — by design, pending a decision (`docs/l2-exit-design.md`). Do not deposit value you expect back. |
+| M2 (Anti-Collusion slash vault) inactive | The vault exists; no rule triggers it. |
+| M4 (HBM scratchpad) not a registered `puzzle_id` | Chain security rests on the §5 double-PoW puzzle only. |
+| No stake ledger / validator rotation | The committee is fixed at genesis (Decision 8); bonding/unbonding are mainnet-gated. |
+| API is unauthenticated | Loopback/tunnel only. |
+| No metrics endpoint | Poll `/v1/status`; scrape logs. |
+| MemPool is in-memory only | A restart begins with an empty pool. |
+| No worker daemon binary | `jnt-worker` drives the SDK only through `address`/`generate`; the run loop is library + tests today. |
+
+## Monitoring during testnet
+
+Health is a liveness check only:
+```
+curl -s http://127.0.0.1:9334/v1/health
+# => {"status":"ok"}
+```
+The real observable is `/v1/status`, which returns network id, height, tip,
+peer count, base fee, total supply, PSCB reserve, `finalized_height`,
+`finality_activation_height`, `finality_depth`, mempool length and the L2
+block. There is **no** Prometheus `/metrics` endpoint; alert by polling
+`/v1/status`:
+
+| Signal (from `/v1/status`) | Alert if |
+|---|---|
+| `height` | unchanged for 2 × the target block interval |
+| `peers` | drops below 2 |
+| `finalized_height` | stops advancing after activation height while `height` climbs |
+| `l2.skipped` | grows more than 5 entries in 10 blocks |
+| `pscb_reserve_sat` | moves unexpectedly |
+
+## Graduation criteria (testnet → mainnet)
+
+Unchanged and still unmet:
+
+1. No consensus-critical bugs in 14 days of continuous operation.
+2. ≥ 20 independent nodes synced.
+3. ≥ 500 L2 tasks created/settled with VWCs.
+4. Checkpoint finality verified across ≥ 3 independent sync restarts.
+5. Fuzz smoke clean for 72 h continuous.
+6. Security sign-off on the attack-surface review.
+7. Community audit window opened and closed.
+
+**Mainnet remains blocked independently of these** by the L2-exit decision
+(`docs/l2-exit-design.md`), the absent stake ledger / mainnet committee
+(Decision 8, `docs/decisions.md`), and M2/M4 activation rules. See
+`docs/mainnet-readiness.md`.

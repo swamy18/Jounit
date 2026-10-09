@@ -1,121 +1,197 @@
 # Mainnet Operational Readiness
 
-## 1. Versioning & Release Management
+**Status: NOT READY.** This document separates what is *documented*, what is
+*implemented*, and what is *tested*. An earlier revision carried several
+figures that exist nowhere in the code (a 10,000,000 JNT cap, `MAX_HALVINGS`,
+a `config.toml`, a `/metrics` endpoint, a `serve --sync` flag) and a
+pre-launch checklist that marked unrun items ✅. Those are corrected below.
+Mainnet is blocked by three things that are not operational at all — they are
+protocol decisions — and the blockers are named at the end.
 
-- **Current version:** 0.2.0 (foundation + P2P transport) per `SPEC.md` header
-- **SemVer policy:** Major = consensus-breaking (halving, checkpoint, validator set); Minor = backward-compatible
-  feature or protocol mechanism activation; Patch = bug fix with no consensus impact.
-- **Release branch convention:** `release/vMAJOR.MINOR` — cut 2 weeks before mainnet launch, receive only
-  bug fixes and security patches.
-- **Release checklist:**
-  1. `cargo fmt --all --check`
-  2. `cargo clippy --workspace --all-targets -- -D warnings`
-  3. `cargo test --workspace` (all test suites pass, 0 failures)
-  4. `cargo build --workspace --release` (no link errors)
-  5. Verify `SUPPORTED_PROTOCOL_VERSIONS` in `jnt-core/src/params.rs`
-  6. Verify no `#[ignore]`d tests remain relevant (only `vwc_perf_probe` is intentionally ignored)
-  7. Update `CHANGELOG.md`
-  8. Tag `vMAJOR.MINOR.PATCH` and publish to GitHub Releases
+## What is actually implemented
 
-## 2. Monitoring & Observability
-
-### Metrics (to be exposed via `/metrics` endpoint)
-
-| Metric | Type | Alert threshold |
-|---|---|---|
-| `jnt_chain_height` | gauge | < prev - 1 for 2 min |
-| `jnt_peer_count` | gauge | < 3 or > 90% of max |
-| `jnt_mempool_size` | gauge | > 95% of byte cap |
-| `jnt_blocks_seen_total` | counter | 0 for 3 block intervals |
-| `jnt_rejected_blocks_total` | counter | spike > 2σ |
-| `jnt_l2_applied_total` | counter | 0 for >5 blocks |
-| `jnt_l2_skipped_total` | counter | spike > 2σ |
-| `jnt_fees_collected_sat` | counter | flat for 10 min |
-| `jnt_finality_height` | gauge | no advance for 30 min (testnet only) |
-
-### Logs
-
-| Level | Condition |
+| Area | Implemented |
 |---|---|
-| `WARN` | Invalid block from peer |
-| `WARN` | L2 payload skipped by name |
-| `WARN` | Reorg deeper than finality window |
-| `ERROR` | Storage open failure |
-| `INFO` | Block accepted with timestamp, height, miner |
-| `INFO` | L2 payload applied/skipped with reason |
+| Versioned network profiles | `NetworkParams::{mainnet, testnet, mini}`, `by_name`, `validate` (`crates/jnt-core/src/params.rs`) |
+| Deterministic genesis | genesis mints nothing; identical across profiles (SPEC §11) |
+| Block storage | `jnt-store`: append-only checksummed `blocks.log` + atomic metadata; torn-tail recovery reported, mid-chain damage refused |
+| Node CLI | `jnt-node {init,mine,send,status,verify,show-block,balance,wallet,export,serve}`; flags only, **no config file** |
+| P2P + tx relay | `jnt-net`, SPEC §13/§13.14 |
+| L2 replay, deposits, VWC, reputation | `jnt-l2`, SPEC §14–§19 |
+| Opt-in REST API | `--api-listen`, `/v1/*` routes (see §2) |
+| Fuzz harness | `fuzz/` (14 targets, cargo-fuzz nightly + ASan) |
+| Benchmarks | inline `#[ignore]`d probes, **not** a `benches/` harness |
 
-## 3. Backup & Recovery
+Not implemented, and named as such: `/metrics`, Prometheus/OpenTelemetry
+export, a node config file, a release/tagging pipeline, a worker daemon
+binary, reproducible-build tooling, log shipping, and the security-disclosure
+channel's PGP key.
 
-### Data directories
+## 1. Versioning & release management
+
+- **Version:** `0.2` (`SPEC.md` header: foundation + P2P transport).
+- **SemVer policy (documented, not enforced by tooling):** major = consensus
+  break; minor = backward-compatible mechanism activation; patch = no
+  consensus impact.
+- **Release branch convention:** `release/vMAJOR.MINOR` — cut 2 weeks before
+  launch, bug/security fixes only.
+- **Release checklist** (each item runnable; the ones that are not yet
+  automatable say so):
+
+  | Step | Command | Current result |
+  |---|---|---|
+  | 1 | `cargo fmt --all --check` | clean |
+  | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
+  | 3 | `cargo test --workspace` | 773 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
+  | 4 | `cargo build --workspace --release` | succeeds |
+  | 5 | vector cross-check: `python sim/verify_vectors.py --check` | see `docs/status.md` |
+  | 6 | confirm the only `#[ignore]`d test is the manual `vwc_perf_probe` | confirmed |
+  | 7 | update `CHANGELOG.md` | **no CHANGELOG exists yet** |
+  | 8 | tag `vMAJOR.MINOR.PATCH`, publish to GitHub Releases | **not yet done** |
+
+## 2. Monitoring & observability
+
+**No metrics endpoint exists.** The `/health` path in an earlier revision is
+wrong twice over: the route is `/v1/health` and it returns only
+`{"status":"ok"}`. The observables are `/v1/status` (rich JSON) and the
+process logs; there is no Prometheus exporter.
+
+`GET /v1/status` returns: `network`, `network_id`, `height`, `tip_hash`,
+`peers`, `base_fee_sat`, `total_supply_sat`, `pscb_reserve_sat`,
+`finalized_height`, `finality_activation_height`, `finality_depth`,
+`mempool_len`, and an `l2` block.
+
+**Suggested alerts** (to be implemented; polling today):
+
+| Signal | Alert if |
+|---|---|
+| `height` | no advance for 2 × target block interval |
+| `peers` | < 3, or > 90 % of `--peers` |
+| `mempool_len` | near the byte cap |
+| `finalized_height` | stops advancing after activation while `height` climbs |
+| `l2.skipped` | spike |
+| `pscb_reserve_sat` | flat where it should move, or a jump |
+
+**Logging:** line-based stdout via the node; there is no structured log
+shipper. Recommended operational additions (not present): log-to-file,
+rotation, and a level switch.
+
+## 3. Backup & recovery
+
+**Data directory** contains only:
 
 ```
-~/.jnt/
-  blocks.log          # append-only, checksummed
-  meta.json           # atomic metadata (height, tip, network)
-  config.toml         # node configuration
-  policy/             # agent authorization policies (Decision 16)
+<data-dir>/
+  blocks.log      # append-only, checksummed, one record per block/UTXO snapshot
+  meta.json       # atomic metadata: network, genesis, tip, height
+  chain.json      # legacy JSON chain, migrated into blocks.log on first open
+  wallets.json    # wallet key material (if any) — protect this
 ```
 
-### Recovery procedure
+There is **no** `config.toml` and **no** `policy/` directory in the data dir
+(agent policies are library values, not node files).
 
-1. **Full node:** Back up `~/.jnt/` daily (blocks.log grows ~864 MB at 1 KB/block for 14 days of mainnet).
-   Recovery: copy directory, `jnt-node serve` — `BlockStore::open` replays from `meta.json` tip.
-2. **Wallet:** Seed phrase (mnemonic per BIP-39). Wallet files are deterministic; no backup needed.
-3. **Lost node:** Resync from any peer: `jnt-node init --network mainnet`, then `jnt-node serve --sync`.
-   Sync speed: ~10k blocks/sec from a single peer (limited by disk I/O, not network).
+**Recovery procedure**
 
-### Disaster scenarios
+1. **Full node:** back up the data directory. Restore by copying it back and
+   running `init` then `serve`; `BlockStore::open` rebuilds the hash index by
+   scanning and resumes from the `meta.json` tip.
+2. **Wallet:** deterministic wallets; back up `wallets.json` (or the mnemonic
+   material it derives from). Losing it loses the keys.
+3. **Resync:** `jnt-node init --network mainnet --data-dir <dir>` then
+   `jnt-node serve --network mainnet --data-dir <dir> --connect <peer>:9333`.
+   There is **no `--sync` flag**; sync is automatic once a peer is connected.
+   State is replayed from genesis on load, so resync time is O(chain); there is
+   no UTXO snapshot fast-path written today.
+
+**Disaster scenarios**
 
 | Scenario | RTO | RPO |
 |---|---|---|
-| Node crash (clean) | <30s | 0 blocks |
-| Torn write (power loss) | <2 min | 0 blocks (torn tail dropped) |
-| Disk failure, last backup ≤24h old | <30 min (resync) | ≤24h |
-| Entire operator fleet down | Restore from any other node's snapshot | 0 blocks |
+| Clean crash | restart | 0 blocks |
+| Torn write (power loss) | reopen; torn tail dropped and reported | 0 committed blocks |
+| Damage mid-chain | refuses to open (no silent truncation) → restore backup | last backup |
+| Whole fleet down | restore from any node's backup | last backup |
 
-## 4. Security Disclosure
+## 4. Security disclosure
 
-- **Bug bounty:** Not yet announced; will be via GitHub Security Advisory.
-- **Responsible disclosure window:** 90 days.
-- **Criticality:** Chain-halting bugs (invalid block accepted) = critical, immediate patch + coordinated
-  disclosure. Wallet compromise bugs = high, 7-day disclosure.
-- **Contact:** security@jounit.org (PGP key to be published).
+- **Bug bounty:** not announced; plan is a GitHub Security Advisory.
+- **Responsible disclosure window:** 90 days (documented).
+- **Severity:** chain-halting (invalid block accepted) = critical, immediate
+  patch + coordinated disclosure; key-compromise = high, 7-day disclosure.
+- **Contact:** security@jounit.org. **PGP key is not yet published** — the
+  channel is therefore not yet operational.
 
-## 5. Genesis & Bootstrapping
+## 5. Genesis & bootstrapping
 
-- **Mainnet genesis** is deterministic + frozen (SPEC.md §9). No allocations. Total supply mints over
-  `MAX_HALVINGS * 10` halving epochs to the cap (10,000,000 JNT).
-- **Mini genesis** (for testnet/dev): seeds 1-3 funded with 1 JNT each, escrow sink per Decision 11.
-- **Testnet genesis:** identical to mainnet structure; committee of 4 keys (quorum 3) declared at activation.
-- **Bootnodes:** To be announced. Current testnet uses 2 stable bootnodes on separate clouds.
+- **Mainnet genesis** is deterministic and frozen (SPEC §11). It mints
+  **nothing** and has no spendable output (0 % premine, enforced in code).
+- **Supply** reaches the cap of **39,945,600 JNT** through the block-reward
+  ladder; it is not "minted over `MAX_HALVINGS × 10` epochs" (no such constant
+  exists). The ladder issues 39,157,200 JNT; **788,400 JNT is permanently
+  unmintable** (see `docs/monetary-policy.md`).
+- **L2 genesis escrow** (Decision 7) is a *reallocation of already-unmintable
+  sats*, not new issuance: even scales fit the gap and `NetworkParams::validate`
+  refuses any profile that does not. `mini` allocates 10 JNT (3 grant accounts
+  of 1 JNT each); `mainnet` allocates 100,000 JNT and grants nothing.
+- **Testnet** uses the dedicated `testnet` profile with four deterministic
+  genesis validators (Decision 13).
+- **Bootnodes:** none exist yet. A bootnode is a `serve --listen` node that
+  joiners dial with `--connect`; no address book or DNS seeding is implemented
+  (SPEC §13.6 by design).
 
-## 6. Upgrade Mechanism
+## 6. Upgrade mechanism
 
-Consensus upgrades use **epoch-based activation** (SPEC.md §10):
+Mechanism activation is by profile parameter, not by an on-chain governance
+epoch:
 
-| Mechanism | Activation | Consensus-active? |
+| Mechanism | Consensus-active? | Authority |
 |---|---|---|
-| M1 | Always (§8) | Yes |
-| M2 | Decision 10 | No (inactive) |
-| M3 | Decision 9 | No (envelope only) |
-| M4 | Decision 11 | No (inactive) |
-| M5 | Decision 12 (testnet: epoch 20, mainnet: none) | Conditional |
+| M1 (50/50 PSCB fee split) | **Yes**, everywhere | SPEC §8 |
+| M2 (Anti-Collusion Slash Vault) | **No** — no rule creates a slash record | `slash.rs` |
+| M3 (Canonical Compute IR) | **No** — envelopes only | `compute_ir.rs` |
+| M4 (HBM scratchpad PoW) | **No** — not a registered `puzzle_id` | `hbm_pow.rs` |
+| M5 (BLS aggregate finality) | **Conditional** — binding where `finality_activation_height > 0` (`testnet` = 20); observation-only on `mini`; unreachable on `mainnet` (empty committee fails closed) | Decisions 11–12, SPEC §14.7–§14.8 |
 
-A node running pre-upgrade software will reject blocks post-activation per the new rules (fail-closed),
-ensuring a hard fork boundary. Operators must upgrade before the activation epoch to stay on consensus.
+A node running pre-activation software rejects post-activation blocks per the
+new rules (fail-closed). Operators must upgrade before an activation height is
+reached.
 
-## 7. Pre-Launch Checklist
+## 7. Pre-launch checklist
 
 | Item | Status |
 |---|---|
-| Clippy clean | ✅ |
-| `cargo fmt --check` clean | ✅ |
-| All tests pass | ✅ (773 passed, 0 failed) |
-| Release build compiles | ✅ (`cargo build --release`) |
-| Vector cross-check | ✅ (Python reference matches Rust) |
-| Fuzz smoke | ✅ (14 targets, 0 crashes) |
-| Genesis hash verified | ✅ (deterministic across profiles) |
-| BLS finality tested | ✅ (18 adversarial checkpoint tests) |
-| L2 end-to-end | ✅ (reputation API, 2-process E2E, chaos suite) |
-| **Before mainnet:** M2/M4 activation rules | ❌ (blocked - needs protocol decision) |
-| **Before mainnet:** M5 committee for mainnet | ❌ (empty committee fails closed) |
+| `cargo fmt --all --check` clean | ✅ |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
+| `cargo test --workspace` passes | ✅ 773 passed, 0 failed |
+| Release build compiles | ✅ |
+| Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
+| Fuzz: 14 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
+| Deterministic genesis across profiles | ✅ |
+| BLS finality adversarial tests | ✅ (18 checkpoint tests) |
+| L2 end-to-end (deposits, tasks, VWC, reputation) | ✅ (2-process E2E + chaos suite) |
+| **L2 → L1 exits** | ❌ **blocked** — no recorded decision (`docs/l2-exit-design.md`) |
+| **Stake ledger / mainnet validator committee** | ❌ **blocked** — Decision 8 builds none; `mainnet` has an empty committee so finality fails closed |
+| M2 / M4 activation rules | ❌ **blocked** — each needs a rule that defines fraudulent compute output / how the HBM puzzle is registered |
+| `/metrics`, log shipping, release pipeline, PGP disclosure key | ❌ operational, not built |
+
+## Exact blockers preventing mainnet
+
+1. **L2 → L1 exits are undefined.** Decision 10 explicitly defers them. The
+   deposit sink is unspendable, so an exit needs a new L1 release rule that no
+   decision authorises. Without it, mainnet deposits would trap user funds.
+   (`docs/l2-exit-design.md`.)
+2. **No stake ledger and no mainnet committee.** Decision 8 builds no stake
+   transaction, bond, or unbonding; `mainnet` carries an empty
+   `genesis_validators`, so checkpoint verification fails closed and binding
+   finality is untestable on mainnet. Real bonded stake (`min_validator_stake_sat`
+   = 5,000 JNT, unbonding after `finality_depth`) remains required and unbuilt.
+3. **M2 and M4 activation rules are unspecified.** M2 has no rule defining what
+   proves a compute result fraudulent; M4 is not a registered `puzzle_id`.
+4. **Operational gaps** (below) — these do **not** block a testnet, but they
+   block a defensible mainnet: no metrics/log shipping, no release/tagging
+   process, no CHANGELOG, no published PGP key, no reproducible-build tooling.
+
+Mainnet readiness is therefore **not claimed**. Testnet is the appropriate
+next milestone, and it too is gated on the operational checklist above (not on
+the three protocol blockers, which are mainnet-only).
