@@ -1083,3 +1083,41 @@ verified, not asserted.
 Milestones **not** claimed here: M-F owns no numeric fee-burn target (deflation
 accepted and documented in `monetary-policy.md`), and the exit rule (P1) remains
 a separate, unimplemented mainnet blocker.
+
+## Decision 18 — Supply anchor: a rate rule replaces the stock cap (PROPOSED)
+
+**Raised by the owner 2026-10-09:** should JNT have a fixed numerical cap, no
+cap, or a mechanism of a different kind, given the goal of a currency for AI,
+robotics and humans that works at today's scale and at a Mars-scale one?
+
+**Full analysis, numbers and migration plan: `docs/supply-anchor-decision.md`.**
+The recommendation is that the stock cap is replaced by a **rate anchor** —
+gross issuance after the ladder era may never exceed **1 % of issued supply per
+`halving_period` (≤ 0.2 %/yr)** — with the permanent tail kept as the floor and
+burns kept on the net side.
+
+The decisive finding is that **the cap and the already-approved permanent tail
+contradict each other**: with policy E, the cap binds at block **8,213,259**
+(≈ **156.2 years**) and issuance then stops forever, so "permanent 0.1 JNT
+floor" really means 156 years. A rate anchor cannot be repealed that way: a
+constant absolute trickle becomes *less* dilutive as supply grows (0.0132 %/yr
+today, 0.0013 % at 10× supply), while a stock cap only grows more binding.
+
+**Relation to the approved M-D.** M-D kept `supply_cap_sat` because it was then
+"the joint L1/L2 conservation anchor **and** the escrow backing rule, not just
+a ceiling". Both of those jobs have since been moved off it by the very
+milestones shipped under M-D/M-E: the joint bound is now
+`cumulative_issuance_sat(height) + escrow_ceiling_sat`, and the escrow is backed
+by the explicit validated `escrow_ceiling_sat`. The cap is therefore *already*
+all ceiling and nothing else, which is why replacing it is a deliberate
+substitution rather than the deletion-for-convenience M-D rejected.
+
+**Status: PROPOSED — awaiting owner sign-off on the mechanism before any code
+changes.** The M-A…M-G freeze ("no editing `params.rs` reward/cap/escrow values,
+`supply.rs`, the consensus cap gate, or committed vectors") applies until that
+sign-off is recorded, so nothing in this decision is implemented yet.
+
+**Compatibility note:** unlike the exit rule (P1), this change needs **no
+activation height**. The mint bound only loosens (`min(integral, cap)` →
+`integral`), so every historical block remains valid and replay stays
+byte-identical.
