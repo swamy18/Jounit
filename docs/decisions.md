@@ -921,6 +921,16 @@ nobody. Acknowledged 2026-10-09: the narrow defaults stand.
 
 ### What is already implemented (safe, non-consensus)
 
+**The proof half (2026-10-09):** `crates/jnt-core/src/state_root.rs` builds and
+verifies account inclusion proofs — `account_leaf`, `state_root`,
+`prove_inclusion`, `verify_inclusion` — and `L2State::state_root` /
+`account_proof` / `verify_account` expose them over real L2 state
+(`crates/jnt-l2/tests/state_root_proof.rs`). This is the piece the exit needed
+and it adds **no consensus rule**: nothing calls it from `Chain::apply_block`, no
+block field carries a root, and `sink_unspendable` / `exit_unavailable` still
+pass unchanged. It exists precisely because it grants no authority until the
+release rule and its activation mechanism are built.
+
 `crates/jnt-core/tests/sink_unspendable.rs`,
 `crates/jnt-l2/tests/exit_unavailable.rs`,
 `crates/jnt-node/src/conservation.rs` (+ `tests/conservation.rs`), and two

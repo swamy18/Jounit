@@ -45,6 +45,7 @@ pub mod ser;
 pub mod service;
 pub mod sig;
 pub mod slash;
+pub mod state_root;
 pub mod supply;
 pub mod tx;
 pub mod u256;

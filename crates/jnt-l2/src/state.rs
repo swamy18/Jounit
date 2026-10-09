@@ -37,6 +37,7 @@ use jnt_core::l2::{
 };
 use jnt_core::ser::{Reader, Writer};
 use jnt_core::slash::SlashVault;
+use jnt_core::state_root::{account_leaf, prove_inclusion, state_root, InclusionProof};
 
 use crate::error::{L2Error, L2Result};
 use crate::genesis::L2Genesis;
@@ -253,6 +254,59 @@ impl L2State {
 
     pub fn balance(&self, addr: &Address) -> u64 {
         self.accounts.get(addr).copied().unwrap_or(0)
+    }
+
+    // --- state commitment (P1 exit proof, non-consensus) ----------------
+
+    /// Every account as `(address, balance)` in canonical address order.
+    ///
+    /// This is the exact ordering the state root commits to and the same
+    /// ordering `encode` uses, so a root and a wire blob can never disagree
+    /// about which account is where.
+    pub fn account_leaves(&self) -> Vec<(Address, u64)> {
+        let mut accounts: Vec<(Address, u64)> =
+            self.accounts.iter().map(|(a, b)| (*a, *b)).collect();
+        accounts.sort_by_key(|(a, _)| *a);
+        accounts
+    }
+
+    /// The committed root over every account balance.
+    ///
+    /// Zero-balance accounts are still leaves: the account *exists*, and
+    /// dropping it would let a root for {alice: 0} collide with a root for an
+    /// empty state.
+    pub fn state_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self
+            .account_leaves()
+            .iter()
+            .map(|(a, b)| account_leaf(a, *b))
+            .collect();
+        state_root(&leaves)
+    }
+
+    /// Prove `addr`'s current balance against [`L2State::state_root`].
+    ///
+    /// `None` for an address that holds no account — there is no leaf, so
+    /// there is nothing to prove. Proving a zero balance for an absent account
+    /// would claim a fact the commitment does not contain.
+    pub fn account_proof(&self, addr: &Address) -> Option<InclusionProof> {
+        let leaves = self.account_leaves();
+        let index = leaves.iter().position(|(a, _)| a == addr)?;
+        let hashed: Vec<Hash> = leaves.iter().map(|(a, b)| account_leaf(a, *b)).collect();
+        prove_inclusion(&hashed, index)
+    }
+
+    /// Convenience for a verifier holding only the root: does this address and
+    /// balance belong to that commitment?
+    pub fn verify_account(&self, addr: &Address, balance_sat: u64) -> bool {
+        match self.account_proof(addr) {
+            Some(proof) => jnt_core::state_root::verify_inclusion(
+                self.state_root(),
+                account_leaf(addr, balance_sat),
+                &proof,
+            ),
+            None => false,
+        }
     }
 
     fn ensure_balance(&self, addr: &Address, amount: u64) -> L2Result<()> {
