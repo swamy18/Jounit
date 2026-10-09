@@ -855,36 +855,17 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
     // inflation on every deposit. Burns anywhere move the sum down, never up —
     // either check failing means value was created, which must never print
     // "ok".
-    if !a.state().check_conservation() {
-        return Err("l2 conservation broken: released value exceeds value in the system".into());
-    }
-    let expected_funded = a
-        .genesis()
-        .escrow_total_sat
-        .saturating_add(a.state().deposited_total());
-    if a.state().funded_total() != expected_funded {
-        return Err("l2 funding anomaly: released value is not genesis plus deposits".into());
-    }
-    let sink_held: u64 = chain
-        .utxo()
-        .outputs_for_address(&chain.params().l2_deposit_sink())
-        .iter()
-        .map(|(_, v)| v)
-        .sum();
-    let joint = chain
-        .utxo()
-        .total_value()
-        .saturating_add(a.state().conservation_total())
-        .saturating_sub(sink_held);
-    if joint > chain.params().supply_cap_sat {
-        return Err(
-            "joint supply exceeds the cap: L1 live plus L2 held minus sink is inflation".into(),
-        );
-    }
+    // The three conservation checks now live in one tested place; this command
+    // only reports the terms it returns.
+    let supply =
+        jnt_node::conservation::verify_conservation(&chain, &a).map_err(|e| e.to_string())?;
     println!(
-        "ok: joint supply conserved (l1 live + l2 held - sink = {} sat of {} cap)",
-        joint,
-        chain.params().supply_cap_sat
+        "ok: joint supply conserved (l1 live {} + l2 held {} - sink {} = {} sat of {} cap)",
+        supply.l1_live_sat,
+        supply.l2_held_sat,
+        supply.sink_held_sat,
+        supply.joint_sat,
+        supply.cap_sat
     );
     for s in a.skipped().iter().take(10) {
         println!(
