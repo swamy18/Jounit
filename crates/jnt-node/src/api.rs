@@ -248,6 +248,12 @@ async fn status(State(state): State<ApiState>) -> ApiResult {
                 "applied": sh.l2.applied_count(),
                 "skipped": sh.l2.skipped().len(),
                 "pending_deposits": sh.l2.pending_deposits().len(),
+                // The exit pipeline (approved P1): queued exits awaiting an L1
+                // release, and value that has already left L2 for L1. An
+                // operator watches `exited_sat` to confirm the two directions
+                // balanced rather than one side inflating.
+                "pending_exits": sh.l2.pending_exits().len(),
+                "exited_sat": sh.l2.state().exited_total(),
             },
         }))
     })
@@ -276,6 +282,7 @@ async fn conservation(State(state): State<ApiState>) -> ApiResult {
             "joint_bound_sat": report.supply.bound_sat(),
             "l1_bound_sat": report.supply.l1_bound_sat,
             "escrow_ceiling_sat": report.supply.escrow_ceiling_sat,
+            "exited_sat": report.supply.exited_sat,
             "l1_issued_sat": jnt_core::supply::cumulative_issuance_sat(sh.chain.params(), sh.chain.height()),
             "l1_removed_sat": sh.chain.base_removed_total(),
             "l1_net_sat": jnt_core::supply::cumulative_issuance_sat(sh.chain.params(), sh.chain.height()).saturating_sub(sh.chain.base_removed_total()),

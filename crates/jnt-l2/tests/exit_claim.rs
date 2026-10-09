@@ -295,10 +295,13 @@ fn exit_claim_releases_exactly_once_and_conserves() {
     assert!(chain.exit_released(&me, 1));
     chain.verify_canonical_chain().unwrap();
 
-    // L2 side: replay observes the release and the books close.
-    let mut l2_after = l2view(&chain);
-    assert!(l2_after.state().exit(&me, 1).is_some());
-    l2_after.state_mut().note_release(&me, 1).unwrap();
+    // L2 side: replay observed the release itself, so the record is already gone
+    // and the books need no manual nudge.
+    let l2_after = l2view(&chain);
+    assert!(
+        l2_after.state().exit(&me, 1).is_none(),
+        "replay absorbed the release: a released exit cannot be proven again"
+    );
     assert!(l2_after.state().check_conservation());
     assert_eq!(
         l2_after.state().funded_total(),

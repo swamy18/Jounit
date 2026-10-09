@@ -27,6 +27,7 @@ pub mod discovery;
 pub mod dispute;
 pub mod error;
 pub mod executor;
+pub mod exit;
 pub mod http;
 pub mod node;
 pub mod submit;
@@ -45,6 +46,7 @@ pub use executor::{
     execute_task, result_hash_of, CpuExecutor, ExecError, ExecutionOutput, ExecutionWork, Executor,
     ExecutorCapabilities,
 };
+pub use exit::{queue_exit, queue_exit_plan, ExitPlan};
 pub use http::{ConservationReport, HttpNode};
 pub use node::{BroadcastError, L2Broadcaster, L2NodeView};
 pub use submit::{reconcile_submitted, submit_plan, submit_result, SubmitPlan, SubmittedState};

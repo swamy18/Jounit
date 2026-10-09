@@ -1139,3 +1139,59 @@ clippy `-D warnings` and `fmt --check` clean.
 activation height**. The mint bound only loosens (`min(integral, cap)` →
 `integral`), so every historical block remains valid and replay stays
 byte-identical.
+
+---
+
+## Decision 19 - L2 -> L1 exit rule (approved, implemented)
+
+**Status: APPROVED and IMPLEMENTED.** Supersedes Decision 10's deferral of
+exits and settles questions 1-3 of `docs/l2-exit-design.md`; questions 4-6 take
+the recommendations recorded there (no cancellation, no challenge window, no
+emergency pause in v1). Normative text: SPEC.md 19.6.
+
+**1. The primitive.** A block carries `exit_claims`. A claim takes **sink
+outputs** as inputs and is authorised by an *inclusion proof* against the
+`l2_state_root` committed at the queue height - not by a signature, because the
+sink holds no key. Consuming the sink rather than minting against it keeps the
+ordinary `value_in >= value_out` rule in force everywhere and reuses the `Undo`
+path, so a reorg unwinds a release exactly as it unwinds any spend. The rejected
+alternative was minting against the sink as a permanent counterweight: it would
+have made the release the protocol's only inflation-exception transaction type.
+
+**2. Permissionless or gated.** **Permissionless.** Anyone may build and submit
+a claim; consensus pays only the `destination` and `claimant` the proven L2 exit
+record names. No operator privilege, no second authorisation path to audit.
+
+**3. Who funds the L1 release fee.** **The exiting owner, prepaid at queue
+time.** The L2 side debits `amount + exit_fee + queue_fee`; the claimant
+receives `exit_fee_sat`, the destination receives `amount`. This is what makes
+the crank griefing-bounded - a claim not worth submitting simply is not
+submitted, and nobody can be forced to pay for it. An unfunded or
+protocol-funded release is a spam surface and was not adopted.
+
+**Activation.** `NetworkParams::exit_activation_height`, where `0` means
+**never** rather than *from genesis*: a profile that has chosen no height accepts
+neither a committed L2 root nor a claim (`Chain::exit_active_at`). At and after
+activation an L2-bearing block must commit a root - an exit cannot be proven
+without one, so a rootless block would silently disable exits.
+
+**Maturity.** The stronger of the two Decision 15 rules: depth `finality_depth`
+**and**, once binding finality is active, the binding checkpoint height. Exits
+are never less safe than deposits.
+
+**Exactly-once.** `(owner, nonce)` is the exit identity. Consensus keeps a
+consumed-identity set, so a replayed release is refused by consensus rather than
+by bookkeeping. A release is an ordinary undoable L1 operation: a reorg clears
+the mark and L2 replay regenerates the watch, so a rolled-back exit is spendable
+again and one the winner keeps is re-marked.
+
+**Accounting.** L2 debit equals L1 release, 1:1, no rate and no fee on the
+principal. The 19.5 joint check is **unchanged**: the L1 payment `+a` and the L2
+debit `-a` cancel while the sink term falls by the same `a`, so `joint_sat`
+needs no exit term. `tests/conservation.rs` passing untouched is the evidence.
+`exited_sat` is reported so an operator can confirm both sides balanced.
+
+**Implementation note.** `ChainL2` captures an `ExitWatch` (record plus
+`InclusionProof`) at the queue block - the only moment the node's L2 root equals
+the block's committed root. A crank never replays back to `queued_height`, which
+the design had rejected as unviable as a consensus rule.

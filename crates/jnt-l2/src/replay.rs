@@ -54,6 +54,8 @@
 
 use jnt_core::bls_checkpoint::{BlsVerifier, ValidatorSet};
 use jnt_core::chain::Chain;
+use jnt_core::hash::Address;
+use jnt_core::state_root::InclusionProof;
 use jnt_core::Hash;
 
 use crate::deposits::{
@@ -61,7 +63,7 @@ use crate::deposits::{
 };
 use crate::error::L2Error;
 use crate::genesis::L2Genesis;
-use crate::state::L2State;
+use crate::state::{ExitRecord, L2State};
 use crate::task_contract::L2Config;
 
 /// An L2 transaction that a canonical block carried but that did not apply.
@@ -75,6 +77,22 @@ pub struct SkippedL2 {
     pub txid: Hash,
     /// The named reason it did not apply.
     pub error: L2Error,
+}
+
+/// A queued exit whose record has just been committed under a block's L2 state
+/// root, with the inclusion proof that binds it to that root.
+///
+/// The proof is captured **at the block that queued the exit** and nowhere
+/// else, because that is the only moment the node holds a state whose root
+/// equals the block's committed `l2_state_root`. A crank therefore never has to
+/// replay back to `queued_height` to build a claim — the expensive alternative
+/// the exit design rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitWatch {
+    pub owner: Address,
+    pub nonce: u64,
+    pub record: ExitRecord,
+    pub proof: InclusionProof,
 }
 
 /// The L2 view of one canonical L1 chain.
@@ -92,6 +110,9 @@ pub struct ChainL2 {
     ignored: Vec<IgnoredDeposit>,
     /// Deposits credited (matured and applied).
     deposits_applied: u64,
+    /// Queued exits still awaiting an L1 release, newest last. Re-derived on
+    /// every replay; a release removes its entry, a reorg replays.
+    watches: Vec<ExitWatch>,
 }
 
 impl ChainL2 {
@@ -120,6 +141,7 @@ impl ChainL2 {
             pending: Vec::new(),
             ignored: Vec::new(),
             deposits_applied: 0,
+            watches: Vec::new(),
         }
     }
 
@@ -230,6 +252,30 @@ impl ChainL2 {
                 }),
             }
         }
+        // Exits queued by this block become crankable here, and only here:
+        // this is the moment the node's root is the block's committed root, so
+        // the proof it captures is the one L1 will verify against. Deposits in
+        // the same block change balances and move the root, so they are applied
+        // after — a block that mixes both simply yields no watch, and the exit
+        // stays queued rather than being provable against the wrong root.
+        if block.l2_state_root == Some(self.state.committed_root()) {
+            self.watch_exits(height);
+        }
+        // A release the chain accepted moves value off L2 (approved P1). L1 is
+        // the authority — it already proved maturity, exact funding and the
+        // identity — so this mirrors it rather than re-deciding. A claim with no
+        // record here means this node's L2 state disagrees with the chain it
+        // replayed; failing closed here would silently un-credit a real debit,
+        // so the disagreement is surfaced instead of being swallowed.
+        for claim in &block.exit_claims {
+            let released = self.state.note_release(&claim.owner, claim.nonce);
+            debug_assert!(
+                released.is_ok(),
+                "an L1-accepted claim must have a queued record on L2"
+            );
+            self.watches
+                .retain(|w| !(w.owner == claim.owner && w.nonce == claim.nonce));
+        }
         // Deposits ride the same block in the same order: detection is a pure
         // function of the block, maturity a pure function of tip + binding
         // finality, and exactly-once comes from the state's consumed set.
@@ -319,6 +365,44 @@ impl ChainL2 {
     /// Whether every L2 transaction in every block applied.
     pub fn is_clean(&self) -> bool {
         self.skipped.is_empty()
+    }
+
+    /// Record a proof for every exit this block queued, so a crank can build a
+    /// claim without replaying back to the queue height.
+    fn watch_exits(&mut self, height: u64) {
+        let fresh: Vec<(Address, u64)> = self
+            .state
+            .exit_records()
+            .into_iter()
+            .filter(|r| r.queued_height == height)
+            .map(|r| (r.owner, r.nonce))
+            .collect();
+        for (owner, nonce) in fresh {
+            if self
+                .watches
+                .iter()
+                .any(|w| w.owner == owner && w.nonce == nonce)
+            {
+                continue;
+            }
+            let Some(proof) = self.state.exit_proof(&owner, nonce) else {
+                continue;
+            };
+            let Some(record) = self.state.exit(&owner, nonce) else {
+                continue;
+            };
+            self.watches.push(ExitWatch {
+                owner,
+                nonce,
+                record: record.clone(),
+                proof,
+            });
+        }
+    }
+
+    /// Queued exits still awaiting an L1 release, oldest first.
+    pub fn pending_exits(&self) -> &[ExitWatch] {
+        &self.watches
     }
 
     /// Deposits detected but not yet final-deep: visible, not spendable.

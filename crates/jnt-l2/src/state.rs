@@ -485,6 +485,16 @@ impl L2State {
         depth_ok && binding_ok
     }
 
+    /// Whether this profile accepts an exit queue at `height`.
+    ///
+    /// `exit_activation_height == 0` means *never*, not *from genesis* — a
+    /// profile that has chosen no height must not encumber funds with no
+    /// release. Exposed so callers can refuse before building a transaction
+    /// rather than after broadcasting one.
+    pub fn exit_queue_is_active(&self, height: u64) -> bool {
+        self.config.exit_activation_height != 0 && height >= self.config.exit_activation_height
+    }
+
     /// Queue an L2 → L1 exit: debit `amount + exit_fee + queue fee` from the
     /// owner and record the pending exit the release rule later pays out.
     ///

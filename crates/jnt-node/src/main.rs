@@ -798,6 +798,10 @@ fn cmd_status(args: &Args) -> Result<(), String> {
         "l2 deposits    {} credited ({} sat) / {} pending / {} ignored",
         ls.deposits_applied, ls.deposited_sat, ls.deposits_pending, ls.deposits_ignored
     );
+    println!(
+        "l2 exits       {} queued / {} sat released to L1",
+        ls.pending_exits, ls.exited_sat
+    );
 
     let wallets = store.load_wallets()?;
     if !wallets.is_empty() {
@@ -1171,6 +1175,20 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         // transactions, because inclusion in a block is the only way L2
         // state changes (SPEC.md §19.1).
         if let Some(addr) = miner_addr {
+            // The crank (approved P1, E-2): matured, funded, proven exits are
+            // settled permissionlessly. Nobody is privileged here — consensus
+            // pays only the destinations the L2 records name. An exit whose
+            // funding is not exactly present stays queued, which is a delay,
+            // never a wrong payment.
+            let exit_claims = sh
+                .l2
+                .crank_claims(&sh.chain, addr)
+                .into_iter()
+                // A block over `max_tx_count` claims is refused outright, so the
+                // crank stops at the cap rather than making the node unable to
+                // mine at all. The rest are simply settled in a later block.
+                .take(sh.chain.params().max_tx_count)
+                .collect::<Vec<_>>();
             let l2_queue = std::mem::take(&mut sh.l2_to_include);
             // An L2-bearing block must commit the root replay will derive
             // (approved P1). The chain may not consult the L2 view — that is
@@ -1182,7 +1200,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             } else {
                 Some(sh.l2.simulate_root(sh.chain.height() + 1, &l2_queue))
             };
-            let mined = if l2_queue.is_empty() {
+            let mined = if l2_queue.is_empty() && exit_claims.is_empty() {
                 sh.chain.mine_from_pool(&mut sh.pool, addr, now_ms())
             } else {
                 sh.chain.mine_from_pool_with_exits(
@@ -1190,7 +1208,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                     addr,
                     now_ms(),
                     l2_queue,
-                    Vec::new(),
+                    exit_claims,
                     l2_root,
                 )
             };

@@ -2534,10 +2534,7 @@ Unfunded L2 accounts are still refused with `InsufficientBalance`. No deposit
 rule is an L1 block rule: funding changes what applies, never what is
 accepted.
 
-**Exits.** None exist. Deposits without exits trap user funds in L2, so this
-section makes *testnet* deposits functional while mainnet still requires a
-separate exit decision and implementation. Nothing here may be read as
-mainnet readiness.
+**Exits.** Defined normatively in §19.6.
 
 **Implementations.** `NetworkParams::{l2_deposit_sink, l2_deposit_minimum_sat}`
 + `validate`, `jnt_l2::deposits::{DepositParams, scan_block, DetectedDeposit,
@@ -2546,3 +2543,89 @@ PendingDeposit, IgnoredDeposit}` (detection is a pure function of one block),
 `ChainL2::{pending_deposits, ignored_deposits, has_pending_matured}`,
 `jnt-node` sync (maturation-triggered replay) + `status`/`verify` (deposit
 pipeline and sink-aware joint check).
+
+---
+
+### 19.6 L2 L1 exits (Decision 19) - IMPLEMENTED, normative
+
+The return route §19.5 required. An owner debits an L2 account; the value
+reaches an L1 address the owner chose, authorised by a proof rather than a
+signature.
+
+**Activation.** `NetworkParams::exit_activation_height` gates the whole rule.
+`0` means **never**, not *from genesis* — a profile that has chosen no height
+accepts neither a committed L2 root nor an exit claim (`Chain::exit_active_at`).
+Below the activation height a block carrying either is refused structurally,
+before any proof is read. At and after it, a block with L2 transactions **must**
+commit an `l2_state_root`: an exit cannot be proven without one, so a
+rootless block would silently disable exits.
+
+**The two sides.**
+
+*L2 side.* `L2TxType::ExitQueue` (`0x15`) carries `ExitQueuePayload`. It debits
+`amount + exit_fee + queue_fee` from the owner and records
+`(owner, nonce) → (amount, destination, exit_fee, queued_height)`. It is refused
+by name on a zero amount, a repeated or rewound per-owner nonce, an inactive
+profile, or an insufficient balance — the record is written only after every
+check passes, so a refused queue leaves no partial state. No cancellation:
+a cancel/claim race needs its own ordering rule for no benefit, and the value is
+encumbered for exactly one finality window.
+
+*L1 side.* A block carries `exit_claims: Vec<ExitClaim>` beside its L2 trailer.
+A claim takes **sink outputs** as inputs and is authorised by an *inclusion
+proof* of the exit record against the `l2_state_root` committed at
+`queued_height` — not by a signature, because the sink holds no key. Consuming
+the sink outputs rather than minting against them keeps the ordinary
+`value_in >= value_out` rule in force everywhere; undo, reorg, fee and maturity
+machinery are reused unchanged.
+
+**Validation.** All fail closed.
+
+1. Active profile, and `queued_height` final under the **stronger** of the two
+   Decision 15 rules — depth `finality_depth` **and**, once binding finality is
+   active, the binding checkpoint height. Exits are never less safe than
+   deposits.
+2. `amount_sat`, `destination` and `exit_fee_sat` equal the proven record
+   exactly. No caller-supplied override is ever read.
+3. Inputs resolve to real sink outputs totalling **exactly**
+   `amount + exit_fee + required L1 fee`. No change output, no tip.
+4. One release per `(owner, nonce)`, ever. Consensus keeps the consumed identity
+   set, so replay is refused by consensus rather than by bookkeeping.
+5. `queued_height < height`: the queue block must be final before the block that
+   settles it.
+
+**Who may settle it.** Permissionless (E-2). Anyone may build and submit a
+claim; consensus pays only the recorded `destination` and the `claimant`'s
+prepaid fee. No operator privilege and no second authorisation path to audit.
+The fee is **prepaid by the owner at queue time** (E-3) — that is what makes an
+unfunded crank impossible, and therefore what makes a permissionless crank safe.
+
+**The proof is captured at the queue block.** `ChainL2` records an `ExitWatch`
+(the record plus its `InclusionProof`) at the one moment the node's L2 root
+equals the block's committed root. A crank therefore never replays back to
+`queued_height` — the expensive alternative the design rejected. A block that
+mixes an exit queue with a deposit moves the root after the queue applies, so it
+yields no watch and the exit simply stays queued; nothing is proved against the
+wrong root.
+
+**Reorg.** A release is an ordinary undoable L1 operation. Rolling back the block
+that settled it restores the sink outputs, clears the identity, and L2 replay
+regenerates the watch, so a rolled-back exit is spendable again and one the
+winner keeps is re-marked. A rolled-back release is not lost and a kept one is
+not double-paid.
+
+**Conservation.** Per exit, L2 debit equals L1 release, 1:1, no rate and no fee
+on the principal. The §19.5 joint check is **unchanged and still holds**: the L1
+payment `+a` and the L2 debit `−a` cancel, while the sink term falls by the same
+`a`. `joint_sat` therefore needs no exit term — that is the strongest available
+evidence the accounting was done right, and `tests/conservation.rs` keeps passing
+untouched. `exited_sat` is reported (`/v1/status`, `/v1/conservation`,
+`jnt-node verify`) so an operator can confirm the two directions balanced.
+
+**Implementations.** `jnt_core::exit::ExitClaim` (+ codec, identity, gas,
+proof verification), `jnt_core::l2::ExitQueuePayload`, `L2State::{queue_exit,
+exit_proof, exit_is_mature, note_release, exited_total, exit_queue_is_active}`,
+`ChainL2::{pending_exits, ExitWatch}` (absorb releases and captures proofs),
+`Chain::{exit_active_at, exit_released, mine_from_pool_with_exits}`,
+`NodeL2::{pending_exits, crank_claims, simulate_root}`, `jnt_worker::{queue_exit,
+queue_exit_plan, ExitPlan}`.

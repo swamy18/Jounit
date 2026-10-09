@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to Jounit are recorded here.
 
@@ -8,21 +8,71 @@ Versions follow the workspace `version` in `Cargo.toml`.
 > **Status:** Jounit is an unreleased development snapshot. There are **no git
 > tags and no published release artifacts**. `0.1.0` below describes the state
 > of `main` at the date shown; it is a development snapshot, not a release.
-> Nothing here should be read as a mainnet-readiness claim — see
+> Nothing here should be read as a mainnet-readiness claim â€” see
 > [docs/final-report.md](docs/final-report.md) and
 > [docs/mainnet-readiness.md](docs/mainnet-readiness.md).
 
 ## [Unreleased]
 
-### Changed (consensus — Decision 18, owner-approved 2026-10-09)
+### Added (consensus - Decision 19, owner-approved)
+
+- **L2 -> L1 exits (SPEC.md 19.6).** Deposits are no longer one-way.
+  - L2 side: `L2TxType::ExitQueue` (`0x15`) + `ExitQueuePayload` debits
+    `amount + exit_fee + queue_fee` from the owner and records the pending
+    exit. Refused by name on a zero amount, a rewound or repeated nonce, an
+    inactive profile or an insufficient balance; no partial state.
+  - L1 side: blocks carry `exit_claims`. A claim consumes **sink outputs**
+    and is authorised by an inclusion proof against the `l2_state_root`
+    committed at the queue height - never a signature, since the sink holds
+    no key. Exact funding only: inputs must total
+    `amount + exit_fee + required L1 fee`, with no change and no tip.
+  - **Permissionless crank.** `NodeL2::crank_claims` builds the matured,
+    funded, proven claims and the serve loop settles them. No operator
+    privilege; consensus pays only the recorded destination and the prepaid
+    claimant fee, and that prepayment is what makes an unfunded crank
+    impossible.
+  - **Reorg-safe.** A release is an ordinary undoable L1 operation: rollback
+    restores the sink outputs, clears the identity, and L2 replay regenerates
+    the watch. `jnt-node/tests/exit_crank.rs` pins the whole loop with
+    nobody hand-building the claim.
+  - **Conservation unchanged and still holds.** The joint check needed no exit
+    term at all - the L1 payment and the L2 debit cancel while the sink term
+    falls by the same amount - so `tests/conservation.rs` passes untouched.
+    `exited_sat` is reported by `/v1/status`, `/v1/conservation` and
+    `jnt-node verify`.
+  - `jnt_worker::{queue_exit, queue_exit_plan, ExitPlan}`: the SDK path for
+    an owner to queue an exit, which refuses before broadcasting rather than
+    after.
+
+### Added (mechanism, part of Decision 19)
+
+- `Chain::exit_active_at` is the single definition of the activation rule,
+  shared by validation and by the miners, so the two cannot drift.
+- `NodeL2::simulate_root` derives the root a replay will derive, from the
+  node's own view, applying each transaction on a clone and skipping refused
+  ones. The chain may not consult the L2 view - that view is what the chain
+  authenticates - so the miner supplies the root instead of one being invented.
+- `ChainL2::{pending_exits, ExitWatch}`: a queued exit's inclusion proof is
+  captured at the queue block, where the node's root equals the block's
+  committed root, so the crank never replays back to the queue height.
+
+### Changed (consensus - Decision 19, owner-approved)
+
+- **An L2-bearing block must commit an `l2_state_root`** once the profile
+  activates exits, and must not carry one before. `exit_activation_height =
+  0` means *never*, not *from genesis*: such a profile refuses both a root
+  and a claim. Migrated the tests that mined rootless L2 blocks; the
+  undefined-type boundary moved from `0x15` to `0x16`.
+
+### Changed (consensus â€” Decision 18, owner-approved 2026-10-09)
 
 - **The stock supply cap is gone.** `NetworkParams::supply_cap_sat` is deleted
   (all profiles) and the deprecated `Error::SupplyCapExceeded` variant is
   removed. The mint bound is the issuance integral alone; the replacement
-  ceiling is the **rate anchor** — gross issuance in any post-ladder halving
+  ceiling is the **rate anchor** â€” gross issuance in any post-ladder halving
   period may not exceed 1 % of the supply issued at that window's start
   (`supply::check_mint_at_height`, ladder era grandfathered). The approved tail
-  sits ~3× under it. `tests/vectors/supply_vectors.json` is regenerated with
+  sits ~3Ã— under it. `tests/vectors/supply_vectors.json` is regenerated with
   the anchor fields; the sims cross-check it.
 - **Net-supply reporting.** `Chain` tracks cumulative base-fee burns
   (reorg-rewound like the PSCB reserve); `status`, `GET /v1/conservation` and
@@ -39,9 +89,9 @@ Versions follow the workspace `version` in `Cargo.toml`.
   mempool size, L1 relay queue depth, L2
   include queue depth, and L2 height/applied/skipped/pending-deposit gauges.
   Gauges only, one static `network` label, no key material or per-user data.
-- `docs/decisions.md`: a *Pending monetary decisions* section (M-A … M-G) that
+- `docs/decisions.md`: a *Pending monetary decisions* section (M-A â€¦ M-G) that
   reduces `docs/monetary-redesign.md` to a sign-off surface, so the
-  unapproved monetary parameters are visible next to the P1–P6 protocol
+  unapproved monetary parameters are visible next to the P1â€“P6 protocol
   blockers instead of buried in a 43 KB proposal.
 - This changelog.
 
@@ -51,9 +101,9 @@ Versions follow the workspace `version` in `Cargo.toml`.
   only (no consensus change). The Decision-18 `### Changed` section above it
   is the first consensus change since 0.1.0: it deletes a parameter and an
   error variant, loosens the mint bound (integral only), and adds the rate
-  anchor — every historical block still validates identically.
+  anchor â€” every historical block still validates identically.
 
-## [0.1.0] — 2026-10-09
+## [0.1.0] â€” 2026-10-09
 
 Development snapshot. The full build order, with the commit that landed each
 step, is recoverable from `git log`; the summary below groups it by area.
@@ -85,7 +135,7 @@ step, is recoverable from `git log`; the summary below groups it by area.
 - **Worker SDK** (`jnt-worker`): claim/submit/dispute/VWC client flows over
   injected seams, and an HTTP transport over the node's REST API.
 - **Service API** (`jnt-node`): opt-in (`--api-listen`), loopback by default,
-  read/write view only — never a consensus surface, and never a signing
+  read/write view only â€” never a consensus surface, and never a signing
   surface.
 - **Verification harness**: 14 `cargo-fuzz` targets, independent Python
   cross-checks of the supply schedule, difficulty retarget, puzzle and wire
@@ -93,7 +143,7 @@ step, is recoverable from `git log`; the summary below groups it by area.
 
 ### Security
 
-- 50/50 anti-collusion slash vault (M2) — **inert**: no rule triggers it, by
+- 50/50 anti-collusion slash vault (M2) â€” **inert**: no rule triggers it, by
   decision.
 - Red-team regression suite pinning fork-choice determinism, finality,
   apply/rollback atomicity, and input-count bounds.
@@ -102,19 +152,19 @@ step, is recoverable from `git log`; the summary below groups it by area.
 
 Recorded as blockers, not oversights, in [docs/decisions.md](docs/decisions.md):
 
-- **P1** — L2 → L1 exits are undefined. The deposit sink holds no key, so an
+- **P1** â€” L2 â†’ L1 exits are undefined. The deposit sink holds no key, so an
   exit needs a new L1 consensus rule. Deposits are one-way until then.
-- **P2** — no stake/bond ledger and no mainnet validator committee
+- **P2** â€” no stake/bond ledger and no mainnet validator committee
   (`mainnet` `genesis_validators` is empty, so binding finality fails closed).
-- **P3** — the M2 activation rule (what proves a compute result fraudulent) is
+- **P3** â€” the M2 activation rule (what proves a compute result fraudulent) is
   unspecified, so the slash vault stays inert.
-- **P4** — the HBM scratchpad puzzle is not a registered `puzzle_id`; chain
+- **P4** â€” the HBM scratchpad puzzle is not a registered `puzzle_id`; chain
   security rests on the base puzzle only.
-- **P5** — a task whose escrow is below the 20,000-sat settle fee fails closed
+- **P5** â€” a task whose escrow is below the 20,000-sat settle fee fails closed
   (`AmountTooSmallForFee`).
 - Monetary parameters beyond the frozen schedule (tail emission, tail floor,
   per-network tail, `supply_cap_sat` fate, `escrow_ceiling`, the fee-burn
-  design) are **unapproved** — see *Pending monetary decisions* in
+  design) are **unapproved** â€” see *Pending monetary decisions* in
   [docs/decisions.md](docs/decisions.md).
 
 [Unreleased]: https://github.com/swamy18/Jounit/commits/main

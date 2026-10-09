@@ -55,11 +55,60 @@
 use jnt_core::bls::RealBls;
 use jnt_core::bls_checkpoint::ValidatorSet;
 use jnt_core::chain::Chain;
+use jnt_core::exit::MAX_CLAIM_INPUTS;
 use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
+use jnt_core::tx::{GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 use jnt_l2::{
     ChainL2, DepositParams, IgnoredDeposit, L2Config, L2Genesis, L2State, PendingDeposit, SkippedL2,
 };
+
+/// Gas an exit claim consumes for `inputs` sink outputs. Mirrors
+/// `ExitClaim::gas_used`, which cannot be called before the input list exists —
+/// and the input list is chosen by how much funding is needed, which depends on
+/// this number.
+fn exit_claim_gas(inputs: usize, has_exit_fee: bool) -> u64 {
+    let outputs = if has_exit_fee { 2 } else { 1 };
+    GAS_TX_BASE
+        .saturating_add(GAS_PER_INPUT.saturating_mul(inputs as u64))
+        .saturating_add(GAS_PER_OUTPUT.saturating_mul(outputs))
+}
+
+/// A subset of exactly `n` outputs totalling exactly `target`, or `None`.
+///
+/// Largest-first and refusing to overshoot: a claim must consume sink outputs
+/// worth precisely its obligation, so the walk stops as soon as the running
+/// total passes the target rather than trimming an output that would leave
+/// change nobody may claim. Returns `None` rather than approximating — leaving
+/// an exit queued costs its owner time, while paying the wrong amount costs
+/// them money.
+fn exact_subset(
+    available: &[(jnt_core::tx::OutPoint, u64)],
+    target: u64,
+    n: usize,
+) -> Option<Vec<jnt_core::tx::OutPoint>> {
+    let mut order: Vec<&(jnt_core::tx::OutPoint, u64)> = available.iter().collect();
+    order.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    let mut picked = Vec::with_capacity(n);
+    let mut total = 0u64;
+    for (op, value) in order {
+        if picked.len() == n {
+            break;
+        }
+        match total.checked_add(*value) {
+            Some(next) if next == target => {
+                picked.push(*op);
+                return Some(picked);
+            }
+            Some(next) if next < target => {
+                total = next;
+                picked.push(*op);
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// L2 dispute-window parameters follow the L1 network profile: `mini` gets the
 /// short test window, every other profile gets production values. The bounty
@@ -374,6 +423,92 @@ impl NodeL2 {
         probe.committed_root()
     }
 
+    /// Queued exits still awaiting an L1 release, oldest first — the crank's
+    /// worklist. Re-derived on every replay, so a reorg that drops a queue block
+    /// drops its watch with it.
+    pub fn pending_exits(&self) -> &[jnt_l2::ExitWatch] {
+        self.inner.pending_exits()
+    }
+
+    /// Matured, unreleased exits this node can settle on L1 right now, as
+    /// fully-formed [`ExitClaim`]s ready for a miner to include (approved P1,
+    /// E-2). The crank is permissionless: nothing here depends on who calls it,
+    /// and consensus pays only the destinations recorded in the proven L2 exit
+    /// records.
+    ///
+    /// Funding is the reason this can return fewer claims than there are mature
+    /// exits. A claim must consume sink outputs totalling *exactly* its
+    /// principal, its prepaid fee and its L1 fee — no change, no tip — so an
+    /// exit whose sink funding is not sitting in a subset summing to that exact
+    /// figure is left queued rather than paid from someone else's deposit. That
+    /// is deliberate: overpaying a release would break the exact-funding
+    /// invariant and let one exit drain another.
+    pub fn crank_claims(
+        &self,
+        chain: &Chain,
+        claimant: jnt_core::hash::Address,
+    ) -> Vec<jnt_core::exit::ExitClaim> {
+        if !chain.exit_active_at(chain.height() + 1) {
+            return Vec::new();
+        }
+        let tip = chain.height();
+        let binding = chain.finality().binding_finalized_height();
+        let depth = self.deposits.maturity_depth;
+        let base_fee = chain.expected_base_fee_for_next_block();
+        let available: Vec<(jnt_core::tx::OutPoint, u64)> = chain
+            .utxo()
+            .outputs_for_address(&chain.params().l2_deposit_sink())
+            .into_iter()
+            .collect();
+        let mut claims = Vec::new();
+        for watch in self.inner.pending_exits() {
+            let record = &watch.record;
+            if chain.exit_released(&watch.owner, watch.nonce) {
+                continue;
+            }
+            if !L2State::exit_is_mature(record.queued_height, tip, binding, depth) {
+                continue;
+            }
+            let Some(principal) = record.amount_sat.checked_add(record.exit_fee_sat) else {
+                continue;
+            };
+            // Gas depends on the input count, and the required funding depends on
+            // the fee, so both are searched together: an exit whose funding sits
+            // in a subset summing exactly to principal + L1 fee is claimable now,
+            // anything else stays queued. Exact-sum or nothing — paying from a
+            // stranger's deposit would let one exit drain another.
+            let mut funded = None;
+            for n in 1..=MAX_CLAIM_INPUTS.min(available.len()) {
+                let gas = exit_claim_gas(n, record.exit_fee_sat != 0);
+                let Some(fee) = base_fee.checked_mul(gas) else {
+                    break;
+                };
+                let Some(needed) = principal.checked_add(fee) else {
+                    break;
+                };
+                if let Some(inputs) = exact_subset(&available, needed, n) {
+                    funded = Some(inputs);
+                    break;
+                }
+            }
+            let Some(inputs) = funded else {
+                continue;
+            };
+            claims.push(jnt_core::exit::ExitClaim {
+                owner: watch.owner,
+                nonce: watch.nonce,
+                amount_sat: record.amount_sat,
+                destination: record.destination,
+                claimant,
+                exit_fee_sat: record.exit_fee_sat,
+                queued_height: record.queued_height,
+                inputs,
+                proof: watch.proof.clone(),
+            });
+        }
+        claims
+    }
+
     /// The genesis allocation this view was built from.
     pub fn genesis(&self) -> &L2Genesis {
         &self.genesis
@@ -437,6 +572,8 @@ impl NodeL2 {
             deposits_pending: self.inner.pending_deposits().len(),
             deposits_ignored: self.inner.ignored_deposits().len(),
             deposited_sat: self.inner.state().deposited_total(),
+            exited_sat: self.inner.state().exited_total(),
+            pending_exits: self.inner.pending_exits().len(),
         }
     }
 }
@@ -456,4 +593,11 @@ pub struct L2Status {
     pub deposits_pending: usize,
     pub deposits_ignored: usize,
     pub deposited_sat: u64,
+    /// Value that has left L2 for L1 through an accepted exit claim (approved
+    /// P1). Reported rather than checked: the joint conservation check already
+    /// holds across a release without modification, because the L1 payment and
+    /// the L2 debit cancel.
+    pub exited_sat: u64,
+    /// Queued exits still awaiting an L1 release — the crank's worklist.
+    pub pending_exits: usize,
 }

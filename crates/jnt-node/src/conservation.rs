@@ -58,6 +58,12 @@ pub struct JointSupply {
     /// The profile's validated `escrow_ceiling_sat` (approved M-E): the most
     /// the L2 genesis side may hold.
     pub escrow_ceiling_sat: u64,
+    /// Value that has left L2 for L1 through an accepted exit claim (approved
+    /// P1). Carried for reporting only: a release conserves without it, because
+    /// the L1 payment and the L2 debit cancel inside `joint_sat` above, and the
+    /// sink term falls by the same amount. An operator reads it to confirm the
+    /// two directions actually balanced.
+    pub exited_sat: u64,
 }
 
 impl JointSupply {
@@ -140,6 +146,7 @@ pub fn joint_supply(chain: &Chain, l2: &NodeL2) -> JointSupply {
             .saturating_sub(sink_held_sat),
         l1_bound_sat: jnt_core::supply::cumulative_issuance_sat(chain.params(), chain.height()),
         escrow_ceiling_sat: chain.params().escrow_ceiling_sat,
+        exited_sat: l2.state().exited_total(),
     }
 }
 
@@ -333,6 +340,7 @@ mod tests {
             joint_sat: joint,
             l1_bound_sat: l1_bound,
             escrow_ceiling_sat: escrow_ceiling,
+            exited_sat: 0,
         }
     }
 
@@ -368,6 +376,7 @@ mod tests {
                 joint_sat: joint,
                 l1_bound_sat: bound,
                 escrow_ceiling_sat: 0,
+                exited_sat: 0,
             },
             l2_closed,
             l2_conservation_sat: funded,
