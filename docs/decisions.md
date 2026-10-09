@@ -871,8 +871,10 @@ what *is* decided.
 
 ## P1 — L2 → L1 exit primitive (mainnet fund-safety blocker)
 
-**Status: OPEN — awaiting owner approval. Recommendation recorded, nothing
-activated. Deposits remain one-way.**
+**Status: APPROVED 2026-10-09 (owner).** E-1 = (a), E-2 = permissionless
+crank, E-3 = exiting owner prepays the exit fee, as recommended; E-4–E-6
+acknowledged at their narrow defaults. Implementation is now authorised along
+exactly those lines; until it ships, deposits remain one-way.
 
 Decision 10 defers exits and states no exit decision is recorded. The deposit
 sink holds no key, so it cannot release funds; any exit needs a **new L1 rule**.
@@ -895,7 +897,7 @@ So the conclusion is not a design preference: **no signature can authorise a
 sink spend, and no L2 state can change that.** There is no implementation-only
 path to an exit.
 
-### Owner approval required — three decisions (full text in `l2-exit-design.md`)
+### Owner decisions — APPROVED 2026-10-09 (full text in `l2-exit-design.md`): E-1 = (a), E-2 = permissionless crank, E-3 = exiting owner prepays
 
 | # | Decision | Recommendation |
 |---|---|---|
@@ -903,11 +905,11 @@ path to an exit.
 | **E-2** | **Permitless crank or gated release.** | **Permissionless crank:** anyone may submit, consensus pays only the recorded `destination`. No operator privilege, no second authorisation path to audit. |
 | **E-3** | **Who funds the L1 release fee.** | **The exiting owner, prepaid at queue time.** The L2 side debits `amount + exit_fee_sat`; the claimant receives the fee, the destination receives the principal. Prepayment is what makes a permissionless crank griefing-bounded. |
 
-**E-4 to E-6 may default to the narrower choice** — no cancellation, no
+**E-4 to E-6 default to the narrower choice** — no cancellation, no
 challenge window, no emergency pause — because each default adds authority to
-nobody. They need acknowledgment, not design work.
+nobody. Acknowledged 2026-10-09: the narrow defaults stand.
 
-### Also required before implementation, and NOT yet decided
+### Also required before implementation — engineering scope, authorised by the approval
 
 - **An L2 → L1 proof mechanism.** L2 state is derived by replay and is **not**
   committed on chain in a form L1 can check. The recommendation is to commit an
@@ -926,6 +928,26 @@ rejection tests in `crates/jnt-node/tests/api.rs`. These pin the one-way
 behaviour and the sink accounting that the exit must preserve. When the rule is
 approved, those tests are the migration checklist — see `docs/l2-exit-design.md`,
 *Migration, activation and compatibility*.
+
+## Decision 17 — Conservation-breach response: freeze funding paths, alarm (2026-10-09)
+
+Owner-approved companion to the live conservation surface (`GET
+/v1/conservation`, the `/metrics` gauges, and the `jnt-worker run` gate).
+When a node detects that the joint-supply bound is broken (L2 not closed, L2
+funding anomaly, or joint supply over its bound), it must:
+
+1. **Refuse the funding-shaped paths** — L2 include-queue admission and the
+   deposit/L2 write endpoints stop being accepted, with an error naming
+   conservation, so the node stops making a bad situation worse;
+2. **Keep serving reads** — `/v1/status`, `/v1/conservation`, `/metrics`,
+   blocks and UTXO queries stay up, so operators can see what happened;
+3. **Log the breach loudly** on every serve iteration while it persists.
+
+Halt (process exit) was rejected: a crash-loop converts a safety alarm into
+a liveness loss and destroys the diagnostics. Alarm-only was rejected as
+insufficient once detection is this cheap. Recovery is an operator action —
+restart after the cause is understood; the check re-runs on every request
+and no state is discarded.
 
 ## P2 — Bonded stake / mainnet validator committee (mainnet blocker)
 
@@ -998,19 +1020,19 @@ permanently unmintable; ladder `76, 38, 19, 9, 4, 2, 1, 0` in whole JNT;
 
 | # | Question | Options | Consequence if changed | Status |
 |---|---|---|---|---|
-| **M-A** | Tail emission shape at ladder exhaustion | **(A)** retain zero tail · **(D)** flat tail · **(E)** declining tail to a floor | Any tail **requires a supply-rule change** and a new issuance anchor; `cap − max_issuance_sat` can no longer be the escrow backing rule (see M-D/M-E) | **OPEN** |
-| **M-B** | Tail floor value | proposed **0.1 JNT/block** · 1.00 · 0.50 · other | Sets steady-state dilution (0.10 JNT ≈ 0.0134 %/yr); the proposal derives this from a security-floor argument, **not** from any repository constant | **OPEN — 0.1 JNT not approved** |
-| **M-C** | Per-network tail | mainnet value · testnet/mini value (proposed **1 sat/block**) | Applying the mainnet value to mini would mint **>1,000 %/yr** (proposal F5); the two profiles must be set independently | **OPEN** |
-| **M-D** | Fate of `supply_cap_sat` | **keep** as a sanity ceiling · **replace** with an explicit invariant | `supply_cap_sat` is currently the *joint L1/L2 conservation anchor* **and** the escrow backing rule, not just a ceiling. Deleting it without a replacement silently removes both checks. The proposal rejects deletion-for-convenience | **OPEN — do not delete to make a tail fit** |
-| **M-E** | Meaning of `escrow_ceiling` | define an explicit, validated parameter · keep the implicit `cap − max_issuance_sat` gap | No `escrow_ceiling` symbol exists in code or SPEC today. It is the proposal's replacement for the gap rule once a tail changes issuance. Ownership, release rules, reorg behaviour and interaction with spendable supply are **all unspecified** | **OPEN — semantics undecided** |
-| **M-F** | Fee-burn / deflation design (proposal F2) | own the design (set an explicit target or accept deflation) · leave unowned and state no target | Under ordinary usage the **whole** base fee leaves live supply (50 % burned + 50 % to the `pscb_reserve` counter, which no code path converts back to UTXOs — verified 2026-10-09). At high activity live supply trends to zero at ~y50 in the proposal's model. This is **not** an issuance question, but it blocks any claim that monetary policy is "complete" | **OPEN — unowned** |
-| **M-G** | Activation mechanism | network-upgrade flag/height · historical-compatibility expectation · vector changes | Proposal §5.4 argues activation at exhaustion (1,839,600) leaves existing history byte-identical. **No mainnet activation until M-A…M-F are approved**; vector changes are only legitimate once an approved rule actually changes consensus | **OPEN** |
-
-**Proposal's own recommendation (not an approval):** decay-to-floor (E) with a
-0.1 JNT mainnet floor, a separately-set testnet tail, `supply_cap_sat` retained
-as a sanity ceiling, and `escrow_ceiling` introduced as an explicit validated
-parameter. Treating that as decided is exactly the error this section exists to
-prevent.
+| **M-A** | Tail emission shape at ladder exhaustion | **(A)** retain zero tail · **(D)** flat tail · **(E)** declining tail to a floor | Any tail **requires a supply-rule change** and a new issuance anchor; `cap − max_issuance_sat` can no longer be the escrow backing rule (see M-D/M-E) | **APPROVED — (E) decay tail** |
+| **M-B** | Tail floor value | proposed **0.1 JNT/block** · 1.00 · 0.50 · other | Sets steady-state dilution (0.10 JNT ≈ 0.0134 %/yr); the proposal derives this from a security-floor argument, **not** from any repository constant | **APPROVED — 0.1 JNT/block mainnet floor** |
+| **M-C** | Per-network tail | mainnet value · testnet/mini value (proposed **1 sat/block**) | Applying the mainnet value to mini would mint **>1,000 %/yr** (proposal F5); the two profiles must be set independently | **APPROVED — 1 sat/block on mini/testnet** |
+| **M-D** | Fate of `supply_cap_sat` | **keep** as a sanity ceiling · **replace** with an explicit invariant | `supply_cap_sat` is currently the *joint L1/L2 conservation anchor* **and** the escrow backing rule, not just a ceiling. Deleting it without a replacement silently removes both checks. The proposal rejects deletion-for-convenience | **APPROVED — cap retained as a sanity ceiling** |
+| **M-E** | Meaning of `escrow_ceiling` | define an explicit, validated parameter · keep the implicit `cap − max_issuance_sat` gap | No `escrow_ceiling` symbol exists in code or SPEC today. It is the proposal's replacement for the gap rule once a tail changes issuance. Ownership, release rules, reorg behaviour and interaction with spendable supply are **all unspecified** | **APPROVED — explicit validated `escrow_ceiling` parameter** |
+| **M-F** | Fee-burn / deflation design (proposal F2) | own the design (set an explicit target or accept deflation) · leave unowned and state no target | Under ordinary usage the **whole** base fee leaves live supply (50 % burned + 50 % to the `pscb_reserve` counter, which no code path converts back to UTXOs — verified 2026-10-09). At high activity live supply trends to zero at ~y50 in the proposal's model. This is **not** an issuance question, but it blocks any claim that monetary policy is "complete" | **APPROVED — no numeric target; deflation accepted and documented** |
+| **M-G** | Activation mechanism | network-upgrade flag/height · historical-compatibility expectation · vector changes | Proposal §5.4 argues activation at exhaustion (1,839,600) leaves existing history byte-identical. **No mainnet activation until M-A…M-F are approved**; vector changes are only legitimate once an approved rule actually changes consensus | **APPROVED — activation at each profile's ladder exhaustion (mainnet 1,839,600; mini/testnet 14,000)** |**Approved 2026-10-09 (owner), item by item:** M-A = (E) decay tail; M-B =
+0.1 JNT/block mainnet floor; M-C = 1 sat/block on mini/testnet; M-D =
+`supply_cap_sat` retained as a sanity ceiling only; M-E = an explicit
+validated `escrow_ceiling` parameter; M-F = no numeric burn target — deflation
+accepted and documented; M-G = activation at each profile's ladder
+exhaustion. Implementation is authorised **only** along these lines; any
+other value needs a new record here.
 
 **What may proceed while M-A…M-G are open:** auditing, tests, simulation and
 documentation that *describe* current behaviour. **What may not:** editing
