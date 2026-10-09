@@ -1112,10 +1112,13 @@ by the explicit validated `escrow_ceiling_sat`. The cap is therefore *already*
 all ceiling and nothing else, which is why replacing it is a deliberate
 substitution rather than the deletion-for-convenience M-D rejected.
 
-**Status: PROPOSED — awaiting owner sign-off on the mechanism before any code
-changes.** The M-A…M-G freeze ("no editing `params.rs` reward/cap/escrow values,
-`supply.rs`, the consensus cap gate, or committed vectors") applies until that
-sign-off is recorded, so nothing in this decision is implemented yet.
+**Status: APPROVED 2026-10-09 (owner sign-off on the rate anchor).** The
+M-A…M-G freeze ("no editing `params.rs` reward/cap/escrow values, `supply.rs`,
+the consensus cap gate, or committed vectors") governs the *reward ladder, tail
+values and fee schedules*, and those stay as approved. It is **lifted for the
+supply anchor only**: the stock cap, the mint bound, and the new rate anchor are
+now authorised for implementation along §4 of `supply-anchor-decision.md`.
+Nothing is implemented yet — stages 2–5 are the work.
 
 **Compatibility note:** unlike the exit rule (P1), this change needs **no
 activation height**. The mint bound only loosens (`min(integral, cap)` →

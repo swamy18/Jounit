@@ -1,10 +1,13 @@
 # The supply anchor: replacing the stock cap with a rate rule
 
-**Status: PROPOSED 2026-10-09 (owner asked for the decision; awaiting sign-off on
-the mechanism before implementation).** Supersedes the `supply_cap_sat` design
-in SPEC.md §7/§10 and Decisions 7 and 10 — *if* approved. Nothing here is
-implemented yet; this document is the analysis, the decision, and the migration
-plan.
+**Status: APPROVED 2026-10-09 (owner sign-off: "rate anchor implement karo").**
+Supersedes the `supply_cap_sat` design in SPEC.md §7/§10 and Decisions 7 and 10.
+The M-A…M-G freeze is lifted **for this scope only** (the supply anchor: the
+stock cap, the mint bound, and the rate anchor). Everything else in that freeze —
+reward ladders, tail values, fee schedules — stays as approved.
+
+Nothing here is implemented yet; this document is the analysis, the decision,
+and the migration plan. Stages 2–5 in §8 are the work.
 
 ## 1. The question
 
