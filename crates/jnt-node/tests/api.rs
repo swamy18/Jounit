@@ -837,3 +837,61 @@ fn an_oversize_body_is_refused_before_it_is_parsed() {
         "an oversize body must be refused, got {status}"
     );
 }
+
+/// An unsupported withdrawal is refused **explicitly** at the API, not
+/// silently ignored.
+///
+/// There is no L2 withdrawal transaction type (`jnt-l2/tests/exit_unavailable.rs`
+/// proves the wire admits exactly five), so the withdrawal-shaped envelope below
+/// is the closest thing to a withdrawal request the API can receive. It must be
+/// a clean 400 that names the problem — never a 500, a panic, or a value that
+/// gets queued for inclusion in a block.
+#[test]
+fn a_withdrawal_shaped_l2_payload_is_refused_by_name() {
+    let node = start();
+
+    // Version 1 envelope, type byte 0x15 — the byte immediately after the
+    // highest defined L2 type (0x14 Settle), which is where a withdrawal would
+    // sit if one existed.
+    let mut envelope = vec![1u8, 0, 0, 0, 0x15];
+    envelope.extend_from_slice(&[0u8; 32]);
+    let hex_body = hex::encode(&envelope);
+
+    let (status, body) = post(
+        &node,
+        "/v1/l2/broadcast",
+        &serde_json::json!({ "l2_tx_hex": hex_body }),
+    );
+    assert_eq!(status, 400, "a client error, never a 500: {body}");
+    assert_eq!(body["error"], "bad_request");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("unknown L2 transaction type"),
+        "the refusal must name the problem, got {detail:?}"
+    );
+
+    // The refusal left nothing behind: no task, no queued transaction.
+    let (s, open) = get(&node, "/v1/tasks/open");
+    assert_eq!(s, 200);
+    assert_eq!(open["count"], 0);
+    let (s, status_json) = get(&node, "/v1/status");
+    assert_eq!(s, 200);
+    assert_eq!(status_json["height"], 0, "no block was mined");
+    assert_eq!(status_json["l2"]["applied"], 0);
+}
+
+/// The same refusal through the CLI's own decode path, so a withdrawal attempt
+/// is rejected identically whether it arrives over HTTP or from a local tool.
+#[test]
+fn an_undefined_l2_type_byte_is_refused_by_the_decoder() {
+    let mut envelope = vec![1u8, 0, 0, 0];
+    envelope.push(0x15);
+    envelope.extend_from_slice(&[0u8; 32]);
+    let err = jnt_core::l2::L2Transaction::deserialize(&envelope)
+        .expect_err("0x15 is not an L2 transaction type");
+    assert!(err.to_string().contains("unknown L2 transaction type"));
+    // And the boundary is exactly five: the highest real type decodes, the next
+    // byte does not.
+    assert!(jnt_core::l2::L2TxType::from_wire(0x14).is_ok());
+    assert!(jnt_core::l2::L2TxType::from_wire(0x15).is_err());
+}
