@@ -91,16 +91,19 @@ def cumulative_jnt(p: dict, blocks: int, policy: str, floor_jnt: float = 0.0) ->
     if blocks <= 0:
         return 0.0
     total = 0.0
-    for period in range(0, 4096):
-        start = period * p["halving_period"] + 1
-        if start > blocks:
-            break
-        end = min(blocks, (period + 1) * p["halving_period"])
-        r = reward_jnt(p, start, policy, floor_jnt)
-        total += r * (end - start + 1)
-        # A policy whose tail is a flat positive value must not stop the loop.
-        if policy == "A" and r == 0:
-            break
+    # Exact block-reward semantics: block `h` pays `reward(h)`, and `halvings()`
+    # is constant over `p*H ..= (p+1)*H - 1`, so period p is that closed range —
+    # block `(p+1)*H` already pays the next rung. Walking the range by height
+    # (not by period index offset from 1) is what keeps the boundary block from
+    # being skipped or counted twice: an earlier revision did both, and the two
+    # errors cancelled only at the rounding this file prints.
+    h = 1
+    while h <= blocks:
+        period = h // p["halving_period"]
+        end = min(blocks, (period + 1) * p["halving_period"] - 1)
+        r = reward_jnt(p, h, policy, floor_jnt)
+        total += r * (end - h + 1)
+        h = end + 1
     return total
 
 
@@ -151,18 +154,21 @@ def selftest() -> int:
             fails.append(name)
 
     print("== hand-computed values ==")
+    # Exact block-reward semantics (see `cumulative_jnt`): the ladder issues
+    # `149H - 76` JNT, the first rung paid by `H - 1` blocks because genesis
+    # mints nothing. The geometric shortcut `149H` over-states it by 76 JNT.
     check("mainnet first block reward (JNT)", reward_jnt(MAINNET, 1, "A"), 76.0)
-    check("mainnet after 1 period", cumulative_jnt(MAINNET, 262_800, "A"), 19_972_800.0)
+    check("mainnet after 1 period", cumulative_jnt(MAINNET, 262_800, "A"), 19_972_762.0)
     check("mainnet +1 block into period 2",
-          cumulative_jnt(MAINNET, 262_801, "A"), 19_972_838.0)
-    check("mainnet after 2 periods", cumulative_jnt(MAINNET, 525_600, "A"), 29_959_200.0)
+          cumulative_jnt(MAINNET, 262_801, "A"), 19_972_800.0)
+    check("mainnet after 2 periods", cumulative_jnt(MAINNET, 525_600, "A"), 29_959_143.0)
     check("mainnet exhaustion height", exhaustion_height(MAINNET), 1_839_600)
-    check("mainnet exhausted issuance", cumulative_jnt(MAINNET, 1_839_600, "A"), 39_157_200.0)
-    check("ladder sum x period (149 x 262800)",
-          sum(ladder_rung_jnt(MAINNET, k) for k in range(7)) * 262_800, 39_157_200.0)
-    check("mainnet unmintable gap", MAINNET["cap_jnt"] - 39_157_200.0, 788_400.0)
-    check("mini exhausted issuance", cumulative_jnt(MINI, 14_000, "A"), 298_000.0)
-    check("mini unmintable gap", MINI["cap_jnt"] - 298_000.0, 6_000.0)
+    check("mainnet exhausted issuance", cumulative_jnt(MAINNET, 1_839_600, "A"), 39_157_124.0)
+    check("ladder sum x period less the genesis slot (149H - 76)",
+          sum(ladder_rung_jnt(MAINNET, k) for k in range(7)) * 262_800 - 76, 39_157_124.0)
+    check("mainnet unmintable gap", MAINNET["cap_jnt"] - 39_157_124.0, 788_476.0)
+    check("mini exhausted issuance", cumulative_jnt(MINI, 14_000, "A"), 297_924.0)
+    check("mini unmintable gap", MINI["cap_jnt"] - 297_924.0, 6_076.0)
     check("mini exhaustion height", exhaustion_height(MINI), 14_000)
 
     print("== continuity ==")
@@ -228,9 +234,9 @@ def selftest() -> int:
                 fails.append(f"{policy}: cumulative decreased at {h}")
             prev = cum
     print("  ok    cumulative issuance is non-decreasing (per policy) over 50M blocks")
-    if cumulative_jnt(MAINNET, 10**9, "A") != 39_157_200.0:
-        fails.append("policy A must stop at 39,157,200")
-    print("  ok    policy A is bounded at 39,157,200 JNT")
+    if cumulative_jnt(MAINNET, 10**9, "A") != 39_157_124.0:
+        fails.append("policy A must stop at 39,157,124")
+    print("  ok    policy A is bounded at 39,157,124 JNT")
 
     print("== overflow headroom ==")
     for tail_sat, profile in [(int(RECOMMENDED_FLOOR_JNT * SAT_PER_JNT), MAINNET),
@@ -304,7 +310,9 @@ def policy_table(p: dict) -> None:
             annual = 0.0
         def dil(s: float) -> str:
             return f"{100 * annual / s:.4f}%" if annual else "0.0000%"
-        print(f"  {label:<28} {annual:>12,.0f} {dil(39_157_200):>17} "
+        # Denominators: the shipped cap, and two illustrative "what if the
+        # supply had been capped at 20M / 10M" sensitivity reads.
+        print(f"  {label:<28} {annual:>12,.0f} {dil(MAINNET['cap_jnt']):>17} "
               f"{dil(20_000_000):>9} {dil(10_000_000):>9}")
 
 

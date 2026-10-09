@@ -179,16 +179,16 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // that node is answering, and cannot be trusted.
     match view.conservation() {
         Ok(Some(r)) if r.holds() => println!(
-            "conservation  ok (joint {} of {} sat, headroom {})",
+            "conservation  ok (joint {} of {} sat bound, headroom {})",
             r.joint_sat,
-            r.supply_cap_sat,
+            r.joint_bound_sat,
             r.headroom_sat()
         ),
         Ok(Some(r)) => {
             return Err(format!(
                 "conservation gate failed: joint {} of {} sat (l1 {} + l2 {} - sink {}), \
                  l2_closed {}, l2_funding_ok {} — refusing to run against this node",
-                r.joint_sat, r.supply_cap_sat, r.l1_live_sat, r.l2_held_sat, r.sink_held_sat,
+                r.joint_sat, r.joint_bound_sat, r.l1_live_sat, r.l2_held_sat, r.sink_held_sat,
                 r.l2_closed, r.l2_funding_ok
             ));
         }

@@ -14,12 +14,17 @@
     ],
     "halving_period_blocks": 262800,
     "halving_period_years": 4.997,
-    "issued_after_first_period_jnt": 19972800,
-    "issued_after_two_periods_jnt": 29959200,
-    "max_reachable_jnt": 39157200,
+    "issued_after_first_period_jnt": 19972762,
+    "issued_after_two_periods_jnt": 29959143,
+    "max_reachable_jnt": 39157124,
     "hard_cap_jnt": 39945600,
-    "unmintable_jnt": 788400,
-    "final_reward_jnt": 0
+    "unmintable_jnt": 788476,
+    "final_reward_jnt": 0,
+    "tail_activation_height": 1839600,
+    "tail_floor_sat": 50000000,
+    "tail_floor_jnt": 0.5,
+    "tail_reward_at_exhaustion_sat": 50000000,
+    "tail_is_constant": false
   },
   "mini": {
     "network": "mini",
@@ -35,11 +40,16 @@
     ],
     "halving_period_blocks": 2000,
     "halving_period_years": 0.0,
-    "issued_after_first_period_jnt": 152000,
-    "issued_after_two_periods_jnt": 228000,
-    "max_reachable_jnt": 298000,
+    "issued_after_first_period_jnt": 151962,
+    "issued_after_two_periods_jnt": 227943,
+    "max_reachable_jnt": 297924,
     "hard_cap_jnt": 304000,
-    "unmintable_jnt": 6000,
-    "final_reward_jnt": 0
+    "unmintable_jnt": 6076,
+    "final_reward_jnt": 0,
+    "tail_activation_height": 14000,
+    "tail_floor_sat": 1,
+    "tail_floor_jnt": 1e-08,
+    "tail_reward_at_exhaustion_sat": 1,
+    "tail_is_constant": true
   }
 }

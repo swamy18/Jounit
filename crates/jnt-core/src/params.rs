@@ -139,6 +139,27 @@ pub fn testnet_committee_secrets() -> Vec<crate::bls::SecretKey> {
     (1u8..=4).map(testnet_validator_secret).collect()
 }
 
+/// Emission once the halving ladder is exhausted (approved 2026-10-09,
+/// `docs/decisions.md` M-A..M-C).
+///
+/// A tail is *miner* emission only: no validator reward and no fee share
+/// exists anywhere in this schedule (Decision 2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailEmission {
+    /// Issuance stops at ladder exhaustion (the pre-tail rule; legal for a
+    /// profile, chosen by none of the shipped ones).
+    None,
+    /// Policy E: halve the subsidy in **satoshis** every halving period from
+    /// 1 JNT down to a permanent `floor_sat`, then pay the floor forever
+    /// (mainnet: 0.1 JNT). Every step is at most a halving; the step into
+    /// the floor is the smallest of the series.
+    DecayToFloor { floor_sat: u64 },
+    /// Fast profiles (1-second blocks): a constant token tail so mining
+    /// never stops. Applying a mainnet-sized tail here would mint >1000 %/yr
+    /// against the fast cap (monetary-redesign F5).
+    Constant { per_block_sat: u64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkParams {
     pub name: String,
@@ -148,7 +169,9 @@ pub struct NetworkParams {
     pub halving_period: u64,
     /// Block reward at halving 0, in satoshis.
     pub start_reward_sat: u64,
-    /// Hard supply ceiling in satoshis. Never exceeded — enforced in `supply.rs`.
+    /// Hard supply ceiling in satoshis (original fixed-supply design).
+    /// Since the approved tail (M-A/M-D) this is a **sanity ceiling only**:
+    /// the load-bearing mint bound is `supply::cumulative_issuance_sat(height)`.
     pub supply_cap_sat: u64,
     pub difficulty_window: u32,
     /// Max per-block difficulty change, in basis points (1000 = +/-10%).
@@ -188,6 +211,13 @@ pub struct NetworkParams {
     /// never mint (`supply_cap_sat - max_issuance_sat`), so combined L1 + L2
     /// money can never exceed the cap with zero L1 consensus change.
     pub l2_genesis_escrow_sat: u64,
+    /// Explicit backing ceiling for the L2 genesis escrow (approved M-E).
+    /// Replaces the old implicit `cap − max_issuance_sat` gap rule, which
+    /// stops being a meaningful quantity the moment issuance has a tail.
+    /// Validated: `l2_genesis_escrow_sat <= escrow_ceiling_sat`.
+    pub escrow_ceiling_sat: u64,
+    /// Emission after ladder exhaustion (approved M-A/M-B/M-C).
+    pub tail: TailEmission,
     /// Genesis-funded L2 accounts, paid out of `l2_genesis_escrow_sat`.
     pub l2_genesis_grants: Vec<L2GenesisGrant>,
     /// Minimum deposit per sink output in satoshis (Decision 10, SPEC.md
@@ -315,6 +345,13 @@ impl NetworkParams {
             // escrow identity. No mainnet grants — real beneficiaries arrive
             // with the deposit mechanism, not as hard-coded allocations.
             l2_genesis_escrow_sat: 100_000 * SAT_PER_JNT,
+            // M-E: the ceiling is exactly the allocation — tight, so the
+            // explicit parameter constrains rather than rubber-stamps.
+            escrow_ceiling_sat: 100_000 * SAT_PER_JNT,
+            // M-A/M-B: Policy E decay to a permanent 0.1 JNT floor.
+            tail: TailEmission::DecayToFloor {
+                floor_sat: 10_000_000,
+            },
             l2_genesis_grants: Vec::new(),
             l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
             // No committee yet: mainnet finality observation arrives with the
@@ -364,6 +401,10 @@ impl NetworkParams {
             // identities (seeds 1–3, whose keys the integration tests hold),
             // 7 JNT remainder to the protocol escrow identity.
             l2_genesis_escrow_sat: 10 * SAT_PER_JNT,
+            // M-C: a 1-sat token tail on 1-second blocks — enough to keep
+            // mining alive forever, negligible against the 304,000 cap.
+            escrow_ceiling_sat: 10 * SAT_PER_JNT,
+            tail: TailEmission::Constant { per_block_sat: 1 },
             l2_genesis_grants: vec![
                 L2GenesisGrant {
                     address: l2_operator_address(1),
@@ -433,6 +474,8 @@ impl NetworkParams {
             // Testnet carries no user grants yet (deposits/exits remain
             // deferred); the escrow is a real, accountable genesis reserve.
             l2_genesis_escrow_sat: 10 * SAT_PER_JNT,
+            escrow_ceiling_sat: 10 * SAT_PER_JNT,
+            tail: TailEmission::Constant { per_block_sat: 1 },
             l2_genesis_grants: Vec::new(),
             l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
             // Four deterministic testnet keys (distinct derivation from mini),
@@ -511,17 +554,29 @@ impl NetworkParams {
                 "l2 genesis grants exceed the escrow total",
             ));
         }
-        // Gap-fit: the escrow must fit in the sats the L1 ladder can never
-        // mint. `max_issuance_sat` is the most L1 can ever hold and the escrow
-        // is the most L2 can ever hold; both maxima fitting under the cap is
-        // what makes the joint invariant hold with no L1 rule change.
-        let gap = self
-            .supply_cap_sat
-            .saturating_sub(crate::supply::max_issuance_sat(self));
-        if self.l2_genesis_escrow_sat > gap {
+        // Escrow backing (approved M-E, 2026-10-09): an explicit, validated
+        // ceiling replaces the old implicit `cap − max_issuance` gap — with a
+        // tail, "unmintable gap" is no longer a meaningful quantity.
+        if self.escrow_ceiling_sat == 0 {
+            return Err(Error::Malformed("escrow_ceiling_sat must be > 0"));
+        }
+        if self.l2_genesis_escrow_sat > self.escrow_ceiling_sat {
             return Err(Error::Malformed(
-                "l2 genesis escrow exceeds the unmintable supply gap",
+                "l2 genesis escrow exceeds escrow_ceiling_sat",
             ));
+        }
+        // Tail positivity (approved M-B/M-C): a zero floor would silently
+        // reinstate "issuance stops", which is policy A — rejected.
+        match self.tail {
+            TailEmission::DecayToFloor { floor_sat: 0 } => {
+                return Err(Error::Malformed("tail floor must be > 0"));
+            }
+            TailEmission::Constant { per_block_sat: 0 } => {
+                return Err(Error::Malformed("constant tail must be > 0"));
+            }
+            TailEmission::DecayToFloor { .. }
+            | TailEmission::Constant { .. }
+            | TailEmission::None => {}
         }
         // Deposit floor (Decision 10 item 3): a zero minimum would credit dust
         // and let anyone bloat the UTXO set and L2 state for free.
@@ -687,34 +742,87 @@ mod tests {
     // --- L2 genesis escrow (Decision 7, SPEC.md §19.4) -----------------------
 
     #[test]
-    fn l2_genesis_escrow_fits_the_unmintable_gap_on_both_profiles() {
-        // The joint conservation invariant as an executable check: the most
-        // L1 can ever mint plus the most L2 can ever hold stays under the cap,
-        // with no L1 rule change. If this fails, the escrow does not fit and
-        // M2's funding model is inflationary.
-        for p in [NetworkParams::mainnet(), NetworkParams::mini()] {
+    fn escrow_respects_the_new_ceiling() {
+        // M-E: the backing rule is an explicit validated parameter, not the
+        // old implicit gap (which a tail would have invalidated).
+        for p in [
+            NetworkParams::mainnet(),
+            NetworkParams::mini(),
+            NetworkParams::testnet(),
+        ] {
             p.validate().unwrap();
-            let reachable = crate::supply::max_issuance_sat(&p);
             assert!(
-                reachable + p.l2_genesis_escrow_sat <= p.supply_cap_sat,
-                "{}: L1 reachable {} + L2 escrow {} exceeds cap {}",
+                p.l2_genesis_escrow_sat <= p.escrow_ceiling_sat,
+                "{}: escrow {} exceeds ceiling {}",
                 p.name,
-                reachable,
                 p.l2_genesis_escrow_sat,
-                p.supply_cap_sat
+                p.escrow_ceiling_sat
             );
         }
-        // Pin the gaps literally, so a halving-schedule change that shrinks
-        // one is noticed here rather than as a far-away funding failure.
+        // The shipped ceilings are exactly their allocations — tight, so the
+        // parameter constrains rather than rubber-stamps.
         assert_eq!(
-            NetworkParams::mainnet().supply_cap_sat
-                - crate::supply::max_issuance_sat(&NetworkParams::mainnet()),
-            788_400 * SAT_PER_JNT
+            NetworkParams::mainnet().escrow_ceiling_sat,
+            100_000 * SAT_PER_JNT
+        );
+        assert_eq!(NetworkParams::mini().escrow_ceiling_sat, 10 * SAT_PER_JNT);
+        assert_eq!(
+            NetworkParams::testnet().escrow_ceiling_sat,
+            10 * SAT_PER_JNT
+        );
+
+        // Config-time refusal: an escrow above its own ceiling. The old
+        // implicit `cap − max_issuance_sat` gap no longer backs anything, so
+        // this is the only rule that bounds the escrow.
+        let mut bad = NetworkParams::mini();
+        bad.escrow_ceiling_sat = bad.l2_genesis_escrow_sat - 1;
+        assert!(bad.validate().is_err(), "escrow above the ceiling");
+        // A default-constructed profile with no ceiling set is refused too.
+        let mut bad = NetworkParams::mini();
+        bad.escrow_ceiling_sat = 0;
+        assert!(bad.validate().is_err(), "zero ceiling is not a ceiling");
+    }
+
+    #[test]
+    fn tail_floor_sat_must_be_positive() {
+        // §6.1 #14 (approved M-B/M-C): a zero floor or a zero constant tail
+        // silently reinstates policy A — "issuance stops" — which the owner
+        // rejected. `validate` is what turns that into a config error instead
+        // of a consensus surprise.
+        let mut bad = NetworkParams::mini();
+        bad.tail = TailEmission::DecayToFloor { floor_sat: 0 };
+        assert!(bad.validate().is_err());
+        let mut bad = NetworkParams::mainnet();
+        bad.tail = TailEmission::DecayToFloor { floor_sat: 0 };
+        assert!(bad.validate().is_err());
+        let mut bad = NetworkParams::mini();
+        bad.tail = TailEmission::Constant { per_block_sat: 0 };
+        assert!(bad.validate().is_err());
+
+        // The shipped profiles are positive by construction, and the mainnet
+        // floor is exactly the approved 0.1 JNT.
+        for p in [
+            NetworkParams::mainnet(),
+            NetworkParams::mini(),
+            NetworkParams::testnet(),
+        ] {
+            p.validate().unwrap();
+            let floor = match p.tail {
+                TailEmission::DecayToFloor { floor_sat } => floor_sat,
+                TailEmission::Constant { per_block_sat } => per_block_sat,
+                TailEmission::None => panic!("{}: a shipped profile must pay a tail", p.name),
+            };
+            assert!(floor > 0, "{}: the tail must be positive", p.name);
+        }
+        assert_eq!(
+            NetworkParams::mainnet().tail,
+            TailEmission::DecayToFloor {
+                floor_sat: 10_000_000
+            }
         );
         assert_eq!(
-            NetworkParams::mini().supply_cap_sat
-                - crate::supply::max_issuance_sat(&NetworkParams::mini()),
-            6_000 * SAT_PER_JNT
+            NetworkParams::mini().tail,
+            TailEmission::Constant { per_block_sat: 1 }
         );
     }
 

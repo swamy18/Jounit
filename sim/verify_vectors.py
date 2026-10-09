@@ -79,9 +79,11 @@ def check_supply_values() -> None:
 
         period = sec["halving_period_blocks"]
         # Floor division makes the reachable total 149 periods' worth, not the
-        # 152 the geometric series suggests. This is the cap invariant.
-        expected_reachable = sum(
-            (76 >> k) * period for k in range(8) if (76 >> k) > 0
+        # 152 the geometric series suggests; and genesis occupies a rung-0
+        # height without minting, so the first rung is paid by `period - 1`
+        # blocks. Reachable = 149 x period - 76.
+        expected_reachable = (
+            sum((76 >> k) * period for k in range(8) if (76 >> k) > 0) - 76
         )
         if sec["max_reachable_jnt"] != expected_reachable:
             problems.append(

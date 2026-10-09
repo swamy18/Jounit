@@ -88,13 +88,15 @@ security floor*; it does not buy an inflation target.
 76 JNT start reward, 262,800-block halving. Two corrections to commonly repeated
 figures: the **ladder exhausts at height 1,839,600 (~34.98 years)**, not 8
 periods (76 ≫ 7 = 0), and reachable issuance is **39,157,200 JNT**, leaving
-**788,400 JNT permanently unmintable**.
+**788,400 JNT permanently unmintable**. (Both are the geometric shortcut: under
+exact block-reward semantics genesis occupies a rung-0 height without minting,
+so the shipped figures are **39,157,124 JNT** and **788,476 JNT** — see §2.2.)
 
 ### 1.2 Derivation of the reachable ceiling (verified)
 
 ```
 ladder = 76, 38, 19, 9, 4, 2, 1, 0          sum(76..1) = 149
-reachable = 149 × 262,800 = 39,157,200 JNT
+reachable = 149 × 262,800 = 39,157,200 JNT   # geometric shortcut (see note)
 cap − reachable = 39,945,600 − 39,157,200 = 788,400 JNT
 mini  = 149 × 2,000 = 298,000;  304,000 − 298,000 = 6,000 JNT
 ```
@@ -162,13 +164,22 @@ are 10× lower again.
 
 ### 2.2 Cumulative gross issuance
 
+Numbers below are `python sim/tail_emission_sim.py` output under the **exact
+block-reward semantics** the shipped code uses (block `h` pays `reward(h)`;
+period `p` covers `pH ..= (p+1)H − 1`). An earlier revision of this table
+carried the same period-boundary off-by-one that `supply.rs` had: every figure
+was up by up to 75 JNT in the 6th digit, and policy A stopped at 39,157,200
+instead of the exact **39,157,124**. The conclusions are unaffected — the
+differences are ≤ 0.0002 % — but the table is now the arithmetic the chain
+actually performs.
+
 | Policy | y10 | y25 | y50 | y100 |
 |---|---:|---:|---:|---:|
-| A fixed cap | 29,966,040 | 38,370,600 | 39,157,200 | 39,157,200 |
-| B tail 1.00 | 29,966,040 | 38,370,600 | 39,947,400 | 42,577,200 |
-| C tail 0.50 | 29,966,040 | 38,370,600 | 39,552,300 | 40,867,200 |
-| D tail 0.10 | 29,966,040 | 38,370,600 | 39,236,220 | 39,499,200 |
-| **E decay → 0.10** | 29,966,040 | 38,370,600 | **39,387,330** | **39,650,310** |
+| A fixed cap | 29,965,983 | 38,370,526 | 39,157,124 | 39,157,124 |
+| B tail 1.00 | 29,965,983 | 38,370,526 | 39,947,325 | 42,577,125 |
+| C tail 0.50 | 29,965,983 | 38,370,526 | 39,552,224 | 40,867,124 |
+| D tail 0.10 | 29,965,983 | 38,370,526 | 39,236,144 | 39,499,124 |
+| **E decay → 0.10** | 29,965,983 | 38,370,526 | **39,387,254** | **39,650,234** |
 
 Every policy is identical through year 25: the ladder dominates and the tail is
 irrelevant for a generation. **A and E differ by 493,110 JNT at year 100

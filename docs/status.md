@@ -1246,7 +1246,8 @@ No new decision** — this builds Decision 7 exactly as recorded; the escrow
 amounts and grantees are parameters under that decision, listed below.
 
 **The model.** The escrow fits in the sats the L1 ladder provably can never
-mint (the unmintable gap: 6,000 JNT on `mini`, 788,400 JNT on `mainnet`).
+mint (the unmintable gap: 6,076 JNT on `mini`, 788,476 JNT on `mainnet`; since
+M-E it is bounded by the explicit `escrow_ceiling_sat`, not by the gap rule).
 `NetworkParams` fixes per profile: `l2_genesis_escrow_sat` (`mini` 10 JNT,
 `mainnet` 100,000 JNT, no mainnet grants) and `l2_genesis_grants` (`mini`:
 1 JNT each to three deterministic operator identities, seeds 1–3). The 7 JNT

@@ -20,7 +20,7 @@ use crate::ledger::{check_tx, Undo, Utxo, UtxoSet};
 use crate::mempool::{Mempool, ReconcileReport};
 use crate::params::NetworkParams;
 use crate::puzzle::{PuzzleRegistry, PuzzleSolver, PuzzleSpec};
-use crate::supply::{block_reward_sat, max_issuance_sat};
+use crate::supply::{block_reward_sat, check_mint_at_height, max_issuance_sat};
 use crate::tx::{OutPoint, Output, Transaction, TX_COINBASE};
 
 /// Upper bound on mining attempts for a single block. Difficulty that would need
@@ -485,18 +485,22 @@ impl Chain {
             return Err(Error::BadFee("coinbase claims more than reward plus tip"));
         }
 
-        // Hard supply cap, checked against live state (SPEC.md §7).
+        // Derived supply bound (monetary-redesign §5.1 rule 1, approved
+        // 2026-10-09): live UTXO value may never exceed the issuance integral
+        // at this height. Defence in depth over the reward+tip rule above —
+        // a reward-function bug becomes a rejected block here instead of an
+        // inflation incident. O(periods), effectively O(1); `supply_cap_sat`
+        // remains as a sanity ceiling but is no longer load-bearing.
+        //
+        // The comparison itself lives in `supply::check_mint_at_height` so the
+        // miner, this validator and the node report share one rule rather than
+        // three copies of it (§5.2 invariant 1).
         let already = self.utxo.total_value();
-        let after = already.checked_add(minted).ok_or(Error::ValueOverflow)?;
-        if after > self.params.supply_cap_sat {
+        if let Err(e) = check_mint_at_height(&self.params, already, minted, height) {
             for u in applied.iter().rev() {
                 self.utxo.undo(u);
             }
-            return Err(Error::SupplyCapExceeded {
-                already,
-                requested: minted,
-                cap: self.params.supply_cap_sat,
-            });
+            return Err(e);
         }
 
         // Apply the coinbase last so its output is the freshest. A zero-value

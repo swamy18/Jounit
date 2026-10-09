@@ -997,9 +997,10 @@ fail closed rather than collecting a partial fee — the safe direction.
 ## P6 — Mainnet L2 genesis escrow scale (not a blocker, a confirmation)
 
 Decision 7 sets `mainnet` `l2_genesis_escrow_sat = 100,000 JNT` inside the
-788,400 JNT unmintable gap. If the protocol owner intends a different scale,
-that is a one-value change; the gap-fit rule (`NetworkParams::validate`) will
-reject anything larger than the gap.
+788,476 JNT that can never be minted. If the protocol owner intends a different
+scale, that is a one-value change; `escrow_ceiling_sat` (M-E) is what
+`NetworkParams::validate` checks, and it is currently set tight to the
+allocation.
 
 ---
 
@@ -1014,9 +1015,11 @@ frozen state in Decisions 7 and 10 stands: cap, ladder, halving schedule and
 both fee schedules are unchanged.
 
 Confirmed current state (read from code, not carried over): cap
-**39,945,600 JNT**; reachable issuance **39,157,200 JNT**; **788,400 JNT**
-permanently unmintable; ladder `76, 38, 19, 9, 4, 2, 1, 0` in whole JNT;
-`halving_period` 262,800; ladder exhausts at height **1,839,600**.
+**39,945,600 JNT**; ladder-era issuance **39,157,124 JNT** (the earlier
+39,157,200 was the geometric shortcut `149 × 262 800`, which over-states the
+schedule by 76 JNT because genesis occupies a rung-0 height without minting);
+**788,476 JNT** permanently unmintable; ladder `76, 38, 19, 9, 4, 2, 1, 0` in
+whole JNT; `halving_period` 262,800; ladder exhausts at height **1,839,600**.
 
 | # | Question | Options | Consequence if changed | Status |
 |---|---|---|---|---|
@@ -1038,3 +1041,20 @@ other value needs a new record here.
 documentation that *describe* current behaviour. **What may not:** editing
 `params.rs` reward/cap/escrow values, `supply.rs`, the consensus cap gate, or
 committed vectors.
+
+## Implementation record — approved 2026-10-09 (M1…M5, complete)
+
+`docs/monetary-redesign.md` §6 is the acceptance matrix; every row below is
+verified, not asserted.
+
+| Milestone | Delivered |
+|---|---|
+| **M1 (decision recorded)** | M-A…M-G recorded above; Decisions 7/10 amended for issuance and the escrow rule only. Commit `e3a5713`. |
+| **M2 (model)** | `sim/supply_schedule_sim.py` exits 0 and regenerated `tests/vectors/supply_vectors.json`; `sim/tail_emission_sim.py --selftest` exits 0; `sim/verify_vectors.py` exits 0. The two sims and `supply.rs` agree to the satoshi, including the period-boundary off-by-one that both previously carried and the exact ladder-era total (39,157,124.5 JNT at the first tail block). |
+| **M3 (consensus)** | `supply::check_mint_at_height` is the single mint gate and `Chain::apply_block` calls it; `params::validate` refuses a zero tail floor/constant and an escrow above its ceiling; §6.1 tests 1–14 exist (`historical_replay_is_unchanged_by_the_tail` = `historical_heights_keep_their_ladder_rungs_under_the_tail`, `reward_step_at_the_ladder_tail_boundary_is_at_most_a_halving` = `every_tail_step_is_at_most_a_halving_and_reaches_the_floor`); `cargo test --workspace` 0 failures; clippy `-D warnings` clean; fmt clean. |
+| **M4 (spec/docs)** | SPEC §7 and §19.4, this file, `docs/monetary-policy.md`, `docs/mainnet-readiness.md` and `README.md` re-stated to the shipped function; no document still claims a frozen zero tail or the `cap − max_issuance_sat` backing rule. |
+| **M5 (ops)** | Vectors frozen in git; `jnt-node verify` and `/v1/conservation` report the joint bound; `jnt-worker run` gates on it (older nodes fall back to the sanity cap, i.e. a stricter check). |
+
+Milestones **not** claimed here: M-F owns no numeric fee-burn target (deflation
+accepted and documented in `monetary-policy.md`), and the exit rule (P1) remains
+a separate, unimplemented mainnet blocker.

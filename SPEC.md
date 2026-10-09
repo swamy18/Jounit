@@ -399,19 +399,39 @@ Per Section 16. `SAT_PER_JNT = 100_000_000`.
 
 ```
 halvings  = height / halving_period
-reward(h) = (start_reward_jnt >> halvings) * SAT_PER_JNT   // whole-JNT halving; 0 once halvings ≥ 7
+rung(p)   = start_reward_jnt >> p                         // whole-JNT halving
+reward(h) = rung(halvings) * SAT_PER_JNT                  // while rung > 0
+tail(p)   = max(tail_floor_sat, 1 JNT >> (p − exhaustion_period + 1))
+reward(h) = tail(halvings)                                // once rung == 0
 
 // The ladder is halved in **whole JNT**, not by shifting satoshis:
 // `start_reward_sat >> halvings` would pay 9.5 JNT at halving 3 and
 // contradict the ladder below. Shifting whole JNT keeps every rung a
 // whole number of JNT and keeps the cap arithmetic exact.
+// The tail is halved in **satoshis** and clamped by its floor.
 ```
 
-Reward ladder: `76, 38, 19, 9, 4, 2, 1, 0`.
+Reward ladder: `76, 38, 19, 9, 4, 2, 1`, then the approved tail (Decisions
+M-A…M-G, `docs/decisions.md`): mainnet `0.50, 0.25, 0.125` JNT and the
+permanent `0.1 JNT` floor; mini/testnet a constant `1 sat` per block. The tail
+activates at each profile's ladder exhaustion (mainnet `1 839 600`, mini and
+testnet `14 000`) and leaves **every historical block byte-identical** — the
+reward stays a pure function of height.
 
-**Cap invariant (hard, enforced in code):** minting must never raise total issued above `supply_cap`. Because rewards are floor-divided, issued supply converges to `149 × 262 800 = 39 157 200 JNT`; the remaining `788 400 JNT` (39 945 600 − 39 157 200) is **permanently unmintable**, not merely "reserved". `sim/supply_schedule_sim.py` regenerates these numbers and `tests/vectors/supply_vectors.json` pins them.
+**Mint bound (hard, enforced in code):** live UTXO value may never exceed the
+issuance integral at the height — `cumulative_issuance_sat(height)` — clamped by
+`supply_cap` as a sanity ceiling (M-D). `supply::check_mint_at_height` is the
+only mint gate and `Chain::apply_block` calls it. Because the first rung is paid
+by `halving_period − 1` blocks (genesis occupies a height without minting), the
+ladder era issues `149 × 262 800 − 76 = 39 157 124 JNT`; the remaining
+`788 476 JNT` (39 945 600 − 39 157 124) is **permanently unmintable**, not merely
+"reserved". With a tail, long-run issuance is unbounded by design, so the bound
+is per-height, never a single total. `sim/supply_schedule_sim.py` regenerates
+these numbers and `tests/vectors/supply_vectors.json` pins them.
 
-If a block reward would cross the cap, the coinbase collects the tips only and the surplus is unrecoverable (provable, not burned-from-circulation).
+If a block reward would cross the bound, the block is refused by consensus
+(`SupplyCapExceeded`); the surplus is unrecoverable rather than burned out of
+circulation.
 
 ---
 
@@ -2384,15 +2404,19 @@ The remainder (`escrow − grants`) parks with the protocol escrow identity:
 no key. It is inert in M2 — no disbursement rule exists for it yet — which is
 stated so its balance cannot be misread as spendable supply.
 
-**The backing rule.** The escrow must fit in the sats the L1 ladder can never
-mint: `l2_genesis_escrow_sat ≤ supply_cap_sat − max_issuance_sat`, enforced by
-`NetworkParams::validate`. Both profiles satisfy it with wide margins (mini:
-10 of 6,000 JNT; mainnet: 100,000 of 788,400 JNT). Because L1 can never hold
-more than the ladder's reachable maximum and L2 can never hold more than its
-escrow total, combined L1 + L2 money can never exceed the cap — with zero
-change to any L1 consensus rule, issuance path, reward, halving schedule, fee
-rule, or the genesis block itself (which still mints nothing). `validate`
-additionally refuses a zero escrow, zero grants, duplicate grantees, grants
+**The backing rule.** The escrow is bounded by its own explicit, validated
+parameter: `l2_genesis_escrow_sat ≤ escrow_ceiling_sat`, enforced by
+`NetworkParams::validate` (Decision M-E). The old implicit
+`supply_cap_sat − max_issuance_sat` gap rule is **gone**: with a tail it no
+longer describes anything. The shipped ceilings are exactly the allocations
+(mini/testnet 10 JNT of the 6 076 JNT permanently unmintable; mainnet
+100 000 JNT of the 788 476 JNT permanently unmintable) — tight, so the
+parameter constrains rather than rubber-stamps. Because L1 can never hold more
+than its issuance integral and L2 can never hold more than its escrow ceiling,
+combined L1 + L2 money can never exceed `cumulative_issuance_sat(height) +
+escrow_ceiling_sat` — the joint bound `GET /v1/conservation` reports and the
+`jnt-worker run` gate checks. `validate` additionally refuses a zero escrow,
+zero grants, duplicate grantees, grants
 naming the escrow identity, and grants summing above the total.
 
 **Application.** `L2State::apply_genesis` releases the allocation once, to a

@@ -260,8 +260,8 @@ async fn status(State(state): State<ApiState>) -> ApiResult {
 /// Read-only, under the same lock as `/v1/status`. The terms sum the whole
 /// UTXO set, so this is a self-check/monitoring endpoint, not a hot path.
 /// `ok` is the full verdict (L2 closed, L2 funded by genesis plus matured
-/// deposits, joint supply under the cap); the component booleans and the
-/// four terms say *which* check moved. `jnt-worker run` gates on this before
+/// deposits, joint supply inside the joint bound); the component booleans and
+/// the terms say *which* check moved. `jnt-worker run` gates on this before
 /// its first pass, and `/metrics` exports the same joint figure as gauges —
 /// all from the one implementation in `crate::conservation`, so the endpoint,
 /// the exporter and `verify` cannot disagree.
@@ -273,6 +273,9 @@ async fn conservation(State(state): State<ApiState>) -> ApiResult {
             "l2_closed": report.l2_closed,
             "l2_funding_ok": report.l2_funding_ok(),
             "joint_sat": report.supply.joint_sat,
+            "joint_bound_sat": report.supply.bound_sat(),
+            "l1_bound_sat": report.supply.l1_bound_sat,
+            "escrow_ceiling_sat": report.supply.escrow_ceiling_sat,
             "supply_cap_sat": report.supply.cap_sat,
             "headroom_sat": report.supply.headroom_sat(),
             "l1_live_sat": report.supply.l1_live_sat,
@@ -416,7 +419,7 @@ async fn metrics(
         gauge(
             &mut out,
             "jounit_supply_cap_sat",
-            "Hard supply cap from the active network profile, in satoshi.",
+            "Sanity supply ceiling from the active network profile, in satoshi; not the binding mint bound since the approved tail.",
             &net,
             p.supply_cap_sat,
         );
@@ -428,14 +431,21 @@ async fn metrics(
         gauge(
             &mut out,
             "jounit_joint_supply_sat",
-            "Joint supply (L1 live + L2 held − deposit sink), in satoshi; must stay at or below the cap.",
+            "Joint supply (L1 live + L2 held − deposit sink), in satoshi; must stay at or below the joint bound.",
             &net,
             report.supply.joint_sat,
         );
         gauge(
             &mut out,
+            "jounit_joint_bound_sat",
+            "Joint ceiling (issuance integral at the tip plus the escrow ceiling), in satoshi.",
+            &net,
+            report.supply.bound_sat(),
+        );
+        gauge(
+            &mut out,
             "jounit_conservation_ok",
-            "1 while L2 balances, L2 funding is genesis plus matured deposits, and joint supply is under the cap; 0 means value was created.",
+            "1 while L2 balances, L2 funding is genesis plus matured deposits, and joint supply is inside the bound; 0 means value was created.",
             &net,
             u64::from(report.ok()),
         );

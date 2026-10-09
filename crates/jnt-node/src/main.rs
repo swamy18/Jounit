@@ -849,7 +849,9 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
     // Joint conservation (Decisions 7 and 10, SPEC.md §19.4–§19.5): L2 holds
     // at most genesis plus matured deposits, and L1 live supply plus
     // everything L2 ever held, minus what sits identifiably in the deposit
-    // sink, stays under the cap. The sink term is the M3 correction: sink
+    // sink, stays under the joint bound — the issuance integral at the tip
+    // plus the escrow ceiling (approved M-E); `supply_cap_sat` is reported as
+    // a sanity ceiling only. The sink term is the M3 correction: sink
     // outputs remain in the L1 UTXO set (unspendable) while their twins live
     // in L2, so counting both sides without subtracting the sink would cry
     // inflation on every deposit. Burns anywhere move the sum down, never up —
@@ -860,11 +862,14 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
     let supply =
         jnt_node::conservation::verify_conservation(&chain, &a).map_err(|e| e.to_string())?;
     println!(
-        "ok: joint supply conserved (l1 live {} + l2 held {} - sink {} = {} sat of {} cap)",
+        "ok: joint supply conserved (l1 live {} + l2 held {} - sink {} = {} sat of {} bound)\n    bound = l1 issuance integral {} + escrow ceiling {} (sanity cap {})",
         supply.l1_live_sat,
         supply.l2_held_sat,
         supply.sink_held_sat,
         supply.joint_sat,
+        supply.bound_sat(),
+        supply.l1_bound_sat,
+        supply.escrow_ceiling_sat,
         supply.cap_sat
     );
     for s in a.skipped().iter().take(10) {

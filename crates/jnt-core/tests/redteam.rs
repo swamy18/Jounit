@@ -13,8 +13,13 @@ use jnt_core::chain::Chain;
 use jnt_core::error::Error;
 use jnt_core::hash::Address;
 use jnt_core::ledger::{Utxo, UtxoSet};
-use jnt_core::params::NetworkParams;
-use jnt_core::supply::block_reward_sat;
+use jnt_core::params::{NetworkParams, TailEmission};
+use jnt_core::supply::{block_reward_sat, exhaustion_period};
+
+/// First height whose reward is the tail rather than a ladder rung.
+fn exhaustion_height(params: &NetworkParams) -> u64 {
+    exhaustion_period(params) as u64 * params.halving_period
+}
 use jnt_core::tx::{Input, OutPoint, Output, Transaction};
 use jnt_core::wallet::Wallet;
 
@@ -533,6 +538,11 @@ fn build_tx_does_not_silently_discard_the_fee_it_was_given() {
 /// unconditionally. After the last halving, `reward + tip` is legitimately
 /// zero for an empty block, so every such block was refused and the chain
 /// stopped dead at a fixed height — an unrecoverable halt baked into consensus.
+///
+/// Since the approved tail (`docs/decisions.md` M-A, 2026-10-09) no shipped
+/// profile has a zero reward any more, so the zero-reward path is exercised on
+/// an explicit `TailEmission::None` profile and the shipped tail gets its own
+/// half of the test below.
 #[test]
 fn a_zero_reward_block_at_the_end_of_the_ladder_is_accepted() {
     // Reach past the last halving by mining on a profile whose ladder is short.
@@ -541,6 +551,9 @@ fn a_zero_reward_block_at_the_end_of_the_ladder_is_accepted() {
     // here, so shrink the period while keeping the ladder shape.
     params.halving_period = 2;
     params.supply_cap_sat = 1_000_000_000_000;
+    // Policy A, deliberately: this test is about the *zero-reward* block, which
+    // only exists on a profile that pays no tail at all.
+    params.tail = TailEmission::None;
     params.validate().unwrap();
 
     let mut chain = Chain::new(params.clone()).unwrap();
@@ -566,6 +579,52 @@ fn a_zero_reward_block_at_the_end_of_the_ladder_is_accepted() {
     assert!(
         height_reached_zero_reward,
         "the test never reached a zero-reward block"
+    );
+    chain.verify_canonical_chain().unwrap();
+}
+
+/// **The rule:** the approved tail (M-A/M-C) — past each profile's exhaustion
+/// height the reward keeps flowing, never stops, and is exactly what the
+/// schedule says.
+///
+/// **The attack this guards:** a zero tail (policy A) after exhaustion. With
+/// no block reward, fees alone must fund security, and an idle chain pays
+/// nothing — the argument the owner accepted when choosing policy E.
+#[test]
+fn the_approved_tail_keeps_blocks_flowing_past_exhaustion() {
+    let mut params = NetworkParams::mini();
+    params.halving_period = 2; // exhaustion at height 14, as above
+    params.validate().unwrap();
+    let expected_tail = block_reward_sat(&params, exhaustion_height(&params));
+    assert_eq!(expected_tail, 1, "mini pays a 1-sat token tail");
+
+    let mut chain = Chain::new(params.clone()).unwrap();
+    let miner = addr(1);
+    let mut past_exhaustion = 0usize;
+    for h in 1..=20u64 {
+        let b = chain.mine_block(miner, vec![], ts(h)).unwrap();
+        let reward = block_reward_sat(chain.params(), h);
+        if h < exhaustion_height(&params) {
+            // Ladder rungs (whole JNT) are all far above the token tail.
+            assert!(
+                reward >= 2 * expected_tail,
+                "height {h} is still on the ladder"
+            );
+        } else {
+            assert_eq!(reward, expected_tail, "height {h} must pay the tail");
+        }
+        chain.submit(b).expect("a tail block must be accepted");
+        if h >= exhaustion_height(&params) {
+            past_exhaustion += 1;
+        }
+    }
+    assert!(
+        past_exhaustion > 0,
+        "the test never crossed the exhaustion height"
+    );
+    assert!(
+        chain.total_supply_sat() > 0,
+        "tail blocks must still mint something"
     );
     chain.verify_canonical_chain().unwrap();
 }

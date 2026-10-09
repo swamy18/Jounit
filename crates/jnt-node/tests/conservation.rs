@@ -125,7 +125,20 @@ fn verify_conservation_passes_with_a_real_deposit_and_reports_headroom() {
         s.headroom_sat() > 0,
         "a real chain occupies only a fraction of the cap"
     );
-    assert!(!s.exceeds_cap());
+    assert!(!s.exceeds_bound());
+    // The joint bound is the issuance integral plus the escrow ceiling; the
+    // sanity cap is reported but no longer decides the verdict.
+    assert_eq!(
+        s.bound_sat(),
+        s.l1_bound_sat + s.escrow_ceiling_sat,
+        "the bound must be the two authorities added"
+    );
+    assert_eq!(s.escrow_ceiling_sat, chain.params().escrow_ceiling_sat);
+    assert_eq!(
+        s.l1_bound_sat,
+        jnt_core::supply::cumulative_issuance_sat(chain.params(), chain.height()),
+        "L1's bound must be the same integral the chain mints against"
+    );
     // L2 holds exactly the genesis escrow plus the deposit that arrived.
     assert_eq!(
         s.l2_held_sat,
@@ -271,7 +284,8 @@ fn a_deposit_is_counted_once_while_pending_and_cancelled_once_matured() {
     // The principal is fully accounted for and still inside the system: value
     // moved between buckets, and the check that caught every step is the same
     // one an exit must not break.
-    assert!(matured.joint_sat < matured.cap_sat);
+    assert!(matured.joint_sat <= matured.bound_sat());
+    assert!(!matured.exceeds_bound());
     // Sanity: the baseline was taken and the chains really are the same chain.
     assert!(matured.l1_live_sat > before.l1_live_sat);
 }

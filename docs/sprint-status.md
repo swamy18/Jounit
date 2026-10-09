@@ -83,10 +83,14 @@ requires a decision not yet recorded. **NOT STARTED** = no work.
    genesis committee with *no* stake transaction, bond or unbonding. Rotating a
    committee without bonded stake is not authorised; Phase 6 is a fixed-committee
    bootstrap by design.
-3. **The 40M supply cap and issuance are frozen.** Decisions 7 and 10 state the
-   cap, issuance paths, block rewards, halving schedule and both fee schedules
-   are *explicitly unchanged*. Any change is a monetary-policy decision and was
-   deliberately not made.
+3. **The 40M supply cap and issuance were frozen *at the time of this sprint*.**
+   Decisions 7 and 10 then stated the cap, issuance paths, block rewards,
+   halving schedule and both fee schedules were explicitly unchanged. The
+   protocol owner has since approved the tail and escrow decisions
+   (M-A…M-G, 2026-10-09, see `docs/decisions.md`); the cap is now a sanity
+   ceiling and the mint bound is the per-height issuance integral. This
+   paragraph records the sprint's constraint, which no longer matches the
+   shipped code.
 4. **Local fuzz execution is unavailable in this environment** (no ASan runtime
    for the MSVC target). Fuzz targets compile; representative *execution* is not
    claimed.

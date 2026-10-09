@@ -437,21 +437,26 @@ window, and `sim/difficulty_attack_sim.py` measures it.
 The ladder halves in **whole JNT**, not by shifting satoshis:
 
 ```
-76, 38, 19, 9, 4, 2, 1, 0
+76, 38, 19, 9, 4, 2, 1, then the tail
 ```
 
-Because every halving rounds down, the seven non-zero steps pay out
-**39 157 200 JNT** in total — exactly 149 periods at the full reward — against a
-39 945 600 cap. The remaining **788 400 JNT is permanently unmintable**, not
-merely reserved: anyone can confirm it by summing the ladder. The cap is checked
-at the point of minting, against live UTXO state.
+Because every halving rounds down, the seven ladder steps pay out **39 157 124
+JNT** — 149 periods at the full reward, minus the 76 JNT genesis slot that mints
+nothing — against a 39 945 600 cap. **788 476 JNT can never be minted**, not
+merely reserved: anyone can confirm it by summing the ladder.
 
-The ladder is the **only** issuance rule today — nothing tapers it into a tail.
-A permanent tail-emission proposal with reproducible evidence exists in
-[docs/monetary-redesign.md](docs/monetary-redesign.md), but it is **not
-implemented** and every parameter in it is unapproved. With no tail, the subsidy
-reaches zero at height 1 839 600 (~35 years) and mining revenue rests on fees
-alone from then on.
+The mint bound is the **issuance integral at the height**
+(`cumulative_issuance_sat`), enforced in `Chain::apply_block`; the cap is kept as
+a sanity ceiling. After the ladder the approved tail (Decisions M-A…M-C) takes
+over: mainnet decays 0.50 → 0.25 → 0.125 JNT and holds a permanent **0.1 JNT**
+floor, while `mini`/`testnet` pay a constant 1 sat/block. Issuance therefore
+never stops, and the subsidy reaches the floor at height 2 628 000 (~50 years)
+instead of ending at 1 839 600.
+
+Issuance is unbounded in the long run by design, so security rests on the tail
+plus fees; the reasoning, sensitivity tables and activation argument are in
+[docs/monetary-redesign.md](docs/monetary-redesign.md), and the approved values
+are recorded in [docs/decisions.md](docs/decisions.md).
 
 ### Fees and burn
 

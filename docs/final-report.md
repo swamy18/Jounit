@@ -87,8 +87,12 @@ now explicitly listed as **not measured**.
 ## 7. SPEC / code mismatches found
 
 1. **Supply arithmetic error in SPEC §7:** the unmintable remainder was written
-   `787 400 JNT`; correct is **788 400** (39,945,600 − 39,157,200). Fixed; the
-   code and `supply::tests` already used 788,400.
+   `787 400 JNT`. The figure went through two corrections: first to **788 400**
+   (39,945,600 − 39,157,200), then — once the approved tail forced the exact
+   block-by-block semantics — to **788 476** (39,945,600 − 39,157,124), because
+   genesis occupies a rung-0 height without minting. `supply::tests`,
+   `sim/supply_schedule_sim.py` and `tests/vectors/supply_vectors.json` now pin
+   the exact figure.
 2. **SPEC reward formula matched nothing in code:** SPEC said
    `start_reward_sat >> halvings`, but `supply::period_reward_sat` halves
    **whole JNT** (`(start_reward_jnt >> period) * SAT_PER_JNT`). Fixed to match

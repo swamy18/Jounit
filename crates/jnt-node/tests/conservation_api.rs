@@ -118,11 +118,29 @@ fn the_endpoint_reports_terms_that_re_add_and_match_status() {
     let sink = v["sink_held_sat"].as_u64().unwrap();
     let joint = v["joint_sat"].as_u64().unwrap();
     let cap = v["supply_cap_sat"].as_u64().unwrap();
+    let bound = v["joint_bound_sat"].as_u64().unwrap();
+    let l1_bound = v["l1_bound_sat"].as_u64().unwrap();
+    let ceiling = v["escrow_ceiling_sat"].as_u64().unwrap();
     assert_eq!(
         joint,
         l1 + l2 - sink,
         "the terms must re-add to the joint figure: {body}"
     );
+    // The joint bound is the issuance integral at the tip plus L2's escrow
+    // ceiling, and it is what `ok` rests on — the sanity cap is reported too,
+    // but is no longer the verdict (approved M-D/M-E).
+    assert_eq!(
+        bound,
+        l1_bound + ceiling,
+        "the joint bound must be the two authorities added: {body}"
+    );
+    assert_eq!(
+        l1_bound,
+        jnt_core::supply::cumulative_issuance_sat(&params, 3),
+        "L1's bound must be the same integral the chain mints against: {body}"
+    );
+    assert_eq!(ceiling, params.escrow_ceiling_sat, "{body}");
+    assert!(joint <= bound, "a healthy node is inside the bound: {body}");
     assert_eq!(
         l2, escrow,
         "a fresh view holds exactly the genesis escrow: {body}"
