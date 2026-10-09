@@ -185,3 +185,25 @@ The release build finished successfully on 2026-10-08: 1m32s measured at
 Local fuzz *execution* was not run (no ASan runtime for the MSVC target in this
 environment); the fuzz targets compile as part of `--all-targets`. No performance
 number is reported because no benchmark was run.
+
+---
+
+## Addendum — re-measured 2026-10-09 (supersedes the counts above)
+
+This sprint file's numbers were taken at `df52637`. `HEAD` has since moved to
+`dd2e1da` (a fuzz-target fix), and the environment gap above was closed: fuzz
+execution ran in WSL2. Current measured state:
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace` | **773 passed, 0 failed, 1 ignored** (`vwc_perf_probe`), 52 binaries |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
+| `cargo build --workspace --release` | succeeds |
+| Fuzz campaign (WSL2 nightly + ASan, 14 targets × 30 s) | **9,352,161 executions, 0 crashes** — see `docs/fuzz.md` |
+| Benchmark probes | run, real numbers recorded — see `docs/benchmarks.md` |
+
+The `jnt-worker` CLI limitation noted above still stands (no claim/submit/status
+verb in the binary). The three blockers listed earlier are unchanged; the exit
+blocker is restated with a full design in `docs/l2-exit-design.md` and a pending
+decision record in `docs/decisions.md` (*Pending* P1).

@@ -1,65 +1,103 @@
 # Fuzz Testing Report
 
-## Target Inventory
+**Last campaign: 2026-10-09 (WSL2 Ubuntu, `nightly-x86_64-unknown-linux-gnu`,
+`cargo-fuzz 0.13.2`, AddressSanitizer).** An earlier revision of this file
+carried a campaign table whose numbers were **not reproducible** (round-looking
+figures such as `456,789`, `1,234,567`, and a `dispute_arbitrate` count byte-
+identical to `wire_msg_decode`). That table has been deleted and replaced with
+the measured run below. Long campaigns are not run on every commit; these are
+the numbers a specific execution produced, and they are labelled as such.
 
-Fourteen fuzz targets cover all high-risk parser, decode, and state-transition surfaces. All targets live in
-`fuzz/fuzz_targets/` and are compiled with `cargo-fuzz` on nightly + ASan.
+## Target inventory
 
-| # | Target | Surface | Invariants |
+Fourteen targets in `fuzz/fuzz_targets/`, each asserting a property, not merely
+panic-freedom.
+
+| # | Target | Surface | Invariant asserted |
 |---|---|---|---|
-| 1 | `tx_decode` | Transaction deserialization | Never panics; rejects trailing bytes, truncation, absurd counts |
-| 2 | `block_decode` | Block deserialization | Never panics; survives bitflips of a valid block |
-| 3 | `wire_msg_decode` | P2P message parsing | Never panics on any type/payload; total decode |
-| 4 | `mempool_admit` | Mempool admission logic | Byte cap holds; idempotent under adversarial input |
-| 5 | `storage_recover` | Block store reopen | Torn-tail recovery preserves committed prefix; never panics |
-| 6 | `checkpoint_validate` | Checkpoint clause validation (all 6) | Every adversarial mutation produces a named error, never accepts |
-| 7 | `meta_parse` | Metadata parsing (version, format) | Unknown versions/too-large sizes refused; never allocates unbounded |
-| 8 | `l2_payload_decode` | L2 transaction payload | Unknown types rejected; never reaches `apply` without full decode |
+| 1 | `tx_decode` | Transaction deserialization | Round-trip identity; trailing bytes, truncation and absurd counts rejected |
+| 2 | `block_decode` | Block deserialization | Round-trip identity; survives bitflips of a valid block |
+| 3 | `wire_msg_decode` | P2P message parsing | Total decode; never panics on any type/payload |
+| 4 | `mempool_admit` | Mempool admission | Byte cap holds; admission idempotent under adversarial input |
+| 5 | `storage_recover` | Block-store reopen | Torn-tail recovery preserves the committed prefix; never panics |
+| 6 | `checkpoint_validate` | Six-clause checkpoint validation | Every mutation produces a *named* error; a valid checkpoint ⇒ honest count, quorum and real signature |
+| 7 | `meta_parse` | Metadata parsing | Unknown version / oversized size refused before allocation |
+| 8 | `l2_payload_decode` | L2 payload | Unknown types rejected; never reaches `apply` without full decode |
 | 9 | `m3_readers` | M3 envelope readers | Total and invertible over adversarial bytes |
-| 10 | `dispute_arbitrate` | Dispute arbitration | Deterministic function; evidence validation is total |
-| 11 | `l2_state_apply` | L2 state machine application | Value conservation holds; every mutation is refused cleanly |
-| 12 | `vwc_decode` | Verified Work Certificate codec | Exact round-trip; id stability; `validate` totality |
-| 13 | `worker_flows` | Worker claim/settle/dispute flows | No partial state on error; replay refuses |
-| 14 | `checkpoint_codec` | Checkpoint serialization codec | Bounded; round-trip is identity; never allocates unbounded |
+| 10 | `dispute_arbitrate` | Dispute arbitration | Deterministic; evidence validation total |
+| 11 | `l2_state_apply` | L2 state machine | Value conservation holds; every mutation refused cleanly |
+| 12 | `vwc_decode` | VWC codec | Exact round-trip; id stability; `validate` totality |
+| 13 | `worker_flows` | Worker claim/settle/dispute flows | No partial state on error; replay refused |
+| 14 | `checkpoint_codec` | Checkpoint codec | Bounded; round-trip identity |
 
-## CI Integration
+## Campaign results — measured 2026-10-09
 
-The `fuzz-smoke` job in `.github/workflows/ci.yml`:
-- Uses `dtolnay/rust-toolchain@nightly` with `llvm-tools-preview`
-- Installs `cargo-fuzz`
-- Runs each target with `-max_total_time=20 -rss_limit_mb=4096`
+One `-max_total_time=30 -rss_limit_mb=4096` run per target, ASan on, over each
+target's committed corpus plus a seedless start. `rc=0` for every target.
 
-## Execution Limitations
+| Target | Executions | Wall (s) | Crashes |
+|---|---:|---:|---:|
+| `tx_decode` | 1,157,972 | 32 | 0 |
+| `block_decode` | 594,510 | 32 | 0 |
+| `wire_msg_decode` | 1,158,948 | 32 | 0 |
+| `mempool_admit` | 1,688 | 32 | 0 |
+| `storage_recover` | 1,369 | 32 | 0 |
+| `checkpoint_validate` | 16,584 | 31 | 0 |
+| `meta_parse` | 194,412 | 32 | 0 |
+| `l2_payload_decode` | 969,970 | 33 | 0 |
+| `m3_readers` | 581,483 | 32 | 0 |
+| `dispute_arbitrate` | 1,682,553 | 33 | 0 |
+| `l2_state_apply` | 1,478 | 32 | 0 |
+| `vwc_decode` | 1,417,179 | 32 | 0 |
+| `worker_flows` | 3,299 | 32 | 0 |
+| `checkpoint_codec` | 1,570,716 | 37 | 0 |
+| **Total** | **9,352,161** | — | **0** |
 
-| Constraint | Details |
+No crash artifact was written (`fuzz/artifacts/*` empty). No sanitizer error,
+leak report, timeout or OOM appeared in any log.
+
+### Reading the low counts honestly
+
+The per-target rates span four orders of magnitude and that reflects the work
+each iteration does, not the value of the run:
+
+- `mempool_admit` (1,688), `storage_recover` (1,369), `l2_state_apply` (1,478)
+  and `worker_flows` (3,299) are **capability-bound**: each iteration builds or
+  reopens real state (a store with fsync, a full chain, an L2 replay). ~50/s is
+  the cost of the operation under test, and a 30-second budget simply executes
+  it ~1,500 times.
+- `checkpoint_validate` (16,584) does real `blst` pairings per iteration, and
+  `checkpoint_codec` (1.57M) does not — 100× apart for that reason.
+- The decode surfaces (`tx_decode`, `wire_msg_decode`, `dispute_arbitrate`,
+  `vwc_decode`, `l2_payload_decode`, `m3_readers`) are the ones with
+  high-throughput budgets, and those are the ones that get millions of
+  iterations.
+
+Longer campaigns are the right way to push the capability-bound ones; the
+numbers above are labelled by wall budget precisely so nobody reads 30 seconds
+as deep coverage.
+
+## CI integration
+
+`.github/workflows/ci.yml` → `fuzz-smoke`: nightly toolchain with
+`llvm-tools-preview`, `cargo install --locked cargo-fuzz`, then each target at
+`-max_total_time=20`. CI proves the harness **builds, runs and survives** a
+seedless start plus the committed corpus; it does not claim the coverage above.
+
+## Execution limitations
+
+| Constraint | Detail |
 |---|---|
-| **Nightly-only** | `cargo-fuzz` requires the nightly toolchain and the `-Zsanitizer=address` flag. On stable, the build fails before any target compiles. Long-running campaigns must be run locally or on a nightly CI runner. |
-| **Windows host** | The ASan runtime is integrated on Linux via `llvm-tools-preview`. On Windows MSVC, `cargo-fuzz` fails at the `rustc` probe stage (`error: the option Z is only accepted on the nightly compiler`). Fuzz campaigns run on WSL2 (Linux subsystem). |
-| **No corpus sync** | Corpora live in `fuzz/corpus/` (git-committed seed corpora). No remote corpus server is configured; manual corpus sharing is the current policy. |
-| **20s per target in CI** | CI proves the harness builds and survives a seedless start + committed corpus; it does not claim deep coverage. |
+| Nightly + ASan required | `cargo-fuzz` needs `nightly` and `-Zsanitizer=address`. On stable the build fails before any target compiles. |
+| Windows host cannot run it | The MSVC nightly toolchain does not ship the ASan runtime. Campaigns run in WSL2 Ubuntu; that is where these numbers come from. |
+| No corpus server | Corpora are git-committed seeds in `fuzz/corpus/`; no remote sync. |
+| Manual cadence | This is a campaign, not a per-commit gate. CI's 20 s smoke is the per-commit gate. |
 
-## Campaign Results (WSL nightly, 40s per target, ASan)
+## Regression policy
 
-| Target | Executions | Crashes |
-|---|---|---|
-| `tx_decode` | 2,103,441 | 0 |
-| `block_decode` | 1,892,003 | 0 |
-| `wire_msg_decode` | 3,760,893 | 0 |
-| `mempool_admit` | 892,301 | 0 |
-| `storage_recover` | 456,789 | 0 |
-| `checkpoint_validate` | 2,034,510 | 0 |
-| `checkpoint_codec` | 1,876,204 | 0 |
-| `meta_parse` | 1,234,567 | 0 |
-| `l2_payload_decode` | 1,987,654 | 0 |
-| `m3_readers` | 876,543 | 0 |
-| `dispute_arbitrate` | 3,760,893 | 0 |
-| `l2_state_apply` | 12,630 | 0 |
-| `vwc_decode` | 1,163,630 | 0 |
-| `worker_flows` | 543,210 | 0 |
-| **Total** | **~22.6M** | **0** |
-
-## Regression Policy
-
-Any crash found by fuzzing enters the test suite as a regression test before the fix is merged. Example:
-`tests/fuzz_invariants.rs` contains the 7 total-over-mutation tests that were derived from earlier
-fuzz-discovered panics. No product bug was surfaced by fuzzing in this phase.
+Any crash found by fuzzing becomes a regression test in the workspace suite
+before the fix merges. `crates/*/tests/fuzz_invariants.rs` holds the
+total-over-mutation tests derived from earlier fuzz-discovered panics. **No
+product bug was surfaced by the 2026-10-09 campaign** — 0 crashes across all
+fourteen targets — which is a statement about this run's coverage, not a proof
+that none exists.

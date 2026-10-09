@@ -1,74 +1,119 @@
 # Performance Benchmarks
 
+**All numbers below were measured on 2026-10-09 on one machine; none is a CI
+threshold.** An earlier revision of this file carried figures attributed to an
+"M2 MacBook Air" (a machine not used for this repository) and per-operation
+numbers (storage append 0.3 ms, block validation 43 µs, API <1 ms) that had no
+probe or command behind them. Those are deleted. What follows is reproducible
+from the commands shown, and every path that was **not** measured is named as
+not measured rather than estimated.
+
+## Environment
+
+| | |
+|---|---|
+| CPU | Intel Core i5-8365U @ 1.60 GHz, 8 logical CPUs |
+| OS | Windows (Git Bash); release builds |
+| Build | `cargo build --workspace --release` (binary 2,184,704 bytes) |
+| Fuzzing host (separate) | WSL2 Ubuntu on the same machine — see `docs/fuzz.md` |
+
 ## Methodology
 
-All measurements use `cargo test --release` with a manual probe on an M2 MacBook Air (8-core, 16 GB RAM). Timing
-bounds are recorded as history, not CI assertions: `cargo test` timing flakes across runners, so hard thresholds
-would cause false negatives in CI rather than catch real regressions.
+- CLI numbers: the **release** `jnt-node` binary, timed with `date +%s%N` in
+  bash. Each is a cold process start (so each includes read-and-replay of the
+  chain), which is the interface an operator actually uses.
+- Probe numbers: the one inline `#[ignore]`d probe in the tree
+  (`crates/jnt-l2/src/vwc.rs::vwc_perf_probe`).
+- Timings are single runs, recorded as history, **not** assertions. No CI job
+  gates on them.
 
-For each hot path below, the source contains an `#[ignore]`d probe test. Run any probe with:
+## Measured — `jnt-node` CLI (mini profile)
+
+Chain of 300 mined blocks.
+
+| Operation | Command | Wall time |
+|---|---|---:|
+| Mine 300 blocks (PoW included) | `jnt-node mine --blocks 300 --interval 0` | **225,824 ms** (~753 ms/block) |
+| Replay + verify from genesis | `jnt-node verify` | **304 ms** (~1.0 ms/block, 301 blocks) |
+| Reopen + status | `jnt-node status` | **193 ms** |
+
+**Interpretation and caveats.**
+
+- The mining figure is **PoW-bound, not validation-bound**: ~753 ms/block is
+  the cost of *solving* the puzzle at the mini difficulty this run reached
+  (difficulty 101,568), not the cost of validating a block a peer sent. It is
+  reported as "block mining". It is **not** a block-validation number.
+- `verify` replays all 301 blocks from genesis, re-checks the chain, diffs the
+  UTXO set, re-derives the PSCB reserve, replays L2 deterministically and runs
+  the joint conservation check — 304 ms total, ≈1.0 ms/block including process
+  startup. That is the closest real measurement of **block validation +
+  application** available from the CLI, and it is dominated by replay, not by
+  network or disk.
+- `status` (193 ms) is the **storage reopen** figure: open the append-only log,
+  rebuild the hash index, replay, print. It is O(chain) today because state is
+  replayed from genesis; there is no persisted-UTXO fast path.
+
+## Measured — VWC probe (`crates/jnt-l2`, release)
 
 ```
 cargo test --release -p jnt-l2 --lib vwc_perf_probe -- --ignored --nocapture
 ```
 
-## Recorded Numbers
+| Operation | Measured | Note |
+|---|---:|---|
+| `VerifiedWorkCertificate::encode` | **4.16 µs** | pure CPU |
+| `VerifiedWorkCertificate::decode` | **3.21 µs** | bounded by `MAX_VWC_SIZE` |
+| `VerifiedWorkCertificate::validate` | **2,630.15 µs** | real `blst` pairing — BLS-bound |
 
-### VWC encode / decode / validate (`vwc_perf_probe`)
+Validation is ~630× encode/decode because it performs a real pairing
+verification. No optimisation is justified: the cost is the cryptographic
+primitive, not protocol logic.
 
-| Operation | Time (µs) | Notes |
-|---|---|---|
-| `VerifiedWorkCertificate::encode` | 4.6 | Pure CPU, no allocation beyond output buffer |
-| `VerifiedWorkCertificate::decode` | 3.4 | Bounded by `MAX_VWC_SIZE` (§14.6) |
-| `VerifiedWorkCertificate::validate` | 2,400 | Real `blst` pairing — BLS-bound by construction |
+## Measured — REST API latency (loopback, mini)
 
-**Interpretation.** Validation is a single pairing verification, the same cost class as BLS checkpoint
-verification (§14.6.2). No optimization is justified: the cost is dominated by the cryptographic primitive,
-not by protocol logic.
+`jnt-node serve --no-mine --api-listen 127.0.0.1:19334`, then `curl`:
 
-### Puzzle solve (`puzzle::tests::test_config_is_faster_than_production`)
-
-The HBM scratchpad PoW puzzle (M4) is configured so that the `test` profile solves in <1 ms while `production`
-parameters match the difficulty ladder in `docs/decisions.md` (Decision 9). The probe confirms the production
-profile is at least 50× harder than `test`, ensuring test suites never accidentally validate against trivial
-difficulty.
-
-### Block validation (chain integration)
-
-Measured via `difficulty_test` (mini profile, 2,000 blocks):
-
-| Operation | Time (ms for 2,000 blocks) | Per-block |
-|---|---|---|
-| `chain.submit` (valid block, no L2) | 86 | 43 µs |
-| `chain.submit` (valid block, 1 L2 tx) | 110 | 55 µs |
-| `chain.submit` (invalid block, bad PoW) | 2 | 1 µs (fast reject) |
-
-### Block persistence (`jnt-store`)
-
-| Operation | Time (ms) |
+| Endpoint | Time |
 |---|---:|
-| Append a 512-byte block to a 10,000-block log | 0.3 (amortized: single append, single fsync pair) |
-| Reopen a 10,000-block store | 45 (replays meta.json + last 100 block headers) |
+| `GET /v1/health` (first request, incl. connection) | 9.1 ms |
+| `GET /v1/status` | 2.0–3.0 ms |
+| `GET /v1/fees` | 2.4 ms |
 
-### API endpoints (`jnt-node`)
+All returned HTTP 200. These are single-client loopback reads; no concurrency
+test was run.
 
-| Endpoint | Response time (ms) under 10 concurrent |
-|---|---:|
-| `GET /health` | <1 |
-| `GET /v1/balance/{address}` | <1 (cached state read) |
-| `PUT /v1/tx` (build + sign) | <5 (secp256k1 signing cost) |
-| `GET /v1/reputation/{address}` | <5 (derived from canonical L2 state) |
+## NOT measured (no probe exists)
 
-## Benchmark Harness
+These were requested for verification but have **no harness**, so no number is
+reported. Fabricating one would be worse than omitting it:
 
-The project does not use `criterion` or a standalone `benches/` workspace. Benchmarks are inline `#[ignore]`d
-probes in the test files next to the code they measure. Rationale: the production paths are already exercised
-by 773 deterministic tests; adding a separate harness would duplicate coverage without catching different bug
-classes. The probes exist solely to detect orders-of-magnitude regressions that a code change might introduce.
+- **Block validation in isolation** (validating a received block without
+  mining it) — no benchmark harness. The `verify` figure above is the closest
+  proxy and includes replay.
+- **L2 transaction application rate** — no probe; L2 replay time is folded into
+  `verify`.
+- **Storage append throughput / fsync cost** — no probe.
+- **Worker ↔ node transport throughput** — the transport is exercised for
+  correctness (`crates/jnt-worker` tests over a live socket), not timed.
+- **Large-chain replay** — measured only at 301 blocks.
+- **Multi-node synchronization** — exercised for correctness
+  (`crates/jnt-net/tests/integration.rs`, two-process tests), not timed.
 
-To re-run all probes:
+## Benchmark harness
+
+There is **no** `criterion` suite and no `benches/` workspace. The only inline
+probe is `vwc_perf_probe`. Adding a harness for the paths above is open work;
+until it exists, this file reports CLI-level timings and one probe, and says so.
+
+To reproduce:
 
 ```bash
+cargo build --workspace --release
+BIN=target/release/jnt-node
+rm -rf /tmp/jntbench && $BIN init --network mini --data-dir /tmp/jntbench
+time $BIN mine   --blocks 300 --interval 0 --data-dir /tmp/jntbench
+time $BIN verify --data-dir /tmp/jntbench
+time $BIN status --data-dir /tmp/jntbench
+
 cargo test --release -p jnt-l2 --lib vwc_perf_probe -- --ignored --nocapture
-cargo test --release -p jnt-core --lib puzzle::tests::test_config_is_faster_than_production -- --nocapture
 ```
