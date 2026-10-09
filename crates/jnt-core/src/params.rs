@@ -349,10 +349,11 @@ impl NetworkParams {
             require_hybrid_signatures: false,
             network_magic: [0x6A, 0x4E, 0x54, 0x01],
             network_id: "jounit/mainnet".into(),
-            // The L2 genesis escrow (Decision 7): 100,000 JNT of the 788,476
-            // JNT the ladder can never mint, held entirely by the protocol
-            // escrow identity. No mainnet grants — real beneficiaries arrive
-            // with the deposit mechanism, not as hard-coded allocations.
+            // The L2 genesis escrow (Decision 7): 100,000 JNT held entirely by
+            // the protocol escrow identity, bounded by the explicit
+            // `escrow_ceiling_sat` below (approved M-E). No mainnet grants —
+            // real beneficiaries arrive with the deposit mechanism, not as
+            // hard-coded allocations.
             l2_genesis_escrow_sat: 100_000 * SAT_PER_JNT,
             // M-E: the ceiling is exactly the allocation — tight, so the
             // explicit parameter constrains rather than rubber-stamps.
@@ -409,7 +410,8 @@ impl NetworkParams {
             // identical, hence the identical genesis hash.
             network_magic: [0x6A, 0x4E, 0x54, 0x02],
             network_id: "jounit/mini".into(),
-            // 10 JNT of the 6,000 JNT gap: 3 × 1 JNT to deterministic operator
+            // 10 JNT of L2 genesis escrow, all of it bounded by
+            // `escrow_ceiling_sat`: 3 × 1 JNT to deterministic operator
             // identities (seeds 1–3, whose keys the integration tests hold),
             // 7 JNT remainder to the protocol escrow identity.
             l2_genesis_escrow_sat: 10 * SAT_PER_JNT,

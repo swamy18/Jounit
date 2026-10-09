@@ -2,17 +2,17 @@
 //!
 //! Layer 2 of Jounit: the verified-work task marketplace.
 //!
-//! This crate is the state machine that turns the five L2 transaction types in
-//! `jnt_core::l2` into a task lifecycle — post, claim, submit, dispute, settle —
-//! and moves JNT against it deterministically.
+//! This crate is the state machine that turns the six L2 transaction types in
+//! `jnt_core::l2` into a task lifecycle — post, claim, submit, dispute, settle,
+//! exit — and moves JNT against it deterministically.
 //!
 //! What is here:
 //! - [`TaskContract`] and [`ContractState`]: the transitions, with no economic
 //!   state and no cryptography.
 //! - [`L2State`]: accounts, escrow, the M2 slash vault, D3 flat fees, replay
-//!   protection, and a conservation invariant.
-//! - [`L2Config`]: the two network-wide parameters (dispute window, vesting
-//!   period).
+//!   protection, exit queue/release accounting, and a conservation invariant.
+//! - [`L2Config`]: the network-wide parameters (dispute window, vesting period,
+//!   whistleblower bounty, exit activation height).
 //!
 //! What is deliberately *not* here, and why:
 //! - **L1 block validity.** L2 transactions are carried in L1 blocks and
@@ -24,9 +24,10 @@
 //!   integration from touching `Chain::submit`.
 //! - **BLS finality activation.** `Settle` verifies a validator-quorum aggregate
 //!   through the existing `BlsVerifier` trait, but nothing here finalizes an L1
-//!   block. M5 stays inert until the end of the cycle (`docs/decisions.md`).
+//!   block. L2 consumes the L1 finality layer's binding answer through the same
+//!   `Chain`; it never grows one of its own.
 //!
-//! What arrived with Phase 4:
+//! What arrived with the certificate milestone:
 //! - **Verified Work Certificates** ([`vwc`], SPEC.md §17): the protocol's
 //!   receipt for verified correct work, issued automatically at settlement —
 //!   `Quorum`-verified for an explicit `Settle`, `WindowElapsed` for an implicit

@@ -190,9 +190,9 @@ impl Chain {
     /// Accumulated Protocol Security & Compute Buffer reserve (M1).
     ///
     /// This is the 50% of every block's base-fee portion that is diverted from
-    /// the burn to the on-chain reserve. It does not count toward the hard
-    /// supply cap (it has already been destroyed for cap purposes), but it is
-    /// tracked here to power the M2 slash recovery vault.
+    /// the burn to the on-chain reserve. It is already-removed supply for
+    /// net-supply reporting (Decision 18 §4.5), tracked here to power the M2
+    /// slash recovery vault.
     pub fn pscb_reserve(&self) -> u64 {
         self.pscb_reserve
     }

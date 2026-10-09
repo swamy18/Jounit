@@ -129,7 +129,7 @@ pub struct Block {
     pub txs: Vec<Transaction>,
     /// L2 transactions carried by this block (Decision 6, SPEC.md §19.1).
     ///
-    /// Empty for every block that predates Phase 6, which is why the field is
+    /// Empty for every block that predates the L2-in-blocks (M1) upgrade, which is why the field is
     /// skipped in the JSON form and the binary form omits its section entirely:
     /// a block with no L2 transactions has exactly one encoding — the original
     /// one — so no frozen vector and no stored block changes.

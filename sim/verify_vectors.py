@@ -31,7 +31,7 @@ VECTORS_DIR = ROOT / "tests" / "vectors"
 EXPECTED = {
     "puzzle_vectors.json": "header serialization + 3 PoW stage digests",
     "ser_vectors.json": "input / output / tx / header byte layouts",
-    "supply_vectors.json": "reward ladder, cumulative supply, cap invariant",
+    "supply_vectors.json": "reward ladder, cumulative supply, rate-anchor invariant",
     "difficulty_vectors.json": "LWMA next-difficulty, timestamp clamp",
     "net_vectors.json": "frame envelope, every msg_type payload, VERSION, bounds",
 }

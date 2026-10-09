@@ -1,10 +1,17 @@
-//! Validator-set machinery per SPEC.md §14.6.
+//! Validator-set machinery per SPEC.md §14.6 (Decision 11).
 //!
-//! **DESIGN ONLY — NOT CONSENSUS-ACTIVE.** Nothing in `Chain::submit` calls
-//! into this module; a checkpoint validated here has no effect on block
-//! acceptance. The module exists so the remaining open questions are purely
-//! economic (stake amounts, rewards, slashing — §14.6's list), with the
-//! deterministic machinery already built and attack-tested.
+//! **Consensus-relevant through M5, per profile.** `Chain::apply_checkpoint`
+//! validates a certificate through this module, and once a profile's
+//! `finality_activation_height` is reached, `Chain::adopt()` refuses any branch
+//! forking at or below the binding-finalized height
+//! (`Error::ReorgWouldCrossFinality`). That makes the machinery live on
+//! `testnet` (activation height 20) and observation-only on `mini`/`mainnet`,
+//! which carry `0`.
+//!
+//! The committee is **declared, not bonded**: Decision 11 fixed the genesis set
+//! and deliberately built no stake ledger, so the keys carry authority by
+//! declaration. The remaining §14.6 questions are economic (bonded stake,
+//! rotation, rewards, equivocation slashing) and are tracked as P2.
 //!
 //! Semantics implemented here, exactly as §14.6 specifies:
 //!

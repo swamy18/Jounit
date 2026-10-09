@@ -10,7 +10,7 @@
 //!   path an operator's own integration would; it implements no consensus
 //!   rule of its own. Before the first pass it gates on the node's live
 //!   conservation report (`GET /v1/conservation`): this daemon moves real
-//!   value, so a node reporting joint supply over the cap — or numbers that
+//!   value, so a node reporting joint supply over the joint bound — or numbers that
 //!   do not re-add — is refused rather than earned from.
 //!
 //! No command ever prints a private key; `generate` writes the file and prints
@@ -52,7 +52,7 @@ fn usage() -> String {
                 --interval-ms 2000, --max-tasks 4, --deposit-sat 0
 
   run gates on GET /v1/conservation first: a node reporting joint supply
-  over the cap (or unreadable numbers) is refused; an unreachable or
+  over the joint bound (or unreadable numbers) is refused; an unreachable or
   non-reporting node warns and continues."
         .to_string()
 }

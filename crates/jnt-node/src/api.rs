@@ -31,7 +31,7 @@
 //! GET  /v1/health              liveness for monitors
 //! GET  /metrics                Prometheus text exposition of the gauges below
 //! GET  /v1/status              network, height, tip, peers, supply, finality, L2
-//! GET  /v1/conservation        live joint L1+L2−sink supply vs the cap (the `verify` arithmetic)
+//! GET  /v1/conservation        live joint L1+L2−sink supply vs the joint bound (the `verify` arithmetic)
 //! GET  /v1/finality            finality status
 //! GET  /v1/fees                fee schedule: gas, base fee, D3 L2 flat fees
 //! GET  /v1/balance/{address}   confirmed / spendable / pending
@@ -469,7 +469,7 @@ async fn metrics(
         gauge(
             &mut out,
             "jounit_conservation_ok",
-            "1 while L2 balances, L2 funding is genesis plus matured deposits, and joint supply is inside the bound; 0 means value was created.",
+            "1 while L2 balances, L2 funding is genesis plus matured deposits minus value released to L1, and joint supply is inside the bound; 0 means value was created.",
             &net,
             u64::from(report.ok()),
         );

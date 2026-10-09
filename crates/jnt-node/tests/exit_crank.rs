@@ -173,6 +173,20 @@ fn a_matured_exit_is_settled_without_anyone_hand_building_the_claim() {
         "released once, ever"
     );
     assert!(view.pending_exits().is_empty(), "the watch is spent");
+
+    // The joint check must still pass AFTER a release. This is the guard for a
+    // real bug: `l2_expected_funded` counted genesis plus deposits without
+    // subtracting what exits had already released, so the first accepted exit
+    // read as a funding breach - verify failed, the conservation alarm fired
+    // and never cleared, and the API refused every write. A release is value
+    // leaving L2, not value appearing from nowhere.
+    let report = jnt_node::conservation::conservation_report(&chain, &view);
+    assert!(
+        report.ok(),
+        "conservation must survive a release: {:?}",
+        report.first_error()
+    );
+    assert_eq!(report.supply.exited_sat, amount + EXIT_FEE);
 }
 
 /// The crank must not act before the profile activates: a mainnet-shaped chain

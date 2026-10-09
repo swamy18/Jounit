@@ -1,6 +1,6 @@
 [package]
 name = "jnt-node"
-description = "Jounit node CLI: genesis, mine, submit, validate, status."
+description = "Jounit node CLI: init, mine, send, status, verify, serve and export, with an opt-in REST API."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

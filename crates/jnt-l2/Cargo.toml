@@ -1,6 +1,6 @@
 [package]
 name = "jnt-l2"
-description = "Jounit Layer 2: TaskContract state machine, five L2 transaction types, D3 fee routing."
+description = "Jounit Layer 2: TaskContract state machine, six L2 transaction types (incl. ExitQueue), D3 fee routing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

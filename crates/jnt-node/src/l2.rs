@@ -32,10 +32,11 @@
 //!
 //! # What this deliberately does not do
 //!
-//! - **No post-genesis funding.** The accounts start funded exactly once, from
-//!   the profile's genesis allocation (Decision 7, SPEC.md §19.4), and no
-//!   production path calls `credit` after that — user deposits are deferred.
-//!   Payloads from genuinely unfunded accounts are still refused with
+//! - **No post-genesis funding outside replay.** The accounts start funded
+//!   exactly once, from the profile's genesis allocation (Decision 7,
+//!   SPEC.md §19.4). The only later production credits are matured deposits
+//!   (Decision 10), applied by `ChainL2::apply_block` during replay — never
+//!   `credit`. Payloads from genuinely unfunded accounts are still refused with
 //!   `InsufficientBalance` and recorded as skipped.
 //! - **The declared committee only.** `Settle` payloads are checked against
 //!   the active validator committee the network profile declares (Decision 15,

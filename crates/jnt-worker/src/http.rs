@@ -720,7 +720,7 @@ impl HttpNode {
     }
 
     /// The node's live conservation report (joint L1 + L2 − sink supply vs
-    /// the cap), or `Ok(None)` when the node does not expose the endpoint —
+    /// the joint bound), or `Ok(None)` when the node does not expose the endpoint —
     /// an older build, which is a fact about the node rather than a failure.
     ///
     /// A `200` whose body cannot be read is `ObservationMalformed`: the node

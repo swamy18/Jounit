@@ -5,10 +5,10 @@ Recorded as the protocol owner's standing decisions.
 > **Reading order.** This file is chronological. Decisions 1–2 sit at the top,
 > then a **dated gap audit** (a snapshot that says Phases 2–5 are NOT STARTED —
 > true when it was written, superseded by the per-phase "Implementation status
-> — Phase N SHIPPED" addenda further down the same file), then Decisions 3–16.
-> The **authoritative** statement of what is built is the last addendum before
-> the *Pending protocol decisions* section at the end. Do not read the gap
-> audit's verdict table as current.
+> — Phase N SHIPPED" addenda further down the same file), then Decisions 3–19.
+> The **authoritative** record of what is built is the Decision 17 / 18 / 19
+> sections and the M1–M5 and SA-1…SA-6 implementation records. The per-phase
+> addenda and the P2–P6 sections are historical where they disagree with those.
 >
 > **Status of the two decisions above.** Since they were recorded, D3 has been
 > *consumed* (the L2 fee path shipped with Phase 2, SPEC §15) and §14.6 has been
@@ -518,13 +518,16 @@ system wearing a currency's notation. A genesis-funded escrow makes
 conservation span both ledgers while needing **no new L1 transaction type**,
 which keeps Phase 6 inside its scope.
 
-**Explicitly unchanged:** the 40M supply cap, issuance paths, block rewards,
-halving schedule, the L1 gas floor, and the D3 L2 fee schedule. The escrow is a
-*reallocation of genesis coins already inside the cap*, not new issuance.
+**Explicitly unchanged:** issuance paths, block rewards, halving schedule, the
+L1 gas floor, and the D3 L2 fee schedule. The escrow is a *reallocation of
+genesis coins*, not new issuance. Decision 18 later deleted the stock cap this
+decision's wording named, so the escrow is bounded by `escrow_ceiling_sat`
+(Decision M-E) and there is no cap to sit inside.
 
 **Deferred, and must be decided before mainnet:** user-facing deposit and exit
-(the L1 lock that funds escrow from a user, and the L2→L1 withdrawal). That is
-a new L1 mechanism and is not authorised by this decision.
+(the L1 lock that funds escrow from a user, and the L2→L1 withdrawal). The
+deposit half shipped as this decision's own implementation (Decision 10, above)
+and the exit half shipped as **Decision 19**.
 
 ## Decision 8 — Testnet bootstraps from a fixed genesis committee, no stake transactions
 
@@ -591,7 +594,7 @@ discriminators.
 | 3 — Dispute engine + M2/M1 | DONE |
 | 4 — Verified Work Certificates | DONE |
 | 5 — Worker SDK | DONE |
-| 6 — Testnet + finality activation | **IN PROGRESS** — STEP 0 audit done; D6–D9 decided, none built; finality still gated |
+| 6 — Testnet + finality activation | **IN PROGRESS** — D6–D9 shipped: L2 transactions in L1 blocks, genesis escrow funding, the REST service API, and the fixed genesis committee. Binding finality is live on `testnet` (`finality_activation_height = 20`); `mini`/`mainnet` keep `0`, i.e. observation only. Deposits (§19.5) and the exits of §19.6 have since shipped too |
 
 ---
 
@@ -639,9 +642,11 @@ L1 machinery is unchanged.**
    from the winning chain, so no persisted record can go stale or duplicate.
 6. **Conservation rule.** Per deposit, exactly 1:1 — credited satoshis equal
    the sink output's satoshis, no rate, no fee on the credit itself. Globally,
-   `L1 live supply + L2 held − sink-held supply ≤ supply cap`: sink outputs
-   stay in the L1 UTXO set (unspendable), so the M2 joint check grows a sink
-   term rather than breaking. Burns anywhere move the sum down, never up.
+   `L1 live supply + L2 held − sink-held supply ≤ cumulative_issuance_sat(height)
+   + escrow_ceiling_sat` (the bound Decision 18 left once the stock cap was
+   deleted): sink outputs stay in the L1 UTXO set (unspendable by signature), so
+   the joint check grows a sink term rather than breaking. Burns anywhere move
+   the sum down, never up.
 7. **Reorg behavior.** Derived, never undone: the winning chain is replayed and
    deposits are re-detected, re-matured and re-credited from it. A deposit on
    the losing branch vanishes; one still present but no longer deep enough
@@ -649,13 +654,15 @@ L1 machinery is unchanged.**
    phantom, double, or stale credit is representable.
 
 **Explicitly unchanged:** L1 consensus rules, the two L1 transaction types and
-their layouts, the monetary cap and issuance, fee rules, L2 transaction
-semantics, the M2 genesis allocation, finality activation.
+their layouts, issuance, fee rules, L2 transaction semantics, the M2 genesis
+allocation, finality activation. (The "monetary cap" this clause once named was
+deleted by Decision 18.)
 
-**Explicitly deferred (mainnet blocker):** L2→L1 exits. Deposits without exits
-trap user funds in L2, so M3 makes *testnet* deposits functional while mainnet
-still requires a separate exit decision and implementation. No exit decision is
-recorded here.
+**Superseded by Decision 19 (2026-10-09):** this decision's deferral of L2→L1
+exits. The exit decision is now recorded and implemented (SPEC.md §19.6).
+Deposits are no longer one-way wherever `exit_activation_height > 0`; on
+`mainnet`, where it is `0` — meaning *never* — deposits stay closed **by
+configuration**, which is a launch choice rather than a missing protocol.
 
 ---
 
@@ -861,27 +868,32 @@ seam they will build on.
 
 ---
 
-# Pending protocol decisions (NOT decided — recorded as blockers)
+# Pending protocol decisions
 
-These are **not** decisions. They are the questions a protocol owner must answer
-before the corresponding work may proceed. They are listed so implementation
-never has to guess, and so no future reader mistakes their absence for an
-oversight. `SPEC.md`, the code and the monetary policy remain the authority for
-what *is* decided.
+These are the questions a protocol owner must answer **before** the
+corresponding work may proceed. They are listed so implementation never has to
+guess, and so no future reader mistakes their absence for an oversight.
+`SPEC.md`, the code and the monetary policy remain the authority for what *is*
+decided.
 
-## P1 — L2 → L1 exit primitive (mainnet fund-safety blocker)
+> **P1 is closed.** It was approved on 2026-10-09 and implemented the same day
+> as **Decision 19** (see below). It is kept here because its design and its
+> six answered questions are still the clearest statement of *why* the exit rule
+> is shaped the way it is. **Do not read this section as an open blocker.**
+> `P2`–`P5` below are the live ones.
 
-**Status: APPROVED 2026-10-09 (owner).** E-1 = (a), E-2 = permissionless
-crank, E-3 = exiting owner prepays the exit fee, as recommended; E-4–E-6
-acknowledged at their narrow defaults. Implementation is now authorised along
-exactly those lines; until it ships, deposits remain one-way.
+## P1 — L2 → L1 exit primitive — RESOLVED: Decision 19 (approved, implemented)
 
-Decision 10 defers exits and states no exit decision is recorded. The deposit
-sink holds no key, so it cannot release funds; any exit needs a **new L1 rule**.
-Full design and the six questions are in `docs/l2-exit-design.md`.
-**Do not implement an exit until this is decided; do not mint value to fake one.**
+**Status: APPROVED 2026-10-09, IMPLEMENTED the same day.** E-1 = (a), E-2 =
+permissionless crank, E-3 = exiting owner prepays the exit fee, as recommended;
+E-4–E-6 at their narrow defaults. See **Decision 19** below for the
+implementation record and `SPEC.md §19.6` for the normative text.
 
-### The blocker is proven in code, not asserted
+Decision 10 originally deferred exits and stated that no exit decision was
+recorded. The deposit sink holds no key, so it cannot release funds; an exit
+therefore needs a **new L1 rule**. Decision 19 is that rule.
+
+### The constraint was proven in code, then satisfied by a rule
 
 `crates/jnt-core/tests/sink_unspendable.rs` drives the real L1 spend rule
 (`ledger::check_tx` → `tx.verify_input(k, &held.out.address, …)`) against a real
@@ -893,51 +905,63 @@ mined deposit and shows:
   earlier (`Error::EmptySignatureBundle`);
 - the sink and escrow identities are distinct, derived, and owned by no wallet.
 
-So the conclusion is not a design preference: **no signature can authorise a
-sink spend, and no L2 state can change that.** There is no implementation-only
-path to an exit.
+That test **still passes unchanged**, and it must: the conclusion it pins is
+about *signatures*. **No signature can authorise a sink spend, and no L2 state
+can change that.** What changed is that a release no longer needs one — it is
+authorised by an inclusion proof against a committed `l2_state_root`, so the
+sink's keylessness is no longer the obstacle. The sink was deliberately **not**
+replaced by a validator-threshold escrow (E-1 option (b) rejected).
 
-### Owner decisions — APPROVED 2026-10-09 (full text in `l2-exit-design.md`): E-1 = (a), E-2 = permissionless crank, E-3 = exiting owner prepays
+### The six questions, as answered by Decision 19
 
-| # | Decision | Recommendation |
+| # | Question | Answer |
 |---|---|---|
-| **E-1** | **The L1 release primitive.** Either *(a)* a consensus-authorised **spend of sink outputs** authorised by an exit proof instead of a signature, or *(b)* replace the keyless sink with a validator-threshold escrow. | **(a).** It keeps the ordinary `value_in >= value_out` rule in force everywhere and reuses the existing `Undo` path, so a reorg unwinds a release like any other spend. *(b)* introduces a key the architecture deliberately avoids and makes committee-key compromise a fund-loss event. |
-| **E-2** | **Permitless crank or gated release.** | **Permissionless crank:** anyone may submit, consensus pays only the recorded `destination`. No operator privilege, no second authorisation path to audit. |
-| **E-3** | **Who funds the L1 release fee.** | **The exiting owner, prepaid at queue time.** The L2 side debits `amount + exit_fee_sat`; the claimant receives the fee, the destination receives the principal. Prepayment is what makes a permissionless crank griefing-bounded. |
+| **E-1** | The L1 release primitive | **(a)** a consensus-authorised **spend of sink outputs**, authorised by an exit proof instead of a signature. Chosen because it keeps the ordinary `value_in >= value_out` rule in force everywhere and reuses the existing `Undo` path, so a reorg unwinds a release like any other spend. |
+| **E-2** | Permitless crank or gated release | **Permissionless crank.** Anyone may submit; consensus pays only the recorded `destination` and `claimant`. No operator privilege, no second authorisation path to audit. |
+| **E-3** | Who funds the L1 release fee | **The exiting owner, prepaid at queue time.** The L2 side debits `amount + exit_fee + queue_fee`; the claimant receives `exit_fee_sat`, the destination receives `amount`. Prepayment is what makes the crank griefing-bounded. |
+| **E-4** | Cancellable queued state | **No cancellation** — the narrower default. A cancel/claim race needs its own ordering rule for no benefit; the value is encumbered for exactly one finality window. |
+| **E-5** | Challenge window | **None in v1** — the narrower default. An exit is a pure function of final L1 state, and finality already supplies the guarantee. |
+| **E-6** | Emergency pause | **Not authorised in v1** — the narrower default. It concentrates trust in a governance key the architecture does not have. |
 
-**E-4 to E-6 default to the narrower choice** — no cancellation, no
-challenge window, no emergency pause — because each default adds authority to
-nobody. Acknowledged 2026-10-09: the narrow defaults stand.
+### Engineering scope — all shipped
 
-### Also required before implementation — engineering scope, authorised by the approval
+- **The L2 → L1 proof mechanism.** Implemented exactly as recommended: a block
+  commits `l2_state_root`, and a claim carries a Merkle inclusion proof of its
+  exit record against it. `ChainL2` captures an `ExitWatch` (record plus proof)
+  at the queue block — the only moment the node's root equals the block's
+  committed root — so a crank never replays back to `queued_height`.
+- **An activation mechanism.** There is still **no negotiated network-upgrade
+  mechanism**. `finality_activation_height`, `exit_activation_height` and the
+  Decision 18 `tail_activation_height` are height-gated **profile data**, not
+  negotiated upgrades. That remains an open prerequisite for changing any of
+  them on a live chain.
 
-- **An L2 → L1 proof mechanism.** L2 state is derived by replay and is **not**
-  committed on chain in a form L1 can check. The recommendation is to commit an
-  L2 state root at the activation height and require a Merkle inclusion proof.
-  This is the largest single piece of the change.
-- **A network-upgrade / activation mechanism.** None exists. `finality_activation_height`
-  is the only height-gated rule and it is profile data, not a negotiated
-  upgrade.
+### What is already implemented
 
-### What is already implemented (safe, non-consensus)
+**Proof half:** `crates/jnt-core/src/state_root.rs` builds and verifies account
+inclusion proofs (`account_leaf`, `state_root`, `prove_inclusion`,
+`verify_inclusion`), exposed over real L2 state by `L2State::{state_root,
+account_proof, verify_account}`, `exit_proof` and
+`crates/jnt-l2/tests/state_root_proof.rs`.
 
-**The proof half (2026-10-09):** `crates/jnt-core/src/state_root.rs` builds and
-verifies account inclusion proofs — `account_leaf`, `state_root`,
-`prove_inclusion`, `verify_inclusion` — and `L2State::state_root` /
-`account_proof` / `verify_account` expose them over real L2 state
-(`crates/jnt-l2/tests/state_root_proof.rs`). This is the piece the exit needed
-and it adds **no consensus rule**: nothing calls it from `Chain::apply_block`, no
-block field carries a root, and `sink_unspendable` / `exit_unavailable` still
-pass unchanged. It exists precisely because it grants no authority until the
-release rule and its activation mechanism are built.
+**Release half (Decision 19):** `crates/jnt-core/src/exit.rs` (claim codec,
+identity, gas, proof verification), `Chain::{check_claim, apply_one_claim,
+exit_active_at, exit_released, mine_from_pool_with_exits}`, `L2State::{queue_exit,
+exit_is_mature, note_release, exited_total}`, `ChainL2::{pending_exits,
+ExitWatch}`, `NodeL2::{crank_claims, simulate_root}`,
+`crates/jnt-worker/src/exit.rs`, and the tests
+`crates/jnt-l2/tests/{exit_flow,exit_claim}.rs`,
+`crates/jnt-node/tests/exit_crank.rs`.
 
-`crates/jnt-core/tests/sink_unspendable.rs`,
-`crates/jnt-l2/tests/exit_unavailable.rs`,
-`crates/jnt-node/src/conservation.rs` (+ `tests/conservation.rs`), and two
-rejection tests in `crates/jnt-node/tests/api.rs`. These pin the one-way
-behaviour and the sink accounting that the exit must preserve. When the rule is
-approved, those tests are the migration checklist — see `docs/l2-exit-design.md`,
-*Migration, activation and compatibility*.
+### The migration checklist, as executed
+
+`crates/jnt-core/tests/sink_unspendable.rs` was **kept** — its claim is about
+signatures, which still cannot spend a sink output. `crates/jnt-l2/tests/
+exit_unavailable.rs` (the "exactly five type bytes" assertion) was **deleted**
+and replaced by `exit_flow.rs` / `exit_claim.rs`. `crates/jnt-node/tests/
+conservation.rs` passes **unchanged**, which is the strongest available evidence
+the accounting was right: the joint check needed no exit term at all, because the
+L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 
 ## Decision 17 — Conservation-breach response: freeze funding paths, alarm (2026-10-09)
 
@@ -1021,51 +1045,64 @@ fail closed rather than collecting a partial fee — the safe direction.
 
 ## P6 — Mainnet L2 genesis escrow scale (not a blocker, a confirmation)
 
-Decision 7 sets `mainnet` `l2_genesis_escrow_sat = 100,000 JNT` inside the
-788,476 JNT that can never be minted. If the protocol owner intends a different
-scale, that is a one-value change; `escrow_ceiling_sat` (M-E) is what
-`NetworkParams::validate` checks, and it is currently set tight to the
-allocation.
+Decision 7 sets `mainnet` `l2_genesis_escrow_sat = 100,000 JNT`, bounded by the
+explicit `escrow_ceiling_sat` that `NetworkParams::validate` checks (approved
+M-E) — currently set tight to the allocation. If the protocol owner intends a
+different scale, that is a one-value change.
+
+(The original wording justified this as a slice of "the 788,476 JNT that can
+never be minted". That figure died with the stock cap in Decision 18: with a tail
+there is no fixed quantity that can never be minted, so the ceiling is now the
+`escrow_ceiling_sat` parameter alone.)
 
 ---
 
-# Pending monetary decisions (NOT decided — recorded as blockers)
+# Monetary decisions M-A…M-E — all APPROVED and IMPLEMENTED (2026-10-09)
 
-`docs/monetary-redesign.md` is a **PROPOSAL** and is not authorisation to change
-consensus. It carries the full analysis, formulas and sensitivity tables; this
-section is the *sign-off surface* — the same questions reduced to items a
-protocol owner can accept or reject. Nothing below is approved, and **no line of
-this section authorises an implementation**. While any item is `OPEN`, the
-frozen state in Decisions 7 and 10 stands: cap, ladder, halving schedule and
-both fee schedules are unchanged.
+`docs/monetary-redesign.md` is the analysis and sensitivity record; this
+section is the *sign-off surface* it was resolved on. Every item below was
+approved on 2026-10-09 and shipped the same day, so nothing here is open. The
+frozen state in Decisions 7 and 10 stood **while** they were open; what changed
+under them is the tail (M-A…M-C), the escrow ceiling (M-E) and — via
+**Decision 18** — the deletion of the stock cap (M-D, superseded the same day).
 
-Confirmed current state (read from code, not carried over): cap
-**39,945,600 JNT**; ladder-era issuance **39,157,124 JNT** (the earlier
+State before Decision 18 (historical, kept so the arithmetic can be checked):
+stock cap **39,945,600 JNT**; ladder-era issuance **39,157,124 JNT** (the earlier
 39,157,200 was the geometric shortcut `149 × 262 800`, which over-states the
 schedule by 76 JNT because genesis occupies a rung-0 height without minting);
-**788,476 JNT** permanently unmintable; ladder `76, 38, 19, 9, 4, 2, 1, 0` in
-whole JNT; `halving_period` 262,800; ladder exhausts at height **1,839,600**.
+**788,476 JNT** of that cap permanently unmintable; ladder
+`76, 38, 19, 9, 4, 2, 1` in whole JNT; `halving_period` 262,800; ladder exhausts
+at height **1,839,600**.
+
+**After Decision 18 there is no cap and no unmintable figure.** 39,157,124 JNT is
+simply what the ladder *pays out*; the rate anchor (≤ 1 % of issued supply per
+post-ladder window) is the only ceiling, and the tail then issues forever.
 
 | # | Question | Options | Consequence if changed | Status |
 |---|---|---|---|---|
 | **M-A** | Tail emission shape at ladder exhaustion | **(A)** retain zero tail · **(D)** flat tail · **(E)** declining tail to a floor | Any tail **requires a supply-rule change** and a new issuance anchor; `cap − max_issuance_sat` can no longer be the escrow backing rule (see M-D/M-E) | **APPROVED — (E) decay tail** |
 | **M-B** | Tail floor value | proposed **0.1 JNT/block** · 1.00 · 0.50 · other | Sets steady-state dilution (0.10 JNT ≈ 0.0134 %/yr); the proposal derives this from a security-floor argument, **not** from any repository constant | **APPROVED — 0.1 JNT/block mainnet floor** |
 | **M-C** | Per-network tail | mainnet value · testnet/mini value (proposed **1 sat/block**) | Applying the mainnet value to mini would mint **>1,000 %/yr** (proposal F5); the two profiles must be set independently | **APPROVED — 1 sat/block on mini/testnet** |
-| **M-D** | Fate of `supply_cap_sat` | **keep** as a sanity ceiling · **replace** with an explicit invariant | `supply_cap_sat` is currently the *joint L1/L2 conservation anchor* **and** the escrow backing rule, not just a ceiling. Deleting it without a replacement silently removes both checks. The proposal rejects deletion-for-convenience | **APPROVED — cap retained as a sanity ceiling** |
+| **M-D** | Fate of `supply_cap_sat` | **keep** as a sanity ceiling · **replace** with an explicit invariant | `supply_cap_sat` is currently the *joint L1/L2 conservation anchor* **and** the escrow backing rule, not just a ceiling. Deleting it without a replacement silently removes both checks. The proposal rejects deletion-for-convenience | **APPROVED — cap retained; SUPERSEDED the same day by [Decision 18](#decision-18--supply-anchor-a-rate-rule-replaces-the-stock-cap-approved-and-implemented-2026-10-09), which deleted `supply_cap_sat` entirely and replaced it with the rate anchor** |
 | **M-E** | Meaning of `escrow_ceiling` | define an explicit, validated parameter · keep the implicit `cap − max_issuance_sat` gap | No `escrow_ceiling` symbol exists in code or SPEC today. It is the proposal's replacement for the gap rule once a tail changes issuance. Ownership, release rules, reorg behaviour and interaction with spendable supply are **all unspecified** | **APPROVED — explicit validated `escrow_ceiling` parameter** |
 | **M-F** | Fee-burn / deflation design (proposal F2) | own the design (set an explicit target or accept deflation) · leave unowned and state no target | Under ordinary usage the **whole** base fee leaves live supply (50 % burned + 50 % to the `pscb_reserve` counter, which no code path converts back to UTXOs — verified 2026-10-09). At high activity live supply trends to zero at ~y50 in the proposal's model. This is **not** an issuance question, but it blocks any claim that monetary policy is "complete" | **APPROVED — no numeric target; deflation accepted and documented** |
-| **M-G** | Activation mechanism | network-upgrade flag/height · historical-compatibility expectation · vector changes | Proposal §5.4 argues activation at exhaustion (1,839,600) leaves existing history byte-identical. **No mainnet activation until M-A…M-F are approved**; vector changes are only legitimate once an approved rule actually changes consensus | **APPROVED — activation at each profile's ladder exhaustion (mainnet 1,839,600; mini/testnet 14,000)** |**Approved 2026-10-09 (owner), item by item:** M-A = (E) decay tail; M-B =
-0.1 JNT/block mainnet floor; M-C = 1 sat/block on mini/testnet; M-D =
-`supply_cap_sat` retained as a sanity ceiling only; M-E = an explicit
-validated `escrow_ceiling` parameter; M-F = no numeric burn target — deflation
-accepted and documented; M-G = activation at each profile's ladder
-exhaustion. Implementation is authorised **only** along these lines; any
-other value needs a new record here.
+| **M-G** | Activation mechanism | network-upgrade flag/height · historical-compatibility expectation · vector changes | Proposal §5.4 argues activation at exhaustion (1,839,600) leaves existing history byte-identical. **No mainnet activation until M-A…M-F are approved**; vector changes are only legitimate once an approved rule actually changes consensus | **APPROVED — activation at each profile's ladder exhaustion (mainnet 1,839,600; mini/testnet 14,000)** |
 
-**What may proceed while M-A…M-G are open:** auditing, tests, simulation and
-documentation that *describe* current behaviour. **What may not:** editing
-`params.rs` reward/cap/escrow values, `supply.rs`, the consensus cap gate, or
-committed vectors.
+**Approved 2026-10-09 (owner), item by item:** M-A = (E) decay tail; M-B =
+0.1 JNT/block mainnet floor; M-C = 1 sat/block on mini/testnet; M-D =
+`supply_cap_sat` retained as a sanity ceiling only — **superseded the same day
+by Decision 18, which deleted the field and `Error::SupplyCapExceeded` and put
+the rate anchor in their place**; M-E = an explicit validated `escrow_ceiling`
+parameter; M-F = no numeric burn target — deflation accepted and documented;
+M-G = activation at each profile's ladder exhaustion. Implementation is
+authorised **only** along these lines; any other value needs a new record here.
+
+**Historical constraint, lifted.** While M-A…M-G were open, only auditing, tests,
+simulation and documentation describing current behaviour was allowed; editing
+`params.rs` reward/cap/escrow values, `supply.rs`, the consensus cap gate, or committed
+vectors was not. Once approved, that work was done under these decisions and under
+Decision 18 — the implementation record below says exactly what changed, and no
+frozen vector moved.
 
 ## Implementation record — approved 2026-10-09 (M1…M5, complete)
 
@@ -1084,7 +1121,7 @@ Milestones **not** claimed here: M-F owns no numeric fee-burn target (deflation
 accepted and documented in `monetary-policy.md`), and the exit rule (P1) remains
 a separate, unimplemented mainnet blocker.
 
-## Decision 18 — Supply anchor: a rate rule replaces the stock cap (PROPOSED)
+## Decision 18 — Supply anchor: a rate rule replaces the stock cap (APPROVED AND IMPLEMENTED 2026-10-09)
 
 **Raised by the owner 2026-10-09:** should JNT have a fixed numerical cap, no
 cap, or a mechanism of a different kind, given the goal of a currency for AI,

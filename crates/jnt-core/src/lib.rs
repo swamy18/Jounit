@@ -7,7 +7,8 @@
 //! - canonical byte-level serialization (§3)
 //! - UTXO ledger, transaction and block validation (§9)
 //! - LWMA difficulty adjustment and tamper-resistant timestamp rules (§6)
-//! - fixed-cap halving supply schedule and EIP-1559-shaped fee burn (§7, §8)
+//! - halving-ladder supply schedule with a tail and a per-height rate anchor,
+//!   plus EIP-1559-shaped fee burn (§7, §8)
 //! - deepest-chain fork choice with a finality rule
 //!
 //! Protocol Mechanisms (in-scope, SPEC.md §M1–§M5):

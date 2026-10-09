@@ -6,16 +6,26 @@
 //! replay* and is not committed anywhere L1 can read, so the design commits a
 //! state root and requires a Merkle inclusion proof against it.
 //!
-//! ## What exists here, and what deliberately does not
+//! ## What this module owns, and what it does not
 //!
-//! This module **only builds and verifies proofs**. It adds **no consensus
-//! rule**: nothing calls it from `Chain::apply_block`, no block field carries
-//! the root, and no sink output can be spent with one. That is intentional —
-//! the release rule needs an activation mechanism that does not exist yet, and
-//! shipping a verifier is safe precisely because it grants no authority.
-//! Until the release rule lands, an exit proof proves a balance and can only be
-//! *displayed*; `crates/jnt-core/tests/sink_unspendable.rs` still holds the
-//! "no signature authorises a sink spend" line.
+//! This module **builds and verifies proofs**. It does **not** decide whether a
+//! root, a height or an identity is acceptable — `Chain` does, because it owns
+//! the blocks that carry roots, the finality view that judges maturity and the
+//! consumed-identity set that makes a release exactly-once. Splitting
+//! proof-checking from chain-checking is what keeps a forged proof
+//! cryptographically impossible even if a miner commits a lying root.
+//!
+//! The consensus rule that consumes these proofs is in `chain.rs`:
+//! `Chain::check_claim` and `Chain::apply_one_claim` verify an exit record
+//! against the `l2_state_root` the queue block committed, and `Block` carries
+//! that root in `l2_state_root`. The activation gate is
+//! `NetworkParams::exit_activation_height` — `0` means *never*, and below the
+//! activation height a committed root is itself refused (`Chain::exit_active_at`).
+//!
+//! `crates/jnt-core/tests/sink_unspendable.rs` still holds the line that **no
+//! signature** authorises a sink spend. That remains true: a release is
+//! authorised by an inclusion proof against a committed root, not by a key —
+//! which is why the sink needs no key at all.
 //!
 //! ## Construction
 //!

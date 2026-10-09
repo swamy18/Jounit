@@ -2,13 +2,13 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// Invariant fuzzer over L2 state transitions (Phase 3, extended in Phase 6 M2).
+// Invariant fuzzer over L2 state transitions (the L2 batch of targets).
 //
-// This is the strongest of the four new targets: rather than checking that a
+// This is the strongest of the L2 targets: rather than checking that a
 // decoder agrees with itself, it drives real, *validly signed* transactions
 // through `L2State` and asserts the one property that must never break —
 //
-//     accounts + locked + burned + PSCB + vault_remaining == total credited
+//     accounts + locked + exits_locked + burned + PSCB + vault_remaining == total credited
 //
 // after every single step, plus the M2 self-check `check_conservation()` (the
 // same sum against the state's own append-only `funded_total`, which is what

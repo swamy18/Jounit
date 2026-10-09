@@ -24,9 +24,10 @@
 //! `L2State::funded_total` counts every satoshi genesis (or a test credit)
 //! ever released; `conservation_total` counts every satoshi still inside the
 //! system. Their equality is the M2 invariant, and together with the params
-//! gap-fit rule (`escrow ≤ cap − reachable`, enforced by
+//! backing rule (`l2_genesis_escrow_sat ≤ escrow_ceiling_sat`, enforced by
 //! `NetworkParams::validate`) it proves combined L1 + L2 money can never
-//! exceed the supply cap (SPEC.md §19.4).
+//! exceed the joint bound — the L1 issuance integral at the tip plus
+//! `escrow_ceiling_sat` (SPEC.md §19.4).
 
 use jnt_core::hash::Address;
 use jnt_core::params::NetworkParams;

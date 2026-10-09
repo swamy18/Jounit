@@ -9,9 +9,10 @@
 //! 1. **Accounts, not UTXOs.** L2 carries a simple account balance per address.
 //!    Funding is genesis-explicit ([`L2State::apply_genesis`], SPEC.md §19.4):
 //!    the profile's escrow total is released once — grants to named accounts,
-//!    remainder to the protocol escrow identity — and no production path funds
-//!    after that. User deposits and exits are deferred past M2. What is real
-//!    today is the accounting below it.
+//!    remainder to the protocol escrow identity. Two later production credits
+//!    exist and both ride L1 blocks: matured deposits (Decision 10,
+//!    `apply_deposit`) and the exit debits that pair with them (Decision 19).
+//!    What is real today is the accounting below them.
 //! 2. **Every explicit transaction pays its D3 flat fee**, split 50/50
 //!    burned/PSCB through `fees::split_flat_fee` — the unchanged M1 rule. Implicit
 //!    transitions (a deadline passing, a dispute window closing) cost nothing,
@@ -305,8 +306,9 @@ impl L2State {
         self.deposits.contains(id)
     }
 
-    /// Satoshis credited through deposits. `funded_total` always equals the
-    /// genesis release plus this — anything else is invented money.
+    /// Satoshis credited through deposits. `funded_total` equals the genesis
+    /// release plus this, minus `exited_total` — anything else is invented or
+    /// vanished money.
     pub fn deposited_total(&self) -> u64 {
         self.deposited_total
     }
@@ -338,8 +340,9 @@ impl L2State {
         Ok(())
     }
 
-    /// Every satoshi ever released into this state. In production this equals
-    /// the profile's escrow total forever — anything else proves an
+    /// Every satoshi ever released into this state, minus what exits have
+    /// taken out. In production this equals the profile's escrow total plus
+    /// credited deposits minus `exited_total` — anything else proves an
     /// unauthorized funding happened.
     pub fn funded_total(&self) -> u64 {
         self.funded_total

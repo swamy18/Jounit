@@ -2,13 +2,20 @@
 //!
 //! Jounit's L2 is the verified-work marketplace: a submitter posts a compute
 //! task with a locked payment, a worker claims and runs it, and settlement
-//! releases the payment against a verdict. These five payload types are the
-//! protocol vocabulary for that loop.
+//! releases the payment against a verdict. A sixth type, `ExitQueue`, moves
+//! value the other way — out of L2 and back to L1 (Decision 19, SPEC.md §19.6).
+//! These six payload types are the protocol vocabulary for that loop.
 //!
 //! Scope, stated precisely because it is easy to over-read: these are *payload*
-//! types. Phase 2 defines them, validates them and fee-routes them; wiring them
-//! into an L1 block is Phase 6 (`memory.md` C). Nothing here touches L1
-//! consensus, the L1 fee floor, the block wire format, or any existing vector.
+//! types. They are validated and fee-routed here — the flat D3 schedule routes
+//! through `fees::split_flat_fee`, so the L1 `base_fee · gas_used` floor is
+//! untouched and no exemption is created. M1 (SPEC.md §19.1) carries them inside
+//! L1 blocks as a length-prefixed trailer committed by
+//! `block::merkle_root_with_l2`.
+//!
+//! Nothing here changes the L1 fee floor, the L1 gas model, or any frozen
+//! vector: a block with no L2 transactions still encodes byte-identically to the
+//! pre-M1 format.
 //!
 //! Encoding discipline, matching the rest of `jnt-core`:
 //! - Every payload is canonically encodable: `serialize`/`from_reader` are exact
