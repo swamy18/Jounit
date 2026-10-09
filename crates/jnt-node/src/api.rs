@@ -930,6 +930,88 @@ async fn tx_build(State(state): State<ApiState>, Json(req): Json<TxBuildReq>) ->
     })?
 }
 
+/// Which funding-shaped path a request wanted (Decision 17).
+///
+/// Only these two are refused during a breach. A blanket freeze was rejected:
+/// it would take the node's ordinary payment traffic down with the accounting,
+/// and a node that stops serving everything is indistinguishable from one that
+/// crashed. The set is exactly the paths that make the broken number *worse*.
+#[derive(Debug, Clone, Copy)]
+enum FundingPath {
+    /// L2 include-queue admission — a write into a state already known bad.
+    L2Write,
+    /// An L1 payment carrying an output to the deposit sink — it debits L1 and
+    /// credits L2, so it grows both sides of a bound that is already broken.
+    Deposit,
+}
+
+impl FundingPath {
+    fn what(self) -> &'static str {
+        match self {
+            FundingPath::L2Write => "L2 write",
+            FundingPath::Deposit => "deposit",
+        }
+    }
+}
+
+/// Decision 17 — the conservation-breach refusal.
+///
+/// When the joint-supply bound is broken, value exists that should not, and any
+/// further funding-shaped write makes the accounting worse. The approved
+/// response is to refuse exactly those writes, name conservation in the error,
+/// and keep every read up (`/v1/conservation`, `/metrics`, blocks, UTXO and
+/// balance queries) so an operator can see what happened. Halt (process exit)
+/// was rejected: a crash-loop converts a safety alarm into a liveness loss and
+/// destroys the diagnostics.
+///
+/// Recomputed per request from the one `crate::conservation` implementation the
+/// endpoint, the exporter and `verify` all share, so the three cannot disagree
+/// about whether there is a breach. No state is discarded and nothing is cached:
+/// recovery is the operator restarting once the cause is understood, and the
+/// check immediately reports all-clear.
+fn refuse_funding_if_breached(
+    sh: &SharedNode,
+    path: FundingPath,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let report = conservation_report(&sh.chain, &sh.l2);
+    if report.ok() {
+        return Ok(());
+    }
+    let detail = report
+        .first_error()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "conservation check failed".to_string());
+    // Loud on every refusal, not just the first: an operator grepping logs must
+    // see the condition is still live rather than infer it from silence.
+    eprintln!(
+        "CONSERVATION BREACH — refusing {}: {detail} (joint {} of {} sat)",
+        path.what(),
+        report.supply.joint_sat,
+        report.supply.bound_sat()
+    );
+    Err(fail(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "conservation_breach",
+        format!(
+            "refusing {}: joint supply is not conserved ({detail}); reads stay available — see GET /v1/conservation",
+            path.what()
+        ),
+    ))
+}
+
+/// Refuse a funding path whose payload does not need to be inspected.
+///
+/// Used by `/v1/l2/broadcast`: the node refuses the *path* while the bound is
+/// broken, so it does not decode, validate or queue a payload it would only
+/// discard. The deposit path cannot use this — a payment has to be parsed to
+/// know it carries a sink output — so there the check runs after decode.
+fn ensure_funding_allowed(
+    state: &ApiState,
+    path: FundingPath,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    with_shared(state, |sh| refuse_funding_if_breached(sh, path))?
+}
+
 #[derive(Deserialize)]
 struct TxBroadcastReq {
     signed_tx_hex: String,
@@ -940,6 +1022,14 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
     let tx = Transaction::deserialize(&bytes).map_err(|e| bad(format!("tx decode: {e}")))?;
     let txid = tx.txid();
     with_shared(&state, |sh| {
+        // Only a deposit is funding-shaped. An ordinary payment still relays:
+        // freezing all of L1 would stop the chain without fixing the number.
+        // Checked after decode so a malformed transaction stays a client error
+        // (`bad_request`) rather than being reported as a breach refusal.
+        let sink = sh.chain.params().l2_deposit_sink();
+        if tx.outputs.iter().any(|o| o.address == sink) {
+            refuse_funding_if_breached(sh, FundingPath::Deposit)?;
+        }
         let outcome = sh.pool.add(
             tx,
             sh.chain.utxo(),
@@ -968,6 +1058,11 @@ struct L2BroadcastReq {
 }
 
 async fn l2_broadcast(State(state): State<ApiState>, Json(req): Json<L2BroadcastReq>) -> ApiResult {
+    // Decision 17, before anything else: on a breached node this write path is
+    // refused outright, ahead of decode, dedup and the dry-run — the node
+    // refuses the path, not the payload, and does no work it would only throw
+    // away. Reads are untouched, so an operator can still diagnose.
+    ensure_funding_allowed(&state, FundingPath::L2Write)?;
     let bytes = decode_hex_bytes(&req.l2_tx_hex, "l2_tx")?;
     let tx = L2Transaction::deserialize(&bytes).map_err(|e| bad(format!("l2 tx decode: {e}")))?;
     let txid = tx.txid();

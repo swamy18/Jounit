@@ -951,13 +951,28 @@ funding anomaly, or joint supply over its bound), it must:
    conservation, so the node stops making a bad situation worse;
 2. **Keep serving reads** — `/v1/status`, `/v1/conservation`, `/metrics`,
    blocks and UTXO queries stay up, so operators can see what happened;
-3. **Log the breach loudly** on every serve iteration while it persists.
-
-Halt (process exit) was rejected: a crash-loop converts a safety alarm into
-a liveness loss and destroys the diagnostics. Alarm-only was rejected as
+3. **Log the breach loudly** on every serve iteration while it persists.Halt (process exit) was rejected: a crash-loop converts a safety alarm into a
+liveness loss and destroys the diagnostics. Alarm-only was rejected as
 insufficient once detection is this cheap. Recovery is an operator action —
 restart after the cause is understood; the check re-runs on every request
 and no state is discarded.
+
+**Implemented 2026-10-09.** The refusal half is
+`api::refuse_funding_if_breached`: `/v1/l2/broadcast` is refused *before the
+payload is decoded* (the path is refused, not the request), and
+`/v1/tx/broadcast` only when the payment actually carries a sink output — a
+blanket L1 freeze was rejected because it would stop the chain without fixing
+the number, so an ordinary payment and a payment to the escrow identity still
+relay. Both refuse with `503 conservation_breach`, name the broken check, and
+point at `GET /v1/conservation`, which goes on serving the broken verdict
+(`ok: false`). The alarm half is the serve loop's repeating `CONSERVATION
+BREACH` line, rate-limited to once a second rather than literally every
+iteration because the loop spins with `--interval-ms 0` and a whole-UTXO scan
+per spin would stall a breached node; it reprints every second for as long as
+the breach lasts, so it cannot pass silently, and prints a clearing line when
+the condition goes away. Nothing is cached or discarded. Pinned by
+`crates/jnt-node/tests/breach_response.rs` (4 tests through real HTTP with a
+real signed deposit) and the pre-existing `api`/`conservation_api` suites.
 
 ## P2 — Bonded stake / mainnet validator committee (mainnet blocker)
 
