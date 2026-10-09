@@ -18,6 +18,13 @@
 //! 3. **Joint supply is under the cap** — L1 live plus L2 held, minus the value
 //!    sitting identifiably in the deposit sink.
 //!
+//! All three are computed once in [`conservation_report`]. Two consumers
+//! render that report differently: `verify_conservation` stops at the first
+//! failure (the command-line verdict), while `GET /v1/conservation` and the
+//! `/metrics` gauges report every term at once (the operational view — a
+//! monitor wants to know *which* check moved). One implementation, so the
+//! endpoint, the exporter and `verify` can never disagree.
+//!
 //! Nothing here reaches `Chain::submit`: it reads state and reports.
 
 use jnt_core::chain::Chain;
@@ -115,34 +122,83 @@ pub fn joint_supply(chain: &Chain, l2: &NodeL2) -> JointSupply {
     }
 }
 
+/// All three checks, with their numbers, computed once.
+///
+/// Plain data: every field is public and `Copy`, so the API handler, the
+/// metrics exporter and the unit tests all work with the same terms rather
+/// than re-deriving them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConservationReport {
+    /// The four supply terms and the cap.
+    pub supply: JointSupply,
+    /// L2's buckets still sum to everything ever released into L2.
+    pub l2_closed: bool,
+    /// What L2 holds, as the funding check saw it (`conservation_total`).
+    pub l2_conservation_sat: u64,
+    /// What was ever released into L2 (`funded_total`).
+    pub l2_funded_sat: u64,
+    /// Genesis escrow plus matured deposits — what L2 was allowed to hold.
+    pub l2_expected_funded_sat: u64,
+}
+
+impl ConservationReport {
+    /// L2 was funded by exactly genesis plus matured deposits.
+    pub fn l2_funding_ok(&self) -> bool {
+        self.l2_funded_sat == self.l2_expected_funded_sat
+    }
+
+    /// The all-clear: all three checks pass.
+    pub fn ok(&self) -> bool {
+        self.l2_closed && self.l2_funding_ok() && !self.supply.exceeds_cap()
+    }
+
+    /// The first broken check, in the order `verify` reports them.
+    pub fn first_error(&self) -> Option<ConservationError> {
+        if !self.l2_closed {
+            return Some(ConservationError::L2NotConserved {
+                conservation_total: self.l2_conservation_sat,
+                funded_total: self.l2_funded_sat,
+            });
+        }
+        if !self.l2_funding_ok() {
+            return Some(ConservationError::L2FundingAnomaly {
+                expected: self.l2_expected_funded_sat,
+                actual: self.l2_funded_sat,
+            });
+        }
+        if self.supply.exceeds_cap() {
+            return Some(ConservationError::JointExceedsCap {
+                joint: self.supply.joint_sat,
+                cap: self.supply.cap_sat,
+            });
+        }
+        None
+    }
+}
+
+/// Compute the three checks against the live chain and L2 view. Read-only.
+pub fn conservation_report(chain: &Chain, l2: &NodeL2) -> ConservationReport {
+    let state = l2.state();
+    ConservationReport {
+        supply: joint_supply(chain, l2),
+        l2_closed: state.check_conservation(),
+        l2_conservation_sat: state.conservation_total(),
+        l2_funded_sat: state.funded_total(),
+        l2_expected_funded_sat: l2
+            .genesis()
+            .escrow_total_sat
+            .saturating_add(state.deposited_total()),
+    }
+}
+
 /// The full check: L2 closed, L2 funding accounted, joint supply under the cap.
 /// Returns the terms on success so the caller can report them.
 pub fn verify_conservation(chain: &Chain, l2: &NodeL2) -> Result<JointSupply, ConservationError> {
-    let state = l2.state();
-    if !state.check_conservation() {
-        return Err(ConservationError::L2NotConserved {
-            conservation_total: state.conservation_total(),
-            funded_total: state.funded_total(),
-        });
+    let report = conservation_report(chain, l2);
+    match report.first_error() {
+        Some(e) => Err(e),
+        None => Ok(report.supply),
     }
-    let expected = l2
-        .genesis()
-        .escrow_total_sat
-        .saturating_add(state.deposited_total());
-    if state.funded_total() != expected {
-        return Err(ConservationError::L2FundingAnomaly {
-            expected,
-            actual: state.funded_total(),
-        });
-    }
-    let supply = joint_supply(chain, l2);
-    if supply.exceeds_cap() {
-        return Err(ConservationError::JointExceedsCap {
-            joint: supply.joint_sat,
-            cap: supply.cap_sat,
-        });
-    }
-    Ok(supply)
 }
 
 #[cfg(test)]
@@ -168,6 +224,67 @@ mod tests {
         assert_eq!(supply(99, 100).headroom_sat(), 1);
         // An over-cap reading reports zero headroom rather than underflowing.
         assert_eq!(supply(1_000, 100).headroom_sat(), 0);
+    }
+
+    /// Build a report with chosen check outcomes and supply terms.
+    fn report(
+        l2_closed: bool,
+        funded: u64,
+        expected: u64,
+        joint: u64,
+        cap: u64,
+    ) -> ConservationReport {
+        ConservationReport {
+            supply: JointSupply {
+                l1_live_sat: joint,
+                l2_held_sat: 0,
+                sink_held_sat: 0,
+                joint_sat: joint,
+                cap_sat: cap,
+            },
+            l2_closed,
+            l2_conservation_sat: funded,
+            l2_funded_sat: funded,
+            l2_expected_funded_sat: expected,
+        }
+    }
+
+    #[test]
+    fn the_report_verdict_names_the_first_broken_check() {
+        // Healthy: no error, funding ok, verdict ok.
+        let r = report(true, 10, 10, 5, 100);
+        assert!(r.ok() && r.l2_funding_ok() && r.first_error().is_none());
+
+        // L2 not closed wins over every later check, and carries its numbers.
+        let r = report(false, 11, 10, 200, 100);
+        assert!(!r.ok());
+        assert_eq!(
+            r.first_error(),
+            Some(ConservationError::L2NotConserved {
+                conservation_total: 11,
+                funded_total: 11,
+            })
+        );
+
+        // A funding anomaly is reported before the cap is examined.
+        let r = report(true, 11, 10, 5, 100);
+        assert!(matches!(
+            r.first_error(),
+            Some(ConservationError::L2FundingAnomaly {
+                expected: 10,
+                actual: 11
+            })
+        ));
+
+        // The cap is the last check.
+        let r = report(true, 10, 10, 101, 100);
+        assert!(matches!(
+            r.first_error(),
+            Some(ConservationError::JointExceedsCap {
+                joint: 101,
+                cap: 100
+            })
+        ));
     }
 
     #[test]

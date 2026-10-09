@@ -31,6 +31,7 @@
 //! GET  /v1/health              liveness for monitors
 //! GET  /metrics                Prometheus text exposition of the gauges below
 //! GET  /v1/status              network, height, tip, peers, supply, finality, L2
+//! GET  /v1/conservation        live joint L1+L2−sink supply vs the cap (the `verify` arithmetic)
 //! GET  /v1/finality            finality status
 //! GET  /v1/fees                fee schedule: gas, base fee, D3 L2 flat fees
 //! GET  /v1/balance/{address}   confirmed / spendable / pending
@@ -82,6 +83,7 @@ use jnt_core::tx::{Transaction, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 use jnt_l2::reputation::ledger_from_state;
 use jnt_l2::task_contract::{ContractState, TaskContract};
 
+use crate::conservation::conservation_report;
 use crate::l2::NodeL2;
 
 /// Largest request body. A block is at most `max_block_bytes` (4 MB on every
@@ -251,6 +253,37 @@ async fn status(State(state): State<ApiState>) -> ApiResult {
     })
 }
 
+/// Live joint conservation (SPEC.md §19.4–§19.5): the arithmetic
+/// `jnt-node verify` prints, served from the same state and reported for all
+/// three checks at once.
+///
+/// Read-only, under the same lock as `/v1/status`. The terms sum the whole
+/// UTXO set, so this is a self-check/monitoring endpoint, not a hot path.
+/// `ok` is the full verdict (L2 closed, L2 funded by genesis plus matured
+/// deposits, joint supply under the cap); the component booleans and the
+/// four terms say *which* check moved. `jnt-worker run` gates on this before
+/// its first pass, and `/metrics` exports the same joint figure as gauges —
+/// all from the one implementation in `crate::conservation`, so the endpoint,
+/// the exporter and `verify` cannot disagree.
+async fn conservation(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let report = conservation_report(&sh.chain, &sh.l2);
+        Json(json!({
+            "ok": report.ok(),
+            "l2_closed": report.l2_closed,
+            "l2_funding_ok": report.l2_funding_ok(),
+            "joint_sat": report.supply.joint_sat,
+            "supply_cap_sat": report.supply.cap_sat,
+            "headroom_sat": report.supply.headroom_sat(),
+            "l1_live_sat": report.supply.l1_live_sat,
+            "l2_held_sat": report.supply.l2_held_sat,
+            "sink_held_sat": report.supply.sink_held_sat,
+            "network_id": sh.chain.params().network_id,
+            "height": sh.chain.height(),
+        }))
+    })
+}
+
 async fn finality(State(state): State<ApiState>) -> ApiResult {
     with_shared(&state, |sh| {
         let p = sh.chain.params();
@@ -386,6 +419,25 @@ async fn metrics(
             "Hard supply cap from the active network profile, in satoshi.",
             &net,
             p.supply_cap_sat,
+        );
+        // Joint conservation (SPEC §19.4–§19.5): the same report
+        // `GET /v1/conservation` serves and `jnt-node verify` prints. Adds one
+        // UTXO-set pass per scrape — the same cost class
+        // `jounit_total_supply_sat` above already pays.
+        let report = conservation_report(&sh.chain, &sh.l2);
+        gauge(
+            &mut out,
+            "jounit_joint_supply_sat",
+            "Joint supply (L1 live + L2 held − deposit sink), in satoshi; must stay at or below the cap.",
+            &net,
+            report.supply.joint_sat,
+        );
+        gauge(
+            &mut out,
+            "jounit_conservation_ok",
+            "1 while L2 balances, L2 funding is genesis plus matured deposits, and joint supply is under the cap; 0 means value was created.",
+            &net,
+            u64::from(report.ok()),
         );
         gauge(
             &mut out,
@@ -1066,6 +1118,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/status", get(status))
+        .route("/v1/conservation", get(conservation))
         .route("/v1/finality", get(finality))
         .route("/v1/fees", get(fee_schedule))
         .route("/v1/balance/{address}", get(balance))
