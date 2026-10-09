@@ -22,7 +22,12 @@ without weakening the security a hash chain depends on.
 > L1 payment to a derived sink credits the depositor after finality depth, 1:1
 > with no new transaction type; exits are still ahead, so mainnet is not ready.
 > Still ahead: L2-to-L1 exits, the worker-node transport, the genesis
-> validator committee and binding finality. Read [Status](#status).
+> validator committee and binding finality. Monetary policy is the open
+> economic question: the reward ladder ends at height 1 839 600 and the whole
+> base fee leaves live supply, so long-run supply currently *contracts* under
+> sustained usage — see [Supply](#supply) and
+> [docs/monetary-redesign.md](docs/monetary-redesign.md), which is a **proposal**
+> with reproducible evidence and nothing implemented. Read [Status](#status).
 
 ---
 
@@ -151,9 +156,10 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-l2/` | 5 400+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates. |
 | `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`) with the L2 replay view over accepted blocks. |
 | `crates/jnt-worker/` | — | Worker SDK (Phase 5, SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, earnings. A minimal secret-free CLI (`jnt-worker address`/`generate`). |
-| `sim/` | 1 609 | Python: independent protocol reference plus attack and supply simulations. |
+| `sim/` | 2 094 | Python: independent protocol reference plus attack, supply and monetary simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
 | [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |
+| [`docs/monetary-redesign.md`](docs/monetary-redesign.md) | 754 | **Proposal, not implemented.** Long-term issuance analysis, the corrected fee-burn accounting, and the open monetary decisions. |
 | [`memory.md`](memory.md) | — | Working notes from the audits and implementations. Not normative. |
 
 ---
@@ -440,21 +446,44 @@ Because every halving rounds down, the seven non-zero steps pay out
 merely reserved: anyone can confirm it by summing the ladder. The cap is checked
 at the point of minting, against live UTXO state.
 
+The ladder is the **only** issuance rule today — nothing tapers it into a tail.
+A permanent tail-emission proposal with reproducible evidence exists in
+[docs/monetary-redesign.md](docs/monetary-redesign.md), but it is **not
+implemented** and every parameter in it is unapproved. With no tail, the subsidy
+reaches zero at height 1 839 600 (~35 years) and mining revenue rests on fees
+alone from then on.
+
 ### Fees and burn
 
-EIP-1559-shaped, and the base fee is **burned**. Only the tip reaches the miner,
-so no new supply is ever minted from usage and the cap cannot be crossed by
-demand.
+EIP-1559-shaped, and **usage removes supply from the spendable set**. The base
+fee is split 50/50 into a burn and the on-chain PSCB (Protocol Security & Compute
+Buffer) reserve, and only the tip reaches the miner — so no new supply is ever
+minted from demand, and the cap cannot be crossed by it.
+
+The asymmetry matters and is worth stating plainly: the `burned` half is
+destroyed by design, while the `pscb` half is *intended* to fund the M2
+time-locked compute reserve. Until that funding path is built, `pscb_reserve` is
+a counter on `Chain` that is only ever incremented and rewound on reorg —
+nothing converts it back into spendable outputs, so **both halves leave live
+supply today**, even though only one is called a burn. The consequences are
+measured in [docs/monetary-redesign.md](docs/monetary-redesign.md).
 
 ```
 gas_per_tx = 16 000 + 1 000 · inputs + 250 · outputs
-gas_cap    = 2 000 000 per block
+gas_cap    = 2 000 000 per block        # also the retarget target
 
-coinbase.value = block_reward(height) + (total_fees − base_fee · gas_used)
+full_base      = base_fee · gas_used
+pscb           = full_base / 2
+burned         = full_base − pscb       # gets the odd satoshi
+coinbase.value = block_reward(height) + (total_fees − full_base)
 ```
 
 The base fee rises by 1/512 per block when the gas target is met exactly, and is
-clamped to `[base_fee_min, base_fee_max]`.
+clamped to `[base_fee_min, base_fee_max]` (100 – 50 000 000 sat on mainnet).
+Note what "the gas target" is here: **a completely full block**. The fee rises
+only when `gas_used == gas_cap` and falls otherwise, so any sustained load below
+100 % drives the fee down toward its floor rather than up — which is why long-run
+fee revenue converges on `base_fee_min`, not on the cap.
 
 ### Transactions and signatures
 
@@ -617,6 +646,23 @@ python sim/supply_schedule_sim.py       # supply vectors
 
 That agreement is the actual evidence `SPEC.md` is unambiguous rather than
 merely self-consistent with the code implementing it.
+
+### Monetary and supply analysis
+
+`sim/tail_emission_sim.py` models the shipped fixed-cap schedule against four
+long-term issuance candidates, per network profile, and is the evidence behind
+[docs/monetary-redesign.md](docs/monetary-redesign.md). That document is a
+**proposal**; the simulation is analysis only and has no consensus effect.
+
+```sh
+python sim/tail_emission_sim.py             # comparative issuance / burn tables
+python sim/tail_emission_sim.py --selftest  # assertions + committed-vector cross-check
+```
+
+`--selftest` re-derives the committed `supply_vectors.json` values and asserts
+the reward-ladder properties, the tail-step bound (no step greater than a
+halving), u64 overflow headroom, per-policy monotonicity, and the fee-removal
+accounting. It is **run locally, not in CI** — see [Known limitations](#known-limitations).
 
 ### CI
 
@@ -787,6 +833,30 @@ the genesis block is hashed through the ordinary `DOM_BLOCK` path. Harmless
 today — nothing depends on genesis having its own tag — but the spec and the
 implementation disagree, and the spec is the document this project treats as
 normative.
+
+**The long-run issuance schedule is undecided, and supply contracts under
+ordinary usage.** The base fee leaves live supply in full ([Fees and
+burn](#fees-and-burn)) while the reward ladder terminates at height 1 839 600.
+Measured in `sim/tail_emission_sim.py`, at the fee floor (100 sat): 2.0 JNT/block
+leaves supply on a full block and 0.50 JNT/block at 25 % activity — both far above
+the proposed 0.10 JNT/block tail, so **net supply falls**. Break-even is ≈5 %
+activity. At sustained full blocks with the base fee at 1 000 sat the removal is
+20 JNT/block and the modelled net supply reaches zero. A tail-emission candidate is
+documented as a **proposal** ([docs/monetary-redesign.md](docs/monetary-redesign.md));
+**no consensus rule, reward parameter, genesis value, fee parameter or committed
+vector has been changed.** What the long-run supply path should be, and whether
+the fee/burn split should change, is unresolved.
+
+**The monetary simulation is not a gated CI check.** `--selftest` passes locally,
+but `.github/workflows/ci.yml` gates only `supply_schedule_sim.py`, the vector
+cross-checks and the difficulty-attack simulation. A regression in the monetary
+assertions would not fail a build.
+
+**The PSCB reserve has no spending path.** `pscb_reserve` is accumulated and
+rewound on reorg but never converted into outputs, so the protocol reserve that is
+meant to fund M2 compute-reserve recovery currently cannot be spent. This is why
+both halves of the base fee leave live supply; wiring the funding path is an
+unimplemented part of M2, not a bug in M1.
 
 ---
 
