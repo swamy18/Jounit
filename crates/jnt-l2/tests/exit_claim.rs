@@ -133,7 +133,6 @@ fn sink_outpoint(chain: &Chain) -> (OutPoint, u64) {
         .utxo()
         .outputs_for_address(&sink)
         .into_iter()
-        .map(|(op, v)| (op, v))
         .next()
         .expect("the deposit sink output")
 }
@@ -181,6 +180,7 @@ fn queue_exit(
 }
 
 /// Build the release claim for a queued exit against the Q-state.
+#[allow(clippy::too_many_arguments)]
 fn build_claim(
     chain: &Chain,
     sim_q: &jnt_l2::L2State,

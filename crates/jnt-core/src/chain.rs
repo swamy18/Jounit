@@ -1187,6 +1187,10 @@ impl Chain {
     // Mining
     // -----------------------------------------------------------------
 
+    // Nine parameters: body, L2 trailer, claims and root are independent
+    // caller-supplied lists, like `apply_body`'s accumulators. Bundling them
+    // would trade one lint for a struct every caller constructs.
+    #[allow(clippy::too_many_arguments)]
     fn build_block(
         &mut self,
         miner_address: crate::hash::Address,
@@ -1402,6 +1406,7 @@ impl Chain {
     /// blocks with L2 transactions and no root are refused by consensus, so a
     /// miner that includes L2 activity must use this path, not
     /// [`Self::mine_block_with_l2`].
+    #[allow(clippy::too_many_arguments)]
     pub fn mine_block_with_l2_root(
         &mut self,
         miner_address: crate::hash::Address,
