@@ -193,6 +193,68 @@ fn health_status_fees_and_finality_answer() {
 }
 
 #[test]
+fn metrics_endpoint_serves_prometheus_gauges_in_the_exposition_format() {
+    let node = start();
+    // `http`/`exchange` deliberately strip the headers, so this test reads the
+    // raw response: the content type *is* part of what must be correct.
+    let mut stream = TcpStream::connect(node.addr).expect("connect to the API");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("write request");
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(status, 200);
+    let (headers, body) = text.split_once("\r\n\r\n").expect("headers then body");
+    assert!(
+        headers
+            .to_lowercase()
+            .contains("content-type: text/plain; version=0.0.4"),
+        "metrics must advertise the Prometheus text content type, got:\n{headers}"
+    );
+
+    // The mini profile's cap is 304,000 JNT; the gauge must carry it exactly,
+    // which is what proves the value came from live params and not a constant.
+    let cap = 304_000u64 * 100_000_000;
+    assert!(
+        body.contains(&format!("jounit_supply_cap_sat{{network=\"{NET}\"}} {cap}")),
+        "cap gauge missing or wrong:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("jounit_height{{network=\"{NET}\"}} 0")),
+        "height gauge missing:\n{body}"
+    );
+    assert!(
+        body.contains("# TYPE jounit_pscb_reserve_sat gauge"),
+        "reserve gauge has no TYPE preamble:\n{body}"
+    );
+
+    // Every sample line must be exactly `name{labels} value` with an integer
+    // value: one malformed line makes a real scraper drop the whole response.
+    for line in body
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let parts: Vec<&str> = line.split(' ').collect();
+        assert_eq!(parts.len(), 2, "not an exposition sample line: {line:?}");
+        assert!(
+            parts[1].parse::<u64>().is_ok(),
+            "value is not an integer: {line:?}"
+        );
+        assert!(parts[0].contains('{'), "sample must be labelled: {line:?}");
+    }
+}
+
+#[test]
 fn an_unknown_balance_address_reads_zero_and_a_malformed_one_is_a_client_error() {
     let node = start();
     let addr = wallet(31, "reader").address().unwrap();

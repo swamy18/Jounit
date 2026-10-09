@@ -29,6 +29,7 @@
 //!
 //! ```text
 //! GET  /v1/health              liveness for monitors
+//! GET  /metrics                Prometheus text exposition of the gauges below
 //! GET  /v1/status              network, height, tip, peers, supply, finality, L2
 //! GET  /v1/finality            finality status
 //! GET  /v1/fees                fee schedule: gas, base fee, D3 L2 flat fees
@@ -56,11 +57,13 @@
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -281,6 +284,171 @@ async fn fee_schedule(State(state): State<ApiState>) -> ApiResult {
             "coinbase_maturity": p.coinbase_maturity,
         }))
     })
+}
+
+/// Escape a Prometheus label value: backslash, double quote and newline are the
+/// only three characters the exposition format requires to be escaped.
+fn escape_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Append one gauge with its `# HELP` / `# TYPE` preamble.
+fn gauge(out: &mut String, name: &str, help: &str, net: &str, value: u64) {
+    // Writing into a String is infallible; the `let _` keeps the fmt::Write
+    // contract explicit without an unwrap that clippy would prefer anyway.
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    let _ = writeln!(out, "{name}{{network=\"{net}\"}} {value}");
+}
+
+/// Prometheus text exposition (Phase 7 observability).
+///
+/// Gauges only, read straight out of the same state `/v1/status` reports, plus
+/// the two relay-queue depths the node already tracks. Deliberately no counters
+/// that would need per-request bookkeeping inside the consensus loop, and the
+/// only label is the static network id — so label cardinality is bounded by
+/// construction and a scraper cannot amplify memory. Nothing here renders key
+/// material or per-user data.
+///
+/// Served at `/metrics` because that is the path a Prometheus scrape config
+/// expects; it carries the same loopback-by-default exposure as every other
+/// route in this module.
+async fn metrics(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let body = with_shared(&state, |sh| {
+        let p = sh.chain.params();
+        let net = escape_label_value(&p.network_id);
+        let peers = state.peers.load(Ordering::Relaxed) as u64;
+        let mut out = String::with_capacity(2048);
+
+        gauge(
+            &mut out,
+            "jounit_height",
+            "Current chain tip height.",
+            &net,
+            sh.chain.height(),
+        );
+        gauge(
+            &mut out,
+            "jounit_finalized_height",
+            "Highest finalized height.",
+            &net,
+            sh.chain.finalized_height(),
+        );
+        gauge(
+            &mut out,
+            "jounit_finality_depth",
+            "Depth-based finality window, in blocks.",
+            &net,
+            p.finality_depth,
+        );
+        gauge(
+            &mut out,
+            "jounit_finality_activation_height",
+            "Binding-finality activation height (0 disables binding finality).",
+            &net,
+            p.finality_activation_height,
+        );
+        gauge(
+            &mut out,
+            "jounit_peers",
+            "Connected peer count.",
+            &net,
+            peers,
+        );
+        gauge(
+            &mut out,
+            "jounit_base_fee_sat_per_gas",
+            "Base fee for the next block, in satoshi per gas.",
+            &net,
+            sh.chain.expected_base_fee_for_next_block(),
+        );
+        gauge(
+            &mut out,
+            "jounit_total_supply_sat",
+            "Live UTXO supply, in satoshi.",
+            &net,
+            sh.chain.total_supply_sat(),
+        );
+        gauge(
+            &mut out,
+            "jounit_supply_cap_sat",
+            "Hard supply cap from the active network profile, in satoshi.",
+            &net,
+            p.supply_cap_sat,
+        );
+        gauge(
+            &mut out,
+            "jounit_pscb_reserve_sat",
+            "PSCB reserve counter, in satoshi (non-spendable; never re-enters supply).",
+            &net,
+            sh.chain.pscb_reserve(),
+        );
+        gauge(
+            &mut out,
+            "jounit_mempool_transactions",
+            "L1 transactions currently in the mempool.",
+            &net,
+            sh.pool.len() as u64,
+        );
+        gauge(
+            &mut out,
+            "jounit_l1_relay_queue",
+            "Accepted L1 txids queued for peer relay.",
+            &net,
+            sh.tx_to_relay.len() as u64,
+        );
+        gauge(
+            &mut out,
+            "jounit_l2_include_queue",
+            "L2 transactions queued to ride the next mined block.",
+            &net,
+            sh.l2_to_include.len() as u64,
+        );
+        gauge(
+            &mut out,
+            "jounit_l2_height",
+            "Canonical L2 height.",
+            &net,
+            sh.l2.height(),
+        );
+        gauge(
+            &mut out,
+            "jounit_l2_applied_total",
+            "L2 payloads applied to canonical state.",
+            &net,
+            sh.l2.applied_count(),
+        );
+        gauge(
+            &mut out,
+            "jounit_l2_skipped_total",
+            "L2 payloads skipped (fail-closed count).",
+            &net,
+            sh.l2.skipped().len() as u64,
+        );
+        gauge(
+            &mut out,
+            "jounit_l2_pending_deposits",
+            "L2 deposits awaiting maturity.",
+            &net,
+            sh.l2.pending_deposits().len() as u64,
+        );
+        out
+    })?;
+    Ok((
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    ))
 }
 
 async fn balance(State(state): State<ApiState>, Path(addr): Path<String>) -> ApiResult {
@@ -896,6 +1064,7 @@ async fn receipt_submit(
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/status", get(status))
         .route("/v1/finality", get(finality))
         .route("/v1/fees", get(fee_schedule))

@@ -51,17 +51,34 @@ channel's PGP key.
 
 ## 2. Monitoring & observability
 
-**No metrics endpoint exists.** The `/health` path in an earlier revision is
-wrong twice over: the route is `/v1/health` and it returns only
-`{"status":"ok"}`. The observables are `/v1/status` (rich JSON) and the
-process logs; there is no Prometheus exporter.
+**A Prometheus text endpoint exists: `GET /metrics`.** It serves
+`text/plain; version=0.0.4` gauges derived from the same state as `/v1/status`,
+plus the two relay-queue depths. Gauges only, one static `network` label, no
+counters that need per-request bookkeeping in the consensus loop, and no key
+material or per-user data — see the handler in `crates/jnt-node/src/api.rs`.
+It carries the same loopback-by-default exposure as every other route.
 
-`GET /v1/status` returns: `network`, `network_id`, `height`, `tip_hash`,
-`peers`, `base_fee_sat`, `total_supply_sat`, `pscb_reserve_sat`,
-`finalized_height`, `finality_activation_height`, `finality_depth`,
-`mempool_len`, and an `l2` block.
+The `/health` path in an earlier revision is wrong twice over: the route is
+`/v1/health` and it returns only `{"status":"ok"}`. The rich JSON observables
+remain `/v1/status` (and `/v1/finality`, `/v1/fees`), and the process logs are
+still the only log surface — **there is no structured log shipper.**
 
-**Suggested alerts** (to be implemented; polling today):
+`GET /metrics` exports (all gauges, labelled `network`):
+`jounit_height`, `jounit_finalized_height`, `jounit_finality_depth`,
+`jounit_finality_activation_height`, `jounit_peers`,
+`jounit_base_fee_sat_per_gas`, `jounit_total_supply_sat`,
+`jounit_supply_cap_sat`, `jounit_pscb_reserve_sat`,
+`jounit_mempool_transactions`, `jounit_l1_relay_queue`,
+`jounit_l2_include_queue`, `jounit_l2_height`, `jounit_l2_applied_total`,
+`jounit_l2_skipped_total`, `jounit_l2_pending_deposits`.
+
+The JSON surfaces remain richer: `GET /v1/status` returns `network`,
+`network_id`, `height`, `tip_hash`, `peers`, `base_fee_sat`,
+`total_supply_sat`, `pscb_reserve_sat`, `finalized_height`,
+`finality_activation_height`, `finality_depth`, `mempool_len`, and an `l2`
+block.
+
+**Suggested alerts** (rules not yet written; the signals now exist):
 
 | Signal | Alert if |
 |---|---|

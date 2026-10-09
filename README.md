@@ -72,9 +72,9 @@ without weakening the security a hash chain depends on.
 | | |
 |---|---|
 | Layer 2 — Verified Work Certificates | Phases 2–4 shipped in `crates/jnt-l2`: task contracts and the five L2 tx types (Phase 2), the dispute engine with M2/M1 integration (Phase 3), and Verified Work Certificates (Phase 4) — an automatic, quorum-verifiable receipt for every correctly settled task. |
-| Worker SDK | Shipped (Phase 5): [`crates/jnt-worker`](crates/jnt-worker) — a worker-side SDK over two injected node seams (`L2NodeView`/`L2Broadcaster`; no wire protocol invented). `WorkerClient` covers discovery, claim, a pluggable `Executor` (§16 CPU-reference shipped), result submission with M3 attestations, dispute observation/participation, VWC observation+validation, and earnings derived from authoritative state. Idempotent-by-txid restart/timeout flows; 32 SDK tests including a 15-test privilege-escalation/secret-hygiene suite. The transport that implements the seams (REST/P2P) is Phase 6. |
+| Worker SDK | Shipped (Phase 5): [`crates/jnt-worker`](crates/jnt-worker) — a worker-side SDK over two injected node seams (`L2NodeView`/`L2Broadcaster`; no wire protocol invented). `WorkerClient` covers discovery, claim, a pluggable `Executor` (§16 CPU-reference shipped), result submission with M3 attestations, dispute observation/participation, VWC observation+validation, and earnings derived from authoritative state. Idempotent-by-txid restart/timeout flows; 32 SDK tests including a 15-test privilege-escalation/secret-hygiene suite. The transport that implements the seams shipped in Phase 6 (`HttpNode` over the node's opt-in REST API), together with the `jnt-worker run` daemon loop. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
-| Coverage-guided fuzzing | Shipped: thirteen cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC + Phase-5 `worker_flows`), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
+| Coverage-guided fuzzing | Shipped: fourteen cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC + Phase-5 `worker_flows`), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
 | License file | Shipped: dual `LICENSE-MIT` / `LICENSE-APACHE` at the repo root, matching `Cargo.toml`'s `MIT OR Apache-2.0`. |
 
 ---
@@ -155,7 +155,7 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | `crates/jnt-store/` | 2 200+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
 | `crates/jnt-l2/` | 5 400+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates. |
 | `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`) with the L2 replay view over accepted blocks. |
-| `crates/jnt-worker/` | — | Worker SDK (Phase 5, SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, earnings. A minimal secret-free CLI (`jnt-worker address`/`generate`). |
+| `crates/jnt-worker/` | — | Worker SDK (Phase 5, SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, earnings. A secret-free CLI: `jnt-worker address`/`generate` for key tooling, and `run` for the worker daemon loop over the node's REST API. |
 | `sim/` | 2 094 | Python: independent protocol reference plus attack, supply and monetary simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
 | [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |

@@ -21,8 +21,8 @@ it says so explicitly.
 | L2 exits | **NOT implemented** — blocked on a recorded decision (`docs/l2-exit-design.md`). Testnet value is intentionally not withdrawable. |
 | L2 task lifecycle / VWC / reputation | **Implemented** — driven by L2 replay; exercised by `crates/jnt-node/tests/e2e_journey.rs` |
 | Opt-in REST API | **Implemented** — `--api-listen`; loopback by default; **unauthenticated** |
-| `jnt-worker` run loop | **NOT implemented as a binary** — `jnt-worker` ships `address` and `generate` only; the worker SDK's claim/execute/submit loop exists as a library over the `L2NodeView`/`L2Broadcaster` seams and is exercised by tests, but there is no operational worker daemon to launch |
-| `/metrics` (Prometheus) | **NOT implemented** — no metrics endpoint exists; monitor via `/v1/status` polling and logs |
+| `jnt-worker` run loop | **Implemented** — `jnt-worker run --from-file <wallet> --node <url>` drives discover → claim → execute → submit over the node's REST API, using the production `RealBls` verifier. Bounded by `--iterations`; otherwise runs until the process is terminated (no portable signal handler — the node's own `serve` loop has none either). Covered by `crates/jnt-worker/tests/cli_run.rs` and the two-process E2E test |
+| `/metrics` (Prometheus) | **Implemented** — `GET /metrics` serves `text/plain; version=0.0.4` gauges (height, finality, peers, base fee, supply, PSCB reserve, mempool, relay/queue depths, L2 counters). `/v1/status` JSON remains for the richer view |
 | Node config file | **NOT implemented** — the node is CLI-flags-only; no `config.toml` is read |
 
 ## Launch runbook (real commands)
@@ -117,9 +117,9 @@ rejected as an unexpected argument.
 | M4 (HBM scratchpad) not a registered `puzzle_id` | Chain security rests on the §5 double-PoW puzzle only. |
 | No stake ledger / validator rotation | The committee is fixed at genesis (Decision 8); bonding/unbonding are mainnet-gated. |
 | API is unauthenticated | Loopback/tunnel only. |
-| No metrics endpoint | Poll `/v1/status`; scrape logs. |
+| Metrics are gauges only | `/metrics` exports no request/error counters — scraping it does not reveal how many requests failed. Poll `/v1/status` alongside it. |
 | MemPool is in-memory only | A restart begins with an empty pool. |
-| No worker daemon binary | `jnt-worker` drives the SDK only through `address`/`generate`; the run loop is library + tests today. |
+| Worker daemon has no signal handler | `jnt-worker run` loops until stopped; it stops between passes, never mid-transaction, but does not trap SIGINT itself. Use `--iterations N` for a bounded run. |
 
 ## Monitoring during testnet
 
