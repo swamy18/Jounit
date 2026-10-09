@@ -322,7 +322,8 @@ impl NetworkParams {
         }
     }
 
-    /// Mainnet: 10-minute blocks, ~40M cap, 5-year halving (SPEC.md §7, §10).
+    /// Mainnet: 10-minute blocks, 5-year halving, no stock cap (Decision 18
+    /// replaced it with the rate anchor) (SPEC.md §7, §10).
     pub fn mainnet() -> Self {
         NetworkParams {
             name: "mainnet".into(),
