@@ -429,6 +429,85 @@ pub struct Observation {
     pub network_id: String,
 }
 
+/// What the node's `GET /v1/conservation` reported about joint supply.
+///
+/// The node sums the terms; the SDK re-derives the verdict from the numbers
+/// itself ([`holds`](ConservationReport::holds)) rather than trusting the
+/// node's `ok` flag — a view is untrusted data (§18.3), and a node that is
+/// wrong about conservation is exactly the node a worker must not earn from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConservationReport {
+    /// Live L1 UTXO supply, sat.
+    pub l1_live_sat: u64,
+    /// Everything L2 still holds, sat.
+    pub l2_held_sat: u64,
+    /// Value sitting in the deposit sink (counted on both sides; subtracted once).
+    pub sink_held_sat: u64,
+    /// The node's own `l1 + l2 − sink` figure, sat.
+    pub joint_sat: u64,
+    /// The profile's hard supply cap, sat.
+    pub supply_cap_sat: u64,
+    /// L2's buckets still sum to what was released into L2.
+    pub l2_closed: bool,
+    /// L2 was funded by exactly genesis plus matured deposits.
+    pub l2_funding_ok: bool,
+    /// The node's own all-clear, kept for the record; never relied on.
+    pub node_ok: bool,
+}
+
+impl ConservationReport {
+    /// The invariant, recomputed here: joint equals `l1 + l2 − sink`, that is
+    /// at most the cap, and both L2 checks hold. A report whose numbers do
+    /// not re-add is refused exactly like one that states a breach — a node
+    /// that cannot add is as untrusted as one that lies.
+    pub fn holds(&self) -> bool {
+        let recomputed = self
+            .l1_live_sat
+            .saturating_add(self.l2_held_sat)
+            .saturating_sub(self.sink_held_sat);
+        recomputed == self.joint_sat
+            && self.joint_sat <= self.supply_cap_sat
+            && self.l2_closed
+            && self.l2_funding_ok
+    }
+
+    /// Satoshis of headroom the report carries under the cap.
+    pub fn headroom_sat(&self) -> u64 {
+        self.supply_cap_sat.saturating_sub(self.joint_sat)
+    }
+}
+
+/// Decode a `/v1/conservation` body. Every field is required: a report a
+/// worker cannot fully read is one it cannot act on.
+fn parse_conservation(value: &Value) -> WorkerResult<ConservationReport> {
+    let num = |key: &str| -> WorkerResult<u64> {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or(WorkerError::ObservationMalformed(
+                "conservation response is missing a numeric field",
+            ))
+    };
+    let flag = |key: &str| -> WorkerResult<bool> {
+        value
+            .get(key)
+            .and_then(Value::as_bool)
+            .ok_or(WorkerError::ObservationMalformed(
+                "conservation response is missing a boolean field",
+            ))
+    };
+    Ok(ConservationReport {
+        l1_live_sat: num("l1_live_sat")?,
+        l2_held_sat: num("l2_held_sat")?,
+        sink_held_sat: num("sink_held_sat")?,
+        joint_sat: num("joint_sat")?,
+        supply_cap_sat: num("supply_cap_sat")?,
+        l2_closed: flag("l2_closed")?,
+        l2_funding_ok: flag("l2_funding_ok")?,
+        node_ok: flag("ok")?,
+    })
+}
+
 /// A worker's view of a node over HTTP.
 ///
 /// Construct with [`HttpNode::new`] (or [`HttpNode::for_network`] to bind the
@@ -637,6 +716,32 @@ impl HttpNode {
     pub fn payment(&self, payment_id: &Hash) -> WorkerResult<Value> {
         self.get_json(&format!("/v1/payment/{}", hex::encode(payment_id)))
     }
+
+    /// The node's live conservation report (joint L1 + L2 − sink supply vs
+    /// the cap), or `Ok(None)` when the node does not expose the endpoint —
+    /// an older build, which is a fact about the node rather than a failure.
+    ///
+    /// A `200` whose body cannot be read is `ObservationMalformed`: the node
+    /// *answered*, and its answer cannot be trusted — a different fact from
+    /// the node being unreachable (`ObservationUnavailable`), which this
+    /// returns like any other transport failure. The verdict is never taken
+    /// from the node's `ok` flag; see [`ConservationReport::holds`].
+    pub fn conservation(&self) -> WorkerResult<Option<ConservationReport>> {
+        let Some(body) = self
+            .raw("GET", "/v1/conservation", None)
+            .map_err(|e| e.into_observation())?
+        else {
+            return Ok(None);
+        };
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| WorkerError::ObservationMalformed("conservation response is not JSON"))?;
+        if !value.is_object() {
+            return Err(WorkerError::ObservationMalformed(
+                "conservation response is not a JSON object",
+            ));
+        }
+        parse_conservation(&value).map(Some)
+    }
 }
 
 impl L2NodeView for HttpNode {
@@ -715,6 +820,86 @@ mod tests {
         assert!(decode_chunked(b"zz\r\nx\r\n").is_err());
         // Empty size line.
         assert!(decode_chunked(b"\r\n").is_err());
+    }
+
+    /// A well-formed healthy report body, with fields the tests may tweak.
+    fn report_json() -> Value {
+        json!({
+            "ok": true,
+            "l2_closed": true,
+            "l2_funding_ok": true,
+            "joint_sat": 1_010,
+            "supply_cap_sat": 10_000,
+            "headroom_sat": 8_990,
+            "l1_live_sat": 10,
+            "l2_held_sat": 1_000,
+            "sink_held_sat": 0,
+            "network_id": "jounit/mini",
+            "height": 3,
+        })
+    }
+
+    #[test]
+    fn conservation_holds_only_when_the_numbers_re_add() {
+        let r = parse_conservation(&report_json()).unwrap();
+        assert!(r.holds());
+        assert_eq!(r.headroom_sat(), 8_990);
+
+        // Joint claims more than the terms sum to — refused.
+        let mut v = report_json();
+        v["joint_sat"] = json!(1_011);
+        assert!(!parse_conservation(&v).unwrap().holds());
+
+        // Joint over the cap — refused, even though it re-adds.
+        let mut v = report_json();
+        v["joint_sat"] = json!(10_001);
+        v["l1_live_sat"] = json!(10_001);
+        assert!(!parse_conservation(&v).unwrap().holds());
+
+        // Each L2 check broken on its own — refused.
+        let mut v = report_json();
+        v["l2_closed"] = json!(false);
+        assert!(!parse_conservation(&v).unwrap().holds());
+        let mut v = report_json();
+        v["l2_funding_ok"] = json!(false);
+        assert!(!parse_conservation(&v).unwrap().holds());
+
+        // The node's own `ok` claim is never what the verdict rests on.
+        let mut v = report_json();
+        v["ok"] = json!(false);
+        let r = parse_conservation(&v).unwrap();
+        assert!(r.holds() && !r.node_ok);
+    }
+
+    #[test]
+    fn conservation_decode_requires_every_field() {
+        for key in [
+            "l1_live_sat",
+            "l2_held_sat",
+            "sink_held_sat",
+            "joint_sat",
+            "supply_cap_sat",
+            "l2_closed",
+            "l2_funding_ok",
+            "ok",
+        ] {
+            let mut v = report_json();
+            v.as_object_mut().unwrap().remove(key);
+            assert!(
+                matches!(
+                    parse_conservation(&v),
+                    Err(WorkerError::ObservationMalformed(_))
+                ),
+                "a report missing {key} must be refused"
+            );
+        }
+        // A present-but-wrong-typed field is refused the same way.
+        let mut v = report_json();
+        v["joint_sat"] = json!("a lot");
+        assert!(matches!(
+            parse_conservation(&v),
+            Err(WorkerError::ObservationMalformed(_))
+        ));
     }
 
     #[test]

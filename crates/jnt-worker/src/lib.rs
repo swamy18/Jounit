@@ -45,7 +45,7 @@ pub use executor::{
     execute_task, result_hash_of, CpuExecutor, ExecError, ExecutionOutput, ExecutionWork, Executor,
     ExecutorCapabilities,
 };
-pub use http::HttpNode;
+pub use http::{ConservationReport, HttpNode};
 pub use node::{BroadcastError, L2Broadcaster, L2NodeView};
 pub use submit::{reconcile_submitted, submit_plan, submit_result, SubmitPlan, SubmittedState};
 pub use vwc::{certificates_for_worker, is_offline_verifiable, observe_certificate};

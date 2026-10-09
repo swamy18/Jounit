@@ -8,7 +8,10 @@
 //!   over a live node's REST API (§18.3). It uses the SDK's injected seams
 //!   and the **production** `RealBls` verifier, so it exercises the same code
 //!   path an operator's own integration would; it implements no consensus
-//!   rule of its own.
+//!   rule of its own. Before the first pass it gates on the node's live
+//!   conservation report (`GET /v1/conservation`): this daemon moves real
+//!   value, so a node reporting joint supply over the cap — or numbers that
+//!   do not re-add — is refused rather than earned from.
 //!
 //! No command ever prints a private key; `generate` writes the file and prints
 //! only the path, and `run` logs task ids and errors but never key material
@@ -30,7 +33,7 @@ use jnt_core::bls_checkpoint::ValidatorSet;
 use jnt_core::hash::{address_to_hex, hash_to_hex, Hash};
 use jnt_core::params::NetworkParams;
 use jnt_worker::node::Host;
-use jnt_worker::{is_retryable, CpuExecutor, HttpNode, WorkerClient, WorkerConfig};
+use jnt_worker::{is_retryable, CpuExecutor, HttpNode, WorkerClient, WorkerConfig, WorkerError};
 
 /// The concrete client the CLI builds: the HTTP transport serves as both the
 /// read view and the broadcaster, and the CPU executor is the SDK's reference
@@ -46,7 +49,11 @@ fn usage() -> String {
                       [--deposit-sat <n>]
 
   run defaults: --network mini, --iterations 0 (until stopped),
-                --interval-ms 2000, --max-tasks 4, --deposit-sat 0"
+                --interval-ms 2000, --max-tasks 4, --deposit-sat 0
+
+  run gates on GET /v1/conservation first: a node reporting joint supply
+  over the cap (or unreadable numbers) is refused; an unreachable or
+  non-reporting node warns and continues."
         .to_string()
 }
 
@@ -161,6 +168,39 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // network id is checked by `for_network`, so a mini worker cannot be
     // pointed at a mainnet node by accident.
     let view = HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
+
+    // Conservation gate (SPEC §19.4–§19.5): value created anywhere — L1 or
+    // L2 — turns every later payment into a claim on nothing, so the daemon
+    // refuses to run against a node whose joint supply is broken. The three
+    // verdicts are recomputed here from the report's own numbers rather than
+    // trusted from its `ok` flag. An unreachable node, or one too old to
+    // report, warns and continues: discovery's own retry loop is the right
+    // handler for those. An answer that is wrong or unreadable is refused —
+    // that node is answering, and cannot be trusted.
+    match view.conservation() {
+        Ok(Some(r)) if r.holds() => println!(
+            "conservation  ok (joint {} of {} sat, headroom {})",
+            r.joint_sat,
+            r.supply_cap_sat,
+            r.headroom_sat()
+        ),
+        Ok(Some(r)) => {
+            return Err(format!(
+                "conservation gate failed: joint {} of {} sat (l1 {} + l2 {} - sink {}), \
+                 l2_closed {}, l2_funding_ok {} — refusing to run against this node",
+                r.joint_sat, r.supply_cap_sat, r.l1_live_sat, r.l2_held_sat, r.sink_held_sat,
+                r.l2_closed, r.l2_funding_ok
+            ));
+        }
+        Ok(None) => eprintln!(
+            "conservation  not reported by this node (older build?); continuing without the self-check"
+        ),
+        Err(WorkerError::ObservationUnavailable(why)) => {
+            eprintln!("conservation  unavailable ({why}); continuing without the self-check")
+        }
+        Err(e) => return Err(format!("conservation gate could not read the node: {e}")),
+    }
+
     let broadcaster =
         HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
     let host = Host::new(view, broadcaster);
