@@ -157,16 +157,19 @@ fn queue_exit(
     // the trailer transaction at Q, no deposits in Q's (empty) body.
     let mut sim = l2.state().clone();
     sim.advance_block(q);
-    sim.apply(
-        &tx,
-        q,
-        &ValidatorSet::new(vec![]),
-        &MockBls,
-    )
-    .expect("the queue must apply: balance was credited by the deposit");
+    sim.apply(&tx, q, &ValidatorSet::new(vec![]), &MockBls)
+        .expect("the queue must apply: balance was credited by the deposit");
     let root = sim.committed_root();
     let b = chain
-        .mine_block_with_l2_root(me, vec![], vec![tx], root, ts(q), None, DEFAULT_MAX_ATTEMPTS)
+        .mine_block_with_l2_root(
+            me,
+            vec![],
+            vec![tx],
+            root,
+            ts(q),
+            None,
+            DEFAULT_MAX_ATTEMPTS,
+        )
         .unwrap();
     chain.submit(b).unwrap();
     assert_eq!(
@@ -281,7 +284,10 @@ fn exit_claim_releases_exactly_once_and_conserves() {
         .sum();
     assert_eq!(fee_got, EXIT_FEE);
     // The sink output is consumed, not copied.
-    assert!(chain.utxo().outputs_for_address(&NetworkParams::mini().l2_deposit_sink()).is_empty());
+    assert!(chain
+        .utxo()
+        .outputs_for_address(&NetworkParams::mini().l2_deposit_sink())
+        .is_empty());
     assert!(chain.exit_released(&me, 1));
     chain.verify_canonical_chain().unwrap();
 
@@ -504,16 +510,14 @@ fn post_activation_l2_without_root_is_refused() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_empty_to(&mut chain, me, 2);
     // A bare L2 transaction (no signature check at L1: validity is L2's job).
-    let tx = L2Transaction::new(L2Payload::ExitQueue(
-        jnt_core::l2::ExitQueuePayload {
-            owner: me,
-            auth: Default::default(),
-            nonce: 1,
-            amount_sat: 1,
-            destination: dest_of(),
-            exit_fee_sat: 0,
-        },
-    ));
+    let tx = L2Transaction::new(L2Payload::ExitQueue(jnt_core::l2::ExitQueuePayload {
+        owner: me,
+        auth: Default::default(),
+        nonce: 1,
+        amount_sat: 1,
+        destination: dest_of(),
+        exit_fee_sat: 0,
+    }));
     let h = chain.height() + 1;
     let b = chain
         .mine_block_with_l2(me, vec![], vec![tx], ts(h), None, DEFAULT_MAX_ATTEMPTS)
@@ -566,7 +570,9 @@ fn reorg_of_the_claim_block_unwinds_the_release() {
     }
     assert!(rival.total_work() > chain.total_work());
     chain.submit(rival.block_at(h).unwrap().clone()).unwrap();
-    chain.submit(rival.block_at(h + 1).unwrap().clone()).unwrap();
+    chain
+        .submit(rival.block_at(h + 1).unwrap().clone())
+        .unwrap();
     assert_ne!(chain.tip_hash(), before_tip);
 
     // No trace of the release remains on the winning branch.
@@ -575,7 +581,13 @@ fn reorg_of_the_claim_block_unwinds_the_release() {
     assert_eq!(sink_value, SINK_VALUE);
     let _ = sink_op;
     assert!(
-        chain.utxo().get(&OutPoint { txid: claim_id, index: 0 }).is_none(),
+        chain
+            .utxo()
+            .get(&OutPoint {
+                txid: claim_id,
+                index: 0
+            })
+            .is_none(),
         "the destination output must be gone with its block"
     );
     chain.verify_canonical_chain().unwrap();

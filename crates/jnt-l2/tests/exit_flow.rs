@@ -328,7 +328,12 @@ fn queue_without_funds_and_zero_amount_are_refused() {
     let p = ExitQueuePayload::build(&poor, 1, 1_000_000, dest, 0).unwrap();
     let err = w
         .state
-        .apply(&L2Transaction::new(L2Payload::ExitQueue(p)), 5, &w.validators, &w.verifier)
+        .apply(
+            &L2Transaction::new(L2Payload::ExitQueue(p)),
+            5,
+            &w.validators,
+            &w.verifier,
+        )
         .expect_err("an unfunded queue must be refused");
     assert!(matches!(err, L2Error::InsufficientBalance { .. }));
     assert_eq!(w.state.exit_count(), 0);
@@ -336,7 +341,12 @@ fn queue_without_funds_and_zero_amount_are_refused() {
     let p = ExitQueuePayload::build(&w.submitter, 1, 0, dest, 0).unwrap();
     let err = w
         .state
-        .apply(&L2Transaction::new(L2Payload::ExitQueue(p)), 5, &w.validators, &w.verifier)
+        .apply(
+            &L2Transaction::new(L2Payload::ExitQueue(p)),
+            5,
+            &w.validators,
+            &w.verifier,
+        )
         .expect_err("a zero-amount queue must be refused");
     assert!(matches!(err, L2Error::ZeroAmount(_)));
     w.assert_conserved("refused queues");
@@ -426,8 +436,8 @@ fn state_wire_round_trips_with_queued_exits() {
 /// construction).
 #[test]
 fn replay_rebuilds_identical_exit_state() {
-    use jnt_l2::{ChainL2, DepositParams, L2Genesis};
     use jnt_core::params::NetworkParams;
+    use jnt_l2::{ChainL2, DepositParams, L2Genesis};
     let params = NetworkParams::mini();
     let mut config = exits_on();
     config.exit_activation_height = params.exit_activation_height;
@@ -437,9 +447,7 @@ fn replay_rebuilds_identical_exit_state() {
     let mut second = ChainL2::empty(config, &genesis, deposits);
     // Fund both identically outside genesis (unit-test seam, like `world`).
     for l2 in [&mut first, &mut second] {
-        l2.state_mut()
-            .credit(addr(&wallet(1)), 10_000_000)
-            .unwrap();
+        l2.state_mut().credit(addr(&wallet(1)), 10_000_000).unwrap();
     }
     let tx = {
         let w = wallet(1);

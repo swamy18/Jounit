@@ -1234,9 +1234,7 @@ impl L2State {
             dispute_window: r.u64le().map_err(|_| codec_err("dispute window"))?,
             vesting_period: r.u64le().map_err(|_| codec_err("vesting period"))?,
             whistleblower_bounty_percent: r.u64le().map_err(|_| codec_err("bounty percent"))?,
-            exit_activation_height: r
-                .u64le()
-                .map_err(|_| codec_err("exit activation height"))?,
+            exit_activation_height: r.u64le().map_err(|_| codec_err("exit activation height"))?,
         };
         let genesis_applied = match r.u8().map_err(|_| codec_err("genesis flag"))? {
             0 => false,
@@ -1338,9 +1336,12 @@ impl L2State {
         for _ in 0..n_exits {
             let record = ExitRecord::decode(&mut r)?;
             exits_locked = exits_locked
-                .checked_add(record.amount_sat.checked_add(record.exit_fee_sat).ok_or(
-                    codec_err("exit value overflows"),
-                )?)
+                .checked_add(
+                    record
+                        .amount_sat
+                        .checked_add(record.exit_fee_sat)
+                        .ok_or(codec_err("exit value overflows"))?,
+                )
                 .ok_or(codec_err("locked exits overflow"))?;
             if exits.insert((record.owner, record.nonce), record).is_some() {
                 return Err(codec_err("duplicate exit identity"));

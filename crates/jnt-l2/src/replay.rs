@@ -137,7 +137,15 @@ impl ChainL2 {
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) -> Self {
-        Self::replay_to(chain, config, genesis, deposits, validators, verifier, chain.height())
+        Self::replay_to(
+            chain,
+            config,
+            genesis,
+            deposits,
+            validators,
+            verifier,
+            chain.height(),
+        )
     }
 
     /// Replay a whole chain from genesis to `upto` (inclusive), not to the tip.

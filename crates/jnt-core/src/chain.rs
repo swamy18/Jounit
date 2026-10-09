@@ -849,11 +849,7 @@ impl Chain {
         // shared helper so the live path and the miner probe agree.
         let mut spent = Vec::with_capacity(claim.inputs.len());
         for op in &claim.inputs {
-            let u = self
-                .utxo
-                .get(op)
-                .ok_or(Error::UnknownOutPoint)?
-                .clone();
+            let u = self.utxo.get(op).ok_or(Error::UnknownOutPoint)?.clone();
             spent.push((*op, u));
         }
         Self::apply_claim_utxo(&mut self.utxo, claim, height);
@@ -869,15 +865,11 @@ impl Chain {
         body_undo.created.extend(undo.created);
         self.released_exits.insert((claim.owner, claim.nonce));
         marked.push((claim.owner, claim.nonce));
-        *total_gas = total_gas
-            .checked_add(gas)
-            .ok_or(Error::ValueOverflow)?;
+        *total_gas = total_gas.checked_add(gas).ok_or(Error::ValueOverflow)?;
         // The L1 fee rides the totals like any transaction fee; the split
         // burns half and PSCBs half, and there is no tip on a claim
         // (exact funding was checked above).
-        *total_fees = total_fees
-            .checked_add(l1_fee)
-            .ok_or(Error::ValueOverflow)?;
+        *total_fees = total_fees.checked_add(l1_fee).ok_or(Error::ValueOverflow)?;
         Ok(())
     }
 
@@ -1218,16 +1210,14 @@ impl Chain {
         } else {
             // Claims are ordinary block space, so their gas feeds the next
             // block's base fee exactly like body gas (approved P1).
-            let parent_gas = parent.total_gas_used()?.checked_add(parent.claims_gas_used()?);
+            let parent_gas = parent
+                .total_gas_used()?
+                .checked_add(parent.claims_gas_used()?);
             let parent_gas = match parent_gas {
                 Some(g) => g,
                 None => return Err(Error::ValueOverflow),
             };
-            next_base_fee(
-                &self.params,
-                parent.header.base_fee_sat,
-                parent_gas,
-            )
+            next_base_fee(&self.params, parent.header.base_fee_sat, parent_gas)
         };
         let timestamp_ms =
             now_ms.max(crate::difficulty::median_previous_timestamp(&history).unwrap_or(0));
@@ -1244,12 +1234,8 @@ impl Chain {
         for claim in &exit_claims {
             let (gas, l1_fee) = self.check_claim(&probe, claim, height, base_fee)?;
             Self::apply_claim_utxo(&mut probe, claim, height);
-            total_gas = total_gas
-                .checked_add(gas)
-                .ok_or(Error::ValueOverflow)?;
-            total_fees = total_fees
-                .checked_add(l1_fee)
-                .ok_or(Error::ValueOverflow)?;
+            total_gas = total_gas.checked_add(gas).ok_or(Error::ValueOverflow)?;
+            total_fees = total_fees.checked_add(l1_fee).ok_or(Error::ValueOverflow)?;
         }
         for tx in &body {
             let delta = check_tx(
@@ -1283,7 +1269,8 @@ impl Chain {
 
         let mut txs = vec![cb_tx];
         txs.extend(body);
-        let merkle = crate::block::merkle_root_with_l2(&txs, &l2_txs, l2_root.as_ref(), &exit_claims);
+        let merkle =
+            crate::block::merkle_root_with_l2(&txs, &l2_txs, l2_root.as_ref(), &exit_claims);
 
         let mut header = Header {
             version: crate::block::BLOCK_VERSION,
@@ -1675,9 +1662,7 @@ impl Chain {
             let gas = parent
                 .total_gas_used()
                 .ok()
-                .and_then(|g| {
-                    g.checked_add(parent.claims_gas_used().unwrap_or(u64::MAX))
-                })
+                .and_then(|g| g.checked_add(parent.claims_gas_used().unwrap_or(u64::MAX)))
                 .unwrap_or(self.params.gas_cap);
             next_base_fee(&self.params, parent.header.base_fee_sat, gas)
         }
