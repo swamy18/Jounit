@@ -22,10 +22,11 @@ protocol decisions — and the blockers are named at the end.
 | Fuzz harness | `fuzz/` (14 targets, cargo-fuzz nightly + ASan) |
 | Benchmarks | inline `#[ignore]`d probes, **not** a `benches/` harness |
 
-Not implemented, and named as such: `/metrics`, Prometheus/OpenTelemetry
-export, a node config file, a release/tagging pipeline, a worker daemon
-binary, reproducible-build tooling, log shipping, and the security-disclosure
-channel's PGP key.
+Not implemented, and named as such: an OpenTelemetry/OTLP exporter (the
+Prometheus text endpoint `/metrics` exists — §2), a node config file, a
+release/tagging pipeline, reproducible-build tooling, log shipping, and the
+security-disclosure channel's PGP key. (The `jnt-worker run` daemon binary
+also exists now, with a conservation gate before its first pass.)
 
 ## 1. Versioning & release management
 
@@ -70,7 +71,13 @@ still the only log surface — **there is no structured log shipper.**
 `jounit_supply_cap_sat`, `jounit_pscb_reserve_sat`,
 `jounit_mempool_transactions`, `jounit_l1_relay_queue`,
 `jounit_l2_include_queue`, `jounit_l2_height`, `jounit_l2_applied_total`,
-`jounit_l2_skipped_total`, `jounit_l2_pending_deposits`.
+`jounit_l2_skipped_total`, `jounit_l2_pending_deposits`,
+`jounit_joint_supply_sat`, `jounit_conservation_ok`. The joint-supply figure
+is also served with its full terms and all three check verdicts at
+`GET /v1/conservation` — the same `crate::conservation` arithmetic
+`jnt-node verify` prints, so the endpoint, the exporter and `verify` cannot
+disagree. `jnt-worker run` gates on that endpoint before its first pass and
+refuses a node reporting a breach.
 
 The JSON surfaces remain richer: `GET /v1/status` returns `network`,
 `network_id`, `height`, `tip_hash`, `peers`, `base_fee_sat`,
@@ -88,6 +95,7 @@ block.
 | `finalized_height` | stops advancing after activation while `height` climbs |
 | `l2.skipped` | spike |
 | `pscb_reserve_sat` | flat where it should move, or a jump |
+| `jounit_conservation_ok` | 0 — value was created somewhere (joint supply over the cap, or an L2 check broke) |
 
 **Logging:** line-based stdout via the node; there is no structured log
 shipper. Recommended operational additions (not present): log-to-file,
@@ -190,7 +198,8 @@ reached.
 | **L2 → L1 exits** | ❌ **blocked** — no recorded decision (`docs/l2-exit-design.md`) |
 | **Stake ledger / mainnet validator committee** | ❌ **blocked** — Decision 8 builds none; `mainnet` has an empty committee so finality fails closed |
 | M2 / M4 activation rules | ❌ **blocked** — each needs a rule that defines fraudulent compute output / how the HBM puzzle is registered |
-| `/metrics`, log shipping, release pipeline, PGP disclosure key | ❌ operational, not built |
+| Live conservation surface (`/v1/conservation`, `/metrics` gauges, worker `run` gate) | ✅ |
+| Log shipping, release pipeline, PGP disclosure key | ❌ operational, not built |
 
 ## Exact blockers preventing mainnet
 

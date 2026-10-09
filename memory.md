@@ -3227,3 +3227,33 @@ Item 11 (canonical agent payment format) -> item 12 (service receipts) -> items
 1/25 (L2 adversarial suite) -> then the decision-blocked items: monetary
 redesign (item 19), exits, validator economics. Items 16-17 (API + MCP/agent
 integrations) are new-surface work with their own decision.
+
+---
+
+## 2026-10-09 (later) — Conservation enforcement (the P1 follow-through)
+
+The exit-design session left one P1 item open: conservation was verified by
+`jnt-node verify` but never enforced during operation. Closed now, at three
+surfaces, all reading one implementation (`jnt_node::conservation::
+conservation_report` — `verify_conservation` became a thin first-error render
+of the same report, so endpoint/exporter/verify cannot drift):
+
+- `GET /v1/conservation` serves all three check verdicts plus the four terms.
+- `/metrics` exports `jounit_joint_supply_sat` and `jounit_conservation_ok`.
+- `jnt-worker run` gates on the report before its first pass: breach or
+  unreadable numbers -> non-zero exit naming every term; unreachable/older
+  node -> warn and continue (discovery's retry loop owns those). The worker
+  recomputes joint == l1 + l2 - sink and the cap from the terms
+  (`ConservationReport::holds`), never the node's `ok` flag.
+
+Tests: `tests/conservation_api.rs` (3: terms re-add + status cross-check,
+metrics match, sink term after a real matured deposit), http.rs decode/holds
+unit tests (2, every missing field refused), `cli_run.rs` fake-node gate
+tests (3: refuse over-cap, refuse garbage, pass+proceed), report-ordering
+unit test in conservation.rs.
+
+Known limit, recorded not hidden: detection is on-demand (endpoint, scrape,
+worker startup) — there is no serve-loop halt, because what a node should DO
+on detected inflation (halt, freeze L2, alarm-only) is an undecided policy.
+The exit rule itself (P1 in decisions.md) remains undecided; mainnet remains
+NO-GO.

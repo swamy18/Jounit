@@ -21,7 +21,8 @@ it says so explicitly.
 | L2 exits | **NOT implemented** — blocked on a recorded decision (`docs/l2-exit-design.md`). Testnet value is intentionally not withdrawable. |
 | L2 task lifecycle / VWC / reputation | **Implemented** — driven by L2 replay; exercised by `crates/jnt-node/tests/e2e_journey.rs` |
 | Opt-in REST API | **Implemented** — `--api-listen`; loopback by default; **unauthenticated** |
-| `jnt-worker` run loop | **Implemented** — `jnt-worker run --from-file <wallet> --node <url>` drives discover → claim → execute → submit over the node's REST API, using the production `RealBls` verifier. Bounded by `--iterations`; otherwise runs until the process is terminated (no portable signal handler — the node's own `serve` loop has none either). Covered by `crates/jnt-worker/tests/cli_run.rs` and the two-process E2E test |
+| `jnt-worker` run loop | **Implemented** — `jnt-worker run --from-file <wallet> --node <url>` drives discover → claim → execute → submit over the node's REST API, using the production `RealBls` verifier. Bounded by `--iterations`; otherwise runs until the process is terminated (no portable signal handler — the node's own `serve` loop has none either). Covered by `crates/jnt-worker/tests/cli_run.rs` and the two-process E2E test. Gates on `GET /v1/conservation` before the first pass |
+| Live conservation surface | **Implemented** — `GET /v1/conservation` reports the joint L1 + L2 − sink supply against the cap with all three check verdicts (the `jnt-node verify` arithmetic, served live); `/metrics` exports `jounit_joint_supply_sat` and `jounit_conservation_ok`; `jnt-worker run` refuses to start against a node reporting a breach or unreadable numbers (an unreachable or non-reporting node warns and continues). Covered by `crates/jnt-node/tests/conservation_api.rs` and the `cli_run.rs` gate tests |
 | `/metrics` (Prometheus) | **Implemented** — `GET /metrics` serves `text/plain; version=0.0.4` gauges (height, finality, peers, base fee, supply, PSCB reserve, mempool, relay/queue depths, L2 counters). `/v1/status` JSON remains for the richer view |
 | Node config file | **NOT implemented** — the node is CLI-flags-only; no `config.toml` is read |
 
@@ -131,8 +132,9 @@ curl -s http://127.0.0.1:9334/v1/health
 The real observable is `/v1/status`, which returns network id, height, tip,
 peer count, base fee, total supply, PSCB reserve, `finalized_height`,
 `finality_activation_height`, `finality_depth`, mempool length and the L2
-block. There is **no** Prometheus `/metrics` endpoint; alert by polling
-`/v1/status`:
+block. `/metrics` (Prometheus text) and `/v1/conservation` (the joint-supply
+report `jnt-worker run` gates on) carry the same signals for scrapers.
+Alert on:
 
 | Signal (from `/v1/status`) | Alert if |
 |---|---|
@@ -141,6 +143,7 @@ block. There is **no** Prometheus `/metrics` endpoint; alert by polling
 | `finalized_height` | stops advancing after activation height while `height` climbs |
 | `l2.skipped` | grows more than 5 entries in 10 blocks |
 | `pscb_reserve_sat` | moves unexpectedly |
+| `jounit_conservation_ok` (from `/metrics`) | drops to 0 — joint supply broke the cap or an L2 check failed; treat as value creation and stop the fleet |
 
 ## Graduation criteria (testnet → mainnet)
 

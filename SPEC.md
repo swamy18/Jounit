@@ -2322,8 +2322,13 @@ needs, so §13 itself is not edited.
 **Implemented (measured).** The node serves the L2 additions above at `GET
 /v1/l2/state` (canonical state as `state_hex`), `GET /v1/task/{task_id}`,
 `GET /v1/tasks/open`, `GET /v1/vwc/{task_id}` (the certificate plus its
-`vwc_hex`) and `POST /v1/l2/broadcast`; `jnt-worker::HttpNode` is a client of
-it that implements both §18.3 seams, `L2NodeView` (reads) and `L2Broadcaster`
+`vwc_hex`) and `POST /v1/l2/broadcast`. `GET /v1/conservation` additionally
+serves the live joint-supply report of §19.4–§19.5 (L1 live + L2 held −
+deposit sink, against the cap, with all three check verdicts) — the same
+arithmetic `jnt-node verify` prints — and the `jnt-worker run` verb gates on
+it before its first pass, recomputing the verdict from the terms rather than
+trusting the node's `ok` flag. `jnt-worker::HttpNode` is a client of the API
+that implements both §18.3 seams, `L2NodeView` (reads) and `L2Broadcaster`
 (writes). The state a node hands a remote observer is a **versioned,
 deterministic encoding** (`L2_STATE_WIRE_VERSION = 1`): sorted maps so two
 nodes agree byte-for-byte, each declared count bounded by the bytes actually

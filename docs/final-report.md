@@ -200,3 +200,29 @@ five protocol decisions that must not be guessed, and the exit decision is the
 one that gates mainnet value safety. Nothing here is claimed complete that is
 not; every fabricate-able number was replaced with a measurement or a labelled
 "not measured".
+
+## 17. Addendum — later sessions, 2026-10-09
+
+Three statements above are superseded by work landed after this report was
+written, and are recorded here rather than edited silently:
+
+- **§9/§11: the `jnt-worker run` daemon verb shipped** (discover → claim →
+  execute → submit over the node's REST API, covered by `crates/jnt-worker/
+tests/cli_run.rs` and the two-process E2E), and **`/metrics` shipped**
+  (Prometheus text gauges, §10's first item).
+- **The conservation-enforcement gap closed.** `GET /v1/conservation` serves
+  the three-check verdict live from the one implementation
+  (`jnt_node::conservation::conservation_report`) that `jnt-node verify`
+  prints from; `/metrics` exports `jounit_joint_supply_sat` and
+  `jounit_conservation_ok`; and `jnt-worker run` gates on that report before
+  its first pass — a breach or unreadable numbers are refused with a
+  non-zero exit naming the terms, an unreachable or non-reporting node warns
+  and continues. The worker recomputes the verdict from the report's own
+  terms (`ConservationReport::holds`), never the node's `ok` flag. Tests:
+  `crates/jnt-node/tests/conservation_api.rs` (3), http.rs unit tests (2),
+  `cli_run.rs` fake-node gate tests (3), `ConservationReport` ordering test.
+- **What this does not do:** detection is on-demand (endpoint, scrape,
+  worker startup), not a serve-loop halt. What a node that detects value
+  creation should *do* — halt, freeze L2, or alarm-only — is an undecided
+  policy, as is the exit rule itself (P1 in `docs/decisions.md`). Mainnet
+  readiness remains **NO-GO** on the same blockers §12 lists.
