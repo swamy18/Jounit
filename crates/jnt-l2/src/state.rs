@@ -1420,7 +1420,7 @@ impl L2State {
         // a valid observation of the chain, whatever its structure said.
         // Exit nonces must also cover their records: a record beyond its
         // owner's last nonce was never queueable.
-        for ((owner, nonce), _) in state.exits.iter() {
+        for (owner, nonce) in state.exits.keys() {
             if state.exit_nonce.get(owner).copied().unwrap_or(0) < *nonce {
                 return Err(codec_err("exit record beyond the owner's last nonce"));
             }
