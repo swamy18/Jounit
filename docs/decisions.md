@@ -871,10 +871,61 @@ what *is* decided.
 
 ## P1 — L2 → L1 exit primitive (mainnet fund-safety blocker)
 
+**Status: OPEN — awaiting owner approval. Recommendation recorded, nothing
+activated. Deposits remain one-way.**
+
 Decision 10 defers exits and states no exit decision is recorded. The deposit
 sink holds no key, so it cannot release funds; any exit needs a **new L1 rule**.
-Full design and the six questions are in `docs/l2-exit-design.md`. **Do not
-implement an exit until this is decided; do not mint value to fake one.**
+Full design and the six questions are in `docs/l2-exit-design.md`.
+**Do not implement an exit until this is decided; do not mint value to fake one.**
+
+### The blocker is proven in code, not asserted
+
+`crates/jnt-core/tests/sink_unspendable.rs` drives the real L1 spend rule
+(`ledger::check_tx` → `tx.verify_input(k, &held.out.address, …)`) against a real
+mined deposit and shows:
+
+- the **depositor cannot reclaim its own sink output** (`Error::WrongAddress`) —
+  the signature verifies against the depositor but is compared to the *sink*;
+- a stranger's attempt fails identically, and an unsigned attempt fails one step
+  earlier (`Error::EmptySignatureBundle`);
+- the sink and escrow identities are distinct, derived, and owned by no wallet.
+
+So the conclusion is not a design preference: **no signature can authorise a
+sink spend, and no L2 state can change that.** There is no implementation-only
+path to an exit.
+
+### Owner approval required — three decisions (full text in `l2-exit-design.md`)
+
+| # | Decision | Recommendation |
+|---|---|---|
+| **E-1** | **The L1 release primitive.** Either *(a)* a consensus-authorised **spend of sink outputs** authorised by an exit proof instead of a signature, or *(b)* replace the keyless sink with a validator-threshold escrow. | **(a).** It keeps the ordinary `value_in >= value_out` rule in force everywhere and reuses the existing `Undo` path, so a reorg unwinds a release like any other spend. *(b)* introduces a key the architecture deliberately avoids and makes committee-key compromise a fund-loss event. |
+| **E-2** | **Permitless crank or gated release.** | **Permissionless crank:** anyone may submit, consensus pays only the recorded `destination`. No operator privilege, no second authorisation path to audit. |
+| **E-3** | **Who funds the L1 release fee.** | **The exiting owner, prepaid at queue time.** The L2 side debits `amount + exit_fee_sat`; the claimant receives the fee, the destination receives the principal. Prepayment is what makes a permissionless crank griefing-bounded. |
+
+**E-4 to E-6 may default to the narrower choice** — no cancellation, no
+challenge window, no emergency pause — because each default adds authority to
+nobody. They need acknowledgment, not design work.
+
+### Also required before implementation, and NOT yet decided
+
+- **An L2 → L1 proof mechanism.** L2 state is derived by replay and is **not**
+  committed on chain in a form L1 can check. The recommendation is to commit an
+  L2 state root at the activation height and require a Merkle inclusion proof.
+  This is the largest single piece of the change.
+- **A network-upgrade / activation mechanism.** None exists. `finality_activation_height`
+  is the only height-gated rule and it is profile data, not a negotiated
+  upgrade.
+
+### What is already implemented (safe, non-consensus)
+
+`crates/jnt-core/tests/sink_unspendable.rs`,
+`crates/jnt-l2/tests/exit_unavailable.rs`,
+`crates/jnt-node/src/conservation.rs` (+ `tests/conservation.rs`), and two
+rejection tests in `crates/jnt-node/tests/api.rs`. These pin the one-way
+behaviour and the sink accounting that the exit must preserve. When the rule is
+approved, those tests are the migration checklist — see `docs/l2-exit-design.md`,
+*Migration, activation and compatibility*.
 
 ## P2 — Bonded stake / mainnet validator committee (mainnet blocker)
 
