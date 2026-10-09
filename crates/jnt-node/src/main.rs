@@ -486,9 +486,11 @@ fn cmd_init(args: &Args) -> Result<(), String> {
     println!("network        {}", store.params.name);
     println!("genesis        {}", hash_to_hex(&chain.tip_hash()));
     println!("block time     {} ms", store.params.target_block_time_ms);
-    println!("supply cap     {} JNT", store.params.supply_cap_jnt());
     println!(
-        "reachable      {} JNT (the rest is permanently unmintable)",
+        "issuance       ladder then a permanent tail; rate-anchored at 1% of issued per halving period (no stock cap, Decision 18)"
+    );
+    println!(
+        "ladder reachable {} JNT",
         max_issuance_sat(&store.params) / SAT_PER_JNT
     );
     println!("data dir       {}", store.dir.display());
@@ -761,10 +763,21 @@ fn cmd_status(args: &Args) -> Result<(), String> {
         jnt(cumulative_supply_sat(&store.params, report.height))
     );
     println!("reachable max  {} JNT", jnt(report.reachable_sat));
-    println!("hard cap       {} JNT", jnt(report.cap_sat));
+    if report.rate_allowance_sat == u64::MAX {
+        println!("rate anchor    ladder era (grandfathered, bounded by the rungs)");
+    } else {
+        println!(
+            "rate anchor    {} JNT max per halving period (1% of issued)",
+            jnt(report.rate_allowance_sat)
+        );
+    }
     println!(
-        "unmintable     {} JNT (never issuable)",
-        jnt(report.cap_sat - report.reachable_sat)
+        "removed        {} JNT (base fees burned + PSCB, all usage ever)",
+        jnt(report.removed_sat)
+    );
+    println!(
+        "net supply     {} JNT (issued minus removed)",
+        jnt(report.net_supply_sat)
     );
 
     // L2 is derived from the stored chain, so `status` reconstructs it the
@@ -850,8 +863,9 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
     // at most genesis plus matured deposits, and L1 live supply plus
     // everything L2 ever held, minus what sits identifiably in the deposit
     // sink, stays under the joint bound — the issuance integral at the tip
-    // plus the escrow ceiling (approved M-E); `supply_cap_sat` is reported as
-    // a sanity ceiling only. The sink term is the M3 correction: sink
+    // plus the escrow ceiling (approved M-E). The stock cap is gone entirely
+    // (Decision 18): the rate anchor bounds issuance, so there is no sanity
+    // ceiling term to report here. The sink term is the M3 correction: sink
     // outputs remain in the L1 UTXO set (unspendable) while their twins live
     // in L2, so counting both sides without subtracting the sink would cry
     // inflation on every deposit. Burns anywhere move the sum down, never up —
@@ -862,7 +876,7 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
     let supply =
         jnt_node::conservation::verify_conservation(&chain, &a).map_err(|e| e.to_string())?;
     println!(
-        "ok: joint supply conserved (l1 live {} + l2 held {} - sink {} = {} sat of {} bound)\n    bound = l1 issuance integral {} + escrow ceiling {} (sanity cap {})",
+        "ok: joint supply conserved (l1 live {} + l2 held {} - sink {} = {} sat of {} bound)\n    bound = l1 issuance integral {} + escrow ceiling {}",
         supply.l1_live_sat,
         supply.l2_held_sat,
         supply.sink_held_sat,
@@ -870,7 +884,6 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         supply.bound_sat(),
         supply.l1_bound_sat,
         supply.escrow_ceiling_sat,
-        supply.cap_sat
     );
     for s in a.skipped().iter().take(10) {
         println!(

@@ -166,9 +166,7 @@ def selftest() -> int:
     check("mainnet exhausted issuance", cumulative_jnt(MAINNET, 1_839_600, "A"), 39_157_124.0)
     check("ladder sum x period less the genesis slot (149H - 76)",
           sum(ladder_rung_jnt(MAINNET, k) for k in range(7)) * 262_800 - 76, 39_157_124.0)
-    check("mainnet unmintable gap", MAINNET["cap_jnt"] - 39_157_124.0, 788_476.0)
     check("mini exhausted issuance", cumulative_jnt(MINI, 14_000, "A"), 297_924.0)
-    check("mini unmintable gap", MINI["cap_jnt"] - 297_924.0, 6_076.0)
     check("mini exhaustion height", exhaustion_height(MINI), 14_000)
 
     print("== continuity ==")
@@ -238,6 +236,22 @@ def selftest() -> int:
         fails.append("policy A must stop at 39,157,124")
     print("  ok    policy A is bounded at 39,157,124 JNT")
 
+    print("== rate anchor headroom (Decision 18) ==")
+    # The 1 % per-halving-period ceiling must never bind the approved DECAY
+    # tail: each of the first tail windows' gross issuance is measured against
+    # the supply issued at that window's start.
+    H = MAINNET["halving_period"]
+    start_h = exhaustion_height(MAINNET)
+    worst = 0.0
+    for k in range(6):
+        ws = start_h + k * H
+        base = cumulative_jnt(MAINNET, ws - 1, "DECAY", RECOMMENDED_FLOOR_JNT)
+        gross = cumulative_jnt(MAINNET, ws + H - 1, "DECAY", RECOMMENDED_FLOOR_JNT) - base
+        worst = max(worst, gross / base)
+        print(f"  ok    tail window {k}: {gross:>12,.0f} JNT on {base:>12,.0f} "
+              f"issued ({100 * gross / base:.4f}%)")
+    check("no approved tail window reaches the 1 % anchor", worst < 0.01, True)
+
     print("== overflow headroom ==")
     for tail_sat, profile in [(int(RECOMMENDED_FLOOR_JNT * SAT_PER_JNT), MAINNET),
                               (1, MINI)]:
@@ -255,11 +269,10 @@ def selftest() -> int:
         check("vectors sat_per_jnt", v["sat_per_jnt"], SAT_PER_JNT)
         for key, prof, policy in (("mainnet", MAINNET, "A"), ("mini", MINI, "A")):
             sec = v[key]
-            check(f"{key} hard_cap_jnt", sec["hard_cap_jnt"], prof["cap_jnt"])
+            check(f"{key} rate_anchor_max_pct_per_period",
+                  sec["rate_anchor_max_pct_per_period"], 1.0)
             reach = int(cumulative_jnt(prof, 64 * prof["halving_period"], policy))
             check(f"{key} max_reachable_jnt", sec["max_reachable_jnt"], reach)
-            check(f"{key} unmintable_jnt", sec["unmintable_jnt"],
-                  prof["cap_jnt"] - reach)
             check(f"{key} issued_after_first_period_jnt",
                   sec["issued_after_first_period_jnt"],
                   int(cumulative_jnt(prof, prof["halving_period"], policy)))

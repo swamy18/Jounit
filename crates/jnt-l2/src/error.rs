@@ -75,6 +75,17 @@ pub enum L2Error {
     /// a later block pay once; the second occurrence is refused by name
     /// (Decision 10 item 5).
     DuplicateDeposit,
+    /// Exits are not active on this state: the profile never activates them
+    /// (`exit_activation_height == 0`) or the queue height predates
+    /// activation. Queueing would encumber funds with no release.
+    ExitNotActive,
+    /// An exit nonce that repeats or rewinds the owner's last queue nonce.
+    /// Nonces are strictly increasing per owner (approved P1 replay rule).
+    BadExitNonce,
+    /// No queued exit for this `(owner, nonce)` — never queued, or already
+    /// released (release removes the record, so a spent exit has no leaf and
+    /// no second release).
+    UnknownExit,
     /// A codec failure raised by `jnt-core`.
     Codec(jnt_core::Error),
     /// A reputation derivation refused a canonical artifact (roadmap item 9).
@@ -130,6 +141,9 @@ impl fmt::Display for L2Error {
             }
             L2Error::InvalidGenesis(why) => write!(f, "invalid l2 genesis: {why}"),
             L2Error::DuplicateDeposit => write!(f, "deposit already credited"),
+            L2Error::ExitNotActive => write!(f, "exits are not active at this height"),
+            L2Error::BadExitNonce => write!(f, "exit nonce repeats or rewinds"),
+            L2Error::UnknownExit => write!(f, "no such queued exit"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),
             L2Error::Reputation(w) => write!(f, "reputation: {w}"),
         }

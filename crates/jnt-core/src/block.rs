@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::exit::{ExitClaim, EXIT_CLAIM_MIN_ENCODED_LEN};
 use crate::hash::{sha256, sha256_dom, Hash, DOM_BLOCK};
 use crate::l2::L2Transaction;
 use crate::ser::{Reader, Writer};
@@ -134,6 +135,27 @@ pub struct Block {
     /// one — so no frozen vector and no stored block changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub l2_txs: Vec<L2Transaction>,
+    /// The committed L2 state root after this block's L2 transitions
+    /// (approved P1, SPEC.md §19.6): the `L2State::committed_root` over
+    /// accounts plus queued exits, which the exit release rule verifies proofs
+    /// against.
+    ///
+    /// `None` for every pre-activation block and for post-activation blocks
+    /// with no L2 transactions — the section rules below keep those encodings
+    /// byte-identical to history. A post-activation block that carries L2
+    /// transactions without a root is refused by consensus (the queue in it
+    /// could never be proven), and a root below activation is refused (one
+    /// encoding per block, and the upgrade must be explicit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2_state_root: Option<Hash>,
+    /// L2 → L1 exit claims settled by this block (approved P1, E-1…E-3).
+    ///
+    /// Each claim consumes sink outputs and pays the recorded destination plus
+    /// the claimant, authorised by an exit proof rather than a signature (see
+    /// `crate::exit`). Empty for every pre-exit block; the section below is
+    /// omitted when empty, so history is byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_claims: Vec<ExitClaim>,
 }
 
 impl Block {
@@ -146,14 +168,32 @@ impl Block {
         for tx in &self.txs {
             w.raw(&tx.serialize());
         }
-        // L2 section (Decision 6). Omitted entirely when empty — see the field
-        // comment: absence is what keeps every pre-Phase-6 block byte-identical.
-        // Each entry is length-prefixed so it can be read back without an L2
-        // reader, and so a malformed entry cannot desynchronise the parse.
-        if !self.l2_txs.is_empty() {
+        // L2 section (Decision 6 + P1 root). Omitted entirely when there is
+        // nothing to commit — see the field comment: absence is what keeps
+        // every pre-Phase-6 block byte-identical. Each entry is length-prefixed
+        // so it can be read back without an L2 reader, and so a malformed
+        // entry cannot desynchronise the parse. The root flag closes the
+        // section explicitly (`0x00` = no root, `0x01` = 32 root bytes
+        // follow): a bare length check could not tell a 32-byte root from a
+        // 32-byte claims section, so the flag — not position — disambiguates.
+        if !self.l2_txs.is_empty() || self.l2_state_root.is_some() {
             w.u32le(self.l2_txs.len() as u32);
             for tx in &self.l2_txs {
                 let bytes = tx.serialize();
+                w.u32le(bytes.len() as u32).raw(&bytes);
+            }
+            match &self.l2_state_root {
+                None => w.u8(0x00),
+                Some(root) => w.u8(0x01).fixed(root),
+            };
+        }
+        // Exit-claim section (approved P1). Omitted entirely when empty, the
+        // same discipline as the L2 section: every pre-exit block keeps its
+        // exact bytes. Entries are length-prefixed like L2 transactions.
+        if !self.exit_claims.is_empty() {
+            w.u32le(self.exit_claims.len() as u32);
+            for claim in &self.exit_claims {
+                let bytes = claim.serialize();
                 w.u32le(bytes.len() as u32).raw(&bytes);
             }
         }
@@ -180,14 +220,23 @@ impl Block {
             txs.push(tx);
         }
 
-        // L2 section (Decision 6). It is present only when non-empty. An empty
-        // section is a *second* encoding of a block that serializes without
-        // one, so it is refused rather than accepted: two encodings for one
-        // block would mean two byte strings claiming the same identity.
+        // L2 section (Decision 6 + P1 root). It is present only when it commits
+        // something: L2 transactions, a state root, or both. An empty section
+        // is a *second* encoding of a block that serializes without one, so it
+        // is refused rather than accepted: two encodings for one block would
+        // mean two byte strings claiming the same identity. The root flag
+        // closes the section explicitly; any flag byte but `0x00`/`0x01` is
+        // malformed, and anything trailing the section that is not the claim
+        // section below is malformed.
         let mut l2_txs = Vec::new();
+        let mut l2_state_root = None;
+        // L2 transactions, if any, come first; the exit-claim section, if
+        // any, comes last. Both are decoded here so one `expect_end` still
+        // guards the whole body.
+        let mut exit_claims = Vec::new();
         if r.remaining() > 0 {
             let m = r.u32le()? as usize;
-            if m == 0 {
+            if m == 0 && r.remaining() == 0 {
                 return Err(Error::Malformed(
                     "empty L2 section is not a canonical block encoding",
                 ));
@@ -201,6 +250,43 @@ impl Block {
                 let bytes = r.fixed_slice(len)?;
                 l2_txs.push(L2Transaction::deserialize(bytes)?);
             }
+            match r.u8()? {
+                0x00 => {}
+                0x01 => {
+                    l2_state_root = Some(r.fixed()?);
+                }
+                _ => {
+                    return Err(Error::Malformed("l2 root flag must be 0x00 or 0x01"));
+                }
+            }
+            // A section with no transactions and no root is the empty section
+            // by another name: refused, so one block keeps one encoding.
+            if m == 0 && l2_state_root.is_none() {
+                return Err(Error::Malformed(
+                    "empty L2 section is not a canonical block encoding",
+                ));
+            }
+            // A root with no transactions commits nothing new — but it is a
+            // distinct shape, not a second encoding, so decoding accepts it
+            // and consensus validation decides (it refuses a rootless L2
+            // section post-activation, never a redundant root).
+            if r.remaining() > 0 {
+                let k = r.u32le()? as usize;
+                if k == 0 {
+                    return Err(Error::Malformed(
+                        "empty exit-claim section is not a canonical block encoding",
+                    ));
+                }
+                if k > r.remaining() / EXIT_CLAIM_MIN_ENCODED_LEN {
+                    return Err(Error::Malformed("exit claim count exceeds buffer"));
+                }
+                exit_claims.reserve(k);
+                for _ in 0..k {
+                    let len = r.u32le()? as usize;
+                    let bytes = r.fixed_slice(len)?;
+                    exit_claims.push(ExitClaim::deserialize(bytes)?);
+                }
+            }
         }
 
         r.expect_end()?;
@@ -210,6 +296,8 @@ impl Block {
             signer_pubkey,
             txs,
             l2_txs,
+            l2_state_root,
+            exit_claims,
         })
     }
 
@@ -218,11 +306,17 @@ impl Block {
     }
 
     /// The root the header commits to. Covers L1 transactions first, then L2
-    /// transactions (Decision 6) — which is what binds an L2 payload to the
-    /// block hash, so `Chain::submit`'s existing merkle check authenticates L2
-    /// content with no new consensus rule.
+    /// transactions (Decision 6), then the committed L2 state root when the
+    /// block carries one, then exit claims in block order (approved P1) — a
+    /// claim stripped from the body no longer matches the header, exactly as
+    /// for L2 transactions.
     pub fn merkle_root(&self) -> Hash {
-        merkle_root_with_l2(&self.txs, &self.l2_txs)
+        merkle_root_with_l2(
+            &self.txs,
+            &self.l2_txs,
+            self.l2_state_root.as_ref(),
+            &self.exit_claims,
+        )
     }
 
     /// Number of L2 transactions carried. Zero for every pre-Phase-6 block.
@@ -240,6 +334,16 @@ impl Block {
             acc.checked_add(t.gas_used()).ok_or(Error::ValueOverflow)
         })
     }
+
+    /// Gas burned by this block's exit claims (approved P1). Claims are
+    /// ordinary block space: they count toward the gas cap and the base-fee
+    /// schedule exactly like body transactions, so exits cannot buy cheap
+    /// block space the fee market never sees.
+    pub fn claims_gas_used(&self) -> Result<u64> {
+        self.exit_claims.iter().try_fold(0u64, |acc, c| {
+            acc.checked_add(c.gas_used()).ok_or(Error::ValueOverflow)
+        })
+    }
 }
 
 const LEAF_TAG: u8 = 0x00;
@@ -247,6 +351,17 @@ const INTERNAL_TAG: u8 = 0x01;
 /// L2 leaves are domain-separated from L1 leaves so an L2 payload can never be
 /// reinterpreted as an L1 transaction leaf (Decision 6, SPEC.md §2 and §19.1).
 const LEAF_TAG_L2: u8 = 0x02;
+/// The committed L2 state root rides as its own leaf (approved P1), after the
+/// L2 transaction leaves. `0x03` is sequential in *this* tree; the L2 state
+/// tree's account-leaf `0x03` lives in a different tree (different root,
+/// different verifier), exactly as the `0x01` internal tag already appears in
+/// both trees without ambiguity.
+const LEAF_TAG_L2_ROOT: u8 = 0x03;
+/// Exit-claim leaves close the tree (approved P1): each claim's canonical
+/// bytes under their own tag, so a claim can never be reinterpreted as a
+/// transaction of either kind. `0x04` is sequential here; the L2 state tree's
+/// exit-record `0x04` is a different tree's tag, same precedent as above.
+const LEAF_TAG_EXIT_CLAIM: u8 = 0x04;
 
 /// Binary merkle root with domain-separated leaves and internal nodes.
 /// Odd nodes are duplicated, Bitcoin-style. SPEC.md §2.
@@ -258,20 +373,35 @@ pub fn merkle_root(txs: &[Transaction]) -> Hash {
     merkle_from_leaves(leaves)
 }
 
-/// Merkle root over a block body that may carry L2 transactions (Decision 6).
+/// Merkle root over a block body that may carry L2 transactions (Decision 6),
+/// a committed L2 state root and exit claims (approved P1).
 ///
-/// L1 leaves come first in block order, then L2 leaves in block order. When
-/// `l2` is empty this is **bit-identical** to `merkle_root(l1)`, which is the
+/// L1 leaves come first in block order, then L2 leaves in block order, then
+/// the root leaf, then claim leaves in block order. When there is nothing but
+/// L1 to commit this is **bit-identical** to `merkle_root(l1)`, which is the
 /// property that keeps `genesis_block()` and every existing block unchanged.
-/// The two leaf kinds use different domain tags, so a body cannot be presented
-/// with an L2 payload where an L1 transaction leaf is expected.
-pub fn merkle_root_with_l2(l1: &[Transaction], l2: &[L2Transaction]) -> Hash {
-    if l2.is_empty() {
+/// Every leaf kind uses its own domain tag, so a body cannot be presented
+/// with one kind where another is expected.
+pub fn merkle_root_with_l2(
+    l1: &[Transaction],
+    l2: &[L2Transaction],
+    root: Option<&Hash>,
+    claims: &[ExitClaim],
+) -> Hash {
+    if l2.is_empty() && root.is_none() && claims.is_empty() {
         return merkle_root(l1);
     }
-    let mut leaves: Vec<Hash> = Vec::with_capacity(l1.len() + l2.len());
+    let mut leaves: Vec<Hash> = Vec::with_capacity(l1.len() + l2.len() + claims.len() + 1);
     leaves.extend(l1.iter().map(|t| sha256(&[&[LEAF_TAG], &t.serialize()])));
     leaves.extend(l2.iter().map(|t| sha256(&[&[LEAF_TAG_L2], &t.serialize()])));
+    if let Some(r) = root {
+        leaves.push(sha256(&[&[LEAF_TAG_L2_ROOT], r]));
+    }
+    leaves.extend(
+        claims
+            .iter()
+            .map(|c| sha256(&[&[LEAF_TAG_EXIT_CLAIM], &c.serialize()])),
+    );
     merkle_from_leaves(leaves)
 }
 
@@ -315,6 +445,8 @@ pub fn genesis_block(difficulty: u128) -> Block {
         signer_pubkey: [0u8; 33],
         txs: vec![coinbase],
         l2_txs: Vec::new(),
+        l2_state_root: None,
+        exit_claims: Vec::new(),
     }
 }
 
@@ -599,7 +731,10 @@ mod tests {
         let hash_without = b.block_hash();
 
         // The compatibility direction first: no L2 txs means the same root.
-        assert_eq!(merkle_root_with_l2(&b.txs, &[]), merkle_root(&b.txs));
+        assert_eq!(
+            merkle_root_with_l2(&b.txs, &[], None, &[]),
+            merkle_root(&b.txs)
+        );
 
         b.l2_txs.push(l2_post());
         let bytes = b.serialize();
@@ -655,6 +790,38 @@ mod tests {
         let b = genesis_block(1);
         let mut bytes = b.serialize();
         bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            Block::deserialize(&bytes),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_committed_l2_root_round_trips_and_moves_the_commitment() {
+        let mut b = genesis_block(1);
+        b.l2_txs.push(l2_post());
+        let rootless = b.merkle_root();
+        b.l2_state_root = Some([0xABu8; 32]);
+        let bytes = b.serialize();
+        let back = Block::deserialize(&bytes).unwrap();
+        assert_eq!(back, b);
+        assert_eq!(back.l2_state_root, Some([0xABu8; 32]));
+        // The root is its own leaf: the commitment moves.
+        assert_ne!(b.merkle_root(), rootless);
+        // Stripping the flag + root (33 bytes) leaves a section the decoder
+        // refuses: the flag is load-bearing, so the root cannot be silently
+        // dropped from committed bytes.
+        let stripped = Block::deserialize(&bytes[..bytes.len() - 33]);
+        assert!(stripped.is_err());
+    }
+
+    #[test]
+    fn trailing_bytes_that_are_not_a_root_are_rejected() {
+        let mut b = genesis_block(1);
+        b.l2_txs.push(l2_post());
+        let mut bytes = b.serialize();
+        // 31 bytes: neither absent nor a full root.
+        bytes.extend_from_slice(&[0x55u8; 31]);
         assert!(matches!(
             Block::deserialize(&bytes),
             Err(Error::Malformed(_))

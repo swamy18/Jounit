@@ -8,19 +8,23 @@
 //! counter bug, since fixed — the comment outlived the code and misdescribed a
 //! consensus rule, which is worse than no comment at all.)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::block::{genesis_block, Block, Header};
 use crate::difficulty::{next_difficulty, validate_local_clock, validate_timestamp};
 use crate::error::{Error, Result};
-use crate::fees::{next_base_fee, split_fees, FeeSplit};
+use crate::exit::ExitClaim;
+use crate::fees::{next_base_fee, required_fee, split_fees, FeeSplit};
 use crate::finality::{FinalityError, FinalityManager};
-use crate::hash::{Hash, DOM_BLOCK};
+use crate::hash::{Address, Hash, DOM_BLOCK};
 use crate::ledger::{check_tx, Undo, Utxo, UtxoSet};
 use crate::mempool::{Mempool, ReconcileReport};
 use crate::params::NetworkParams;
 use crate::puzzle::{PuzzleRegistry, PuzzleSolver, PuzzleSpec};
-use crate::supply::{block_reward_sat, check_mint_at_height, max_issuance_sat};
+use crate::supply::{
+    block_reward_sat, check_mint_at_height, cumulative_issuance_sat, max_issuance_sat,
+    rate_anchor_allowance,
+};
 use crate::tx::{OutPoint, Output, Transaction, TX_COINBASE};
 
 /// Upper bound on mining attempts for a single block. Difficulty that would need
@@ -34,6 +38,10 @@ struct Snapshot {
     undo: HashMap<Hash, Undo>,
     pscb_reserve: u64,
     pscb_undo: HashMap<Hash, u64>,
+    burned_fees_total: u64,
+    burned_undo: HashMap<Hash, u64>,
+    released_exits: HashSet<(Address, u64)>,
+    exit_undo: HashMap<Hash, Vec<(Address, u64)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,12 +62,31 @@ pub struct Chain {
     /// Accumulated PSCB (Protocol Security & Compute Buffer) reserve.
     /// M1 protocol mechanism: 50% of every block's base-fee portion is routed
     /// here rather than burned. The reserve backs the M2 Time-Locked Compute
-    /// Reserve vault without touching the hard supply cap.
+    /// Reserve vault; it is already-removed supply, tracked as a
+    /// protocol-owned accounting claim rather than re-entering circulation.
     pscb_reserve: u64,
     /// Per-block PSCB deltas, keyed by block hash. Required for reorg
     /// correctness: when a canonical block is rolled back, its PSCB contribution
     /// must be subtracted from the running total.
     pscb_undo: HashMap<Hash, u64>,
+    /// Exit identities already released to L1, keyed by `(owner, nonce)`
+    /// (approved P1). One release per identity, ever: consensus refuses a
+    /// replay by this set rather than by bookkeeping, so a re-submitted
+    /// claim is invalid on every node, not just on nodes that remember it.
+    released_exits: HashSet<(Address, u64)>,
+    /// Per-block released identities, keyed by block hash. Required for reorg
+    /// correctness exactly like the PSCB deltas: rolling a block back unmarks
+    /// its releases, so a reorged-away release can happen again on the
+    /// winning branch — and a release the winner keeps stays released.
+    exit_undo: HashMap<Hash, Vec<(Address, u64)>>,
+    /// Accumulated base-fee burn (M1's destroyed half, Stage SA-4). The other
+    /// half is the PSCB reserve above; together they are everything usage
+    /// ever removed from live supply, so `issued integral − (burned +
+    /// PSCB)` is the net supply holders experience (Decision 18 §4.5).
+    burned_fees_total: u64,
+    /// Per-block burn deltas, keyed by block hash — rewound exactly like the
+    /// PSCB deltas, for the same reason.
+    burned_undo: HashMap<Hash, u64>,
     /// Non-coinbase transactions the most recent successful reorg rolled back,
     /// oldest block first. Drained by the caller so the mempool can re-admit
     /// them.
@@ -101,6 +128,10 @@ impl Chain {
             undo: HashMap::new(),
             pscb_reserve: 0,
             pscb_undo: HashMap::new(),
+            burned_fees_total: 0,
+            burned_undo: HashMap::new(),
+            released_exits: HashSet::new(),
+            exit_undo: HashMap::new(),
             disconnected_txs: Vec::new(),
             finality: FinalityManager::default(),
         };
@@ -164,6 +195,21 @@ impl Chain {
     /// tracked here to power the M2 slash recovery vault.
     pub fn pscb_reserve(&self) -> u64 {
         self.pscb_reserve
+    }
+
+    /// Cumulative base-fee value destroyed by the M1 burn half (Stage SA-4).
+    ///
+    /// Together with [`Chain::pscb_reserve`] this is everything usage ever
+    /// removed from live supply: net supply = issuance integral − (burned +
+    /// PSCB). Rewound per rolled-back block, exactly like the reserve.
+    pub fn burned_fees_total(&self) -> u64 {
+        self.burned_fees_total
+    }
+
+    /// Everything usage ever removed from live supply: the destroyed half
+    /// plus the PSCB half of every block's base fee (Stage SA-4).
+    pub fn base_removed_total(&self) -> u64 {
+        self.burned_fees_total.saturating_add(self.pscb_reserve)
     }
 
     /// Height below which history is immutable.
@@ -314,6 +360,12 @@ impl Chain {
                 cap: self.params.max_tx_count,
             });
         }
+        if block.exit_claims.len() > self.params.max_tx_count {
+            return Err(Error::TooManyTxs {
+                got: block.exit_claims.len(),
+                cap: self.params.max_tx_count,
+            });
+        }
         if block.txs.is_empty() {
             return Err(Error::BadCoinbase("block has no transactions"));
         }
@@ -338,6 +390,10 @@ impl Chain {
         }
 
         let gas_used = block.total_gas_used()?;
+        let claims_gas = block.claims_gas_used()?;
+        let gas_used = gas_used
+            .checked_add(claims_gas)
+            .ok_or(Error::ValueOverflow)?;
         if gas_used > self.params.gas_cap {
             return Err(Error::GasOverCap {
                 used: gas_used,
@@ -350,6 +406,35 @@ impl Chain {
             if !seen.insert(tx.txid()) {
                 return Err(Error::DuplicateTxid);
             }
+        }
+        // Claims live in the same id space for duplication purposes: a
+        // replayed claim is the same bytes with the same id, and an id that
+        // collides across the two lists is refused rather than interpreted.
+        for claim in &block.exit_claims {
+            if !seen.insert(claim.claim_id()) {
+                return Err(Error::DuplicateTxid);
+            }
+        }
+
+        // Exit activation (approved P1): below the height the profile
+        // activates, a committed root or a claim is a second encoding rule
+        // the network never agreed to — refused structurally, before any
+        // proof is read. At and after activation, L2 transactions without a
+        // committed root are refused: a queue in such a block could never be
+        // proven, so the block would silently disable exits.
+        let activation = self.params.exit_activation_height;
+        let active = activation != 0 && block.header.height >= activation;
+        if !active {
+            if block.l2_state_root.is_some() {
+                return Err(Error::Malformed("l2 root before exit activation"));
+            }
+            if !block.exit_claims.is_empty() {
+                return Err(Error::Malformed("exit claim before activation"));
+            }
+        } else if !block.l2_txs.is_empty() && block.l2_state_root.is_none() {
+            return Err(Error::Malformed(
+                "post-activation L2 section must commit a root",
+            ));
         }
 
         // The cached solver must agree with the registry entry it stands in for.
@@ -455,6 +540,18 @@ impl Chain {
         // that fails partway through must leave the ledger exactly as it found
         // it, or the node credits outputs from a block it just rejected.
         let mut applied: Vec<Undo> = Vec::new();
+        // Exit claims (approved P1) settle before the body, so a body
+        // transaction may spend a release output in the same block. Their gas
+        // and fees fold into the block totals below, exactly like body
+        // transactions — a claim is ordinary block space, not an exemption.
+        let marked = self.apply_exit_claims(
+            block,
+            height,
+            &mut applied,
+            &mut body_undo,
+            &mut total_gas,
+            &mut total_fees,
+        )?;
         let outcome = self.apply_body(
             block,
             body,
@@ -470,6 +567,7 @@ impl Chain {
                 for u in applied.iter().rev() {
                     self.utxo.undo(u);
                 }
+                self.unwind_claims(&marked);
                 return Err(e);
             }
         };
@@ -482,6 +580,7 @@ impl Chain {
             for u in applied.iter().rev() {
                 self.utxo.undo(u);
             }
+            self.unwind_claims(&marked);
             return Err(Error::BadFee("coinbase claims more than reward plus tip"));
         }
 
@@ -489,8 +588,9 @@ impl Chain {
         // 2026-10-09): live UTXO value may never exceed the issuance integral
         // at this height. Defence in depth over the reward+tip rule above —
         // a reward-function bug becomes a rejected block here instead of an
-        // inflation incident. O(periods), effectively O(1); `supply_cap_sat`
-        // remains as a sanity ceiling but is no longer load-bearing.
+        // inflation incident. O(periods), effectively O(1). Decision 18
+        // (2026-10-09) removed the stock cap; the second bound is the rate
+        // anchor, enforced by the same function.
         //
         // The comparison itself lives in `supply::check_mint_at_height` so the
         // miner, this validator and the node report share one rule rather than
@@ -500,6 +600,7 @@ impl Chain {
             for u in applied.iter().rev() {
                 self.utxo.undo(u);
             }
+            self.unwind_claims(&marked);
             return Err(e);
         }
 
@@ -530,6 +631,14 @@ impl Chain {
         // hard-capped fee schedule makes this unreachable.
         self.pscb_reserve = self.pscb_reserve.saturating_add(split.pscb);
         self.pscb_undo.insert(hash, split.pscb);
+        // The destroyed half, tracked the same way (Stage SA-4): the two
+        // halves together are the removal term net-supply reporting needs.
+        self.burned_fees_total = self.burned_fees_total.saturating_add(split.burned);
+        self.burned_undo.insert(hash, split.burned);
+        // Record this block's releases (approved P1): the identities stay
+        // marked while the block is canonical and are unmarked by
+        // `rollback_block` if a reorg takes it.
+        self.exit_undo.insert(hash, marked);
         self.undo.insert(hash, body_undo);
         Ok(())
     }
@@ -576,6 +685,254 @@ impl Chain {
         split_fees(*total_gas, *total_fees, block.header.base_fee_sat)
     }
 
+    /// Validate one exit claim against current state (approved P1, E-1…E-3).
+    ///
+    /// Pure validation: resolves sink inputs against `utxo`, checks the exit
+    /// proof against the root the queue block committed, maturity under the
+    /// stronger Decision-15 rule, idempotency against the released set, and
+    /// exact funding (`inputs == amount + exit_fee + required L1 fee` — no
+    /// change output, no tip). Returns the gas and the L1 fee for the caller
+    /// to fold into the block totals. Every refusal names its reason, exactly
+    /// like `check_tx`: a claim that fails must say which rule failed.
+    fn check_claim(
+        &self,
+        utxo: &UtxoSet,
+        claim: &ExitClaim,
+        height: u64,
+        base_fee: u64,
+    ) -> Result<(u64, u64)> {
+        let activation = self.params.exit_activation_height;
+        if activation == 0 || height < activation {
+            return Err(Error::Malformed("exit claim before activation"));
+        }
+        if claim.queued_height < activation {
+            return Err(Error::Malformed("exit queued before activation"));
+        }
+        if claim.queued_height >= height {
+            return Err(Error::Malformed("exit queue height not yet final"));
+        }
+        // Maturity: depth *and* the binding checkpoint once binding finality
+        // is active (Decision 15) — exits are never less safe than deposits,
+        // and `binding == 0` keeps depth-only finality where it never
+        // activated. `height - 1` is the tip this block extends.
+        let mature_at = claim
+            .queued_height
+            .saturating_add(self.params.finality_depth);
+        if height.saturating_sub(1) < mature_at {
+            return Err(Error::Malformed("exit not yet mature"));
+        }
+        let binding = self.finality().binding_finalized_height();
+        if binding != 0 && claim.queued_height > binding {
+            return Err(Error::Malformed("exit queue block not binding-final"));
+        }
+        // Idempotency by exit identity: one release per `(owner, nonce)`,
+        // ever, refused by consensus rather than by bookkeeping.
+        if self.released_exits.contains(&(claim.owner, claim.nonce)) {
+            return Err(Error::Malformed("exit already released"));
+        }
+        // The anchor: the queue block's committed root must exist and the
+        // record proof must verify against it. A queue in a block that
+        // committed no root cannot be proven — which is why post-activation
+        // L2 sections must carry one.
+        let root = self
+            .block_at(claim.queued_height)
+            .and_then(|b| b.l2_state_root)
+            .ok_or(Error::Malformed("no committed root at queue height"))?;
+        if !claim.verify_proof(&root) {
+            return Err(Error::Malformed("exit proof does not verify"));
+        }
+        // Sink inputs: real UTXOs, all sink outputs, no duplicates (a doubled
+        // outpoint would resolve twice and count its value twice), totalling
+        // exactly principal + prepaid fee + the required L1 fee.
+        let mut seen: Vec<OutPoint> = claim.inputs.clone();
+        seen.sort();
+        let before = seen.len();
+        seen.dedup();
+        if seen.len() != before {
+            return Err(Error::Malformed("exit claim repeats an input"));
+        }
+        let sink = self.params.l2_deposit_sink();
+        let mut value_in = 0u64;
+        for op in &claim.inputs {
+            let u = utxo.get(op).ok_or(Error::UnknownOutPoint)?;
+            if u.out.address != sink {
+                return Err(Error::Malformed("exit claim input is not a sink output"));
+            }
+            value_in = value_in
+                .checked_add(u.out.value)
+                .ok_or(Error::ValueOverflow)?;
+        }
+        let gas = claim.gas_used();
+        let l1_fee = required_fee(base_fee, gas);
+        let want = claim
+            .amount_sat
+            .checked_add(claim.exit_fee_sat)
+            .and_then(|v| v.checked_add(l1_fee))
+            .ok_or(Error::ValueOverflow)?;
+        if value_in != want {
+            return Err(Error::Malformed(
+                "exit claim inputs must total exactly amount + fee + l1 fee",
+            ));
+        }
+        Ok((gas, l1_fee))
+    }
+
+    /// Apply every exit claim of `block`, accumulating gas, fees and undo
+    /// data. Claims settle before the body so a body transaction may spend a
+    /// release output in the same block; the order is deterministic either
+    /// way, and claims-first is what lets a crank's release be immediately
+    /// usable. Caller unwinds UTXO writes with `applied` and identity marks
+    /// with the returned list on error — a block that fails partway must
+    /// leave the ledger *and* the released set exactly as it found them.
+    ///
+    /// Atomic within itself: a claim that fails unwinds the claims this call
+    /// already applied, so the caller never sees a half-applied claim list.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_exit_claims(
+        &mut self,
+        block: &Block,
+        height: u64,
+        applied: &mut Vec<Undo>,
+        body_undo: &mut Undo,
+        total_gas: &mut u64,
+        total_fees: &mut u64,
+    ) -> Result<Vec<(Address, u64)>> {
+        let mut marked = Vec::with_capacity(block.exit_claims.len());
+        // Local undo tail so a failing claim unwinds exactly what this call
+        // wrote (the caller's `applied` only ever grows, never shrinks).
+        let applied_base = applied.len();
+        let spent_base = body_undo.spent.len();
+        let created_base = body_undo.created.len();
+        for claim in &block.exit_claims {
+            if let Err(e) = self.apply_one_claim(
+                claim,
+                block,
+                height,
+                applied,
+                body_undo,
+                total_gas,
+                total_fees,
+                &mut marked,
+            ) {
+                for u in applied[applied_base..].iter().rev() {
+                    self.utxo.undo(u);
+                }
+                applied.truncate(applied_base);
+                body_undo.spent.truncate(spent_base);
+                body_undo.created.truncate(created_base);
+                self.unwind_claims(&marked);
+                return Err(e);
+            }
+        }
+        Ok(marked)
+    }
+
+    /// Validate and apply a single exit claim. See [`Self::apply_exit_claims`]
+    /// for the ordering and unwinding discipline.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_one_claim(
+        &mut self,
+        claim: &ExitClaim,
+        block: &Block,
+        height: u64,
+        applied: &mut Vec<Undo>,
+        body_undo: &mut Undo,
+        total_gas: &mut u64,
+        total_fees: &mut u64,
+        marked: &mut Vec<(Address, u64)>,
+    ) -> Result<()> {
+        let (gas, l1_fee) =
+            self.check_claim(&self.utxo, claim, height, block.header.base_fee_sat)?;
+        // Resolve first, mutate second (the `apply_tx` atomicity rule):
+        // every input must exist before any of them is removed. The pairs
+        // below are the undo record; the mutation itself goes through the
+        // shared helper so the live path and the miner probe agree.
+        let mut spent = Vec::with_capacity(claim.inputs.len());
+        for op in &claim.inputs {
+            let u = self
+                .utxo
+                .get(op)
+                .ok_or(Error::UnknownOutPoint)?
+                .clone();
+            spent.push((*op, u));
+        }
+        Self::apply_claim_utxo(&mut self.utxo, claim, height);
+        let id = claim.claim_id();
+        let mut created = Vec::with_capacity(2);
+        created.push(OutPoint { txid: id, index: 0 });
+        if claim.exit_fee_sat > 0 {
+            created.push(OutPoint { txid: id, index: 1 });
+        }
+        let undo = Undo { spent, created };
+        applied.push(undo.clone());
+        body_undo.spent.extend(undo.spent);
+        body_undo.created.extend(undo.created);
+        self.released_exits.insert((claim.owner, claim.nonce));
+        marked.push((claim.owner, claim.nonce));
+        *total_gas = total_gas
+            .checked_add(gas)
+            .ok_or(Error::ValueOverflow)?;
+        // The L1 fee rides the totals like any transaction fee; the split
+        // burns half and PSCBs half, and there is no tip on a claim
+        // (exact funding was checked above).
+        *total_fees = total_fees
+            .checked_add(l1_fee)
+            .ok_or(Error::ValueOverflow)?;
+        Ok(())
+    }
+
+    /// Unmark exit identities a failed block had claimed. UTXO writes unwind
+    /// through `applied`; this unwinds the consensus identity set, so a
+    /// rejected block changes neither.
+    fn unwind_claims(&mut self, marked: &[(Address, u64)]) {
+        for id in marked {
+            self.released_exits.remove(id);
+        }
+    }
+
+    /// Whether an exit identity is already released (approved P1). The miner
+    /// crank reads this to skip spent exits; consensus writes it.
+    pub fn exit_released(&self, owner: &Address, nonce: u64) -> bool {
+        self.released_exits.contains(&(*owner, nonce))
+    }
+
+    /// Apply a *checked* claim's UTXO effects to an arbitrary set.
+    ///
+    /// The caller validated everything first (miner probe in `build_block`,
+    /// live set in [`Chain::apply_one_claim`]); this only moves value, so
+    /// mining and applying cannot disagree about what a claim does to the
+    /// ledger. Outputs are keyed by claim id, exactly as a transaction's are
+    /// keyed by txid.
+    fn apply_claim_utxo(utxo: &mut UtxoSet, claim: &ExitClaim, height: u64) {
+        for op in &claim.inputs {
+            let _ = utxo.remove(op);
+        }
+        let id = claim.claim_id();
+        utxo.insert(
+            OutPoint { txid: id, index: 0 },
+            Utxo {
+                out: crate::tx::Output {
+                    value: claim.amount_sat,
+                    address: claim.destination,
+                },
+                height,
+            },
+        );
+        // A zero prepaid fee creates no output (see `apply_one_claim`).
+        if claim.exit_fee_sat > 0 {
+            utxo.insert(
+                OutPoint { txid: id, index: 1 },
+                Utxo {
+                    out: crate::tx::Output {
+                        value: claim.exit_fee_sat,
+                        address: claim.claimant,
+                    },
+                    height,
+                },
+            );
+        }
+    }
+
     fn rollback_block(&mut self, hash: &Hash) {
         let Some(block) = self.blocks.get(hash).cloned() else {
             return;
@@ -600,6 +957,18 @@ impl Chain {
         if let Some(delta) = self.pscb_undo.remove(hash) {
             self.pscb_reserve = self.pscb_reserve.saturating_sub(delta);
         }
+        // Undo the burn debit the same way, or a reorg would leave phantom
+        // removal behind and net-supply reporting would drift from replay.
+        if let Some(delta) = self.burned_undo.remove(hash) {
+            self.burned_fees_total = self.burned_fees_total.saturating_sub(delta);
+        }
+        // Unmark this block's releases (approved P1 reorg correctness): a
+        // rolled-back release never happened, so its identity is spendable
+        // again on the winning branch — and a release the winner keeps is
+        // re-marked when the winner applies.
+        if let Some(ids) = self.exit_undo.remove(hash) {
+            self.unwind_claims(&ids);
+        }
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -609,6 +978,10 @@ impl Chain {
             undo: self.undo.clone(),
             pscb_reserve: self.pscb_reserve,
             pscb_undo: self.pscb_undo.clone(),
+            burned_fees_total: self.burned_fees_total,
+            burned_undo: self.burned_undo.clone(),
+            released_exits: self.released_exits.clone(),
+            exit_undo: self.exit_undo.clone(),
         }
     }
 
@@ -618,6 +991,10 @@ impl Chain {
         self.undo = s.undo;
         self.pscb_reserve = s.pscb_reserve;
         self.pscb_undo = s.pscb_undo;
+        self.burned_fees_total = s.burned_fees_total;
+        self.burned_undo = s.burned_undo;
+        self.released_exits = s.released_exits;
+        self.exit_undo = s.exit_undo;
     }
 
     fn path_to(&self, target: &Hash) -> Option<Vec<Hash>> {
@@ -823,6 +1200,8 @@ impl Chain {
         miner_address: crate::hash::Address,
         body: Vec<Transaction>,
         l2_txs: Vec<crate::l2::L2Transaction>,
+        exit_claims: Vec<ExitClaim>,
+        l2_root: Option<Hash>,
         now_ms: u64,
         difficulty_override: Option<u128>,
         max_attempts: u64,
@@ -837,19 +1216,41 @@ impl Chain {
         let base_fee = if height == 1 {
             self.params.base_fee_initial_sat
         } else {
+            // Claims are ordinary block space, so their gas feeds the next
+            // block's base fee exactly like body gas (approved P1).
+            let parent_gas = parent.total_gas_used()?.checked_add(parent.claims_gas_used()?);
+            let parent_gas = match parent_gas {
+                Some(g) => g,
+                None => return Err(Error::ValueOverflow),
+            };
             next_base_fee(
                 &self.params,
                 parent.header.base_fee_sat,
-                parent.total_gas_used()?,
+                parent_gas,
             )
         };
         let timestamp_ms =
             now_ms.max(crate::difficulty::median_previous_timestamp(&history).unwrap_or(0));
 
         // Fee split needs a UTXO view with the body applied. Do it on a copy.
+        // Claims settle first (approved P1), so they are checked and applied
+        // on the probe before the body: a body transaction may spend a release
+        // output, and claim gas/fees fold into the same totals. A claim the
+        // chain would refuse fails the miner here instead — with the same
+        // named error `submit` would return.
         let mut probe = self.utxo.clone();
         let mut total_gas = 0u64;
         let mut total_fees = 0u64;
+        for claim in &exit_claims {
+            let (gas, l1_fee) = self.check_claim(&probe, claim, height, base_fee)?;
+            Self::apply_claim_utxo(&mut probe, claim, height);
+            total_gas = total_gas
+                .checked_add(gas)
+                .ok_or(Error::ValueOverflow)?;
+            total_fees = total_fees
+                .checked_add(l1_fee)
+                .ok_or(Error::ValueOverflow)?;
+        }
         for tx in &body {
             let delta = check_tx(
                 &probe,
@@ -882,7 +1283,7 @@ impl Chain {
 
         let mut txs = vec![cb_tx];
         txs.extend(body);
-        let merkle = crate::block::merkle_root_with_l2(&txs, &l2_txs);
+        let merkle = crate::block::merkle_root_with_l2(&txs, &l2_txs, l2_root.as_ref(), &exit_claims);
 
         let mut header = Header {
             version: crate::block::BLOCK_VERSION,
@@ -917,6 +1318,8 @@ impl Chain {
                     // unmined block below. One clone per *successful* mine, in
                     // exchange for not threading it through the loop.
                     l2_txs: l2_txs.clone(),
+                    l2_state_root: l2_root,
+                    exit_claims: exit_claims.clone(),
                 });
             }
             nonce = nonce.wrapping_add(1);
@@ -927,8 +1330,10 @@ impl Chain {
             signer_pubkey: [0u8; 33],
             txs,
             // Reported through the error's hash, so it must be the block that
-            // would have been produced — L2 payload included.
+            // would have been produced — L2 payload and claims included.
             l2_txs,
+            l2_state_root: l2_root,
+            exit_claims,
         };
         Err(Error::PowInvalid {
             hash: crate::hash::hash_to_hex(&unmined.block_hash()),
@@ -961,6 +1366,8 @@ impl Chain {
             miner_address,
             body,
             Vec::new(),
+            Vec::new(),
+            None,
             now_ms,
             difficulty_override,
             max_attempts,
@@ -992,6 +1399,38 @@ impl Chain {
             miner_address,
             body,
             l2_txs,
+            Vec::new(),
+            None,
+            now_ms,
+            difficulty_override,
+            max_attempts,
+        )
+    }
+
+    /// Mine a block that carries L2 transactions **and** commits the L2 state
+    /// root after them (approved P1).
+    ///
+    /// The caller (which holds the L2 view the chain must not consult) computed
+    /// the root by replaying this block's L2 transitions. Post-activation
+    /// blocks with L2 transactions and no root are refused by consensus, so a
+    /// miner that includes L2 activity must use this path, not
+    /// [`Self::mine_block_with_l2`].
+    pub fn mine_block_with_l2_root(
+        &mut self,
+        miner_address: crate::hash::Address,
+        body: Vec<Transaction>,
+        l2_txs: Vec<crate::l2::L2Transaction>,
+        l2_root: Hash,
+        now_ms: u64,
+        difficulty_override: Option<u128>,
+        max_attempts: u64,
+    ) -> Result<Block> {
+        self.build_block(
+            miner_address,
+            body,
+            l2_txs,
+            Vec::new(),
+            Some(l2_root),
             now_ms,
             difficulty_override,
             max_attempts,
@@ -1036,6 +1475,26 @@ impl Chain {
         now_ms: u64,
         l2_txs: Vec<crate::l2::L2Transaction>,
     ) -> Result<Block> {
+        self.mine_from_pool_with_exits(pool, miner_address, now_ms, l2_txs, Vec::new(), None)
+    }
+
+    /// [`mine_from_pool_with_l2`] that additionally settles exit claims and
+    /// commits the caller's L2 state root (approved P1).
+    ///
+    /// This is the node's crank path: the caller (which holds the L2 view the
+    /// chain must not consult) supplies the matured claims and the root its
+    /// replay computed for this block's L2 transitions. The chain checks every
+    /// claim with the same named errors `submit` would return, so a bad claim
+    /// fails the miner here instead of producing a block the network refuses.
+    pub fn mine_from_pool_with_exits(
+        &mut self,
+        pool: &mut Mempool,
+        miner_address: crate::hash::Address,
+        now_ms: u64,
+        l2_txs: Vec<crate::l2::L2Transaction>,
+        exit_claims: Vec<ExitClaim>,
+        l2_root: Option<Hash>,
+    ) -> Result<Block> {
         let cursor = self.height();
         let body = pool.select_for_block(self.params.gas_cap, self.params.max_block_bytes);
         // Pool mining is L1-only: the mempool holds L1 transactions. L2
@@ -1044,6 +1503,8 @@ impl Chain {
             miner_address,
             body,
             l2_txs,
+            exit_claims,
+            l2_root,
             now_ms,
             None,
             DEFAULT_MAX_ATTEMPTS,
@@ -1209,8 +1670,15 @@ impl Chain {
         } else {
             // A canonical block's gas total cannot overflow (validate_standalone
             // rejects anything over the cap); fall back to the cap if it somehow
-            // does rather than panicking on a display path.
-            let gas = parent.total_gas_used().unwrap_or(self.params.gas_cap);
+            // does rather than panicking on a display path. Claims are block
+            // space too (approved P1), so their gas feeds the schedule.
+            let gas = parent
+                .total_gas_used()
+                .ok()
+                .and_then(|g| {
+                    g.checked_add(parent.claims_gas_used().unwrap_or(u64::MAX))
+                })
+                .unwrap_or(self.params.gas_cap);
             next_base_fee(&self.params, parent.header.base_fee_sat, gas)
         }
     }
@@ -1256,31 +1724,57 @@ impl Chain {
         if probe.pscb_reserve != self.pscb_reserve {
             return Err(Error::Malformed("pscb reserve diverged on replay"));
         }
+        if probe.burned_fees_total != self.burned_fees_total {
+            return Err(Error::Malformed("burned fee total diverged on replay"));
+        }
         if probe.pscb_undo != self.pscb_undo {
             return Err(Error::Malformed("pscb undo records diverged on replay"));
+        }
+        // Released exit identities are consensus state (approved P1): a wrong
+        // undo here would unmark a spent exit or keep a reorged one marked,
+        // and `verify` would be blind to both.
+        if probe.released_exits != self.released_exits {
+            return Err(Error::Malformed("released exits diverged on replay"));
         }
         Ok(())
     }
 
     /// Provable statements for `status` / the whitepaper.
     pub fn supply_report(&self) -> SupplyReport {
+        let issued = cumulative_issuance_sat(&self.params, self.height());
         SupplyReport {
-            cap_sat: self.params.supply_cap_sat,
+            // The stock cap is gone (Decision 18): the report names the rate
+            // anchor instead — the most the current halving period may issue.
+            rate_allowance_sat: rate_anchor_allowance(&self.params, self.height() + 1),
             reachable_sat: max_issuance_sat(&self.params),
             live_sat: self.utxo.total_value(),
             height: self.height(),
             reward_sat: block_reward_sat(&self.params, self.height() + 1),
+            issued_sat: issued,
+            // Net supply (Decision 18 §4.5): gross issuance minus everything
+            // usage removed (burned half + PSCB half). This is the dilution
+            // holders experience; gross issuance is what the anchor bounds.
+            removed_sat: self.base_removed_total(),
+            net_supply_sat: issued.saturating_sub(self.base_removed_total()),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupplyReport {
-    pub cap_sat: u64,
+    /// The rate anchor at the next height: the most gross issuance the current
+    /// `halving_period` window may add (1 % of supply at the window's start).
+    /// `u64::MAX` inside the grandfathered ladder era.
+    pub rate_allowance_sat: u64,
     pub reachable_sat: u64,
     pub live_sat: u64,
     pub height: u64,
     pub reward_sat: u64,
+    pub issued_sat: u64,
+    /// Everything usage ever removed from live supply (burned + PSCB).
+    pub removed_sat: u64,
+    /// Gross issuance minus removal: the supply holders experience.
+    pub net_supply_sat: u64,
 }
 
 #[cfg(test)]
@@ -1736,6 +2230,66 @@ mod tests {
             supply_before + reward - burned,
             "base fee must be destroyed, not redistributed"
         );
+    }
+
+    /// Stage SA-4: the removal counter and the net-supply report. Net supply
+    /// is gross issuance minus everything usage removed (burned half + PSCB
+    /// half) — the dilution holders experience (Decision 18 §4.5). On L1,
+    /// live supply equals it exactly: no other leak exists.
+    #[test]
+    fn the_burn_counter_and_net_report_track_removal() {
+        let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+        let miner = Wallet::new_random("miner");
+        let alice = Wallet::new_random("alice");
+        let miner_addr = miner.address().unwrap();
+        let alice_addr = alice.address().unwrap();
+        for h in 1..=12u64 {
+            let b = chain.mine_block(miner_addr, vec![], ts(h)).unwrap();
+            chain.submit(b).unwrap();
+        }
+        assert_eq!(chain.base_removed_total(), 0, "empty blocks remove nothing");
+
+        // A matured coinbase pays Alice with a fee, so block 13 removes its
+        // full base fee from live supply.
+        let coinbase = chain.block_at(1).unwrap();
+        let op = OutPoint {
+            txid: coinbase.txs[0].txid(),
+            index: 0,
+        };
+        let spendable = chain.utxo().get(&op).expect("matured coinbase").out.value;
+        let base_fee = chain.tip().header.base_fee_sat;
+        let fee = base_fee * 50_000 + 1_000;
+        let tx = miner
+            .build_tx(
+                &[op],
+                vec![crate::tx::Output {
+                    value: spendable / 2,
+                    address: alice_addr,
+                }],
+                fee,
+            )
+            .unwrap();
+        let gas_used = tx.gas_used();
+        let b = chain.mine_block(miner_addr, vec![tx], ts(13)).unwrap();
+        let full_base = b.header.base_fee_sat * gas_used;
+        assert!(full_base > 0, "the test needs a block that removes supply");
+        chain.submit(b).unwrap();
+
+        let removed = chain.base_removed_total();
+        assert_eq!(removed, full_base, "removal is the whole base fee");
+        assert_eq!(
+            removed,
+            chain.burned_fees_total() + chain.pscb_reserve(),
+            "removal is the destroyed half plus the PSCB half"
+        );
+        let r = chain.supply_report();
+        assert_eq!(r.removed_sat, removed);
+        assert_eq!(r.net_supply_sat, r.issued_sat.saturating_sub(removed));
+        assert_eq!(
+            r.live_sat, r.net_supply_sat,
+            "on L1, live supply is net supply — no other leak exists"
+        );
+        chain.verify_canonical_chain().unwrap();
     }
 
     /// M1's PSCB reserve must survive a reorganization intact: credited per

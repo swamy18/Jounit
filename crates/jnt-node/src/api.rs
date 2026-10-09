@@ -276,7 +276,9 @@ async fn conservation(State(state): State<ApiState>) -> ApiResult {
             "joint_bound_sat": report.supply.bound_sat(),
             "l1_bound_sat": report.supply.l1_bound_sat,
             "escrow_ceiling_sat": report.supply.escrow_ceiling_sat,
-            "supply_cap_sat": report.supply.cap_sat,
+            "l1_issued_sat": jnt_core::supply::cumulative_issuance_sat(sh.chain.params(), sh.chain.height()),
+            "l1_removed_sat": sh.chain.base_removed_total(),
+            "l1_net_sat": jnt_core::supply::cumulative_issuance_sat(sh.chain.params(), sh.chain.height()).saturating_sub(sh.chain.base_removed_total()),
             "headroom_sat": report.supply.headroom_sat(),
             "l1_live_sat": report.supply.l1_live_sat,
             "l2_held_sat": report.supply.l2_held_sat,
@@ -418,10 +420,25 @@ async fn metrics(
         );
         gauge(
             &mut out,
-            "jounit_supply_cap_sat",
-            "Sanity supply ceiling from the active network profile, in satoshi; not the binding mint bound since the approved tail.",
+            "jounit_rate_anchor_allowance_sat",
+            "Rate anchor (Decision 18): the most gross issuance the current halving period may add, 1% of supply issued at the window's start, in satoshi. u64::MAX inside the grandfathered ladder era.",
             &net,
-            p.supply_cap_sat,
+            jnt_core::supply::rate_anchor_allowance(p, sh.chain.height() + 1),
+        );
+        gauge(
+            &mut out,
+            "jounit_issued_sat",
+            "Gross issuance so far (the issuance integral at the tip height), in satoshi; burns are what make net supply lower.",
+            &net,
+            jnt_core::supply::cumulative_issuance_sat(p, sh.chain.height()),
+        );
+        gauge(
+            &mut out,
+            "jounit_net_supply_sat",
+            "Net supply (gross issuance minus base fees burned and PSCB-routed), in satoshi: the dilution holders experience.",
+            &net,
+            jnt_core::supply::cumulative_issuance_sat(p, sh.chain.height())
+                .saturating_sub(sh.chain.base_removed_total()),
         );
         // Joint conservation (SPEC §19.4–§19.5): the same report
         // `GET /v1/conservation` serves and `jnt-node verify` prints. Adds one

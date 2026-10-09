@@ -14,11 +14,29 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed (consensus — Decision 18, owner-approved 2026-10-09)
+
+- **The stock supply cap is gone.** `NetworkParams::supply_cap_sat` is deleted
+  (all profiles) and the deprecated `Error::SupplyCapExceeded` variant is
+  removed. The mint bound is the issuance integral alone; the replacement
+  ceiling is the **rate anchor** — gross issuance in any post-ladder halving
+  period may not exceed 1 % of the supply issued at that window's start
+  (`supply::check_mint_at_height`, ladder era grandfathered). The approved tail
+  sits ~3× under it. `tests/vectors/supply_vectors.json` is regenerated with
+  the anchor fields; the sims cross-check it.
+- **Net-supply reporting.** `Chain` tracks cumulative base-fee burns
+  (reorg-rewound like the PSCB reserve); `status`, `GET /v1/conservation` and
+  the `/metrics` gauges (`jounit_issued_sat`, `jounit_net_supply_sat`,
+  `jounit_rate_anchor_allowance_sat`) report gross issuance, removal and net.
+  The old `supply_cap_sat` conservation field and `jounit_supply_cap_sat`
+  gauge are removed.
+
 ### Added
 
 - `GET /metrics` on the opt-in service API: Prometheus text exposition
   (`text/plain; version=0.0.4`) of height, finality, peers, base fee, live
-  supply, supply cap, PSCB reserve, mempool size, L1 relay queue depth, L2
+  supply, rate-anchor allowance, gross issuance, net supply, PSCB reserve,
+  mempool size, L1 relay queue depth, L2
   include queue depth, and L2 height/applied/skipped/pending-deposit gauges.
   Gauges only, one static `network` label, no key material or per-user data.
 - `docs/decisions.md`: a *Pending monetary decisions* section (M-A … M-G) that
@@ -29,8 +47,11 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ### Notes
 
-- No consensus rule, parameter, fee, genesis value or committed vector was
-  changed by the Unreleased work. It is observability and documentation only.
+- The Unreleased work above this entry was observability and documentation
+  only (no consensus change). The Decision-18 `### Changed` section above it
+  is the first consensus change since 0.1.0: it deletes a parameter and an
+  error variant, loosens the mint bound (integral only), and adds the rate
+  anchor — every historical block still validates identically.
 
 ## [0.1.0] — 2026-10-09
 

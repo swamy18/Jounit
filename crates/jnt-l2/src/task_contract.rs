@@ -50,6 +50,12 @@ pub struct L2Config {
     /// Whole percent, 0..=100. Not a basis-point value because the bounty is a
     /// coarse incentive, not a fee split that has to reconcile to the satoshi.
     pub whistleblower_bounty_percent: u64,
+    /// First L1 height at which an exit may be queued (approved P1). `0`
+    /// means the profile never activates exits — queueing is refused rather
+    /// than encumbering funds with no release. Wired from
+    /// `NetworkParams::exit_activation_height` by the node; the constructors
+    /// below carry `0` and the node overrides per profile.
+    pub exit_activation_height: u64,
 }
 
 impl L2Config {
@@ -60,6 +66,7 @@ impl L2Config {
             dispute_window: 100,
             vesting_period: VESTING_BLOCKS_MAINNET,
             whistleblower_bounty_percent: 25,
+            exit_activation_height: 0,
         }
     }
 
@@ -72,6 +79,7 @@ impl L2Config {
             dispute_window: 5,
             vesting_period: jnt_core::slash::VESTING_BLOCKS_MINI,
             whistleblower_bounty_percent: 25,
+            exit_activation_height: 0,
         }
     }
 }

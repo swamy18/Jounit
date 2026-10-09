@@ -47,6 +47,11 @@ pub const FEE_TX_CLAIM_TASK_SAT: u64 = 2_000;
 pub const FEE_TX_SUBMIT_RESULT_SAT: u64 = 2_000;
 pub const FEE_TX_DISPUTE_SAT: u64 = 10_000;
 pub const FEE_TX_SETTLE_SAT: u64 = 20_000;
+/// Queueing an L2 → L1 exit (approved P1, E-1…E-3). Same tier as claim/submit:
+/// a simple owner-signed debit-and-record, not arbitration. Chosen with the
+/// exit implementation and recorded in `docs/decisions.md` (P1 record); it is a
+/// fee for a *new* type, not a change to any decided value.
+pub const FEE_TX_EXIT_QUEUE_SAT: u64 = 2_000;
 
 /// The D3 schedule as one table, so the exact set is asserted in one place and a
 /// future change has a single spot to be checked against the decision record.
@@ -56,6 +61,7 @@ pub const L2_FEE_SCHEDULE: &[(&str, u64)] = &[
     ("TxSubmitResult", FEE_TX_SUBMIT_RESULT_SAT),
     ("TxDispute", FEE_TX_DISPUTE_SAT),
     ("TxSettle", FEE_TX_SETTLE_SAT),
+    ("TxExitQueue", FEE_TX_EXIT_QUEUE_SAT),
 ];
 
 /// One genesis-funded L2 balance (Decision 7, SPEC.md §19.4).
@@ -169,10 +175,6 @@ pub struct NetworkParams {
     pub halving_period: u64,
     /// Block reward at halving 0, in satoshis.
     pub start_reward_sat: u64,
-    /// Hard supply ceiling in satoshis (original fixed-supply design).
-    /// Since the approved tail (M-A/M-D) this is a **sanity ceiling only**:
-    /// the load-bearing mint bound is `supply::cumulative_issuance_sat(height)`.
-    pub supply_cap_sat: u64,
     pub difficulty_window: u32,
     /// Max per-block difficulty change, in basis points (1000 = +/-10%).
     pub change_limit_bps: u32,
@@ -207,9 +209,12 @@ pub struct NetworkParams {
     pub network_id: String,
     /// Total L2 genesis allocation in satoshis (Decision 7, SPEC.md §19.4).
     /// Released once, at L2 genesis: the grants below plus the remainder to
-    /// the protocol escrow identity. Must fit in the sats the L1 ladder can
-    /// never mint (`supply_cap_sat - max_issuance_sat`), so combined L1 + L2
-    /// money can never exceed the cap with zero L1 consensus change.
+    /// the protocol escrow identity. Bounded by the explicit
+    /// `escrow_ceiling_sat` (approved M-E) and validated against it; L1's side
+    /// is bounded separately by the issuance integral at the tip height, so
+    /// combined L1 + L2 money can never exceed that joint bound with zero L1
+    /// consensus change. There is no stock supply cap any more (Decision 18:
+    /// the rate anchor replaced it 2026-10-09).
     pub l2_genesis_escrow_sat: u64,
     /// Explicit backing ceiling for the L2 genesis escrow (approved M-E).
     /// Replaces the old implicit `cap − max_issuance_sat` gap rule, which
@@ -241,6 +246,13 @@ pub struct NetworkParams {
     /// keeps the depth-based fallback only. A checkpoint at a height below this
     /// is observed but never gates `Chain::adopt()`.
     pub finality_activation_height: u64,
+    /// First L1 height at which an L2 → L1 exit may be queued and released
+    /// (approved P1). `0` means never — the same convention as
+    /// `finality_activation_height`: queueing is refused below activation so
+    /// funds can never be encumbered with no release. `mini`/`testnet` carry
+    /// `1` (active from the first block, so exits are exercisable in tests);
+    /// `mainnet` carries `0` until the launch decision sets a height.
+    pub exit_activation_height: u64,
 }
 
 impl NetworkParams {
@@ -250,10 +262,6 @@ impl NetworkParams {
     /// to let a 40% attacker pull difficulty down; one block time does not.
     pub fn future_limit_ms(&self) -> u64 {
         self.target_block_time_ms
-    }
-
-    pub fn supply_cap_jnt(&self) -> u64 {
-        self.supply_cap_sat / SAT_PER_JNT
     }
 
     /// The protocol escrow identity holding the un-granted remainder of the L2
@@ -321,7 +329,7 @@ impl NetworkParams {
             target_block_time_ms: 600_000,
             halving_period: 262_800,
             start_reward_sat: 76 * SAT_PER_JNT,
-            supply_cap_sat: 39_945_600 * SAT_PER_JNT,
+
             difficulty_window: 60,
             change_limit_bps: 1_000,
             genesis_difficulty: 1,
@@ -362,6 +370,9 @@ impl NetworkParams {
             // Binding finality is not activated on mainnet (Decision 12):
             // `0` keeps the depth-based fallback only.
             finality_activation_height: 0,
+            // Exits never activate on mainnet until the launch decision sets a
+            // height (approved P1): `0` refuses queueing outright.
+            exit_activation_height: 0,
         }
     }
 
@@ -374,7 +385,7 @@ impl NetworkParams {
             target_block_time_ms: 1_000,
             halving_period: 2_000,
             start_reward_sat: 76 * SAT_PER_JNT,
-            supply_cap_sat: 304_000 * SAT_PER_JNT,
+
             difficulty_window: 60,
             change_limit_bps: 1_000,
             genesis_difficulty: 1,
@@ -402,7 +413,7 @@ impl NetworkParams {
             // 7 JNT remainder to the protocol escrow identity.
             l2_genesis_escrow_sat: 10 * SAT_PER_JNT,
             // M-C: a 1-sat token tail on 1-second blocks — enough to keep
-            // mining alive forever, negligible against the 304,000 cap.
+            // mining alive forever, a trickle against issued supply.
             escrow_ceiling_sat: 10 * SAT_PER_JNT,
             tail: TailEmission::Constant { per_block_sat: 1 },
             l2_genesis_grants: vec![
@@ -433,6 +444,9 @@ impl NetworkParams {
             // mini either (that is the dedicated `testnet` profile's job), so
             // mini keeps depth-only finality.
             finality_activation_height: 0,
+            // Exits are active from the first block on mini, so the queue →
+            // mature → release loop is exercisable in tests.
+            exit_activation_height: 1,
         }
     }
 
@@ -450,7 +464,7 @@ impl NetworkParams {
             target_block_time_ms: 1_000,
             halving_period: 2_000,
             start_reward_sat: 76 * SAT_PER_JNT,
-            supply_cap_sat: 304_000 * SAT_PER_JNT,
+
             difficulty_window: 60,
             change_limit_bps: 1_000,
             genesis_difficulty: 1,
@@ -491,6 +505,8 @@ impl NetworkParams {
             // deterministic activation condition. Below it, observed
             // certificates are never binding.
             finality_activation_height: 20,
+            // Exits are active from the first block on testnet, like mini.
+            exit_activation_height: 1,
         }
     }
 
@@ -528,7 +544,9 @@ impl NetworkParams {
         }
         // L2 genesis escrow (Decision 7, SPEC.md §19.4). Every rule here is a
         // conservation rule: together they prove combined L1 + L2 money can
-        // never exceed the cap (see the module docs on `l2_genesis_escrow_sat`).
+        // never exceed the joint bound — L1's issuance integral at the tip
+        // plus `escrow_ceiling_sat` (see the module docs on
+        // `l2_genesis_escrow_sat`).
         if self.l2_genesis_escrow_sat == 0 {
             return Err(Error::Malformed("l2_genesis_escrow_sat must be > 0"));
         }
@@ -630,7 +648,8 @@ mod tests {
     fn mainnet_matches_design_doc_section_16() {
         let p = NetworkParams::mainnet();
         p.validate().unwrap();
-        assert_eq!(p.supply_cap_jnt(), 39_945_600);
+        // No stock cap any more (Decision 18): mainnet is identified by its
+        // ladder start, period and timing, not by a supply number.
         assert_eq!(p.start_reward_jnt(), 76);
         assert_eq!(p.halving_period, 5 * 365 * 144);
         assert_eq!(p.target_block_time_ms, 10 * 60 * 1000);
@@ -641,13 +660,12 @@ mod tests {
     }
 
     #[test]
-    fn mini_cap_is_two_halving_periods_of_rewards() {
+    fn mini_ladder_shape_matches_its_pinned_integral() {
         let p = NetworkParams::mini();
         p.validate().unwrap();
-        assert_eq!(
-            p.supply_cap_jnt(),
-            2 * p.halving_period * p.start_reward_jnt()
-        );
+        // Was "mini_cap_is_two_halving_periods_of_rewards": the ladder's
+        // *integral* is what the test pins; the cap it once computed is gone.
+        assert_eq!(crate::supply::max_issuance_sat(&p), 297_924 * SAT_PER_JNT);
         assert_eq!(p.target_block_time_ms, 1_000);
     }
 
@@ -702,6 +720,7 @@ mod tests {
                 ("TxSubmitResult", 2_000),
                 ("TxDispute", 10_000),
                 ("TxSettle", 20_000),
+                ("TxExitQueue", 2_000),
             ]
         );
     }
@@ -885,9 +904,10 @@ mod tests {
         let mut p = good.clone();
         p.l2_genesis_grants[0].address = p.l2_escrow_address();
         assert!(p.validate().is_err());
-        // Escrow above the gap is inflation against the cap.
+        // Escrow above its explicit ceiling is refused (approved M-E); with
+        // the stock cap gone (Decision 18) this ceiling is the only bound.
         let mut p = good.clone();
-        p.l2_genesis_escrow_sat = p.supply_cap_sat;
+        p.l2_genesis_escrow_sat = p.escrow_ceiling_sat + 1;
         assert!(p.validate().is_err());
     }
 

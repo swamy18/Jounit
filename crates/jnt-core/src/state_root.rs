@@ -33,13 +33,46 @@
 //! carry *itself* as its sibling. Without both checks, a 3-leaf tree and a
 //! 4-leaf tree can share a root and a forged proof would still verify.
 
+use crate::error::{Error, Result};
 use crate::hash::{sha256, sha256_dom, Address, Hash};
+use crate::ser::{Reader, Writer};
 
 const INTERNAL_TAG: u8 = 0x01;
 
 /// Account leaves are domain-separated from block leaves: `0x00` is an L1
 /// transaction leaf and `0x02` an L2 transaction leaf (`block.rs`).
 pub const ACCOUNT_LEAF_TAG: u8 = 0x03;
+
+/// Exit-record leaves (approved P1): a queued L2 → L1 exit, committed under
+/// the same state root as the accounts. A distinct tag so an account leaf can
+/// never be reinterpreted as an exit record and vice versa.
+pub const EXIT_LEAF_TAG: u8 = 0x04;
+
+/// The leaf for one queued exit: owner, per-owner nonce, amount, destination,
+/// prepaid release fee and the L1 height that queued it.
+///
+/// Every field is fixed-width and little-endian where numeric, so two records
+/// differing in one digit cannot collide by concatenation. The leaf commits to
+/// the *queue-time* facts only: maturity and release are judged by consensus
+/// against the chain, never by this hash.
+pub fn exit_record_leaf(
+    owner: &Address,
+    nonce: u64,
+    amount_sat: u64,
+    destination: &Address,
+    exit_fee_sat: u64,
+    queued_height: u64,
+) -> Hash {
+    sha256(&[
+        &[EXIT_LEAF_TAG],
+        owner,
+        &nonce.to_le_bytes(),
+        &amount_sat.to_le_bytes(),
+        destination,
+        &exit_fee_sat.to_le_bytes(),
+        &queued_height.to_le_bytes(),
+    ])
+}
 
 /// Domain string for the final fold, so a state root is never a bare merkle
 /// root over the same leaves.
@@ -167,6 +200,49 @@ pub fn verify_inclusion(root: Hash, leaf: Hash, proof: &InclusionProof) -> bool 
     // The fold is wrapped in the root domain, so the last step is not a bare
     // comparison against the folded node.
     depth == proof.siblings.len() && sha256_dom(STATE_ROOT_DOMAIN, &[&node]) == root
+}
+
+impl InclusionProof {
+    /// Canonical encoding: index and leaf count as little-endian u64, then the
+    /// sibling count and the siblings. The sibling count is bounded by the
+    /// remaining buffer before it drives an allocation, like every other
+    /// count field in this repository.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u64le(self.index as u64)
+            .u64le(self.leaf_count as u64)
+            .u64le(self.siblings.len() as u64);
+        for s in &self.siblings {
+            w.fixed(s);
+        }
+        w.into_vec()
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let index = r.u64le()? as usize;
+        let leaf_count = r.u64le()? as usize;
+        let n = r.u64le()? as usize;
+        // One sibling is 32 bytes; a depth beyond the buffer is a lie. A real
+        // tree of u64 leaves is never deeper than 64, and the buffer bound is
+        // the load-bearing one.
+        if n > r.remaining() / 32 {
+            return Err(Error::Malformed("proof sibling count exceeds buffer"));
+        }
+        // An empty tree has no leaves and therefore no proof; any other
+        // out-of-range index is a forgery shape, refused at decode time.
+        if index >= leaf_count {
+            return Err(Error::Malformed("proof index outside committed count"));
+        }
+        let mut siblings = Vec::with_capacity(n);
+        for _ in 0..n {
+            siblings.push(r.fixed()?);
+        }
+        Ok(InclusionProof {
+            index,
+            leaf_count,
+            siblings,
+        })
+    }
 }
 
 #[cfg(test)]

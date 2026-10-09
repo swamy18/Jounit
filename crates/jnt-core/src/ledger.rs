@@ -145,6 +145,14 @@ impl UtxoSet {
             self.map.remove(&(op.txid, op.index));
         }
     }
+
+    /// Remove one outpoint, returning what was there. The exit-claim path uses
+    /// this after resolving every input first (the same resolve-then-mutate
+    /// atomicity as [`Self::apply_tx`]); callers that need the batch form
+    /// should use [`Self::apply_tx`] or [`Self::drop_created`].
+    pub fn remove(&mut self, op: &OutPoint) -> Option<Utxo> {
+        self.map.remove(&(op.txid, op.index))
+    }
 }
 
 /// Accumulated view of one block, resolved against a UTXO set without

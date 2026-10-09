@@ -394,7 +394,7 @@ Per Section 16. `SAT_PER_JNT = 100_000_000`.
 |---|---|
 | `halving_period` | `262 800` blocks (5 years at 10 min) |
 | `start_reward` | `76 JNT` = `7_600_000_000 sat` |
-| `supply_cap` | `39 945 600 JNT` = `3_994_560_000_000_000 sat` |
+| `supply_cap` | **none** — Decision 18 (2026-10-09) replaced the stock cap with the rate anchor below |
 | `tail_emission` | `0` (v0.1; Section 11 notes tail emission as an option) |
 
 ```
@@ -407,7 +407,7 @@ reward(h) = tail(halvings)                                // once rung == 0
 // The ladder is halved in **whole JNT**, not by shifting satoshis:
 // `start_reward_sat >> halvings` would pay 9.5 JNT at halving 3 and
 // contradict the ladder below. Shifting whole JNT keeps every rung a
-// whole number of JNT and keeps the cap arithmetic exact.
+// whole number of JNT and keeps the issuance arithmetic exact.
 // The tail is halved in **satoshis** and clamped by its floor.
 ```
 
@@ -419,25 +419,40 @@ testnet `14 000`) and leaves **every historical block byte-identical** — the
 reward stays a pure function of height.
 
 **Mint bound (hard, enforced in code):** live UTXO value may never exceed the
-issuance integral at the height — `cumulative_issuance_sat(height)` — clamped by
-`supply_cap` as a sanity ceiling (M-D). `supply::check_mint_at_height` is the
-only mint gate and `Chain::apply_block` calls it. Because the first rung is paid
-by `halving_period − 1` blocks (genesis occupies a height without minting), the
-ladder era issues `149 × 262 800 − 76 = 39 157 124 JNT`; the remaining
-`788 476 JNT` (39 945 600 − 39 157 124) is **permanently unmintable**, not merely
-"reserved". With a tail, long-run issuance is unbounded by design, so the bound
-is per-height, never a single total. `sim/supply_schedule_sim.py` regenerates
-these numbers and `tests/vectors/supply_vectors.json` pins them.
+issuance integral at the height — `cumulative_issuance_sat(height)`.
+`supply::check_mint_at_height` is the only mint gate and `Chain::apply_block`
+calls it. Because the first rung is paid by `halving_period − 1` blocks
+(genesis occupies a height without minting), the ladder era issues
+`149 × 262 800 − 76 = 39 157 124 JNT`. There is no stock cap any more
+(Decision 18): with a tail, long-run issuance is unbounded by design, so the
+bound is per-height, never a single total. `sim/supply_schedule_sim.py`
+regenerates these numbers and `tests/vectors/supply_vectors.json` pins them.
 
-If a block reward would cross the bound, the block is refused by consensus
-(`SupplyCapExceeded`); the surplus is unrecoverable rather than burned out of
+**Rate anchor (hard, enforced in code):** after ladder exhaustion, gross
+issuance inside the current `halving_period` window plus the next reward must
+not exceed **1 % of the supply issued at the window's start** (Decision 18 §4.3
+— ≤ 0.2 %/yr). The ladder era is grandfathered and bounded by its own rungs.
+The approved tail sits ~3× under this ceiling, so it never binds in normal
+operation; it exists to refuse a future schedule that would dilute far faster.
+A consensus-visible violation is refused with `SupplyRateExceeded`, which also
+names the period allowance, so the refusal is auditable.
+
+**Net supply (reported, not a bound):** gross issuance minus everything usage
+ever removed — the burned half plus the PSCB half of every block's base fee
+(`Chain::burned_fees_total` + `Chain::pscb_reserve`, both rewound on reorg).
+`status`, `GET /v1/conservation` and the `/metrics` gauges report it; it is
+the dilution holders experience, while gross issuance is what the two bounds
+above constrain.
+
+If a block reward would cross either bound, the block is refused by consensus
+(`SupplyRateExceeded`); the surplus is unrecoverable rather than burned out of
 circulation.
 
 ---
 
 ## 8. Fees, burn and the PSCB split
 
-Per Sections 28.1 / 24.3: EIP-1559-shaped base fee. No new supply is minted from fees, so the cap can never be exceeded by usage.
+Per Sections 28.1 / 24.3: EIP-1559-shaped base fee. No new supply is minted from fees, so usage can never inflate issuance past the mint bound.
 
 ```
 fee_total(block)   = Σ fee(tx)
@@ -462,10 +477,11 @@ paid to the miner, as before.
 
 `pscb_credit` is **reorg-correct**: it is credited per canonical block and
 subtracted again when that block is rolled back, so the reserve always equals
-the sum over the canonical chain. It does **not** count toward `supply_cap` —
-those satoshis are already destroyed for cap purposes; the reserve is a
-protocol-owned accounting claim on them, not new issuance. `verify_canonical_chain`
-re-derives it by replay and fails if it diverges.
+the sum over the canonical chain. The burned half is tracked the same way
+(`Chain::burned_fees_total`, rewound per rolled-back block); together the two
+halves are the removal term net-supply reporting subtracts from gross
+issuance. `verify_canonical_chain`
+re-derives both by replay and fails if either diverges.
 
 ```
 gas_per_tx  = 16 000 + 1 000 × input_count + 250 × output_count
@@ -530,7 +546,7 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `target_block_time_ms` | `600 000` | `1 000` | `1 000` |
 | `halving_period` | `262 800` | `2 000` | `2 000` |
 | `start_reward_jnt` | `76` | `76` | `76` |
-| `supply_cap_jnt` | `39 945 600` | `304 000` | `304 000` |
+| `rate_anchor_pct` | `1 %` of issued per `halving_period` (all profiles) | | |
 | `difficulty_window` | `60` | `60` | `60` |
 | `change_limit_bps` | `1000` | `1000` | `1000` |
 | `genesis_difficulty` | `1` | `1` | `1` |
@@ -550,9 +566,9 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `finality_activation_height` | `0` | `0` | `20` |
 | `genesis_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
 
-`supply_cap_mini = 2 × 2 000 × 76 = 304 000 JNT`; `testnet` shares the mini
-cap and block schedule but has its own magic/id, its own deterministic
-committee (distinct derivation), and the §14.8 activation height.
+`testnet` shares the mini ladder and block schedule but has its own magic/id,
+its own deterministic committee (distinct derivation), and the §14.8
+activation height. No profile carries a stock supply cap (Decision 18).
 
 ---
 
@@ -2406,11 +2422,8 @@ stated so its balance cannot be misread as spendable supply.
 
 **The backing rule.** The escrow is bounded by its own explicit, validated
 parameter: `l2_genesis_escrow_sat ≤ escrow_ceiling_sat`, enforced by
-`NetworkParams::validate` (Decision M-E). The old implicit
-`supply_cap_sat − max_issuance_sat` gap rule is **gone**: with a tail it no
-longer describes anything. The shipped ceilings are exactly the allocations
-(mini/testnet 10 JNT of the 6 076 JNT permanently unmintable; mainnet
-100 000 JNT of the 788 476 JNT permanently unmintable) — tight, so the
+`NetworkParams::validate` (Decision M-E). The shipped ceilings are exactly the
+allocations (mini/testnet 10 JNT; mainnet 100 000 JNT) — tight, so the
 parameter constrains rather than rubber-stamps. Because L1 can never hold more
 than its issuance integral and L2 can never hold more than its escrow ceiling,
 combined L1 + L2 money can never exceed `cumulative_issuance_sat(height) +

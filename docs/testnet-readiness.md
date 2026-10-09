@@ -100,7 +100,7 @@ operator-tunable:
 | `finality_activation_height` | 20 |
 | `checkpoint_interval_blocks` | 10 |
 | `genesis_validators` | 4 deterministic keys (quorum 3) |
-| `supply_cap_sat` | 304,000 JNT (shared with `mini`) |
+| Stock supply cap | none (rate anchor: ≤ 1 % of issued per halving period) |
 | `base_fee_initial_sat` / `min` / `max` | 100 / 10 / 1,000,000 |
 
 Node flags that exist: `--network`, `--data-dir`, `--listen`, `--connect`,

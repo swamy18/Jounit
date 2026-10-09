@@ -114,7 +114,10 @@ fn joint_supply_subtracts_the_sink_exactly_once() {
     );
     // Subtracting the sink is what keeps the total below the un-adjusted sum.
     assert!(s.joint_sat < s.l1_live_sat + s.l2_held_sat);
-    assert_eq!(s.cap_sat, chain.params().supply_cap_sat);
+    // The bound terms: L1's issuance integral at the tip plus the escrow
+    // ceiling; there is no stock cap term any more (Decision 18).
+    assert_eq!(s.l1_live_sat, chain.utxo().total_value());
+    assert_eq!(s.escrow_ceiling_sat, chain.params().escrow_ceiling_sat);
 }
 
 #[test]

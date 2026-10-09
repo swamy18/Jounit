@@ -30,8 +30,8 @@ use crate::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Address, Hash};
 use crate::params::{
-    FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_POST_TASK_SAT, FEE_TX_SETTLE_SAT,
-    FEE_TX_SUBMIT_RESULT_SAT,
+    FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_EXIT_QUEUE_SAT, FEE_TX_POST_TASK_SAT,
+    FEE_TX_SETTLE_SAT, FEE_TX_SUBMIT_RESULT_SAT,
 };
 use crate::ser::{Reader, Writer};
 use crate::sig::{Bundle, Component, SCHEME_SECP256K1_ECDSA, SCHEME_SECP256K1_SCHNORR};
@@ -49,6 +49,11 @@ pub const DOM_L2_SUBMIT: &[u8] = b"jounit/l2/submit/v1";
 pub const DOM_L2_DISPUTE: &[u8] = b"jounit/l2/dispute/v1";
 pub const DOM_L2_SETTLE: &[u8] = b"jounit/l2/settle/v1";
 pub const DOM_L2_TXID: &[u8] = b"jounit/l2/txid/v1";
+/// Exit queue authorization (approved P1, E-1…E-3). Covers the owner, the
+/// per-owner nonce, the amount, the destination and the prepaid release fee —
+/// exactly the record the L1 release proof re-states, so a queue
+/// authorization cannot be reinterpreted as anything else.
+pub const DOM_L2_EXIT_QUEUE: &[u8] = b"jounit/l2/exit-queue/v1";
 /// Verified Work Certificate identity (SPEC.md §17.3). Derives a certificate id
 /// from its canonical encoding; a different preimage needs a new tag.
 pub const DOM_L2_VWC: &[u8] = b"jounit/l2/vwc/v1";
@@ -61,6 +66,10 @@ pub const L2_TX_CLAIM: u8 = 0x11;
 pub const L2_TX_SUBMIT: u8 = 0x12;
 pub const L2_TX_DISPUTE: u8 = 0x13;
 pub const L2_TX_SETTLE: u8 = 0x14;
+/// L2 → L1 exit queue (approved P1). Next free byte after the Phase-2 five;
+/// an older node reads it as an unknown L2 type and skips the transaction,
+/// exactly as it does for any future type.
+pub const L2_TX_EXIT_QUEUE: u8 = 0x15;
 
 /// Largest settle signer bitmap accepted, in bytes (512 validators). `TopN = 21`
 /// is the decided committee size, so this is a generous structural cap whose only
@@ -79,6 +88,7 @@ pub enum L2TxType {
     SubmitResult,
     Dispute,
     Settle,
+    ExitQueue,
 }
 
 impl L2TxType {
@@ -89,6 +99,7 @@ impl L2TxType {
             L2TxType::SubmitResult => L2_TX_SUBMIT,
             L2TxType::Dispute => L2_TX_DISPUTE,
             L2TxType::Settle => L2_TX_SETTLE,
+            L2TxType::ExitQueue => L2_TX_EXIT_QUEUE,
         }
     }
 
@@ -99,6 +110,7 @@ impl L2TxType {
             L2_TX_SUBMIT => Ok(L2TxType::SubmitResult),
             L2_TX_DISPUTE => Ok(L2TxType::Dispute),
             L2_TX_SETTLE => Ok(L2TxType::Settle),
+            L2_TX_EXIT_QUEUE => Ok(L2TxType::ExitQueue),
             _ => Err(Error::Malformed("unknown L2 transaction type")),
         }
     }
@@ -110,6 +122,7 @@ impl L2TxType {
             L2TxType::SubmitResult => "SubmitResult",
             L2TxType::Dispute => "Dispute",
             L2TxType::Settle => "Settle",
+            L2TxType::ExitQueue => "ExitQueue",
         }
     }
 
@@ -121,6 +134,7 @@ impl L2TxType {
             L2TxType::SubmitResult => FEE_TX_SUBMIT_RESULT_SAT,
             L2TxType::Dispute => FEE_TX_DISPUTE_SAT,
             L2TxType::Settle => FEE_TX_SETTLE_SAT,
+            L2TxType::ExitQueue => FEE_TX_EXIT_QUEUE_SAT,
         }
     }
 }
@@ -679,6 +693,100 @@ impl SettlePayload {
 }
 
 // ---------------------------------------------------------------------------
+// ExitQueue
+// ---------------------------------------------------------------------------
+
+/// Queues an L2 → L1 exit (approved P1, E-1…E-3): debits `amount_sat` plus the
+/// prepaid L1 release fee (`exit_fee_sat`) from the owner's L2 account and
+/// records the pending exit the release rule later pays out.
+///
+/// The nonce is strictly increasing per owner (replay protection, mirroring
+/// the agent authorization discipline); the destination is bound by the
+/// owner's own signature, so no third party can redirect the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitQueuePayload {
+    pub owner: Address,
+    pub auth: Auth,
+    pub nonce: u64,
+    pub amount_sat: u64,
+    pub destination: Address,
+    pub exit_fee_sat: u64,
+}
+
+impl ExitQueuePayload {
+    pub fn build(
+        wallet: &Wallet,
+        nonce: u64,
+        amount_sat: u64,
+        destination: Address,
+        exit_fee_sat: u64,
+    ) -> Result<Self> {
+        let mut p = ExitQueuePayload {
+            owner: wallet.address()?,
+            auth: Auth::default(),
+            nonce,
+            amount_sat,
+            destination,
+            exit_fee_sat,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_EXIT_QUEUE, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.owner, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.owner);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.u64le(self.nonce)
+            .u64le(self.amount_sat)
+            .fixed(&self.destination)
+            .u64le(self.exit_fee_sat);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let owner: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let nonce = r.u64le()?;
+        let amount_sat = r.u64le()?;
+        let destination: Address = r.fixed()?;
+        let exit_fee_sat = r.u64le()?;
+        Ok(ExitQueuePayload {
+            owner,
+            auth,
+            nonce,
+            amount_sat,
+            destination,
+            exit_fee_sat,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
@@ -689,6 +797,7 @@ pub enum L2Payload {
     Submit(SubmitResultPayload),
     Dispute(DisputePayload),
     Settle(SettlePayload),
+    ExitQueue(ExitQueuePayload),
 }
 
 impl L2Payload {
@@ -699,6 +808,7 @@ impl L2Payload {
             L2Payload::Submit(_) => L2TxType::SubmitResult,
             L2Payload::Dispute(_) => L2TxType::Dispute,
             L2Payload::Settle(_) => L2TxType::Settle,
+            L2Payload::ExitQueue(_) => L2TxType::ExitQueue,
         }
     }
 
@@ -711,6 +821,7 @@ impl L2Payload {
             L2Payload::Submit(p) => Some(p.worker),
             L2Payload::Dispute(p) => Some(p.challenger),
             L2Payload::Settle(_) => None,
+            L2Payload::ExitQueue(p) => Some(p.owner),
         }
     }
 
@@ -721,6 +832,7 @@ impl L2Payload {
             L2Payload::Submit(p) => p.signing_hash(),
             L2Payload::Dispute(p) => p.signing_hash(),
             L2Payload::Settle(p) => p.signing_hash(),
+            L2Payload::ExitQueue(p) => p.signing_hash(),
         }
     }
 
@@ -733,6 +845,7 @@ impl L2Payload {
             L2Payload::Submit(p) => p.verify_auth(),
             L2Payload::Dispute(p) => p.verify_auth(),
             L2Payload::Settle(_) => Ok(()),
+            L2Payload::ExitQueue(p) => p.verify_auth(),
         }
     }
 
@@ -743,6 +856,7 @@ impl L2Payload {
             L2Payload::Submit(p) => p.serialize(),
             L2Payload::Dispute(p) => p.serialize(),
             L2Payload::Settle(p) => p.serialize(),
+            L2Payload::ExitQueue(p) => p.serialize(),
         }
     }
 
@@ -753,6 +867,7 @@ impl L2Payload {
             L2TxType::SubmitResult => L2Payload::Submit(SubmitResultPayload::from_reader(r)?),
             L2TxType::Dispute => L2Payload::Dispute(DisputePayload::from_reader(r)?),
             L2TxType::Settle => L2Payload::Settle(SettlePayload::from_reader(r)?),
+            L2TxType::ExitQueue => L2Payload::ExitQueue(ExitQueuePayload::from_reader(r)?),
         })
     }
 }
@@ -884,6 +999,7 @@ mod tests {
             L2TxType::SubmitResult,
             L2TxType::Dispute,
             L2TxType::Settle,
+            L2TxType::ExitQueue,
         ] {
             assert_eq!(L2TxType::from_wire(t.to_wire()).unwrap(), t);
             assert!(t.to_wire() >= 0x10, "L2 codes must not collide with L1");
@@ -901,6 +1017,7 @@ mod tests {
         assert_eq!(L2TxType::SubmitResult.fee_sat(), 2_000);
         assert_eq!(L2TxType::Dispute.fee_sat(), 10_000);
         assert_eq!(L2TxType::Settle.fee_sat(), 20_000);
+        assert_eq!(L2TxType::ExitQueue.fee_sat(), 2_000);
     }
 
     // --- task id --------------------------------------------------------
@@ -1011,6 +1128,9 @@ mod tests {
                 signer_bitmap: vec![0b0000_0111],
                 signer_count: 3,
             }),
+            L2Payload::ExitQueue(
+                ExitQueuePayload::build(&w, 1, 50_000, [0xCCu8; 20], 1_000).unwrap(),
+            ),
         ];
         for payload in payloads {
             let tx = L2Transaction::new(payload);

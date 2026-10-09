@@ -740,9 +740,10 @@ fn joint_supply_holds_with_live_deposits() {
         .saturating_add(view.state().conservation_total())
         .saturating_sub(sink_held);
     assert!(
-        joint <= params.supply_cap_sat,
-        "joint supply {joint} exceeds cap {}",
-        params.supply_cap_sat
+        joint
+            <= jnt_core::supply::cumulative_issuance_sat(&params, chain.height())
+                .saturating_add(params.escrow_ceiling_sat),
+        "joint supply {joint} exceeds the joint bound"
     );
     // Without the sink term this chain would already read as inflation —
     // which is why M2's joint check grew the term rather than breaking.

@@ -30,7 +30,6 @@ MAINNET = {
     "name": "mainnet",
     "halving_period": 262_800,
     "start_reward_jnt": 76,
-    "cap_jnt": 39_945_600,
     "block_time_s": 600,
     "tail_decay_to_floor_sat": 10_000_000,
 }
@@ -38,10 +37,14 @@ MINI = {
     "name": "mini",
     "halving_period": 2_000,
     "start_reward_jnt": 76,
-    "cap_jnt": 304_000,
     "block_time_s": 1,
     "tail_constant_sat": 1,
 }
+
+# Decision 18 (2026-10-09): no stock cap. The replacement is the rate anchor —
+# gross issuance in any halving period after ladder exhaustion may not exceed
+# this share of the supply issued at that window's start.
+RATE_ANCHOR_MAX_PCT_PER_PERIOD = 1.0
 
 
 def exhaustion_period(params: dict) -> int:
@@ -105,18 +108,38 @@ def cumulative_sat(params: dict, mined_blocks: int) -> int:
 
 
 def max_issuance_jnt(params: dict) -> int:
-    """The ladder-era integral: the reporting figure, not a bound (with a tail
-    long-run issuance is unbounded by design, so the bound is per-height).
+    """The ladder-era integral: the reporting figure, not a bound (long-run
+    issuance is unbounded by design, so the bound is per-height).
 
     Genesis occupies a rung-0 height without minting, so the first rung is paid
     by `H - 1` blocks: the exact figure is `149H - 76` JNT, 76 JNT below the
     `149H` geometric shortcut the design doc quotes.
     """
-    return min(
+    return (
         cumulative_sat(params, exhaustion_period(params) * params["halving_period"] - 1)
-        // SAT_PER_JNT,
-        params["cap_jnt"],
+        // SAT_PER_JNT
     )
+
+
+def largest_tail_window_pct(params: dict, windows: int = 6) -> float:
+    """The most any post-exhaustion window issues, as a percent of the supply
+    issued at that window's start.
+
+    This is the figure the rate anchor must sit above: with the approved tail
+    it is ~0.34 % on mainnet (the 0.5-JNT first tail period), so the 1 %
+    ceiling never binds in normal operation.
+    """
+    start_period = exhaustion_period(params)
+    worst = 0.0
+    for k in range(windows):
+        per = start_period + k
+        window_start = per * params["halving_period"]
+        issued_start = cumulative_sat(params, window_start - 1)
+        if issued_start == 0:
+            continue
+        gross = cumulative_sat(params, window_start + params["halving_period"] - 1) - issued_start
+        worst = max(worst, 100.0 * gross / issued_start)
+    return worst
 
 
 def year_of(height: int, params: dict) -> float:
@@ -127,7 +150,6 @@ def year_of(height: int, params: dict) -> float:
 def report(params: dict) -> dict:
     ladder = reward_ladder(params)
     reachable = max_issuance_jnt(params)
-    cap = params["cap_jnt"]
     periods = params["halving_period"]
     return {
         "network": params["name"],
@@ -141,8 +163,11 @@ def report(params: dict) -> dict:
             params, cumulative_sat(params, 2 * periods), "two periods"
         ),
         "max_reachable_jnt": reachable,
-        "hard_cap_jnt": cap,
-        "unmintable_jnt": cap - reachable,
+        # Decision 18: no stock cap. The anchor is the only ceiling: at most
+        # 1 % of issued supply per halving period, and the approved schedule
+        # sits ~3x under it (see `largest_tail_window_pct_of_issued`).
+        "rate_anchor_max_pct_per_period": RATE_ANCHOR_MAX_PCT_PER_PERIOD,
+        "largest_tail_window_pct_of_issued": largest_tail_window_pct(params),
         "final_reward_jnt": next((r for r in ladder if r == 0), None),
         # The approved tail (M-A..M-G). `tail_activation_height` is where the
         # ladder gives way to it; the floor is what the decay clamps to. Both
@@ -175,29 +200,27 @@ def check_design_doc_claims() -> list[str]:
     problems: list[str] = []
     m = report(MAINNET)
 
-    # Section 16: cap = 2 x 262,800 x 76.
-    if m["hard_cap_jnt"] != 2 * 262_800 * 76:
-        problems.append(f"cap is {m['hard_cap_jnt']}, expected {2 * 262_800 * 76}")
-    if m["hard_cap_jnt"] != 39_945_600:
-        problems.append("cap does not match the stated ~39.95M")
+    # Section 16: the ladder start and shape (no stock cap since Decision 18).
     if m["ladder_jnt"] != [76, 38, 19, 9, 4, 2, 1, 0]:
         problems.append(f"reward ladder is {m['ladder_jnt']}, expected [76,38,19,9,4,2,1,0]")
     if abs(m["halving_period_years"] - 5.0) > 0.01:
         problems.append(f"halving period is {m['halving_period_years']}y, expected 5y")
 
-    # The geometric-series shortcut over-states issuance, and so does the
-    # "500 x 262,800" shortcut: floor division means the ladder issues
-    # 149H - 76 JNT (genesis eats a rung-0 height without minting), and the
-    # remainder is unreachable.
-    geometric = 2 * 262_800 * 76
+    # The geometric-series shortcut over-states issuance: floor division means
+    # the ladder issues 149H - 76 JNT (genesis eats a rung-0 height without
+    # minting).
     if m["max_reachable_jnt"] != 149 * 262_800 - 76:
         problems.append(
             f"reachable issuance is {m['max_reachable_jnt']}, expected {149 * 262_800 - 76}"
         )
-    if m["unmintable_jnt"] != geometric - (149 * 262_800 - 76):
-        problems.append("unmintable remainder does not reconcile with the cap formula")
-    if m["max_reachable_jnt"] >= m["hard_cap_jnt"]:
-        problems.append("reachable issuance must stay strictly under the cap")
+    # Decision 18: the rate anchor replaces the stock cap. The approved
+    # schedule must fit under it with headroom (~3x on mainnet), never bind.
+    if m["rate_anchor_max_pct_per_period"] != 1.0:
+        problems.append("the rate anchor must be 1 % per halving period")
+    if not 0.0 < m["largest_tail_window_pct_of_issued"] < 1.0:
+        problems.append(
+            f"largest tail window {m['largest_tail_window_pct_of_issued']}% must sit under the 1 % anchor"
+        )
 
     # The tail (M-A/M-B): 0.5 JNT at activation, then 0.25, 0.125, then the
     # 0.1 JNT floor held forever — every step at most a halving, the step into
@@ -225,24 +248,26 @@ def check_design_doc_claims() -> list[str]:
     late = cumulative_sat(MAINNET, 64 * 262_800)
     if late <= m["max_reachable_jnt"] * SAT_PER_JNT:
         problems.append("the tail did not add any issuance past the ladder era")
-    # The ladder era itself still stops short of the sanity ceiling, so the
-    # last pre-tail block is the closest the schedule ever came to it.
-    if cumulative_sat(MAINNET, m["tail_activation_height"] - 1) >= m["hard_cap_jnt"] * SAT_PER_JNT:
-        problems.append("ladder-era issuance crossed the sanity ceiling")
-    # …and it stays a trickle: under 0.02 %/yr of the cap at 10-minute blocks.
+    # …and it stays a trickle: the mainnet floor mints ~0.013 %/yr of the
+    # supply issued at exhaustion, far under the 0.2 %/yr the anchor implies.
     tail_year = 52_596 * 10_000_000
-    if tail_year * 1_000 >= m["hard_cap_jnt"] * SAT_PER_JNT:
-        problems.append("the mainnet floor mints more than 0.1 %/yr of the cap")
+    issued_at_tail_start = cumulative_sat(MAINNET, m["tail_activation_height"] - 1)
+    if tail_year * 500 >= issued_at_tail_start:
+        problems.append("the mainnet floor mints more than 0.2 %/yr of issued supply")
 
     mi = report(MINI)
-    if mi["hard_cap_jnt"] != 2 * mi["halving_period_blocks"] * 76:
-        problems.append("mini cap does not follow the same formula")
     if mi["tail_activation_height"] != 14_000 or mi["tail_floor_sat"] != 1:
         problems.append("mini tail is not the approved 1 sat/block from height 14,000")
-    # The mainnet value on a 1-second profile would mint >1000 %/yr (F5).
+    # Mini's own 1-sat tail is a trickle of its issued supply: under the
+    # 0.2 %/yr the anchor implies. (F5's >1000 %/yr warning was about a
+    # mainnet-sized floor on 1-second blocks — which is why the profiles'
+    # tails are set independently.)
+    mini_issued = cumulative_sat(MINI, mi["tail_activation_height"] - 1)
     mini_year = 31_536_000 * mi["tail_reward_at_exhaustion_sat"]
-    if mini_year > mi["hard_cap_jnt"] * SAT_PER_JNT:
-        problems.append("mini's tail mints more than its whole cap in a year")
+    if mini_year * 500 >= mini_issued:
+        problems.append("mini's tail mints more than 0.2 %/yr of issued supply")
+    if mi["largest_tail_window_pct_of_issued"] >= 1.0:
+        problems.append("mini's tail must sit under the 1 % anchor")
     return problems
 
 

@@ -68,7 +68,8 @@ still the only log surface — **there is no structured log shipper.**
 `jounit_height`, `jounit_finalized_height`, `jounit_finality_depth`,
 `jounit_finality_activation_height`, `jounit_peers`,
 `jounit_base_fee_sat_per_gas`, `jounit_total_supply_sat`,
-`jounit_supply_cap_sat`, `jounit_pscb_reserve_sat`,
+`jounit_rate_anchor_allowance_sat`, `jounit_issued_sat`,
+`jounit_net_supply_sat`, `jounit_pscb_reserve_sat`,
 `jounit_mempool_transactions`, `jounit_l1_relay_queue`,
 `jounit_l2_include_queue`, `jounit_l2_height`, `jounit_l2_applied_total`,
 `jounit_l2_skipped_total`, `jounit_l2_pending_deposits`,
@@ -152,15 +153,15 @@ There is **no** `config.toml` and **no** `policy/` directory in the data dir
 - **Mainnet genesis** is deterministic and frozen (SPEC §11). It mints
   **nothing** and has no spendable output (0 % premine, enforced in code).
 - **Supply** is bounded per height by the issuance integral
-  (`cumulative_issuance_sat(height)`), clamped by the **39,945,600 JNT** sanity
-  ceiling; it is not "minted over `MAX_HALVINGS × 10` epochs" (no such constant
-  exists). The ladder issues **39,157,124 JNT** (the geometric `149 × 262 800`
-  over-states it by 76 JNT, because genesis occupies a rung-0 height without
-  minting); after the ladder the approved tail keeps issuing 0.1 JNT/block
-  forever, so **788,476 JNT of the cap can never be minted** (see
+  (`cumulative_issuance_sat(height)`) and per halving period by the rate anchor
+  (≤ 1 % of issued supply — Decision 18); there is no stock cap. It is not
+  "minted over `MAX_HALVINGS × 10` epochs" (no such constant exists). The ladder
+  issues **39,157,124 JNT** (the geometric `149 × 262 800` over-states it by 76
+  JNT, because genesis occupies a rung-0 height without minting); after the
+  ladder the approved tail keeps issuing 0.1 JNT/block forever (see
   `docs/monetary-policy.md`).
-- **L2 genesis escrow** (Decision 7, amended by M-E) is a *reallocation of
-  headroom that can never be minted*, not new issuance:
+- **L2 genesis escrow** (Decision 7, amended by M-E) is bounded by its own
+  validated ceiling, not new issuance:
   `NetworkParams::validate` refuses any escrow above its own
   `escrow_ceiling_sat`. `mini` allocates 10 JNT (3 grant accounts of 1 JNT
   each); `mainnet` allocates 100,000 JNT and grants nothing.

@@ -65,12 +65,18 @@ use jnt_l2::{
 /// short test window, every other profile gets production values. The bounty
 /// share is identical in both (it is an incentive, not a timing knob), so this
 /// mapping changes when a block is challengeable, never how value moves.
+///
+/// The exit activation height always comes from the profile itself
+/// (`NetworkParams::exit_activation_height`): the constructors below default
+/// it to `0` (never) and this override is what activates exits per network.
 pub fn config_for(params: &NetworkParams) -> L2Config {
-    if params.name == "mini" {
+    let mut config = if params.name == "mini" {
         L2Config::mini()
     } else {
         L2Config::mainnet()
-    }
+    };
+    config.exit_activation_height = params.exit_activation_height;
+    config
 }
 
 /// The validator set the node checks `Settle` payloads against (Decision 15).

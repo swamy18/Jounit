@@ -73,11 +73,11 @@ pub enum Error {
     BadPubkey,
     /// address derived from the input pubkey does not own the spent output
     WrongAddress,
-    /// would mint past the hard supply cap
-    SupplyCapExceeded {
+    /// would exceed the rate anchor in effect at this height (Stage SA-1/SA-3)
+    SupplyRateExceeded {
         already: u64,
         requested: u64,
-        cap: u64,
+        allowed_in_period: u64,
     },
     /// key material was not 32 bytes, or a keypair was not generated
     BadKey(&'static str),
@@ -169,13 +169,13 @@ impl fmt::Display for Error {
             }
             Error::BadPubkey => write!(f, "invalid compressed secp256k1 pubkey"),
             Error::WrongAddress => write!(f, "pubkey does not own the spent output"),
-            Error::SupplyCapExceeded {
+            Error::SupplyRateExceeded {
                 already,
                 requested,
-                cap,
+                allowed_in_period,
             } => write!(
                 f,
-                "mint would exceed cap: issued {already} + reward {requested} > cap {cap}"
+                "mint exceeds the rate anchor: issued {already} + reward {requested} > {allowed_in_period} sat allowed in this period"
             ),
             Error::BadKey(w) => write!(f, "bad key material: {w}"),
             Error::BadPuzzleSpec(w) => write!(f, "invalid puzzle spec: {w}"),

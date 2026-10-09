@@ -49,18 +49,18 @@ fn closed_port() -> u16 {
 }
 
 /// A healthy `/v1/conservation` body: 10 + 1000 − 0 re-adds to 1010, well
-/// under the cap, both L2 checks true.
+/// under the 10000 joint bound, both L2 checks true.
 const HEALTHY_REPORT: &str = concat!(
     r#"{"ok":true,"l2_closed":true,"l2_funding_ok":true,"#,
-    r#""joint_sat":1010,"supply_cap_sat":10000,"headroom_sat":8990,"#,
+    r#""joint_sat":1010,"joint_bound_sat":10000,"headroom_sat":8990,"#,
     r#""l1_live_sat":10,"l2_held_sat":1000,"sink_held_sat":0,"#,
     r#""network_id":"jounit/mini","height":3}"#
 );
 
-/// A broken body: the terms re-add (101 + 0 − 0), but joint 101 > cap 100.
+/// A broken body: the terms re-add (101 + 0 − 0), but joint 101 > bound 100.
 const BROKEN_REPORT: &str = concat!(
     r#"{"ok":false,"l2_closed":true,"l2_funding_ok":true,"#,
-    r#""joint_sat":101,"supply_cap_sat":100,"headroom_sat":0,"#,
+    r#""joint_sat":101,"joint_bound_sat":100,"headroom_sat":0,"#,
     r#""l1_live_sat":101,"l2_held_sat":0,"sink_held_sat":0,"#,
     r#""network_id":"jounit/mini","height":3}"#
 );

@@ -90,12 +90,12 @@ def check_supply_values() -> None:
                 f"{network}: reachable issuance {sec['max_reachable_jnt']} "
                 f"!= {expected_reachable}"
             )
-        if sec["hard_cap_jnt"] != 2 * period * 76:
-            problems.append(f"{network}: cap does not equal 2 x period x 76")
-        if sec["max_reachable_jnt"] >= sec["hard_cap_jnt"]:
-            problems.append(f"{network}: reachable issuance must stay under the cap")
-        if sec["unmintable_jnt"] != sec["hard_cap_jnt"] - sec["max_reachable_jnt"]:
-            problems.append(f"{network}: unmintable remainder does not reconcile")
+        if sec.get("rate_anchor_max_pct_per_period") != 1.0:
+            problems.append(f"{network}: rate anchor must be 1 % per halving period")
+        if not 0.0 < sec.get("largest_tail_window_pct_of_issued", 1.0) < 1.0:
+            problems.append(
+                f"{network}: the approved schedule must sit under the 1 % anchor"
+            )
 
 
 def check_puzzle_against_reference() -> None:

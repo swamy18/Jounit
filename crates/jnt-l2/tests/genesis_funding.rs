@@ -187,19 +187,19 @@ fn malformed_allocations_fail_closed() {
 }
 
 #[test]
-fn joint_supply_fits_under_the_cap_on_both_profiles() {
-    // The composition the whole model rests on, stated in one place: the most
-    // L1 can ever mint plus the most L2 can ever hold never reaches the cap.
-    // No L1 rule changed to make this true — the escrow was sized into the
-    // gap the ladder provably cannot mint.
+fn l2_genesis_escrow_fits_under_its_own_ceiling_on_both_profiles() {
+    // The composition the whole model rests on, stated in one place: L1 is
+    // bounded by the issuance integral (checked by the mint gate), and L2's
+    // genesis side is bounded by its own validated ceiling (approved M-E).
+    // There is no stock cap any more (Decision 18), so the escrow's own
+    // ceiling is the bound this test pins.
     for p in [NetworkParams::mainnet(), NetworkParams::mini()] {
         p.validate().unwrap();
         let g = L2Genesis::for_params(&p);
         g.validate().unwrap();
-        let reachable = jnt_core::supply::max_issuance_sat(&p);
         assert!(
-            reachable + g.escrow_total_sat <= p.supply_cap_sat,
-            "{}: joint supply would breach the cap",
+            g.escrow_total_sat <= p.escrow_ceiling_sat,
+            "{}: escrow would breach its ceiling",
             p.name
         );
         // And the escrow identity is bound to its own network.

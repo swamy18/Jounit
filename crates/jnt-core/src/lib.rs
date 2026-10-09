@@ -28,6 +28,7 @@ pub mod chain;
 pub mod compute_ir;
 pub mod difficulty;
 pub mod error;
+pub mod exit;
 pub mod fees;
 pub mod finality;
 pub mod hash;

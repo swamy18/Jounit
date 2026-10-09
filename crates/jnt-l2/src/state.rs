@@ -32,12 +32,14 @@ use jnt_core::bls_checkpoint::{BlsSignature, BlsVerifier, ValidatorSet};
 use jnt_core::fees::split_flat_fee;
 use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
-    ClaimTaskPayload, DisputePayload, L2Payload, L2Transaction, PostTaskPayload, SettlePayload,
-    SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
+    ClaimTaskPayload, DisputePayload, ExitQueuePayload, L2Payload, L2Transaction, PostTaskPayload,
+    SettlePayload, SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
 };
 use jnt_core::ser::{Reader, Writer};
 use jnt_core::slash::SlashVault;
-use jnt_core::state_root::{account_leaf, prove_inclusion, state_root, InclusionProof};
+use jnt_core::state_root::{
+    account_leaf, exit_record_leaf, prove_inclusion, state_root, InclusionProof,
+};
 
 use crate::error::{L2Error, L2Result};
 use crate::genesis::L2Genesis;
@@ -84,6 +86,18 @@ pub enum L2Effect {
         submitter_refunded: u64,
         worker_deposit_burned: u64,
     },
+    ExitQueued {
+        owner: Address,
+        nonce: u64,
+        amount_sat: u64,
+        destination: Address,
+    },
+    ExitReleased {
+        owner: Address,
+        nonce: u64,
+        amount_sat: u64,
+        destination: Address,
+    },
 }
 
 /// Equality here is *state* equality: two nodes that replayed the same
@@ -129,6 +143,81 @@ pub struct L2State {
     /// Verified Work Certificates, keyed by task id (Phase 4, SPEC.md §17.7).
     /// Certificates hold no value, so they are outside the conservation sum.
     vwcs: HashMap<Hash, VerifiedWorkCertificate>,
+    /// Queued L2 → L1 exits, keyed by `(owner, nonce)` (approved P1). A record
+    /// exists from queue until release; release *removes* it rather than
+    /// flagging it, so the map is exactly the outstanding-exit set and replay
+    /// re-derives it from the winning chain with no persisted ledger.
+    exits: HashMap<(Address, u64), ExitRecord>,
+    /// Last queue nonce used per owner. Strictly increasing nonces are the
+    /// replay protection for exits (mirroring the agent authorization
+    /// discipline); a repeated or rewound nonce is refused by name.
+    exit_nonce: HashMap<Address, u64>,
+    /// Value currently encumbered in queued exits (`amount + exit_fee` per
+    /// record). Part of the conservation sum: queueing moves value out of an
+    /// account into this bucket, release moves it out of L2 entirely.
+    exits_locked: u64,
+    /// Value ever released to L1, append-only. `funded_total` equals genesis
+    /// plus deposits minus this — anything else is invented or vanished money.
+    exited_total: u64,
+}
+
+/// One queued L2 → L1 exit: the exact record the L1 release proof re-states.
+///
+/// The leaf committed under the L2 state root is computed from these fields
+/// only (see [`L2State::committed_root`]); maturity and release are judged by
+/// consensus against the chain, never by this hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitRecord {
+    pub owner: Address,
+    pub nonce: u64,
+    pub amount_sat: u64,
+    pub destination: Address,
+    pub exit_fee_sat: u64,
+    pub queued_height: u64,
+}
+
+impl ExitRecord {
+    /// Fixed 72-byte encoding: owner(20) + nonce(8) + amount(8) +
+    /// destination(20) + fee(8) + height(8). Fixed size, so the wire count is
+    /// bounded by the buffer with no prefix to lie about.
+    pub const ENCODED_LEN: usize = 72;
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.fixed(&self.owner)
+            .u64le(self.nonce)
+            .u64le(self.amount_sat)
+            .fixed(&self.destination)
+            .u64le(self.exit_fee_sat)
+            .u64le(self.queued_height);
+    }
+
+    pub fn decode(r: &mut Reader<'_>) -> L2Result<Self> {
+        let owner: Address = r.fixed().map_err(|_| codec_err("exit owner"))?;
+        let nonce = r.u64le().map_err(|_| codec_err("exit nonce"))?;
+        let amount_sat = r.u64le().map_err(|_| codec_err("exit amount"))?;
+        let destination: Address = r.fixed().map_err(|_| codec_err("exit destination"))?;
+        let exit_fee_sat = r.u64le().map_err(|_| codec_err("exit fee"))?;
+        let queued_height = r.u64le().map_err(|_| codec_err("exit height"))?;
+        Ok(ExitRecord {
+            owner,
+            nonce,
+            amount_sat,
+            destination,
+            exit_fee_sat,
+            queued_height,
+        })
+    }
+
+    pub fn leaf(&self) -> Hash {
+        exit_record_leaf(
+            &self.owner,
+            self.nonce,
+            self.amount_sat,
+            &self.destination,
+            self.exit_fee_sat,
+            self.queued_height,
+        )
+    }
 }
 
 impl L2State {
@@ -146,6 +235,10 @@ impl L2State {
             pscb: 0,
             slash_vault: SlashVault::new(),
             vwcs: HashMap::new(),
+            exits: HashMap::new(),
+            exit_nonce: HashMap::new(),
+            exits_locked: 0,
+            exited_total: 0,
         }
     }
 
@@ -309,6 +402,182 @@ impl L2State {
         }
     }
 
+    // --- exits (approved P1) -------------------------------------------
+
+    /// The consensus-committed root: account leaves in address order, then exit
+    /// leaves in `(owner, nonce)` order, under one tree.
+    ///
+    /// With no queued exits the leaf list is the account list, so this equals
+    /// [`L2State::state_root`]: a pre-exit state commits identically under both
+    /// functions, and the block commitment never disagrees with the SDK root
+    /// for states that predate exits.
+    pub fn committed_root(&self) -> Hash {
+        let mut leaves: Vec<Hash> = self
+            .account_leaves()
+            .iter()
+            .map(|(a, b)| account_leaf(a, *b))
+            .collect();
+        let mut exits: Vec<(&(Address, u64), &ExitRecord)> = self.exits.iter().collect();
+        exits.sort_by_key(|(k, _)| **k);
+        leaves.extend(exits.iter().map(|(_, r)| r.leaf()));
+        state_root(&leaves)
+    }
+
+    /// Every queued exit, sorted by `(owner, nonce)`. Deterministic
+    /// enumeration, like [`L2State::tasks`]: two nodes holding the same state
+    /// list the same records in the same order.
+    pub fn exit_records(&self) -> Vec<&ExitRecord> {
+        let mut ids: Vec<(Address, u64)> = self.exits.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|id| &self.exits[&id]).collect()
+    }
+
+    pub fn exit(&self, owner: &Address, nonce: u64) -> Option<&ExitRecord> {
+        self.exits.get(&(*owner, nonce))
+    }
+
+    pub fn exit_count(&self) -> usize {
+        self.exits.len()
+    }
+
+    /// Value currently encumbered in queued exits.
+    pub fn exits_locked_total(&self) -> u64 {
+        self.exits_locked
+    }
+
+    /// Value ever released to L1, append-only.
+    pub fn exited_total(&self) -> u64 {
+        self.exited_total
+    }
+
+    /// Prove a queued exit record against [`L2State::committed_root`].
+    ///
+    /// `None` for an unknown or already-released record — there is no leaf, so
+    /// there is nothing to prove. Release *removes* the record precisely so a
+    /// spent exit can never be proven again.
+    pub fn exit_proof(&self, owner: &Address, nonce: u64) -> Option<InclusionProof> {
+        let mut leaves: Vec<Hash> = self
+            .account_leaves()
+            .iter()
+            .map(|(a, b)| account_leaf(a, *b))
+            .collect();
+        let mut exits: Vec<(&(Address, u64), &ExitRecord)> = self.exits.iter().collect();
+        exits.sort_by_key(|(k, _)| **k);
+        let position = exits.iter().position(|(k, _)| **k == (*owner, nonce))?;
+        leaves.extend(exits.iter().map(|(_, r)| r.leaf()));
+        prove_inclusion(&leaves, self.account_leaves().len() + position)
+    }
+
+    /// Whether a queued exit may be released at `tip`: its queue block is
+    /// final under the stronger of the two Decision-15 rules — depth
+    /// `maturity_depth` **and**, once binding finality is active, the binding
+    /// checkpoint height. The same rule that governs deposit maturity, never
+    /// weaker for exits. `binding_finalized == 0` means binding finality has
+    /// not activated and depth alone governs.
+    pub fn exit_is_mature(
+        queued_height: u64,
+        tip: u64,
+        binding_finalized: u64,
+        maturity_depth: u64,
+    ) -> bool {
+        let depth_ok = tip >= queued_height.saturating_add(maturity_depth);
+        let binding_ok = binding_finalized == 0 || queued_height <= binding_finalized;
+        depth_ok && binding_ok
+    }
+
+    /// Queue an L2 → L1 exit: debit `amount + exit_fee + queue fee` from the
+    /// owner and record the pending exit the release rule later pays out.
+    ///
+    /// Fail-closed: below the activation height, on a zero amount, on a
+    /// repeated or rewound nonce, or on insufficient balance — the record is
+    /// written only after every check passes, so a refused queue leaves no
+    /// partial state.
+    pub fn queue_exit(
+        &mut self,
+        p: &ExitQueuePayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        // `0` means the profile never activates exits: queueing would encumber
+        // funds with no release, so it is refused rather than left to mature
+        // into nothing.
+        if self.config.exit_activation_height == 0 || height < self.config.exit_activation_height {
+            return Err(L2Error::ExitNotActive);
+        }
+        if p.amount_sat == 0 {
+            return Err(L2Error::ZeroAmount("exit"));
+        }
+        let last = self.exit_nonce.get(&p.owner).copied().unwrap_or(0);
+        if p.nonce <= last {
+            return Err(L2Error::BadExitNonce);
+        }
+        let need = p
+            .amount_sat
+            .checked_add(p.exit_fee_sat)
+            .and_then(|v| v.checked_add(fee))
+            .ok_or(L2Error::Overflow)?;
+        self.ensure_balance(&p.owner, need)?;
+        if self.exits.contains_key(&(p.owner, p.nonce)) {
+            return Err(L2Error::BadExitNonce);
+        }
+        self.charge_unchecked(&p.owner, need);
+        self.collect_fee(fee);
+        self.exits_locked = self
+            .exits_locked
+            .checked_add(p.amount_sat + p.exit_fee_sat)
+            .ok_or(L2Error::Overflow)?;
+        self.exits.insert(
+            (p.owner, p.nonce),
+            ExitRecord {
+                owner: p.owner,
+                nonce: p.nonce,
+                amount_sat: p.amount_sat,
+                destination: p.destination,
+                exit_fee_sat: p.exit_fee_sat,
+                queued_height: height,
+            },
+        );
+        self.exit_nonce.insert(p.owner, p.nonce);
+        Ok(L2Effect::ExitQueued {
+            owner: p.owner,
+            nonce: p.nonce,
+            amount_sat: p.amount_sat,
+            destination: p.destination,
+        })
+    }
+
+    /// Release a queued exit to L1: remove the record and move its value out
+    /// of L2 accounting entirely.
+    ///
+    /// Called by replay when it observes a consensus-valid release in an L1
+    /// block body — validity (proof, maturity, idempotency) is the L1 rule's
+    /// job; this enforces the L2 side effects exactly once. An unknown record
+    /// (never queued, or already released and therefore removed) is refused by
+    /// name rather than debited twice.
+    pub fn note_release(&mut self, owner: &Address, nonce: u64) -> L2Result<ExitRecord> {
+        let record = self
+            .exits
+            .remove(&(*owner, nonce))
+            .ok_or(L2Error::UnknownExit)?;
+        let value = record
+            .amount_sat
+            .checked_add(record.exit_fee_sat)
+            .ok_or(L2Error::Overflow)?;
+        self.exits_locked = self
+            .exits_locked
+            .checked_sub(value)
+            .ok_or(L2Error::Overflow)?;
+        self.exited_total = self
+            .exited_total
+            .checked_add(value)
+            .ok_or(L2Error::Overflow)?;
+        self.funded_total = self
+            .funded_total
+            .checked_sub(value)
+            .ok_or(L2Error::Overflow)?;
+        Ok(record)
+    }
+
     fn ensure_balance(&self, addr: &Address, amount: u64) -> L2Result<()> {
         let have = self.balance(addr);
         if have < amount {
@@ -397,6 +666,7 @@ impl L2State {
             L2Payload::Submit(p) => self.apply_submit(p, height, fee),
             L2Payload::Dispute(p) => self.apply_dispute(p, height, fee),
             L2Payload::Settle(p) => self.apply_settle(p, txid, height, validators, verifier, fee),
+            L2Payload::ExitQueue(p) => self.queue_exit(p, height, fee),
         }?;
 
         // Only a transaction that actually applied is marked applied. A
@@ -800,6 +1070,7 @@ impl L2State {
     pub fn conservation_total(&self) -> u64 {
         self.total_accounts()
             .saturating_add(self.total_locked())
+            .saturating_add(self.exits_locked)
             .saturating_add(self.total_burned())
             .saturating_add(self.pscb)
             .saturating_add(self.vault_remaining())
@@ -819,10 +1090,21 @@ impl L2State {
 
 /// The only state-transport version this build writes *and* reads. A blob
 /// carrying another version is refused, never guessed at.
-pub const L2_STATE_WIRE_VERSION: u8 = 1;
+///
+/// Version 2 adds the exit queue (approved P1): the activation height in the
+/// config area, the exit records and per-owner nonces after the deposits, and
+/// the two exit counters with the other counters. Version-1 blobs are refused
+/// rather than guessed at — a state without exits cannot describe a chain
+/// that queued one.
+pub const L2_STATE_WIRE_VERSION: u8 = 2;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
+/// Smallest possible encoded exit record: owner(20) + nonce(8) + amount(8) +
+/// destination(20) + fee(8) + height(8). Fixed size, no prefix to lie about.
+const WIRE_EXIT_MIN: usize = 72;
+/// Smallest possible encoded exit-nonce entry: `20` owner + `8` nonce.
+const WIRE_NONCE_MIN: usize = 28;
 /// Smallest possible encoded applied-id entry.
 const WIRE_HASH_MIN: usize = 32;
 /// Smallest possible encoded deposit identity: `32` txid + `4` output index.
@@ -866,9 +1148,11 @@ impl L2State {
             .u64le(self.config.dispute_window)
             .u64le(self.config.vesting_period)
             .u64le(self.config.whistleblower_bounty_percent)
+            .u64le(self.config.exit_activation_height)
             .u8(u8::from(self.genesis_applied))
             .u64le(self.funded_total)
             .u64le(self.deposited_total)
+            .u64le(self.exited_total)
             .u64le(self.burned)
             .u64le(self.pscb);
 
@@ -900,6 +1184,23 @@ impl L2State {
         for d in deposits {
             w.fixed(&d.0).u32le(d.1);
         }
+
+        let mut exits: Vec<(&(Address, u64), &ExitRecord)> = self.exits.iter().collect();
+        exits.sort_by_key(|(k, _)| **k);
+        w.u64le(exits.len() as u64);
+        for ((owner, nonce), record) in exits {
+            debug_assert_eq!(*owner, record.owner);
+            debug_assert_eq!(*nonce, record.nonce);
+            record.encode(&mut w);
+        }
+
+        let mut nonces: Vec<(&Address, &u64)> = self.exit_nonce.iter().collect();
+        nonces.sort_by_key(|(a, _)| **a);
+        w.u64le(nonces.len() as u64);
+        for (owner, nonce) in nonces {
+            w.fixed(owner).u64le(*nonce);
+        }
+        w.u64le(self.exits_locked);
 
         let mut vwcs: Vec<(&Hash, &VerifiedWorkCertificate)> = self.vwcs.iter().collect();
         vwcs.sort_by_key(|(id, _)| **id);
@@ -933,6 +1234,9 @@ impl L2State {
             dispute_window: r.u64le().map_err(|_| codec_err("dispute window"))?,
             vesting_period: r.u64le().map_err(|_| codec_err("vesting period"))?,
             whistleblower_bounty_percent: r.u64le().map_err(|_| codec_err("bounty percent"))?,
+            exit_activation_height: r
+                .u64le()
+                .map_err(|_| codec_err("exit activation height"))?,
         };
         let genesis_applied = match r.u8().map_err(|_| codec_err("genesis flag"))? {
             0 => false,
@@ -941,6 +1245,7 @@ impl L2State {
         };
         let funded_total = r.u64le().map_err(|_| codec_err("funded total"))?;
         let deposited_total = r.u64le().map_err(|_| codec_err("deposited total"))?;
+        let exited_total = r.u64le().map_err(|_| codec_err("exited total"))?;
         let burned = r.u64le().map_err(|_| codec_err("burned"))?;
         let pscb = r.u64le().map_err(|_| codec_err("pscb"))?;
 
@@ -1021,6 +1326,47 @@ impl L2State {
             }
         }
 
+        let declared_exits = r.u64le().map_err(|_| codec_err("exit count"))?;
+        let n_exits = bounded_count(
+            &r,
+            declared_exits,
+            WIRE_EXIT_MIN,
+            "exit count exceeds buffer",
+        )?;
+        let mut exits = HashMap::with_capacity(n_exits);
+        let mut exits_locked = 0u64;
+        for _ in 0..n_exits {
+            let record = ExitRecord::decode(&mut r)?;
+            exits_locked = exits_locked
+                .checked_add(record.amount_sat.checked_add(record.exit_fee_sat).ok_or(
+                    codec_err("exit value overflows"),
+                )?)
+                .ok_or(codec_err("locked exits overflow"))?;
+            if exits.insert((record.owner, record.nonce), record).is_some() {
+                return Err(codec_err("duplicate exit identity"));
+            }
+        }
+
+        let declared_nonces = r.u64le().map_err(|_| codec_err("exit nonce count"))?;
+        let n_nonces = bounded_count(
+            &r,
+            declared_nonces,
+            WIRE_NONCE_MIN,
+            "exit nonce count exceeds buffer",
+        )?;
+        let mut exit_nonce = HashMap::with_capacity(n_nonces);
+        for _ in 0..n_nonces {
+            let owner: Address = r.fixed().map_err(|_| codec_err("nonce owner"))?;
+            let nonce = r.u64le().map_err(|_| codec_err("nonce value"))?;
+            if exit_nonce.insert(owner, nonce).is_some() {
+                return Err(codec_err("duplicate nonce owner"));
+            }
+        }
+        let decoded_exits_locked = r.u64le().map_err(|_| codec_err("locked exits"))?;
+        if decoded_exits_locked != exits_locked {
+            return Err(codec_err("locked exits disagree with the records"));
+        }
+
         let declared_vwcs = r.u64le().map_err(|_| codec_err("certificate count"))?;
         let n_vwcs = bounded_count(
             &r,
@@ -1064,9 +1410,20 @@ impl L2State {
             pscb,
             slash_vault,
             vwcs,
+            exits,
+            exit_nonce,
+            exits_locked,
+            exited_total,
         };
         // The protocol's own invariant. A state that does not conserve is not
         // a valid observation of the chain, whatever its structure said.
+        // Exit nonces must also cover their records: a record beyond its
+        // owner's last nonce was never queueable.
+        for ((owner, nonce), _) in &state.exits {
+            if state.exit_nonce.get(owner).copied().unwrap_or(0) < *nonce {
+                return Err(codec_err("exit record beyond the owner's last nonce"));
+            }
+        }
         if !state.check_conservation() {
             return Err(codec_err("decoded state fails the conservation invariant"));
         }

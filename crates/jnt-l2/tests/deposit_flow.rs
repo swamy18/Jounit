@@ -74,6 +74,8 @@ fn block_with(tx: Transaction, height: u64) -> Block {
         signer_pubkey: [0u8; 33],
         txs: vec![coinbase, tx],
         l2_txs: Vec::new(),
+        l2_state_root: None,
+        exit_claims: Vec::new(),
     }
 }
 
@@ -157,6 +159,8 @@ fn coinbase_to_sink_is_never_a_deposit() {
         signer_pubkey: [0u8; 33],
         txs: vec![coinbase_to_sink],
         l2_txs: Vec::new(),
+        l2_state_root: None,
+        exit_claims: Vec::new(),
     };
     let (found, ignored) = jnt_l2::deposits::scan_block(&block, 9, &p);
     assert!(found.is_empty());

@@ -1118,7 +1118,22 @@ the consensus cap gate, or committed vectors") governs the *reward ladder, tail
 values and fee schedules*, and those stay as approved. It is **lifted for the
 supply anchor only**: the stock cap, the mint bound, and the new rate anchor are
 now authorised for implementation along §4 of `supply-anchor-decision.md`.
-Nothing is implemented yet — stages 2–5 are the work.
+
+**Implementation record — stages 2–5 complete (2026-10-09).** `supply_cap_sat`
+is deleted from `NetworkParams` (all profiles), the deprecated
+`Error::SupplyCapExceeded` variant is removed, and the mint bound is the
+issuance integral alone. The rate anchor is enforced in
+`supply::check_mint_at_height` (1 % of issued per post-ladder window; the ladder
+era is grandfathered), pinned by
+`supply::tests::rate_anchor_refuses_a_schedule_that_over_issues_a_window` and
+the sim's rate-headroom section. `tests/vectors/supply_vectors.json` is
+regenerated with the anchor fields (`rate_anchor_max_pct_per_period`,
+`largest_tail_window_pct_of_issued` ≈ 0.34 % on mainnet). Net supply
+(gross issuance minus burned + PSCB removal, both rewound on reorg) is reported
+by `status`, `GET /v1/conservation` and the `/metrics` gauges. Touched suites
+green (`jnt-core` lib, `redteam`, node conservation/api/l2 suites, worker
+http/cli), both sim selftests pass, `verify_vectors.py --check` passes,
+clippy `-D warnings` and `fmt --check` clean.
 
 **Compatibility note:** unlike the exit rule (P1), this change needs **no
 activation height**. The mint bound only loosens (`min(integral, cap)` →

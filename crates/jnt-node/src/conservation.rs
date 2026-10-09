@@ -21,8 +21,9 @@
 //! Since the approved tail (`docs/decisions.md` M-A…M-E, 2026-10-09) the joint
 //! ceiling is **`cumulative_issuance_sat(tip height) + escrow_ceiling_sat`**:
 //! L1 can never hold more than the integral of the reward function, and L2's
-//! genesis side is bounded by its own validated ceiling. `supply_cap_sat`
-//! stays as a reported sanity ceiling (M-D) and is no longer the verdict.
+//! genesis side is bounded by its own validated ceiling. The old stock cap
+//! (`supply_cap_sat`) was removed entirely by Decision 18 (2026-10-09): the
+//! rate anchor now bounds issuance and no ceiling field remains here.
 //!
 //! All three are computed once in [`conservation_report`]. Two consumers
 //! render that report differently: `verify_conservation` stops at the first
@@ -57,9 +58,6 @@ pub struct JointSupply {
     /// The profile's validated `escrow_ceiling_sat` (approved M-E): the most
     /// the L2 genesis side may hold.
     pub escrow_ceiling_sat: u64,
-    /// The active profile's sanity ceiling (`supply_cap_sat`), retained by
-    /// M-D. Reported, but **not** the joint verdict.
-    pub cap_sat: u64,
 }
 
 impl JointSupply {
@@ -142,7 +140,6 @@ pub fn joint_supply(chain: &Chain, l2: &NodeL2) -> JointSupply {
             .saturating_sub(sink_held_sat),
         l1_bound_sat: jnt_core::supply::cumulative_issuance_sat(chain.params(), chain.height()),
         escrow_ceiling_sat: chain.params().escrow_ceiling_sat,
-        cap_sat: chain.params().supply_cap_sat,
     }
 }
 
@@ -336,9 +333,6 @@ mod tests {
             joint_sat: joint,
             l1_bound_sat: l1_bound,
             escrow_ceiling_sat: escrow_ceiling,
-            // The sanity ceiling is deliberately generous here so the verdict
-            // is provably driven by the bound and not by this field.
-            cap_sat: u64::MAX,
         }
     }
 
@@ -374,7 +368,6 @@ mod tests {
                 joint_sat: joint,
                 l1_bound_sat: bound,
                 escrow_ceiling_sat: 0,
-                cap_sat: u64::MAX,
             },
             l2_closed,
             l2_conservation_sat: funded,

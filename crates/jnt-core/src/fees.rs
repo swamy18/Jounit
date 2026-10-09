@@ -4,7 +4,7 @@
 //! Design doc Sections 24.3 and 28.1: base fees are the deflationary lever AND
 //! the on-protocol reserve that backs slashed compute stake recovery (M2). The
 //! 50% burn maintains supply pressure; the 50% PSCB accrual funds the Time-Locked
-//! Compute Reserve vault without touching the hard cap.
+//! Compute Reserve vault as already-removed supply, never as new issuance.
 
 use crate::error::{Error, Result};
 use crate::params::NetworkParams;

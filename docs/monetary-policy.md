@@ -1,7 +1,8 @@
 # Monetary Policy
 
 **Reconciled against code and SPEC on 2026-10-09**, including the approved tail
-(Decisions M-A…M-G in `docs/decisions.md`). This file previously
+(Decisions M-A…M-G in `docs/decisions.md`) and the approved supply anchor
+(Decision 18: the stock cap replaced by a rate rule). This file previously
 described a schedule that exists nowhere in the repository (a 10,000,000 JNT
 cap, a 1 JNT initial reward, 210,000-block halvings, `TARGET_SUPPLY_SAT` /
 `MAX_HALVINGS` constants). None of those names or numbers exist in the code.
@@ -13,13 +14,21 @@ tests (`supply::tests::*`, `params::tests::*`) fail first.
 
 ## Design
 
-JNT is a **capped, time-based issuance** cryptocurrency with **no premine**:
-genesis mints nothing. Minting is bounded per height by the issuance integral
-`cumulative_issuance_sat(height)` through the single gate
-`supply::check_mint_at_height`; `NetworkParams::supply_cap_sat` is retained as a
-sanity ceiling (M-D), not as the binding rule. After the ladder the approved
-tail (§Issuance schedule) keeps a small, bounded issuance flowing forever, so
-the supply is capped *per height* and asymptotically unbounded in total.
+JNT is a **rate-anchored, time-based issuance** cryptocurrency with **no premine**
+and **no stock cap**: genesis mints nothing, and Decision 18 (2026-10-09)
+removed the numerical supply ceiling entirely. Minting is bounded per height by
+the issuance integral `cumulative_issuance_sat(height)` through the single gate
+`supply::check_mint_at_height`, and per halving period by the rate anchor —
+gross issuance in any post-ladder window may not exceed 1 % of the supply
+issued at that window's start. After the ladder the approved tail (§Issuance
+schedule) keeps a small, bounded issuance flowing forever, so long-run issuance
+is unbounded by design and every bound consensus enforces is a rate, never a
+total.
+
+**Net supply** — gross issuance minus everything usage ever removed (the burned
+half plus the PSCB half of every block's base fee) — is what holders
+experience, and `status`, `GET /v1/conservation` and the `/metrics` gauges
+report it (Decision 18 §4.5).
 
 There is **no `TARGET_SUPPLY_SAT`** and **no `MAX_HALVINGS` constant** in the
 code. Halvings are computed as `height / halving_period` (clamped), and the
@@ -30,7 +39,8 @@ over; `period_reward_sat` returns 0 for any epoch ≥ 64 as a hard stop.
 
 | Parameter | Mainnet | Testnet / Mini |
 |---|---|---|
-| `supply_cap_sat` | 39,945,600 JNT = 3,994,560,000,000,000 sat | 304,000 JNT = 30,400,000,000,000 sat |
+| Stock supply cap | **none** (Decision 18 — the rate anchor below replaced it) | none |
+| Rate anchor | ≤ 1 % of issued supply per halving period (≤ 0.2 %/yr) | same rule |
 | `start_reward_sat` | 76 JNT (7,600,000,000 sat) per block | 76 JNT |
 | `halving_period` | 262,800 blocks (5 years at 10 min) | 2,000 blocks |
 | Reward ladder | 76, 38, 19, 9, 4, 2, 1 JNT (then the tail) | same ladder |
@@ -40,8 +50,8 @@ over; `period_reward_sat` returns 0 for any epoch ≥ 64 as a hard stop.
 
 The ladder halves in **whole JNT**
 (`period_reward_sat = (start_reward_jnt >> epoch) * SAT_PER_JNT`), not by
-shifting satoshis — shifting would pay 9.5 JNT at epoch 3 and break the cap
-arithmetic. Epochs ≥ 7 pay the tail, halved in **satoshis** and clamped by the
+shifting satoshis — shifting would pay 9.5 JNT at epoch 3 and break the
+issuance arithmetic. Epochs ≥ 7 pay the tail, halved in **satoshis** and clamped by the
 floor (`DecayToFloor`), never zero on any shipped profile.
 
 ## Issuance schedule (mainnet)
@@ -57,28 +67,28 @@ Epoch 6: 262,800 blocks ×  1 JNT =    262,800 JNT
 Epoch 7 (1,839,600): tail begins at 0.50 JNT, decays to the 0.1 JNT floor
 ────────────────────────────────────────────────
 Ladder-era issuance:  149 × 262,800 − 76 = 39,157,124 JNT
-Supply cap (sanity ceiling):                39,945,600 JNT
-Permanently unmintable:                          788,476 JNT
+Rate anchor (the only ceiling):  ≤ 1 % of issued per halving period
 Tail (steady state):        0.1 JNT/block ≈ 5,260 JNT/yr ≈ 0.013 %/yr
 ```
 
 The tail is the approved policy (Decisions M-A…M-C): the ladder's last rung is
 followed by 0.50 → 0.25 → 0.125 JNT and then a **permanent 0.1 JNT floor**, so
-issuance never stops. Long-run issuance is therefore unbounded by design and the
-bound that consensus enforces is per-height, not a total:
-`cumulative_issuance_sat(height)`, clamped by the cap as a sanity ceiling (M-D).
+issuance never stops. Long-run issuance is therefore unbounded by design; the
+bounds consensus enforces are the per-height issuance integral and the
+per-period rate anchor (Decision 18) — never a stock total.
 
-On `mini`/`testnet` the same ladder over 2,000-block epochs reaches
-**297,924 JNT issued** against the 304,000 JNT cap; **6,076 JNT is permanently
-unmintable**. Their tail is a constant **1 sat/block** (M-C): the mainnet value
-on a 1-second profile would mint a four-digit percentage per year against its
-own cap (`sim/supply_schedule_sim.py` prints `max_reachable_jnt 297924 /
-hard_cap_jnt 304000 / unmintable_jnt 6076`).
+On `mini`/`testnet` the same ladder over 2,000-block epochs issues **297,924
+JNT** through the ladder era. Their tail is a constant **1 sat/block** (M-C):
+the mainnet value on a 1-second profile would mint a four-digit percentage per
+year against its own issued supply, which is why the tails are set
+independently. The largest tail window issues ~0.34 % of supply on mainnet —
+about a third of the 1 % anchor, so the anchor never binds the approved
+schedule (`sim/supply_schedule_sim.py` prints
+`largest_tail_window_pct_of_issued`).
 
-The unmintable surplus is *provable*, not reserved: anyone can compute it
-with `supply::max_issuance_sat`. If a block reward would cross the bound, the
-block is refused (`supply::check_mint_at_height` → `SupplyCapExceeded`) and the
-surplus is never created.
+If a block reward would cross either bound, the block is refused
+(`supply::check_mint_at_height` → `SupplyRateExceeded`) and the surplus is
+never created.
 
 ## Fee model (M1 — 50/50 PSCB split)
 
@@ -92,9 +102,10 @@ SPEC.md §8, implemented in `fees::split_fees` / `fees::split_flat_fee`:
 
 Both L1 (`split_fees`) and L2 (`split_flat_fee`, Decision D3) round the same
 way — `flat_split_puts_the_odd_satoshi_where_split_fees_does` pins it — so an
-L1 fee and an L2 fee of the same size burn identical amounts. The PSCB does
-not count toward the cap: those satoshis are already destroyed for cap
-purposes, and the reserve is a protocol-owned accounting claim on them.
+L1 fee and an L2 fee of the same size burn identical amounts. The PSCB is a
+protocol-owned accounting claim on already-removed supply, not new issuance;
+together with the burned half it is the removal term net-supply reporting
+subtracts from gross issuance.
 
 L1 has a gas floor (`min_tx_fee = base_fee × GAS_TX_BASE`, `GAS_TX_BASE =
 16,000`); L2 transactions pay the flat D3 schedule
@@ -104,13 +115,9 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
 ## Escrow and the L2 deposit sink (Decisions 7 and 10)
 
 - **Genesis escrow (Decision 7, amended by M-E):** `l2_genesis_escrow_sat` is
-  a *reallocation of unmintable headroom*, not new issuance: mainnet 100,000
-  JNT of the 788,476 JNT that can never be minted; mini/testnet 10 JNT of
-  6,076 JNT. Since the tail (M-E) the backing rule is the explicit, validated
-  `escrow_ceiling_sat` — the old `cap − max_issuance_sat` gap rule is gone,
-  because with a tail it no longer describes anything.
-  `params::validate` rejects any profile whose escrow exceeds its ceiling
-  (`escrow_respects_the_new_ceiling`).
+  bounded by the explicit, validated `escrow_ceiling_sat` — mainnet 100,000
+  JNT, mini/testnet 10 JNT. `params::validate` rejects any profile whose
+  escrow exceeds its ceiling (`escrow_respects_the_new_ceiling`).
 - **User deposits (Decision 10):** an ordinary L1 payment to the
   network-bound `l2_deposit_sink` address (unspendable, holds no key) is
   read by L2 replay as a deposit, credited 1:1 after
@@ -124,11 +131,12 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
 
 1. No inflation beyond the integral: `supply::tests::no_block_can_mint_beyond_cumulative_issuance`
    and `supply::tests::derived_supply_bound_holds_at_every_height`
-2. No value creation from thin air: `ledger::tests::total_value_never_exceeds_the_cap_and_never_wraps`
-3. Value conservation in transactions: `ledger::tests::a_transaction_can_never_create_more_value_than_it_spends`
-4. L1 + L2 supply never exceeds the joint bound: `jnt-node` `tests/l2_funding.rs::joint_l1_plus_l2_supply_never_exceeds_the_cap`
+2. The rate anchor refuses a dilutive schedule: `supply::tests::rate_anchor_refuses_a_schedule_that_over_issues_a_window`
+3. Net supply is issuance minus removal: `chain::tests::the_burn_counter_and_net_report_track_removal`
+4. Value conservation in transactions: `ledger::tests::a_transaction_can_never_create_more_value_than_it_spends`
+5. L1 + L2 supply never exceeds the joint bound: `jnt-node` `tests/l2_funding.rs::joint_l1_plus_l2_supply_stays_under_the_joint_bound`
    and `GET /v1/conservation` (issuance integral + escrow ceiling)
-5. Escrow respects its own ceiling: `params::tests::escrow_respects_the_new_ceiling`
+6. Escrow respects its own ceiling: `params::tests::escrow_respects_the_new_ceiling`
 
 ## Policy decisions
 
@@ -138,16 +146,21 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
   `l2::tests::fee_mapping_is_the_decided_d3_schedule`. The settle fee is
   fixed; no fee was changed by any Phase-6 milestone.
 - **Decisions M-A…M-G (2026-10-09):** tail shape (E, decay to a floor),
-  0.1 JNT mainnet floor, 1 sat/block on mini/testnet, cap retained as a sanity
-  ceiling, an explicit `escrow_ceiling_sat`, no fee-burn target (deflation
-  accepted), activation at each profile's ladder exhaustion. Implemented in
-  `supply.rs`/`params.rs`/`chain.rs`, vectors regenerated, and pinned by
-  `supply::tests::*`, `params::tests::*`, `sim/supply_schedule_sim.py
-  --selftest` and `sim/tail_emission_sim.py --selftest`.
-- The 39,945,600 JNT cap (as a sanity ceiling), the issuance paths, block
-  rewards, halving schedule, tail values and both fee schedules are **frozen**
-  at the recorded decisions; changing any of them is a consensus monetary
-  decision requiring explicit sign-off (roadmap item 19).
+  0.1 JNT mainnet floor, 1 sat/block on mini/testnet, an explicit
+  `escrow_ceiling_sat`, no fee-burn target (deflation accepted), activation at
+  each profile's ladder exhaustion. Implemented in `supply.rs`/`params.rs`/`chain.rs`,
+  vectors regenerated, and pinned by `supply::tests::*`, `params::tests::*`,
+  `sim/supply_schedule_sim.py --selftest` and `sim/tail_emission_sim.py --selftest`.
+- **Decision 18 (2026-10-09):** the stock cap deleted and replaced by the rate
+  anchor (≤ 1 % of issued per halving period), with net-supply reporting
+  (issuance minus burns) on `status`, `/v1/conservation` and `/metrics`.
+  Implemented in `supply.rs`/`chain.rs`/`conservation.rs`/`api.rs`, vectors
+  regenerated with the anchor fields, pinned by the tests in §Conservation
+  laws above.
+- The issuance paths, block rewards, halving schedule, tail values, rate anchor
+  and both fee schedules are **frozen** at the recorded decisions; changing any
+  of them is a consensus monetary decision requiring explicit sign-off (roadmap
+  item 19).
 
 ## References
 

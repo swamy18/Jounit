@@ -137,7 +137,25 @@ impl ChainL2 {
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) -> Self {
-        let tip = chain.height();
+        Self::replay_to(chain, config, genesis, deposits, validators, verifier, chain.height())
+    }
+
+    /// Replay a whole chain from genesis to `upto` (inclusive), not to the tip.
+    ///
+    /// The miner crank needs the L2 state *as of the queue block* to build an
+    /// exit proof against the root that block committed: the tip state has
+    /// moved on since, and a proof is only valid against its own root. Same
+    /// pass as [`Self::replay`], capped early.
+    pub fn replay_to(
+        chain: &Chain,
+        config: L2Config,
+        genesis: &L2Genesis,
+        deposits: DepositParams,
+        validators: &ValidatorSet,
+        verifier: &dyn BlsVerifier,
+        upto: u64,
+    ) -> Self {
+        let tip = chain.height().min(upto);
         // The one binding-finality floor for this replay: a pure read of the L1
         // chain's finality layer, fixed for the whole pass so every deposit is
         // judged against the same consensus answer (Decision 15).

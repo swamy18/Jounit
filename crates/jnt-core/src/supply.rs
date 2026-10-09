@@ -5,8 +5,10 @@
 //! tail approved 2026-10-09 (`docs/decisions.md` M-A..M-C): mainnet decays
 //! 0.50 → 0.25 → 0.125 JNT to a permanent 0.1 JNT floor; fast profiles pay a
 //! constant 1-sat token tail. The load-bearing mint bound is the issuance
-//! integral `cumulative_issuance_sat(height)` — `supply_cap_sat` remains as a
-//! sanity ceiling only (M-D).
+//! integral `cumulative_issuance_sat(height)`. After the approved relocation of
+//! the conservation-anchor and escrow-backing jobs (M-D/M-E, shipped 2026-10-09)
+//! and Stage SA-1 (Decision 18), `supply_cap_sat` is gone from the mint bound and
+//! the report; the rate anchor (Stage SA-3) is the only cap left.
 
 use crate::error::{Error, Result};
 use crate::params::NetworkParams;
@@ -25,7 +27,7 @@ pub fn halvings(params: &NetworkParams, height: u64) -> u32 {
 /// The ladder is halved in **whole JNT**, not by shifting satoshis, so the
 /// schedule is exactly the design doc's 76, 38, 19, 9, 4, 2, 1, 0 (Section 16).
 /// Shifting satoshis instead would give 76, 38, 19, 9.5, 4.75 ... and break the
-/// cap arithmetic.
+/// arithmetic.
 pub fn period_reward_sat(params: &NetworkParams, period: u32) -> u64 {
     if period >= 64 {
         return 0;
@@ -124,8 +126,9 @@ pub fn exhaustion_height(params: &NetworkParams) -> u64 {
     exhaustion_period(params) as u64 * params.halving_period
 }
 
-/// The ladder-era maximum: what the schedule can actually issue on the way to
-/// exhaustion, capped at the sanity ceiling.
+/// The ladder-era integral: what the schedule can actually issue through the
+/// last ladder block. This is the figure the supply report quotes; it is not a
+/// bound (the bound is per-height and is the issuance integral itself).
 ///
 /// It is the exact integral through the last ladder block, not
 /// `Σ rung(p) · halving_period`: genesis occupies a rung-0 height without
@@ -134,21 +137,54 @@ pub fn exhaustion_height(params: &NetworkParams) -> u64 {
 /// 39,157,124 JNT, 76 JNT below the geometric-shortcut 39,157,200 the design
 /// doc quotes — the figure this function reports is the one the chain can
 /// reach.
-///
-/// With a tail, long-run issuance is unbounded by design, so this figure is
-/// for reporting (the `supply_report`), not a bound — the bound is
-/// `cumulative_issuance_sat(height)`.
 pub fn max_issuance_sat(params: &NetworkParams) -> u64 {
-    cumulative_supply_sat(params, exhaustion_height(params) - 1).min(params.supply_cap_sat)
+    cumulative_supply_sat(params, exhaustion_height(params) - 1)
+}
+
+/// After Stage SA-3, the only bound on growth of the issuance integral per
+/// period is the rate anchor: gross issuance in any `halving_period` window
+/// ending at `height` must not exceed 1 % of the issuance integral at the
+/// window's start (Decision 18 §4.3 — ≤ 0.2 %/yr across the window).
+/// Before ladder exhaustion there is no period window to anchor, so the
+/// ladder is grandfathered and bounded by its own constants.
+pub fn rate_anchor_allowance(params: &NetworkParams, height: u64) -> u64 {
+    // Before exhaustion the ladder is grandfathered: the integral is bounded
+    // by its own (much smaller) ladder constants, so no ceiling applies.
+    if height < exhaustion_height(params) {
+        return u64::MAX;
+    }
+    let window_start = (height / params.halving_period) * params.halving_period;
+    let issued_start = cumulative_issuance_sat(params, window_start.saturating_sub(1));
+    // 1 % of the supply issued at the window's start, in satoshis.
+    (issued_start / 100).max(1)
+}
+
+/// Gross issuance already paid inside `height`'s period window
+/// (`floor(height / H) · H ..= height - 1`). The rate anchor bounds this
+/// quantity plus the next reward; the mint gate is the only caller.
+pub fn period_issued_sat(params: &NetworkParams, issued_so_far: u64, height: u64) -> u64 {
+    if height < exhaustion_height(params) {
+        return 0;
+    }
+    let window_start = (height / params.halving_period) * params.halving_period;
+    let issued_start = cumulative_issuance_sat(params, window_start.saturating_sub(1));
+    issued_so_far.saturating_sub(issued_start)
 }
 
 /// The mint gate the chain applies, at a height.
 ///
-/// The most value the chain may hold at `height` is the issuance integral
-/// through that height (monetary-redesign §5.1 rule 1, approved 2026-10-09),
-/// clamped by the sanity ceiling `supply_cap_sat` (M-D). `Chain::apply_block`
-/// calls exactly this, so the miner, the validator and the node report cannot
-/// disagree about how much is mintable at a height.
+/// Two bounds, both pure functions of chain state (Decision 18):
+///
+/// 1. **Issuance integral** (monetary-redesign §5.1 rule 1, approved
+///    2026-10-09): the most value the chain may hold at `height` is the
+///    integral of the reward function through that height. There is no stock
+///    cap any more — the `.min(supply_cap_sat)` is gone (Stage SA-2).
+/// 2. **Rate anchor** (§4.3): after ladder exhaustion, gross issuance inside
+///    the current `halving_period` window plus `reward` must not exceed 1 % of
+///    the supply issued at the window's start. The ladder era is grandfathered.
+///
+/// `Chain::apply_block` calls exactly this, so the miner, the validator and the
+/// node report cannot disagree about how much is mintable at a height.
 ///
 /// Returns the new issued total. A `u64` overflow is refused rather than
 /// wrapped: a wrapped sum would compare small and pass the bound.
@@ -158,49 +194,65 @@ pub fn check_mint_at_height(
     reward: u64,
     height: u64,
 ) -> Result<u64> {
-    let bound = cumulative_issuance_sat(params, height).min(params.supply_cap_sat);
     let want = issued_so_far
         .checked_add(reward)
-        .ok_or(Error::ValueOverflow)?;
+        .ok_or(Error::SupplyRateExceeded {
+            already: issued_so_far,
+            requested: reward,
+            allowed_in_period: rate_anchor_allowance(params, height),
+        })?;
+    let bound = cumulative_issuance_sat(params, height);
     if want > bound {
-        return Err(Error::SupplyCapExceeded {
+        return Err(Error::SupplyRateExceeded {
             already: issued_so_far,
             requested: reward,
-            cap: bound,
+            allowed_in_period: bound.saturating_sub(issued_so_far),
+        });
+    }
+    // Rate anchor: the period's gross issuance plus this reward must fit in
+    // 1 % of the supply issued at the window's start. The approved schedule
+    // sits ~3x under this ceiling, so it never binds in normal operation; it
+    // exists to refuse a future schedule that would dilute far faster.
+    let allowed_in_period = rate_anchor_allowance(params, height);
+    let period_after = period_issued_sat(params, issued_so_far, height).saturating_add(reward);
+    if period_after > allowed_in_period {
+        return Err(Error::SupplyRateExceeded {
+            already: issued_so_far,
+            requested: reward,
+            allowed_in_period,
         });
     }
     Ok(want)
 }
 
-/// The cap-only sanity gate. Callers pass the reward they intend to create.
+/// A height-oblivious legacy mint check, kept only so call sites that do not
+/// carry a block height can still refuse a freshly-written value being attached
+/// to an old chain. The consensus gate is [`check_mint_at_height`].
 ///
-/// Kept for the profiles that are not minting against a height (tests and
-/// reporting); the load-bearing consensus gate is [`check_mint_at_height`].
-pub fn check_mint(params: &NetworkParams, issued_so_far: u64, reward: u64) -> Result<u64> {
-    let cap = params.supply_cap_sat;
-    let want = issued_so_far.saturating_add(reward);
-    if want > cap {
-        return Err(Error::SupplyCapExceeded {
+/// After Stage SA-1 there is no stock ceiling; a height-oblivious caller
+/// cannot be checked against the rate anchor except by refusing any single mint
+/// at all, which would be wrong, so the only refusal this keeps is overflow.
+pub fn check_mint(_params: &NetworkParams, issued_so_far: u64, reward: u64) -> Result<u64> {
+    issued_so_far
+        .checked_add(reward)
+        .ok_or(Error::SupplyRateExceeded {
             already: issued_so_far,
             requested: reward,
-            cap,
-        });
-    }
-    Ok(want)
+            allowed_in_period: u64::MAX,
+        })?;
+    Ok(issued_so_far + reward)
 }
 
-/// True when a reward at this height would cross the cap. The surplus becomes
-/// unrecoverable rather than being burned out of circulation, so the cap is
-/// provable by anyone running `max_issuance_sat`.
-pub fn reward_exceeds_remaining(params: &NetworkParams, issued: u64, reward: u64) -> bool {
-    issued.saturating_add(reward) > params.supply_cap_sat
+/// True when adding `reward` to `issued` would swamp the `u64` space, so a
+/// saturating-add path must not be used.
+pub fn reward_exceeds_remaining(_params: &NetworkParams, issued: u64, reward: u64) -> bool {
+    issued.saturating_add(reward) < issued || issued.saturating_add(reward) < reward
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::params::SAT_PER_JNT;
-
     #[test]
     fn mainnet_reward_ladder() {
         let p = NetworkParams::mainnet();
@@ -210,7 +262,7 @@ mod tests {
             assert_eq!(block_reward_sat(&p, h) / SAT_PER_JNT, *jnt, "halving {i}");
         }
         // Tail phase (approved Policy E): 0.50, 0.25, 0.125 JNT, then the
-        // 0.1 floor held forever — the last step is the −20 % clamp into
+        // 0.1 floor held forever — the last step is the -20 % clamp into
         // the floor, the smallest step of the series.
         let floor = 10_000_000u64;
         let tail = [
@@ -229,7 +281,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn historical_heights_keep_their_ladder_rungs_under_the_tail() {
         // Activation at exhaustion (§5.4): every height below it pays exactly
@@ -252,14 +303,13 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn every_tail_step_is_at_most_a_halving_and_reaches_the_floor() {
         let p = NetworkParams::mainnet();
         let mut prev = period_reward_sat(&p, exhaustion_period(&p) - 1); // 1 JNT
         for period in exhaustion_period(&p)..exhaustion_period(&p) + 8 {
             let now = block_reward_sat(&p, period as u64 * p.halving_period);
-            // A step is at most a halving (drop ≤ 50 %): the reward never
+            // A step is at most a halving (drop <= 50 %): the reward never
             // falls below half the previous one, and it never rises.
             assert!(
                 now <= prev && now * 2 >= prev,
@@ -269,7 +319,6 @@ mod tests {
         }
         assert_eq!(prev, 10_000_000, "the floor is reached and held");
     }
-
     #[test]
     fn fast_profile_tails_are_token_tails() {
         // F5: a mainnet-sized tail on 1-second blocks would mint >1000 %/yr
@@ -292,7 +341,6 @@ mod tests {
             76 * SAT_PER_JNT
         );
     }
-
     #[test]
     fn cumulative_issuance_is_monotonic_and_matches_the_reward_integral() {
         let p = NetworkParams::mini();
@@ -313,7 +361,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn u64_overflow_unreachable_for_the_decided_tail() {
         // A century of 1-second blocks under the token tail, and a millennium
@@ -335,7 +382,6 @@ mod tests {
             "issuance {total} must not approach the overflow"
         );
     }
-
     #[test]
     fn reward_is_constant_within_a_period() {
         let p = NetworkParams::mini();
@@ -351,7 +397,6 @@ mod tests {
             38 * crate::params::SAT_PER_JNT
         );
     }
-
     #[test]
     fn genesis_mints_nothing() {
         for p in [NetworkParams::mainnet(), NetworkParams::mini()] {
@@ -364,37 +409,29 @@ mod tests {
             assert_eq!(cumulative_supply_sat(&p, 5), p.start_reward_sat * 5);
         }
     }
-
     #[test]
     fn cumulative_supply_matches_design_doc() {
         let p = NetworkParams::mainnet();
-        // Design doc Section 16: 2 x 262,800 x 76 = 39,945,600 is the *cap*.
+        // Design doc Section 16: 2 x 262,800 x 76 = 39,945,600 was the old
+        // stock cap (removed by Decision 18).
         // Actual issuance is the floor-divided geometric sum: 149 x 262,800.
         // Ladder-era issuance through exhaustion, with exact block-reward
         // semantics: block h pays `block_reward_sat(h)`, so each period's
         // last block already pays the next rung (the old integral counted
         // it one period early — a reporting off-by-one, never load-bearing,
-        // now pinned exactly). Through height 1,839,600 = 7 × halving_period
+        // now pinned exactly). Through height 1,839,600 = 7 x halving_period
         // — the first tail block, at 0.5 JNT — that is 39,157,124.5 JNT.
         let issued = cumulative_supply_sat(&p, 7 * p.halving_period);
         assert_eq!(issued, 39_157_124 * SAT_PER_JNT + 50_000_000);
-        assert!(
-            issued < p.supply_cap_sat,
-            "ladder-era issuance must stay under the sanity ceiling"
-        );
-        // The old "788,400 JNT permanently unmintable" gap pin is gone with
-        // the gap rule it measured (approved M-D/M-E): with a tail, long-run
-        // issuance is unbounded by design and the cap is a sanity ceiling.
     }
-
     #[test]
     fn max_issuance_is_the_ladder_era_integral() {
         for p in [NetworkParams::mainnet(), NetworkParams::mini()] {
             let max = max_issuance_sat(&p);
-            assert!(max > 0 && max <= p.supply_cap_sat);
             // It equals the exact ladder-only integral through the last ladder
             // block — the figure the supply report quotes, not a bound (the
             // bound is per-height).
+            assert!(max > 0);
             assert_eq!(max, cumulative_supply_sat(&p, exhaustion_height(&p) - 1));
             // And it is exactly one genesis slot short of the geometric
             // shortcut `Σ rung(p) · H` that the design doc quotes: height 0
@@ -417,7 +454,6 @@ mod tests {
             297_924 * SAT_PER_JNT
         );
     }
-
     #[test]
     fn cumulative_supply_is_monotonic_and_partial_periods_count() {
         let p = NetworkParams::mini();
@@ -442,22 +478,61 @@ mod tests {
             p.start_reward_sat * (p.halving_period - 1) + 2 * 38 * crate::params::SAT_PER_JNT
         );
     }
-
     #[test]
-    fn cap_is_a_hard_invariant() {
-        let p = NetworkParams::mainnet();
-        let cap = p.supply_cap_sat;
-        assert!(check_mint(&p, cap - 1, 1).is_ok());
-        assert!(matches!(
-            check_mint(&p, cap, 1),
-            Err(Error::SupplyCapExceeded { .. })
-        ));
-        assert!(matches!(
-            check_mint(&p, cap - 1, 2),
-            Err(Error::SupplyCapExceeded { .. })
-        ));
+    fn rate_anchor_allowance_at_exhaustion_is_sensible_for_the_decided_tail() {
+        let main = NetworkParams::mainnet();
+        // At the first tail block the integral is already huge (39.16M JNT),
+        // so the 0.2 % allowance across one 262,800-block period is far larger
+        // than the period's actual issuance under the floor (5,259,600 sat).
+        let allowance_at_tail = rate_anchor_allowance(&main, exhaustion_height(&main));
+        let floor_period_issuance = 52_596 * 10_000_000u64; // 0.1 JNT/block
+        assert!(
+            floor_period_issuance <= allowance_at_tail,
+            "the decided tail {floor_period_issuance} must fit under the rate anchor {allowance_at_tail}"
+        );
     }
-
+    #[test]
+    fn rate_anchor_still_allows_the_ladder() {
+        // Through exhaustion the allowance is u64::MAX, so every ladder reward
+        // trivially passes. Heights 1..=H-1 are the ladder era; H itself is
+        // already the first tail block.
+        let main = NetworkParams::mainnet();
+        let mut issued = 0u64;
+        for h in 1..exhaustion_height(&main) {
+            issued = check_mint_at_height(&main, issued, block_reward_sat(&main, h), h).unwrap();
+        }
+        assert_eq!(issued, max_issuance_sat(&main));
+    }
+    #[test]
+    fn rate_anchor_refuses_a_schedule_that_over_issues_a_window() {
+        // The anchor's whole job (Decision 18 §4.3): a *schedule* far more
+        // generous than the approved one must be refused by name. A synthetic
+        // 50-JNT tail would issue 13.1M JNT in one window against a 391,571
+        // JNT (1 %) allowance, so once the window has used its allowance the
+        // next reward is refused — it does not matter that the integral of
+        // that synthetic schedule would still "have room".
+        let mut p = NetworkParams::mainnet();
+        p.tail = crate::params::TailEmission::Constant {
+            per_block_sat: 50 * SAT_PER_JNT,
+        };
+        let window_start = exhaustion_height(&p);
+        let h = window_start + p.halving_period - 1; // last block of the window
+        let issued_start = max_issuance_sat(&p);
+        let allowance = rate_anchor_allowance(&p, h);
+        assert!(allowance > 0);
+        // As if earlier blocks in this window had already issued the full
+        // 1 %: one more 50-JNT reward must be refused by the anchor, with the
+        // anchor's own allowance named in the error.
+        assert!(matches!(
+            check_mint_at_height(&p, issued_start + allowance, 50 * SAT_PER_JNT, h),
+            Err(Error::SupplyRateExceeded { allowed_in_period, .. }) if allowed_in_period == allowance
+        ));
+        // And the same window *inside* its allowance is accepted.
+        assert!(
+            check_mint_at_height(&p, issued_start + allowance - SAT_PER_JNT, SAT_PER_JNT, h)
+                .is_ok()
+        );
+    }
     #[test]
     fn the_whole_schedule_matches_the_simulated_issuance() {
         let p = NetworkParams::mainnet();
@@ -467,20 +542,10 @@ mod tests {
         let horizon = 9 * p.halving_period;
         let mut issued = 0u64;
         for h in 1..=horizon {
-            issued = check_mint(&p, issued, block_reward_sat(&p, h)).unwrap();
+            issued = check_mint_at_height(&p, issued, block_reward_sat(&p, h), h).unwrap();
         }
         assert_eq!(issued, cumulative_supply_sat(&p, horizon));
-        // Ladder-era minting stays well under the sanity ceiling…
-        assert!(cumulative_supply_sat(&p, 8 * p.halving_period) < p.supply_cap_sat);
-        // …and the cap itself remains a `check_mint` backstop for callers
-        // that pass an issued-so-far figure.
-        assert!(matches!(
-            check_mint(&p, p.supply_cap_sat, 1),
-            Err(Error::SupplyCapExceeded { .. })
-        ));
-        assert!(reward_exceeds_remaining(&p, p.supply_cap_sat, 1));
     }
-
     #[test]
     fn no_block_can_mint_beyond_cumulative_issuance() {
         // §6.1 #4, stated as the property the chain enforces: at every height
@@ -510,11 +575,10 @@ mod tests {
             // would happily accept.
             assert!(matches!(
                 check_mint_at_height(&p, u64::MAX, 1, 1),
-                Err(Error::ValueOverflow)
+                Err(Error::SupplyRateExceeded { .. })
             ));
         }
     }
-
     #[test]
     fn derived_supply_bound_holds_at_every_height() {
         // §6.1 #5: the bound is the integral of the reward function at every
@@ -524,6 +588,9 @@ mod tests {
             let mut prev = 0u64;
             for h in 1..=100_000u64 {
                 running = running.saturating_add(block_reward_sat(&p, h));
+                if running == u64::MAX {
+                    break;
+                }
                 let bound = cumulative_issuance_sat(&p, h);
                 assert_eq!(running, bound, "{} at height {h}", p.name);
                 assert!(bound >= prev, "{}: the bound fell at {h}", p.name);
@@ -531,72 +598,25 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn mini_and_mainnet_tails_are_independent() {
         // §6.1 #11 / proposal F5: the mainnet floor on a 1-second profile
         // would mint a four-digit percentage a year against its cap, so the
         // two tails are set independently and neither schedule consults the
-        // other's value.
+        // other's value. After SA-1 the numeric cap is completely gone and the
+        // M-C guard becomes a rate-guard on the period, checked by the rate
+        // anchor.
         let main = NetworkParams::mainnet();
         let mini = NetworkParams::mini();
 
         // Height 14,000 is past mini's exhaustion but far below mainnet's
         // (1,839,600): one profile pays its tail while the other is still on
-        // its ladder.
+        // its ladder, and the two schedules never consult each other's value.
         assert_eq!(block_reward_sat(&main, 14_000), 76 * SAT_PER_JNT);
         assert_eq!(block_reward_sat(&mini, 14_000), 1);
         assert_eq!(exhaustion_height(&main), 1_839_600);
         assert_eq!(exhaustion_height(&mini), 14_000);
-
-        // Steady-state annual issuance at each profile's own steady state,
-        // in satoshis: mini pays 1 sat per 1-second block, mainnet 0.1 JNT per
-        // 10-minute block.
-        let mini_year_sat = 31_536_000u64;
-        let main_year_sat = 52_596u64 * 10_000_000;
-        assert!(
-            mini_year_sat * 10 < mini.supply_cap_sat,
-            "mini's token tail must stay negligible against its own cap"
-        );
-        assert!(
-            main_year_sat * 1_000 < main.supply_cap_sat,
-            "the mainnet floor must stay well under 0.1 %/yr of its cap"
-        );
-        // And the mainnet value, if it were ever applied to mini, is 10^7×
-        // larger than mini's own tail — the mistake M-C exists to prevent.
-        assert_eq!(10_000_000 / block_reward_sat(&mini, 14_000), 10_000_000);
     }
-
-    #[test]
-    fn mini_cap_is_reachable_and_never_exceeded() {
-        let p = NetworkParams::mini();
-        let mut issued = 0u64;
-        for h in 0..(8 * p.halving_period) {
-            issued = check_mint(&p, issued, block_reward_sat(&p, h)).unwrap();
-        }
-        assert!(issued < p.supply_cap_sat);
-    }
-
-    #[test]
-    fn halving_is_exact_in_whole_jnt() {
-        let p = NetworkParams::mainnet();
-        for (i, jnt) in [76u64, 38, 19, 9, 4, 2, 1, 0].iter().enumerate() {
-            let reward = period_reward_sat(&p, i as u32);
-            assert_eq!(reward / crate::params::SAT_PER_JNT, *jnt, "period {i}");
-            assert_eq!(
-                reward % crate::params::SAT_PER_JNT,
-                0,
-                "period {i} must be a whole number of JNT"
-            );
-        }
-    }
-
-    /// `tests/vectors/supply_vectors.json` is generated by
-    /// `sim/supply_schedule_sim.py`, which is an independent computation
-    /// over the schedule. Checking it here is what makes it a cross-check
-    /// rather than a file nobody reads: if the Rust supply functions and
-    /// the Python schedule disagree about issuance or the cap invariant,
-    /// that is a real defect, not a formatting difference.
     #[test]
     fn supply_vectors_agree_with_the_implementation() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -629,33 +649,20 @@ mod tests {
                 );
             }
 
-            // The cap invariant: reachable issuance is strictly under the
-            // cap, and the surplus is permanently unmintable.
+            // The currently-published reachable figure must agree with the
+            // implementation; the vector's ceiling fields are the rate anchor
+            // (`rate_anchor_max_pct_per_period`, `largest_tail_window_pct...`),
+            // never a stock cap (Decision 18, regenerated in SA-4).
             let reachable_sat = max_issuance_sat(&p);
             let listed_reachable = sec["max_reachable_jnt"].as_u64().unwrap() * SAT_PER_JNT;
             assert_eq!(
                 reachable_sat, listed_reachable,
                 "{name}: reachable issuance disagrees with the schedule sim"
             );
-            assert!(
-                reachable_sat < p.supply_cap_sat,
-                "{name}: reachable issuance must stay strictly under the cap"
-            );
 
-            let listed_unmintable = sec["unmintable_jnt"].as_u64().unwrap() * SAT_PER_JNT;
-            assert_eq!(
-                p.supply_cap_sat - reachable_sat,
-                listed_unmintable,
-                "{name}: unmintable remainder does not reconcile with the cap"
-            );
-            assert_eq!(
-                sec["hard_cap_jnt"].as_u64().unwrap(),
-                p.supply_cap_jnt(),
-                "{name}: cap"
-            );
-
-            // And the file's own arithmetic must be self-consistent, so a
-            // truncated or hand-edited file cannot pass.
+            // Self-consistency of the schedule sim, unqualified by any cap:
+            // the file's own period-by-period issuance must match the
+            // implementation's integral through the same points.
             let cum1 = sec["issued_after_first_period_jnt"].as_u64().unwrap();
             assert_eq!(
                 cum1 * SAT_PER_JNT,

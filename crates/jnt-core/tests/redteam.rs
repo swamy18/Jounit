@@ -101,6 +101,8 @@ fn handcraft(chain: &Chain, miner: Address, body: Vec<Transaction>, height: u64)
         signer_pubkey: [0u8; 33],
         txs,
         l2_txs: Vec::new(),
+        l2_state_root: None,
+        exit_claims: Vec::new(),
     }
 }
 
@@ -539,10 +541,10 @@ fn build_tx_does_not_silently_discard_the_fee_it_was_given() {
 /// zero for an empty block, so every such block was refused and the chain
 /// stopped dead at a fixed height — an unrecoverable halt baked into consensus.
 ///
-/// Since the approved tail (`docs/decisions.md` M-A, 2026-10-09) no shipped
-/// profile has a zero reward any more, so the zero-reward path is exercised on
-/// an explicit `TailEmission::None` profile and the shipped tail gets its own
-/// half of the test below.
+/// Since the approved rate anchor (Decision 18, 2026-10-09) no shipped profile
+/// has a fixed stock number at all, the zero-reward path is exercised on an
+/// explicit no-tail profile and the rate anchor gets its own half of the test
+/// below.
 #[test]
 fn a_zero_reward_block_at_the_end_of_the_ladder_is_accepted() {
     // Reach past the last halving by mining on a profile whose ladder is short.
@@ -550,7 +552,6 @@ fn a_zero_reward_block_at_the_end_of_the_ladder_is_accepted() {
     // Eight halving periods of 2 000 blocks is 16 000 blocks, too slow to mine
     // here, so shrink the period while keeping the ladder shape.
     params.halving_period = 2;
-    params.supply_cap_sat = 1_000_000_000_000;
     // Policy A, deliberately: this test is about the *zero-reward* block, which
     // only exists on a profile that pays no tail at all.
     params.tail = TailEmission::None;
@@ -583,15 +584,16 @@ fn a_zero_reward_block_at_the_end_of_the_ladder_is_accepted() {
     chain.verify_canonical_chain().unwrap();
 }
 
-/// **The rule:** the approved tail (M-A/M-C) — past each profile's exhaustion
-/// height the reward keeps flowing, never stops, and is exactly what the
-/// schedule says.
+/// **The rule:** the approved rate anchor (Decision 18, 2026-10-09) —
+/// issuance is bounded by the issuance integral plus a per-period rate ceiling,
+/// not by any fixed stock number. Past each profile's exhaustion height the
+/// reward keeps flowing, never stops, and is exactly what the schedule says.
 ///
-/// **The attack this guards:** a zero tail (policy A) after exhaustion. With
-/// no block reward, fees alone must fund security, and an idle chain pays
-/// nothing — the argument the owner accepted when choosing policy E.
+/// **The attack this guards:** a fixed stock cap (policy A) after exhaustion.
+/// With no fixed ceiling and a permanent tail, an idle chain never runs out of
+/// subsidy — the argument the owner accepted when choosing the rate anchor.
 #[test]
-fn the_approved_tail_keeps_blocks_flowing_past_exhaustion() {
+fn the_rate_anchor_keeps_blocks_flowing_and_does_not_halt_the_chain() {
     let mut params = NetworkParams::mini();
     params.halving_period = 2; // exhaustion at height 14, as above
     params.validate().unwrap();
@@ -611,6 +613,13 @@ fn the_approved_tail_keeps_blocks_flowing_past_exhaustion() {
                 "height {h} is still on the ladder"
             );
         } else {
+            // After exhaustion the bound is the integral plus the period rate
+            // allowance: our 1-sat blocks are never near the limit.
+            let before = jnt_core::supply::cumulative_issuance_sat(&params, h - 1);
+            assert!(
+                jnt_core::supply::check_mint_at_height(&params, before, reward, h).is_ok(),
+                "height {h} must pass the rate anchor gate"
+            );
             assert_eq!(reward, expected_tail, "height {h} must pay the tail");
         }
         chain.submit(b).expect("a tail block must be accepted");

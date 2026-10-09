@@ -117,7 +117,6 @@ fn the_endpoint_reports_terms_that_re_add_and_match_status() {
     let l2 = v["l2_held_sat"].as_u64().unwrap();
     let sink = v["sink_held_sat"].as_u64().unwrap();
     let joint = v["joint_sat"].as_u64().unwrap();
-    let cap = v["supply_cap_sat"].as_u64().unwrap();
     let bound = v["joint_bound_sat"].as_u64().unwrap();
     let l1_bound = v["l1_bound_sat"].as_u64().unwrap();
     let ceiling = v["escrow_ceiling_sat"].as_u64().unwrap();
@@ -127,12 +126,23 @@ fn the_endpoint_reports_terms_that_re_add_and_match_status() {
         "the terms must re-add to the joint figure: {body}"
     );
     // The joint bound is the issuance integral at the tip plus L2's escrow
-    // ceiling, and it is what `ok` rests on — the sanity cap is reported too,
-    // but is no longer the verdict (approved M-D/M-E).
+    // ceiling, and it is the whole verdict — the stock cap is gone
+    // (Decision 18) and is not reported at all.
     assert_eq!(
         bound,
         l1_bound + ceiling,
         "the joint bound must be the two authorities added: {body}"
+    );
+    // Net supply (Decision 18 §4.5): gross issuance minus everything usage
+    // removed — the dilution holders experience, served on this endpoint.
+    let issued = v["l1_issued_sat"].as_u64().unwrap();
+    let removed = v["l1_removed_sat"].as_u64().unwrap();
+    let net = v["l1_net_sat"].as_u64().unwrap();
+    assert_eq!(issued, l1_bound, "gross issuance is the integral: {body}");
+    assert_eq!(
+        net,
+        issued - removed,
+        "net is issuance minus removal: {body}"
     );
     assert_eq!(
         l1_bound,
@@ -146,7 +156,6 @@ fn the_endpoint_reports_terms_that_re_add_and_match_status() {
         "a fresh view holds exactly the genesis escrow: {body}"
     );
     assert_eq!(sink, 0, "nothing has touched the sink: {body}");
-    assert!(joint <= cap, "a healthy node is under the cap: {body}");
 
     // The same live supply, cross-checked against `/v1/status`: both routes
     // read the same state under the same lock, so they cannot disagree.

@@ -222,12 +222,22 @@ fn metrics_endpoint_serves_prometheus_gauges_in_the_exposition_format() {
         "metrics must advertise the Prometheus text content type, got:\n{headers}"
     );
 
-    // The mini profile's cap is 304,000 JNT; the gauge must carry it exactly,
-    // which is what proves the value came from live params and not a constant.
-    let cap = 304_000u64 * 100_000_000;
+    // At height 0 the ladder is grandfathered: the allowance is u64::MAX and
+    // nothing is issued. Both gauges must carry exactly those live values,
+    // which is what proves they came from the chain and not a constant.
     assert!(
-        body.contains(&format!("jounit_supply_cap_sat{{network=\"{NET}\"}} {cap}")),
-        "cap gauge missing or wrong:\n{body}"
+        body.contains(&format!(
+            "jounit_rate_anchor_allowance_sat{{network=\"{NET}\"}} 18446744073709551615"
+        )),
+        "rate-anchor gauge missing or wrong:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("jounit_issued_sat{{network=\"{NET}\"}} 0")),
+        "issued gauge missing or wrong:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("jounit_net_supply_sat{{network=\"{NET}\"}} 0")),
+        "net-supply gauge missing or wrong:\n{body}"
     );
     assert!(
         body.contains(&format!("jounit_height{{network=\"{NET}\"}} 0")),

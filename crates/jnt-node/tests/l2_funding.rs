@@ -272,7 +272,7 @@ fn two_independent_nodes_agree_on_everything() {
 // --- joint supply: 1 JNT L1 can never become 1 L1 + 1 L2 --------------------
 
 #[test]
-fn joint_l1_plus_l2_supply_never_exceeds_the_cap() {
+fn joint_l1_plus_l2_supply_stays_under_the_joint_bound() {
     // The STEP 6 attack goal, stated as an invariant: no sequence of funded
     // operations may push live L1 supply plus everything L2 ever held past
     // the cap. Mining rewards grow L1 while L2 spends down its escrow.
@@ -288,11 +288,11 @@ fn joint_l1_plus_l2_supply_never_exceeds_the_cap() {
         .utxo()
         .total_value()
         .saturating_add(view.state().conservation_total());
-    assert!(
-        joint <= params.supply_cap_sat,
-        "joint supply {joint} exceeds cap {}",
-        params.supply_cap_sat
-    );
+    // The joint bound (Decision 18 removed the stock cap): L1's issuance
+    // integral at the tip plus the L2 escrow ceiling.
+    let bound = jnt_core::supply::cumulative_issuance_sat(&params, chain.height())
+        .saturating_add(params.escrow_ceiling_sat);
+    assert!(joint <= bound, "joint supply {joint} exceeds bound {bound}");
     // And the slack is exactly what the gap-fit promises: L1 mints at most
     // reachable, L2 holds at most escrow.
     assert!(chain.utxo().total_value() <= jnt_core::supply::max_issuance_sat(&params));

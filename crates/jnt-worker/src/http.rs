@@ -446,12 +446,9 @@ pub struct ConservationReport {
     /// The node's own `l1 + l2 − sink` figure, sat.
     pub joint_sat: u64,
     /// The joint ceiling the verdict uses: the node's `joint_bound_sat`
-    /// (issuance integral at the tip plus escrow ceiling) when it reports one.
-    /// A node from before the approved tail has no such field, so the sanity
-    /// cap it does report is used instead — the older, stricter check.
+    /// (issuance integral at the tip plus escrow ceiling). Required: the
+    /// stock cap it once fell back to is gone with Decision 18.
     pub joint_bound_sat: u64,
-    /// The profile's sanity supply ceiling, sat.
-    pub supply_cap_sat: u64,
     /// L2's buckets still sum to what was released into L2.
     pub l2_closed: bool,
     /// L2 was funded by exactly genesis plus matured deposits.
@@ -501,21 +498,12 @@ fn parse_conservation(value: &Value) -> WorkerResult<ConservationReport> {
                 "conservation response is missing a boolean field",
             ))
     };
-    let supply_cap_sat = num("supply_cap_sat")?;
     Ok(ConservationReport {
         l1_live_sat: num("l1_live_sat")?,
         l2_held_sat: num("l2_held_sat")?,
         sink_held_sat: num("sink_held_sat")?,
         joint_sat: num("joint_sat")?,
-        // Optional: absent on nodes built before the approved tail, where the
-        // sanity cap was the binding check. Falling back keeps those nodes
-        // gated (and gated more strictly), rather than reading every one of
-        // them as `ObservationMalformed`.
-        joint_bound_sat: value
-            .get("joint_bound_sat")
-            .and_then(Value::as_u64)
-            .unwrap_or(supply_cap_sat),
-        supply_cap_sat,
+        joint_bound_sat: num("joint_bound_sat")?,
         l2_closed: flag("l2_closed")?,
         l2_funding_ok: flag("l2_funding_ok")?,
         node_ok: flag("ok")?,
@@ -846,7 +834,6 @@ mod tests {
             "joint_bound_sat": 10_000,
             "l1_bound_sat": 9_000,
             "escrow_ceiling_sat": 1_000,
-            "supply_cap_sat": 10_000,
             "headroom_sat": 8_990,
             "l1_live_sat": 10,
             "l2_held_sat": 1_000,
@@ -873,31 +860,6 @@ mod tests {
         v["l1_live_sat"] = json!(10_001);
         assert!(!parse_conservation(&v).unwrap().holds());
 
-        // The bound is what gates, not the sanity cap: joint between the two
-        // passes, and joint above the bound fails even under a huge cap.
-        // (`l2_held_sat` is 1_000 in this fixture, so joint = l1 + 1_000.)
-        let mut v = report_json();
-        v["joint_sat"] = json!(9_500);
-        v["l1_live_sat"] = json!(8_500);
-        v["joint_bound_sat"] = json!(10_000);
-        v["supply_cap_sat"] = json!(39_945_600);
-        assert!(parse_conservation(&v).unwrap().holds());
-        v["joint_sat"] = json!(10_001);
-        v["l1_live_sat"] = json!(9_001);
-        assert!(!parse_conservation(&v).unwrap().holds());
-
-        // A node built before the tail reports only the sanity cap; the
-        // fallback keeps it gated on that (the stricter check).
-        let mut v = report_json();
-        v.as_object_mut().unwrap().remove("joint_bound_sat");
-        v["joint_sat"] = json!(10_001);
-        v["l1_live_sat"] = json!(9_001);
-        assert!(!parse_conservation(&v).unwrap().holds());
-        // …and a healthy reading stays healthy through the fallback.
-        let mut v = report_json();
-        v.as_object_mut().unwrap().remove("joint_bound_sat");
-        assert!(parse_conservation(&v).unwrap().holds());
-
         // Each L2 check broken on its own — refused.
         let mut v = report_json();
         v["l2_closed"] = json!(false);
@@ -920,7 +882,7 @@ mod tests {
             "l2_held_sat",
             "sink_held_sat",
             "joint_sat",
-            "supply_cap_sat",
+            "joint_bound_sat",
             "l2_closed",
             "l2_funding_ok",
             "ok",
