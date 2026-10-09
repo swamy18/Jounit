@@ -927,3 +927,41 @@ Decision 7 sets `mainnet` `l2_genesis_escrow_sat = 100,000 JNT` inside the
 788,400 JNT unmintable gap. If the protocol owner intends a different scale,
 that is a one-value change; the gap-fit rule (`NetworkParams::validate`) will
 reject anything larger than the gap.
+
+---
+
+# Pending monetary decisions (NOT decided — recorded as blockers)
+
+`docs/monetary-redesign.md` is a **PROPOSAL** and is not authorisation to change
+consensus. It carries the full analysis, formulas and sensitivity tables; this
+section is the *sign-off surface* — the same questions reduced to items a
+protocol owner can accept or reject. Nothing below is approved, and **no line of
+this section authorises an implementation**. While any item is `OPEN`, the
+frozen state in Decisions 7 and 10 stands: cap, ladder, halving schedule and
+both fee schedules are unchanged.
+
+Confirmed current state (read from code, not carried over): cap
+**39,945,600 JNT**; reachable issuance **39,157,200 JNT**; **788,400 JNT**
+permanently unmintable; ladder `76, 38, 19, 9, 4, 2, 1, 0` in whole JNT;
+`halving_period` 262,800; ladder exhausts at height **1,839,600**.
+
+| # | Question | Options | Consequence if changed | Status |
+|---|---|---|---|---|
+| **M-A** | Tail emission shape at ladder exhaustion | **(A)** retain zero tail · **(D)** flat tail · **(E)** declining tail to a floor | Any tail **requires a supply-rule change** and a new issuance anchor; `cap − max_issuance_sat` can no longer be the escrow backing rule (see M-D/M-E) | **OPEN** |
+| **M-B** | Tail floor value | proposed **0.1 JNT/block** · 1.00 · 0.50 · other | Sets steady-state dilution (0.10 JNT ≈ 0.0134 %/yr); the proposal derives this from a security-floor argument, **not** from any repository constant | **OPEN — 0.1 JNT not approved** |
+| **M-C** | Per-network tail | mainnet value · testnet/mini value (proposed **1 sat/block**) | Applying the mainnet value to mini would mint **>1,000 %/yr** (proposal F5); the two profiles must be set independently | **OPEN** |
+| **M-D** | Fate of `supply_cap_sat` | **keep** as a sanity ceiling · **replace** with an explicit invariant | `supply_cap_sat` is currently the *joint L1/L2 conservation anchor* **and** the escrow backing rule, not just a ceiling. Deleting it without a replacement silently removes both checks. The proposal rejects deletion-for-convenience | **OPEN — do not delete to make a tail fit** |
+| **M-E** | Meaning of `escrow_ceiling` | define an explicit, validated parameter · keep the implicit `cap − max_issuance_sat` gap | No `escrow_ceiling` symbol exists in code or SPEC today. It is the proposal's replacement for the gap rule once a tail changes issuance. Ownership, release rules, reorg behaviour and interaction with spendable supply are **all unspecified** | **OPEN — semantics undecided** |
+| **M-F** | Fee-burn / deflation design (proposal F2) | own the design (set an explicit target or accept deflation) · leave unowned and state no target | Under ordinary usage the **whole** base fee leaves live supply (50 % burned + 50 % to the `pscb_reserve` counter, which no code path converts back to UTXOs — verified 2026-10-09). At high activity live supply trends to zero at ~y50 in the proposal's model. This is **not** an issuance question, but it blocks any claim that monetary policy is "complete" | **OPEN — unowned** |
+| **M-G** | Activation mechanism | network-upgrade flag/height · historical-compatibility expectation · vector changes | Proposal §5.4 argues activation at exhaustion (1,839,600) leaves existing history byte-identical. **No mainnet activation until M-A…M-F are approved**; vector changes are only legitimate once an approved rule actually changes consensus | **OPEN** |
+
+**Proposal's own recommendation (not an approval):** decay-to-floor (E) with a
+0.1 JNT mainnet floor, a separately-set testnet tail, `supply_cap_sat` retained
+as a sanity ceiling, and `escrow_ceiling` introduced as an explicit validated
+parameter. Treating that as decided is exactly the error this section exists to
+prevent.
+
+**What may proceed while M-A…M-G are open:** auditing, tests, simulation and
+documentation that *describe* current behaviour. **What may not:** editing
+`params.rs` reward/cap/escrow values, `supply.rs`, the consensus cap gate, or
+committed vectors.
