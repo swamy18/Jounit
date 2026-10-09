@@ -1,25 +1,52 @@
-//! The worker CLI — minimal, secret-free (SPEC.md §18, "CLI" item).
+//! The worker CLI — secret-free (SPEC.md §18, "CLI" item).
 //!
-//! The SDK's architecture is an in-process library over injected seams, so a
-//! *useful* worker CLI needs a live node transport, which this build does not
-//! have yet (§18.3). What IS appropriate today — and provided here — is the
-//! worker's own key tooling on the SDK's primitives:
+//! Commands:
 //!
-//! - `address`  print the wallet's Jounit address (`jt1…`)
-//! - `generate` create a wallet file (0600-equivalent, operator-supplied path)
+//! - `address`   print the wallet's Jounit address (`jt1…`)
+//! - `generate`  create a wallet file (0600-equivalent, operator-supplied path)
+//! - `run`       the worker daemon loop: discover → claim → execute → submit,
+//!   over a live node's REST API (§18.3). It uses the SDK's injected seams
+//!   and the **production** `RealBls` verifier, so it exercises the same code
+//!   path an operator's own integration would; it implements no consensus
+//!   rule of its own.
 //!
-//! Anything beyond (claim/submit/status) is Phase 6 with the REST API, and is
-//! documented as such in the SDK README/docs. No command ever prints a
-//! private key; `generate` writes the file and prints only the path.
+//! No command ever prints a private key; `generate` writes the file and prints
+//! only the path, and `run` logs task ids and errors but never key material
+//! (§18.16).
+//!
+//! **Shutdown:** the `run` loop is bounded by `--iterations` for operators who
+//! want that, and otherwise runs until the process is terminated. There is no
+//! portable signal handler here (and the node's own `serve` loop has none
+//! either); between passes nothing is left half-written, because every step in
+//! a pass is a complete signed transaction broadcast to the node.
 
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use jnt_core::bls::RealBls;
+use jnt_core::bls_checkpoint::ValidatorSet;
+use jnt_core::hash::{address_to_hex, hash_to_hex, Hash};
+use jnt_core::params::NetworkParams;
+use jnt_worker::node::Host;
+use jnt_worker::{is_retryable, CpuExecutor, HttpNode, WorkerClient, WorkerConfig};
+
+/// The concrete client the CLI builds: the HTTP transport serves as both the
+/// read view and the broadcaster, and the CPU executor is the SDK's reference
+/// engine.
+type CliClient = WorkerClient<HttpNode, HttpNode, CpuExecutor>;
 
 fn usage() -> String {
     "usage:
-  jnt-worker address --from-file <path>
-  jnt-worker generate --out-file <path> [--label <label>]"
+  jnt-worker address  --from-file <path>
+  jnt-worker generate --out-file <path> [--label <label>]
+  jnt-worker run      --from-file <path> --node <base-url> [--network <name>]
+                      [--iterations <n>] [--interval-ms <n>] [--max-tasks <n>]
+                      [--deposit-sat <n>]
+
+  run defaults: --network mini, --iterations 0 (until stopped),
+                --interval-ms 2000, --max-tasks 4, --deposit-sat 0"
         .to_string()
 }
 
@@ -43,6 +70,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "address" => cmd_address(args),
         "generate" => cmd_generate(args),
+        "run" => cmd_run(args),
         other => Err(format!("unknown command `{other}`\n{}", usage())),
     }
 }
@@ -88,6 +116,112 @@ fn cmd_generate(args: &[String]) -> Result<(), String> {
     // Print only the path. The key bytes now exist in exactly one operator-
     // controlled file and nowhere else in this process's output.
     println!("{}", out);
+    Ok(())
+}
+
+/// A u64 flag, or `default` when absent. A present-but-unparseable value is an
+/// error rather than a silent fallback, so a typo cannot change the daemon's
+/// behaviour behind the operator's back.
+fn num_arg(args: &[String], name: &str, default: u64) -> Result<u64, String> {
+    match str_arg(args, name) {
+        None => Ok(default),
+        Some(v) => v.parse::<u64>().map_err(|e| format!("{name}: {e}")),
+    }
+}
+
+/// First 12 hex chars of a hash, for legible logs. Never truncates fewer than
+/// the string it has.
+fn short(id: &Hash) -> String {
+    let h = hash_to_hex(id);
+    h[..12.min(h.len())].to_string()
+}
+
+/// The worker daemon loop (§18.3 transport, §18.4–§18.7 lifecycle).
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    let file = str_arg(args, "--from-file").ok_or("run needs --from-file <wallet>")?;
+    let node_url = str_arg(args, "--node").ok_or("run needs --node <base-url>")?;
+    let network = str_arg(args, "--network")
+        .map(String::as_str)
+        .unwrap_or("mini");
+    let params = NetworkParams::by_name(network).map_err(|e| e.to_string())?;
+
+    let iterations = num_arg(args, "--iterations", 0)?;
+    let interval_ms = num_arg(args, "--interval-ms", 2_000)?;
+    let max_tasks = num_arg(args, "--max-tasks", 4)?;
+    let deposit_sat = num_arg(args, "--deposit-sat", 0)?;
+
+    let wallet = load_wallet(file)?;
+    let address = wallet
+        .address()
+        .map_err(|e| format!("wallet unusable: {e}"))?;
+    let config = WorkerConfig::from_wallet(&wallet).with_deposit(deposit_sat);
+
+    // Two independent transports: a view (reads) and a broadcaster (writes).
+    // Neither sees the key — signing happens inside the client (§18.3). The
+    // network id is checked by `for_network`, so a mini worker cannot be
+    // pointed at a mainnet node by accident.
+    let view = HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
+    let broadcaster =
+        HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
+    let host = Host::new(view, broadcaster);
+    let validators = ValidatorSet::new(params.genesis_validators.clone());
+    let mut client = WorkerClient::new(host, wallet, CpuExecutor::default(), validators, &RealBls)
+        .with_config(config)
+        .map_err(|e| format!("worker config: {e}"))?;
+
+    println!("worker         {}", address_to_hex(&address));
+    println!("node           {node_url}");
+    println!("network        {}", params.network_id);
+    println!("max tasks/pass {max_tasks}");
+    println!("deposit (sat)  {deposit_sat}");
+
+    let mut pass: u64 = 0;
+    loop {
+        pass += 1;
+        run_one_pass(&mut client, max_tasks, pass)?;
+        if iterations != 0 && pass >= iterations {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+    Ok(())
+}
+
+/// One discovery → claim → execute → submit pass.
+///
+/// Task-local failures are logged and skipped: a task that expires mid-flight
+/// must not stop the daemon, and a claim the protocol refused is information,
+/// not a crash. Only a discovery failure that `is_retryable` rejects is fatal,
+/// because at that point the node is answering but its answer is unusable.
+fn run_one_pass(client: &mut CliClient, max_tasks: u64, pass: u64) -> Result<(), String> {
+    let tasks = match client.discover() {
+        Ok(t) => t,
+        Err(e) if is_retryable(&e) => {
+            eprintln!("pass {pass}: discovery unavailable, will retry: {e}");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("discovery failed, refusing to continue: {e}")),
+    };
+    println!("pass {pass}: {} claimable task(s)", tasks.len());
+
+    for task in tasks.iter().take(max_tasks as usize) {
+        let id = task.task_id;
+        match client.claim(id) {
+            Ok(_) => println!(
+                "  claim   {} net={} sat",
+                short(&id),
+                task.net_payment_sat()
+            ),
+            Err(e) => {
+                eprintln!("  claim   {} refused: {e}", short(&id));
+                continue;
+            }
+        }
+        match client.execute_and_submit(id) {
+            Ok(_) => println!("  submit  {} ok", short(&id)),
+            Err(e) => eprintln!("  submit  {} refused: {e}", short(&id)),
+        }
+    }
     Ok(())
 }
 
