@@ -74,12 +74,30 @@ fn claim_unknown_task(seed: u8) -> L2Transaction {
     ))
 }
 
-/// Mine `l2` into the next block and submit it.
-fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) {
+/// Mine `l2` into the next block, committing the root replay derives
+/// (`NodeL2::simulate_root`): the node's own view is the reference, so the
+/// block commits the outcome replay recomputes rather than a guess.
+fn mine_l2(chain: &mut Chain, view: &NodeL2, l2: Vec<L2Transaction>) -> jnt_core::block::Block {
     let h = chain.height() + 1;
-    let block = chain
-        .mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-        .expect("a block we just mined must build");
+    if l2.is_empty() {
+        return chain
+            .mine_block_with_l2(addr(1), Vec::new(), Vec::new(), ts(h), None, MAX_ATTEMPTS)
+            .expect("a block we just mined must build");
+    }
+    if !chain.exit_active_at(h) {
+        return chain
+            .mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
+            .expect("a block we just mined must build");
+    }
+    let root = view.simulate_root(h, &l2);
+    chain
+        .mine_block_with_l2_root(addr(1), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
+        .expect("a block we just mined must build")
+}
+
+/// Mine `l2` into the next block and submit it.
+fn mine_and_submit(chain: &mut Chain, view: &mut NodeL2, l2: Vec<L2Transaction>) {
+    let block = mine_l2(chain, view, l2);
     chain.submit(block).expect("it must be accepted");
 }
 
@@ -108,7 +126,7 @@ fn an_invalid_l2_payload_is_skipped_by_name_not_crashed() {
     // not leave any partial state.
     let bad = bad_auth_post(2, 1, 200);
     let txid = bad.txid();
-    mine_and_submit(&mut chain, vec![bad]);
+    mine_and_submit(&mut chain, &mut view, vec![bad]);
     view.sync(&chain);
 
     assert_eq!(
@@ -133,7 +151,7 @@ fn an_unknown_task_claim_is_skipped_without_partial_write() {
 
     let claim = claim_unknown_task(2);
     let txid = claim.txid();
-    mine_and_submit(&mut chain, vec![claim]);
+    mine_and_submit(&mut chain, &mut view, vec![claim]);
     view.sync(&chain);
 
     assert_eq!(view.skipped().len(), 1);
@@ -156,7 +174,7 @@ fn a_settle_without_quorum_is_refused() {
         signer_count: 0,
     }));
     let txid = settle.txid();
-    mine_and_submit(&mut chain, vec![settle]);
+    mine_and_submit(&mut chain, &mut view, vec![settle]);
     view.sync(&chain);
 
     assert_eq!(view.skipped().len(), 1);
@@ -182,17 +200,7 @@ fn a_rejected_block_never_mutates_l2_state() {
     let before = view.state().clone();
 
     // Build a block with a bad merkle root — it must be rejected by submit.
-    let h = chain.height() + 1;
-    let mut bad_block = chain
-        .mine_block_with_l2(
-            addr(1),
-            Vec::new(),
-            vec![post(2, 1, 200)],
-            ts(h),
-            None,
-            MAX_ATTEMPTS,
-        )
-        .unwrap();
+    let mut bad_block = mine_l2(&mut chain, &view, vec![post(2, 1, 200)]);
     bad_block.header.merkle_root = [0xFFu8; 32];
 
     let result = chain.clone().submit(bad_block);
@@ -215,7 +223,7 @@ fn a_bad_authorization_is_refused_before_balance_check() {
     // longer covers the body. Authorization is checked first, so this is
     // refused even on an empty/unfunded ledger.
     let bad = bad_auth_post(2, 1, 200);
-    mine_and_submit(&mut chain, vec![bad]);
+    mine_and_submit(&mut chain, &mut view, vec![bad]);
     view.sync(&chain);
 
     assert_eq!(view.skipped()[0].error, L2Error::BadAuthorization);
@@ -229,7 +237,7 @@ fn sequential_incremental_sync_matches_full_replay() {
 
     // Apply blocks one at a time (incremental path).
     for nonce in 1..=3u64 {
-        mine_and_submit(&mut chain, vec![post(2, nonce, 200)]);
+        mine_and_submit(&mut chain, &mut view, vec![post(2, nonce, 200)]);
         view.sync(&chain);
     }
     let incremental_skips = view.skipped().len();
@@ -250,7 +258,7 @@ fn an_empty_l2_section_is_absent_not_stripped() {
     let params = NetworkParams::mini();
     let (mut chain, mut view) = fresh_node(&params);
 
-    mine_and_submit(&mut chain, Vec::new());
+    mine_and_submit(&mut chain, &mut view, Vec::new());
     view.sync(&chain);
     assert!(view.is_clean(), "empty L2 is clean");
     assert_eq!(view.skipped().len(), 0);
@@ -291,10 +299,7 @@ fn double_spend_is_rejected() {
     let p2 = post(2, 1, 200);
     assert_eq!(p1.txid(), p2.txid(), "same nonce => same txid");
 
-    let h = chain.height() + 1;
-    let block = chain
-        .mine_block_with_l2(addr(1), Vec::new(), vec![p1, p2], ts(h), None, MAX_ATTEMPTS)
-        .unwrap();
+    let block = mine_l2(&mut chain, &view, vec![p1, p2]);
     assert!(
         chain.clone().submit(block).is_ok(),
         "both are accepted into the block (replay is an L2 concern)"
@@ -324,34 +329,14 @@ fn l2_replay_refuses_duplicate_apply() {
     };
 
     // First appearance: funded => applied, task created.
-    let h = chain.height() + 1;
-    let block1 = chain
-        .mine_block_with_l2(
-            addr(1),
-            Vec::new(),
-            vec![tx.clone()],
-            ts(h),
-            None,
-            MAX_ATTEMPTS,
-        )
-        .unwrap();
+    let block1 = mine_l2(&mut chain, &view, vec![tx.clone()]);
     chain.submit(block1).unwrap();
     view.sync(&chain);
     assert_eq!(view.applied_count(), 1, "first post was applied");
     assert!(view.state().task(&task_id).is_some(), "task was created");
 
     // Second appearance in the next block: refused as Replay.
-    let h2 = chain.height() + 1;
-    let block2 = chain
-        .mine_block_with_l2(
-            addr(1),
-            Vec::new(),
-            vec![tx.clone()],
-            ts(h2),
-            None,
-            MAX_ATTEMPTS,
-        )
-        .unwrap();
+    let block2 = mine_l2(&mut chain, &view, vec![tx.clone()]);
     chain.submit(block2).unwrap();
     view.sync(&chain);
 
@@ -393,7 +378,7 @@ fn restart_through_block_store_preserves_canonical_chain() {
     let (mut chain, mut view) = fresh_node(&params);
 
     for nonce in 1..=3u64 {
-        mine_and_submit(&mut chain, vec![post(2, nonce, 200)]);
+        mine_and_submit(&mut chain, &mut view, vec![post(2, nonce, 200)]);
         view.sync(&chain);
     }
     let height = chain.height();

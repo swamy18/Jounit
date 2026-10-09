@@ -422,8 +422,7 @@ impl Chain {
         // proof is read. At and after activation, L2 transactions without a
         // committed root are refused: a queue in such a block could never be
         // proven, so the block would silently disable exits.
-        let activation = self.params.exit_activation_height;
-        let active = activation != 0 && block.header.height >= activation;
+        let active = self.exit_active_at(block.header.height);
         if !active {
             if block.l2_state_root.is_some() {
                 return Err(Error::Malformed("l2 root before exit activation"));
@@ -694,6 +693,15 @@ impl Chain {
     /// change output, no tip). Returns the gas and the L1 fee for the caller
     /// to fold into the block totals. Every refusal names its reason, exactly
     /// like `check_tx`: a claim that fails must say which rule failed.
+    /// Whether exit claims and committed L2 roots are live at `height` on this
+    /// profile (approved P1). `exit_activation_height == 0` means *never*, not
+    /// *from genesis*: a profile that has not chosen a height must not accept
+    /// the encoding rules early.
+    pub fn exit_active_at(&self, height: u64) -> bool {
+        let activation = self.params.exit_activation_height;
+        activation != 0 && height >= activation
+    }
+
     fn check_claim(
         &self,
         utxo: &UtxoSet,
@@ -702,7 +710,7 @@ impl Chain {
         base_fee: u64,
     ) -> Result<(u64, u64)> {
         let activation = self.params.exit_activation_height;
-        if activation == 0 || height < activation {
+        if !self.exit_active_at(height) {
             return Err(Error::Malformed("exit claim before activation"));
         }
         if claim.queued_height < activation {

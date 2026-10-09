@@ -211,11 +211,14 @@ fn deposit_end_to_end_funds_posttask_and_survives_restart() {
     // 8–9. The deposited user posts; it applies through the normal path.
     let post = l2_post(60, 1, 500);
     let h = chain.height() + 1;
+    // An L2-bearing block commits the root replay derives (approved P1).
+    let root = view.simulate_root(h, std::slice::from_ref(&post));
     let b = chain
-        .mine_block_with_l2(
+        .mine_block_with_l2_root(
             user_addr,
             vec![],
             vec![post.clone()],
+            root,
             ts(h),
             None,
             MAX_ATTEMPTS,
@@ -568,11 +571,17 @@ fn unfunded_l2_account_still_closed() {
     mine_empty_to(&mut chain, addr_of_miner(), 3);
     let post = l2_post(69, 1, 200);
     let h = chain.height() + 1;
+    // Unfunded post: replay skips it, so the committed root is the skipped one.
+    let root = {
+        let empty = NodeL2::fresh(&params);
+        empty.simulate_root(h, std::slice::from_ref(&post))
+    };
     let b = chain
-        .mine_block_with_l2(
+        .mine_block_with_l2_root(
             addr_of_miner(),
             vec![],
             vec![post.clone()],
+            root,
             ts(h),
             None,
             MAX_ATTEMPTS,

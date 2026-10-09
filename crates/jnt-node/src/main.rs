@@ -1172,11 +1172,27 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         // state changes (SPEC.md §19.1).
         if let Some(addr) = miner_addr {
             let l2_queue = std::mem::take(&mut sh.l2_to_include);
+            // An L2-bearing block must commit the root replay will derive
+            // (approved P1). The chain may not consult the L2 view — that is
+            // the view the chain exists to authenticate — so the miner derives
+            // it from its own view and hands it over. A block that committed
+            // nothing would be refused on every peer, so this is not optional.
+            let l2_root = if l2_queue.is_empty() {
+                None
+            } else {
+                Some(sh.l2.simulate_root(sh.chain.height() + 1, &l2_queue))
+            };
             let mined = if l2_queue.is_empty() {
                 sh.chain.mine_from_pool(&mut sh.pool, addr, now_ms())
             } else {
-                sh.chain
-                    .mine_from_pool_with_l2(&mut sh.pool, addr, now_ms(), l2_queue)
+                sh.chain.mine_from_pool_with_exits(
+                    &mut sh.pool,
+                    addr,
+                    now_ms(),
+                    l2_queue,
+                    Vec::new(),
+                    l2_root,
+                )
             };
             if let Ok(block) = mined {
                 let hash = block.block_hash();

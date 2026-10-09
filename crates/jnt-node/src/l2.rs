@@ -354,6 +354,26 @@ impl NodeL2 {
         Ok(())
     }
 
+    /// The L2 state root that applying `txs` at `height` would produce
+    /// (approved P1), for a miner to commit into the block it is building.
+    ///
+    /// This is [`check`] run for real on a clone and kept: a refused
+    /// transaction is *skipped* rather than fatal, exactly as `sync` will skip
+    /// it, so the root returned is the one replay recomputes — not the root a
+    /// block "should" have had. It advances a clone too, because the per-height
+    /// effects (expiry, settlement, maturity) are part of the root.
+    pub fn simulate_root(&self, height: u64, txs: &[jnt_core::l2::L2Transaction]) -> Hash {
+        let mut probe = self.state().clone();
+        probe.advance_block(height);
+        for tx in txs {
+            // A refusal is not an error here: replay skips it, so the root has
+            // to skip it too. `check` already refused malformed payloads before
+            // they were queued; anything left is genuinely skipped.
+            let _ = probe.apply(tx, height, &self.validators, &RealBls);
+        }
+        probe.committed_root()
+    }
+
     /// The genesis allocation this view was built from.
     pub fn genesis(&self) -> &L2Genesis {
         &self.genesis

@@ -110,9 +110,21 @@ fn settle_no_quorum() -> L2Transaction {
 /// path in miniature. Returns the accepted block.
 fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) -> Block {
     let h = chain.height() + 1;
-    let block = chain
-        .mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-        .expect("a block we just mined must build");
+    // An L2-bearing block commits the root replay derives (approved P1); the
+    // view is rebuilt from the chain so far, as `replay_from` would.
+    let block = if l2.is_empty() {
+        chain.mine_block(addr(1), Vec::new(), ts(h))
+    } else if chain.exit_active_at(h) {
+        // An L2-bearing block commits the root replay derives (approved P1);
+        // the view is rebuilt from the chain so far, as `replay_from` would.
+        let root = NodeL2::replay_from(chain, chain.params()).simulate_root(h, &l2);
+        chain.mine_block_with_l2_root(addr(1), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
+    } else {
+        // Pre-activation profile: a root would be a second encoding rule the
+        // network never agreed to, so the trailer rides without one.
+        chain.mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
+    }
+    .expect("a block we just mined must build");
     chain.submit(block.clone()).expect("it must be accepted");
     block
 }
@@ -156,10 +168,12 @@ fn block_with_valid_l2_is_carried_committed_and_skipped_by_name() {
     let expected = post(9, 2, 200);
     let h = chain.height() + 1;
     let block = chain
-        .mine_block_with_l2(
+        .mine_block_with_l2_root(
             addr(1),
             Vec::new(),
             vec![expected.clone()],
+            NodeL2::replay_from(&chain, chain.params())
+                .simulate_root(h, std::slice::from_ref(&expected)),
             ts(h),
             None,
             MAX_ATTEMPTS,
@@ -530,9 +544,18 @@ fn reorg_replays_the_winning_chain_with_no_silent_divergence() {
         } else {
             Vec::new()
         };
-        let rb = rival
-            .mine_block_with_l2(addr(2), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-            .unwrap();
+        let rb = if l2.is_empty() {
+            rival.mine_block(addr(2), Vec::new(), ts(h)).unwrap()
+        } else if rival.exit_active_at(h) {
+            let root = NodeL2::replay_from(&rival, rival.params()).simulate_root(h, &l2);
+            rival
+                .mine_block_with_l2_root(addr(2), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
+                .unwrap()
+        } else {
+            rival
+                .mine_block_with_l2(addr(2), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
+                .unwrap()
+        };
         rival.submit(rb.clone()).unwrap();
         rival_blocks.push(rb);
     }
@@ -624,10 +647,11 @@ fn funded_claim_for_unknown_task_is_skipped_without_partial_write() {
     let claim = claim_unknown_task(2);
     let h = chain.height() + 1;
     let block = chain
-        .mine_block_with_l2(
+        .mine_block_with_l2_root(
             addr(1),
             Vec::new(),
             vec![claim.clone()],
+            view.simulate_root(h, std::slice::from_ref(&claim)),
             ts(h),
             None,
             MAX_ATTEMPTS,
@@ -654,10 +678,11 @@ fn funded_post_applies_through_incremental_sync() {
     let tx = post(2, 1, 200);
     let h = chain.height() + 1;
     let block = chain
-        .mine_block_with_l2(
+        .mine_block_with_l2_root(
             addr(1),
             Vec::new(),
             vec![tx.clone()],
+            view.simulate_root(h, std::slice::from_ref(&tx)),
             ts(h),
             None,
             MAX_ATTEMPTS,
@@ -674,14 +699,22 @@ fn funded_post_applies_through_incremental_sync() {
 
 #[test]
 fn l2_config_follows_the_network_profile() {
-    assert_eq!(
-        jnt_node::l2::config_for(&NetworkParams::mini()),
-        L2Config::mini()
-    );
-    assert_eq!(
-        jnt_node::l2::config_for(&NetworkParams::mainnet()),
-        L2Config::mainnet()
-    );
+    // The profile constructors own the tuning fields; `exit_activation_height`
+    // is not one of them — it comes from `NetworkParams`, so it is compared
+    // against the params it is supposed to track.
+    for (params, defaults) in [
+        (NetworkParams::mini(), L2Config::mini()),
+        (NetworkParams::mainnet(), L2Config::mainnet()),
+    ] {
+        let cfg = jnt_node::l2::config_for(&params);
+        assert_eq!(cfg.dispute_window, defaults.dispute_window);
+        assert_eq!(cfg.vesting_period, defaults.vesting_period);
+        assert_eq!(
+            cfg.whistleblower_bounty_percent,
+            defaults.whistleblower_bounty_percent
+        );
+        assert_eq!(cfg.exit_activation_height, params.exit_activation_height);
+    }
 }
 
 #[test]

@@ -184,10 +184,19 @@ impl Node {
     /// carry an invalid payload, where a refusal is the point.
     fn mine_l2_raw(&mut self, l2: Vec<L2Transaction>) -> Block {
         let h = self.chain.height() + 1;
-        let block = self
-            .chain
-            .mine_block_with_l2([9u8; 20], Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-            .expect("a block we just mined must build");
+        // An L2-bearing block commits the root replay derives (approved P1):
+        // simulate the view forward exactly as `sync` will, skipping refused
+        // transactions the same way, so the block commits the real outcome.
+        let block = if l2.is_empty() {
+            self.chain
+                .mine_block([9u8; 20], Vec::new(), ts(h))
+                .expect("a block we just mined must build")
+        } else {
+            let root = self.view.simulate_root(h, &l2);
+            self.chain
+                .mine_block_with_l2_root([9u8; 20], Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
+                .expect("a block we just mined must build")
+        };
         self.chain
             .submit(block.clone())
             .expect("it must be accepted");

@@ -68,9 +68,18 @@ fn task_id_of(tx: &L2Transaction) -> [u8; 32] {
 
 fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) -> Block {
     let h = chain.height() + 1;
-    let block = chain
-        .mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-        .expect("a block we just mined must build");
+    // An L2-bearing block commits the root replay derives (approved P1). The
+    // view is rebuilt from the chain so far, exactly as `replay_from` would
+    // for the node that later replays this block.
+    let block = if l2.is_empty() {
+        chain.mine_block(addr(1), Vec::new(), ts(h))
+    } else if chain.exit_active_at(h) {
+        let root = NodeL2::replay_from(chain, chain.params()).simulate_root(h, &l2);
+        chain.mine_block_with_l2_root(addr(1), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
+    } else {
+        chain.mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
+    }
+    .expect("a block we just mined must build");
     chain.submit(block.clone()).expect("it must be accepted");
     block
 }
@@ -215,9 +224,18 @@ fn reorg_does_not_duplicate_funding_or_keep_losing_tasks() {
         } else {
             Vec::new()
         };
-        let rb = rival
-            .mine_block_with_l2(addr(2), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-            .unwrap();
+        let rb = if l2.is_empty() {
+            rival.mine_block(addr(2), Vec::new(), ts(h)).unwrap()
+        } else if rival.exit_active_at(h) {
+            let root = NodeL2::replay_from(&rival, rival.params()).simulate_root(h, &l2);
+            rival
+                .mine_block_with_l2_root(addr(2), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
+                .unwrap()
+        } else {
+            rival
+                .mine_block_with_l2(addr(2), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
+                .unwrap()
+        };
         rival.submit(rb.clone()).unwrap();
         rival_blocks.push(rb);
     }

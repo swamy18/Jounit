@@ -194,9 +194,17 @@ fn declared_committee(params: &NetworkParams) -> Vec<(SecretKey, BlsPublicKey)> 
 
 fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) {
     let h = chain.height() + 1;
-    let block = chain
-        .mine_block_with_l2([1u8; 20], Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
-        .expect("a block we just mined must build");
+    // An L2-bearing block commits the root replay derives (approved P1).
+    let block = if l2.is_empty() {
+        chain.mine_block([1u8; 20], Vec::new(), ts(h))
+    } else if chain.exit_active_at(h) {
+        let root = NodeL2::replay_from(chain, chain.params()).simulate_root(h, &l2);
+        chain.mine_block_with_l2_root([1u8; 20], Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
+    } else {
+        // Pre-activation profile: the trailer rides without a root.
+        chain.mine_block_with_l2([1u8; 20], Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
+    }
+    .expect("a block we just mined must build");
     chain.submit(block).expect("it must be accepted");
 }
 

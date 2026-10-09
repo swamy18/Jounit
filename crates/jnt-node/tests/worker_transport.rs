@@ -84,11 +84,14 @@ fn start_with_task() -> (SocketAddr, Arc<Mutex<SharedNode>>, Hash) {
     let task_id = post.task_id;
     let tx = L2Transaction::new(L2Payload::Post(post));
     let h = chain.height() + 1;
+    // An L2-bearing block commits the root replay derives (approved P1).
+    let root = l2.simulate_root(h, std::slice::from_ref(&tx));
     let block = chain
-        .mine_block_with_l2(
+        .mine_block_with_l2_root(
             [9u8; 20],
             Vec::new(),
             vec![tx],
+            root,
             GENESIS_TIMESTAMP_MS + h * 1_000,
             None,
             MAX_ATTEMPTS,

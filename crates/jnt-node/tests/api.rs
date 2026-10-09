@@ -860,10 +860,10 @@ fn an_oversize_body_is_refused_before_it_is_parsed() {
 fn a_withdrawal_shaped_l2_payload_is_refused_by_name() {
     let node = start();
 
-    // Version 1 envelope, type byte 0x15 — the byte immediately after the
-    // highest defined L2 type (0x14 Settle), which is where a withdrawal would
-    // sit if one existed.
-    let mut envelope = vec![1u8, 0, 0, 0, 0x15];
+    // Version 1 envelope, type byte 0x16 — the byte immediately after the
+    // highest defined L2 type (0x15 ExitQueue), which is where a withdrawal
+    // would sit if one existed.
+    let mut envelope = vec![1u8, 0, 0, 0, 0x16];
     envelope.extend_from_slice(&[0u8; 32]);
     let hex_body = hex::encode(&envelope);
 
@@ -895,13 +895,13 @@ fn a_withdrawal_shaped_l2_payload_is_refused_by_name() {
 #[test]
 fn an_undefined_l2_type_byte_is_refused_by_the_decoder() {
     let mut envelope = vec![1u8, 0, 0, 0];
-    envelope.push(0x15);
+    envelope.push(0x16);
     envelope.extend_from_slice(&[0u8; 32]);
     let err = jnt_core::l2::L2Transaction::deserialize(&envelope)
-        .expect_err("0x15 is not an L2 transaction type");
+        .expect_err("0x16 is not an L2 transaction type");
     assert!(err.to_string().contains("unknown L2 transaction type"));
-    // And the boundary is exactly five: the highest real type decodes, the next
-    // byte does not.
-    assert!(jnt_core::l2::L2TxType::from_wire(0x14).is_ok());
-    assert!(jnt_core::l2::L2TxType::from_wire(0x15).is_err());
+    // And the boundary is exactly six: the highest real type decodes, the
+    // next byte does not.
+    assert!(jnt_core::l2::L2TxType::from_wire(0x15).is_ok());
+    assert!(jnt_core::l2::L2TxType::from_wire(0x16).is_err());
 }
