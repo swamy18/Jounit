@@ -288,7 +288,7 @@ status, and this list is repeated in `docs/status.md`.
 ### M1 — 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
 Base fees collected in each block are split equally:
 - **50% Burned:** Permanently destroyed, preserving the deflationary pressure of EIP-1559.
-- **50% Protocol Security & Compute Buffer (PSCB):** Accumulated on-chain in the `pscb_reserve`. Provides protocol-level liquidity and backing for useful-work validator stakes.
+- **50% Protocol Security & Compute Buffer (PSCB):** Accumulated on-chain in the `pscb_reserve` counter. It is *intended* as protocol-level backing for useful-work validator stakes (M2), but **nothing can spend it yet**: the counter is only incremented and rewound on reorg, so it is not liquid today — see [Fees and burn](#fees-and-burn).
 - **Miner Tip:** 100% of user priority tips go directly to the miner.
 - **Invariant:** `burned + pscb + tip == total_fees`.
 - **Reorg-correct:** the credit is rewound per rolled-back block, and `verify_canonical_chain` re-derives it by replay.
