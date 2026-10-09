@@ -1248,7 +1248,7 @@ clean, no `benches/`, no HTTP server, no `jnt-mcp`/`jnt-elizaos-plugin`/
 | — | Validator economics | **DEFERRED BY DECISION** | Recorded in Decision 2 (§14.6) and Decision 11; deliberately not implemented because staking needs economics this protocol cannot yet support safely. |
 
 Honest completion count after Phase 6: **done 29–30 (items 1–20, 24–29 all shipped, 18/20),
-partial 0, not started 0 (all items addressed), blocked 1 (exits, pending Decision 21).**
+partial 0, not started 0 (all items addressed), blocked 1 (exits — deferred by Decision 10; design and required decision in `docs/l2-exit-design.md`).**
 
 ---
 

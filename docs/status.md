@@ -1517,7 +1517,8 @@ All identified threat surfaces covered by tests and/or fuzzing. Fuzz report:
 
 **SPEC reconciliation:** `docs/roadmap.md` updated — 14/14 Phase 6 items implemented.
 SPEC.md §14.2 L2 payload types now match `crates/jnt-core/src/l2.rs` exactly.
-SPEC.md §15 (node API) added for the three endpoints (health, tx build, reputation).
+SPEC.md §19.2 (opt-in service API) specifies the REST surface (health, tx build,
+reputation and the L2/task/payment/receipt endpoints).
 
 **CI:** Added `checkpoint_codec` to the fuzz-smoke target list. All CI jobs green:
 fmt, clippy (`--workspace --all-targets -- -D warnings`), tests, vectors, sim suite.
@@ -1527,5 +1528,7 @@ provide launch runbooks, monitoring configs, backup/recovery procedures, and
 graduation criteria.
 
 **Documentation:** Added `docs/benchmarks.md`, `docs/fuzz.md`,
-`docs/monetary-policy.md`, `docs/micro-payment-audit.md`, `docs/l2-exit-design.md`
-(proposed — blocked on Decision 21: exit mechanism).
+`docs/monetary-policy.md`, `docs/micro-payment-audit.md`, `docs/l2-exit-design.md`.
+The exit design is **blocked on a decision not yet recorded** — the exit deferral
+in Decision 10 (`docs/decisions.md` *Pending* P1); an earlier revision of this
+line cited a "Decision 21" that does not exist in the repository.

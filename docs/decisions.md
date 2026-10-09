@@ -1,11 +1,27 @@
 # Protocol decisions — D3 (L2 fees) and §14.6 (validator economics)
 
-Recorded as the protocol owner's standing decisions. **Neither decision changes
-any runtime rule today**: no code activates, the 40M supply cap, mining
-economics, block rewards and monetary policy are untouched. They become
-*operative* only when their enabling phases are built (D3 → first L2 tx type,
-Phase 2; §14.6 → testnet activation gate, Phase 6), each behind an explicit,
-reviewable change.
+Recorded as the protocol owner's standing decisions.
+
+> **Reading order.** This file is chronological. Decisions 1–2 sit at the top,
+> then a **dated gap audit** (a snapshot that says Phases 2–5 are NOT STARTED —
+> true when it was written, superseded by the per-phase "Implementation status
+> — Phase N SHIPPED" addenda further down the same file), then Decisions 3–16.
+> The **authoritative** statement of what is built is the last addendum before
+> the *Pending protocol decisions* section at the end. Do not read the gap
+> audit's verdict table as current.
+>
+> **Status of the two decisions above.** Since they were recorded, D3 has been
+> *consumed* (the L2 fee path shipped with Phase 2, SPEC §15) and §14.6 has been
+> partially scaffolded (Decisions 11–12 built the fixed committee and binding
+> activation; the stake ledger is still unbuilt — see *Pending*). At recording
+> time neither changed a runtime rule; that was true then and is no longer the
+> whole story.
+
+**Neither decision changed any runtime rule at the time it was recorded**: no
+code activated, the supply cap, mining economics, block rewards and monetary
+policy were untouched. They become *operative* only when their enabling phases
+are built (D3 → first L2 tx type, Phase 2; §14.6 → testnet activation gate,
+Phase 6), each behind an explicit, reviewable change.
 
 ---
 
@@ -842,3 +858,72 @@ validation (that would be a consensus change and needs its own decision);
 (b) the canonical agent service-payment format (item 11); (c) service receipts
 (item 12); (d) bridge and reputation layers. The `Authorization` type is the
 seam they will build on.
+
+---
+
+# Pending protocol decisions (NOT decided — recorded as blockers)
+
+These are **not** decisions. They are the questions a protocol owner must answer
+before the corresponding work may proceed. They are listed so implementation
+never has to guess, and so no future reader mistakes their absence for an
+oversight. `SPEC.md`, the code and the monetary policy remain the authority for
+what *is* decided.
+
+## P1 — L2 → L1 exit primitive (mainnet fund-safety blocker)
+
+Decision 10 defers exits and states no exit decision is recorded. The deposit
+sink holds no key, so it cannot release funds; any exit needs a **new L1 rule**.
+Full design and the six questions are in `docs/l2-exit-design.md`. **Do not
+implement an exit until this is decided; do not mint value to fake one.**
+
+## P2 — Bonded stake / mainnet validator committee (mainnet blocker)
+
+Decision 2 fixes the economics (5,000 JNT `min_validator_stake_sat`, bonded,
+unbonding after `finality_depth`; TopN 21; no rewards; no fee share;
+full-bond equivocation burn) and Decision 8 deliberately builds **none** of the
+mechanism — no stake transaction, no bond ledger, no unbonding. Consequences
+that remain unbuilt:
+
+1. A **stake/bond transaction type** and its validation rules (new L1 rule).
+2. A **bonded-stake ledger** and the selection rule that reads it ("TopN by
+   stake at the seed block" is currently a pure function over the genesis list).
+3. **Unbonding** after a full finality window, and the interaction with the
+   checkpoint-signing duty.
+4. **Validator rewards / fee share** — deliberately *none* today (Decision 2
+   item 3). Adding any is a monetary decision and is explicitly out of scope.
+5. **Equivocation slashing** — evidence exists (`EquivocationEvidence`) but no
+   bond exists to burn, so punishment is deferred.
+6. **A mainnet committee.** `NetworkParams::mainnet()` carries an **empty**
+   `genesis_validators`, so checkpoint verification fails closed and binding
+   finality is untestable on mainnet. Choosing the bootstrap committee is a
+   decision.
+
+None of 1–6 may be invented by implementation; each needs a recorded decision.
+
+## P3 — M2 activation rule (mainnet blocker)
+
+The anti-collusion slash vault exists (`slash.rs`) but **no rule triggers it**.
+What must be decided: what *proves* a compute result fraudulent well enough to
+slash, and how that verdict enters consensus. Unspecified → M2 stays inactive.
+
+## P4 — M4 registration (mainnet blocker)
+
+The HBM scratchpad puzzle (`hbm_pow.rs`) is **not a registered `puzzle_id`**.
+What must be decided: whether M4 *replaces* or *composes with* the §5 puzzle,
+and the registration/versioning rule. Unspecified → chain security rests on §5
+only.
+
+## P5 — Open interaction carried from Phase 2/3 (economic)
+
+A task whose L2 escrow or worker deposit is smaller than the **20,000 sat
+settle fee** cannot be settled (`AmountTooSmallForFee` fails closed). Carried
+forward since Phase 2. What must be decided: whether the settle fee is drawn
+from elsewhere or the D3 schedule is re-parameterised. Until then, small tasks
+fail closed rather than collecting a partial fee — the safe direction.
+
+## P6 — Mainnet L2 genesis escrow scale (not a blocker, a confirmation)
+
+Decision 7 sets `mainnet` `l2_genesis_escrow_sat = 100,000 JNT` inside the
+788,400 JNT unmintable gap. If the protocol owner intends a different scale,
+that is a one-value change; the gap-fit rule (`NetworkParams::validate`) will
+reject anything larger than the gap.
