@@ -3,33 +3,34 @@
 An AI-native cryptocurrency: mining that pulls compute onto GPU and AI hardware
 without weakening the security a hash chain depends on.
 
-> **Status: Layer 1 base layer + P2P networking + Layer 2 core implemented.** The
-> core protocol includes hybrid hash + neural PoW, 5 protocol mechanisms (PSCB fee
-> split, Time-Locked slash reserve, canonical compute IR, HBM scratchpad PoW, and
-> BLS finality gadget), `jnt-net` block relay and sync, and a working Layer 2
-> (`jnt-l2`): task contracts, the six L2 transaction types (incl. `ExitQueue`), D3 fees, a complete
-> dispute engine with M2 slashing and M1 PSCB accounting, and Verified Work
-> Certificates for settled work. The worker SDK (`jnt-worker`, Phase 5):
-> a task-economy client for humans, AI agents and machines — discover,
-> claim, execute, submit, dispute participation, certificate observation,
-> and earnings derived from protocol state. Phase 6 (integration + testnet) has
-> begun: L2 transactions now ride inside L1 blocks and L2 state is rebuilt from
-> the chain (**SPEC.md §19.1**), and the node replays it on every accepted
-> block (`status`/`verify` surface it). M2 funds L2 from a genesis escrow
-> (**SPEC.md §19.4**): `mini` grants three operator identities, the remainder
-> parks with a derived protocol escrow, and `verify` proves joint L1+L2 supply
-> stays under the joint bound (issuance integral + escrow ceiling). M3 adds user deposits (**SPEC.md §19.5**): an ordinary
-> L1 payment to a derived sink credits the depositor after finality depth, 1:1
-> with no new transaction type. L2→L1 exits are implemented at the protocol
-> layer (P1, E-1…E-3: `ExitQueue` on L2, proof-authorised sink spend on L1
-> against the committed L2 state root); the miner crank, mainnet activation
-> and the L2 absorb hook remain, so mainnet is not ready.
-> Still ahead: exit crank/activation, the worker-node transport, the genesis
-> validator committee and binding finality. Monetary policy is settled:
-> the approved tail (M-A…M-C) pays issuance forever, the stock cap is gone —
-> replaced by the rate anchor (Decision 18, ≤ 1 % of issued per halving
-> period) — and the surfaces report net supply (issuance minus burns).
-> See [Supply](#supply). Read [Status](#status).
+> **Status: Layer 1 base layer + P2P networking + Layer 2 core implemented,
+> including the L2↔L1 exit loop.** The core protocol includes hybrid hash +
+> neural PoW, 5 protocol mechanisms (PSCB fee split, Time-Locked slash reserve,
+> canonical compute IR, HBM scratchpad PoW, and BLS finality gadget), `jnt-net`
+> block relay and sync, and a working Layer 2 (`jnt-l2`): task contracts, the six
+> L2 transaction types (incl. `ExitQueue`), D3 fees, a complete dispute engine
+> with M2 slashing and M1 PSCB accounting, and Verified Work Certificates for
+> settled work. The worker SDK (`jnt-worker`, Phase 6): a task-economy client for
+> humans, AI agents and machines — discover, claim, execute, submit, dispute
+> participation, certificate observation, queue an **L2→L1 exit**, and earnings
+> derived from protocol state. L2 transactions ride inside L1 blocks and L2
+> state is rebuilt from the chain (**SPEC.md §19.1**); the node replays it on
+> every accepted block (`status`/`verify` surface it). M2 funds L2 from a
+> genesis escrow (**SPEC.md §19.4**), and `verify` proves joint L1+L2 supply
+> stays under the joint bound (issuance integral + escrow ceiling). M3 adds user
+> deposits (**SPEC.md §19.5**): an ordinary L1 payment to a derived sink credits
+> the depositor after finality depth, 1:1, with no new transaction type.
+> **L2→L1 exits are implemented end to end (Decision 19, SPEC.md §19.6):**
+> `ExitQueue` on L2, a proof-authorised sink spend on L1 against the committed
+> L2 state root, a permissionless miner crank, and L2 replay absorbing the
+> release. What remains before mainnet is **configuration, not protocol**: the
+> profile's `exit_activation_height`, and the still-open P2–P5 decisions
+> (validator bonded stake, M2 activation, M4 registration, settle-fee floor).
+> The genesis validator committee and binding finality are likewise ahead.
+> Monetary policy is settled: the approved tail (M-A…M-C) pays issuance forever,
+> the stock cap is gone — replaced by the rate anchor (Decision 18, ≤ 1 % of
+> issued per halving period) — and the surfaces report net supply (issuance
+> minus burns). See [Supply](#supply). Read [Status](#status).
 
 ---
 
@@ -52,6 +53,7 @@ without weakening the security a hash chain depends on.
   - [Transactions and signatures](#transactions-and-signatures)
 - [Consensus rules](#consensus-rules)
 - [Network profiles](#network-profiles)
+- [Deposits and exits](#deposits-and-exits)
 - [Node CLI reference](#node-cli-reference)
 - [Testing and verification](#testing-and-verification)
 - [Security: defects found and fixed](#security-defects-found-and-fixed)
@@ -73,9 +75,11 @@ without weakening the security a hash chain depends on.
 
 | | |
 |---|---|
-| Layer 2 — Verified Work Certificates | Phases 2–4 shipped in `crates/jnt-l2`: task contracts and the five L2 tx types (Phase 2), the dispute engine with M2/M1 integration (Phase 3), and Verified Work Certificates (Phase 4) — an automatic, quorum-verifiable receipt for every correctly settled task. |
-| Worker SDK | Shipped (Phase 5): [`crates/jnt-worker`](crates/jnt-worker) — a worker-side SDK over two injected node seams (`L2NodeView`/`L2Broadcaster`; no wire protocol invented). `WorkerClient` covers discovery, claim, a pluggable `Executor` (§16 CPU-reference shipped), result submission with M3 attestations, dispute observation/participation, VWC observation+validation, and earnings derived from authoritative state. Idempotent-by-txid restart/timeout flows; 32 SDK tests including a 15-test privilege-escalation/secret-hygiene suite. The transport that implements the seams shipped in Phase 6 (`HttpNode` over the node's opt-in REST API), together with the `jnt-worker run` daemon loop — which gates on the node's live conservation report (`GET /v1/conservation`) before its first pass and refuses a node whose joint L1 + L2 − sink supply is over the joint bound or whose numbers do not re-add. |
-| L2 → L1 exits (P1, in progress) | `ExitQueue` L2 type + proof-authorised L1 sink spend against the committed L2 state root implemented and tested on L2; L1 claim validation/apply/reorg-unwind in `jnt-core`. Remaining: miner crank, L2 absorb hook, mainnet activation, SPEC §19.6. |
+| Layer 2 — Verified Work Certificates | Phases 2–4 shipped in `crates/jnt-l2`: task contracts and the L2 tx types (Phase 2), the dispute engine with M2/M1 integration (Phase 3), and Verified Work Certificates (Phase 4) — an automatic, quorum-verifiable receipt for every correctly settled task. |
+| Worker SDK | Shipped (Phase 6): [`crates/jnt-worker`](crates/jnt-worker) — a worker-side SDK over two injected node seams (`L2NodeView`/`L2Broadcaster`; no wire protocol invented). `WorkerClient` covers discovery, claim, a pluggable `Executor` (§16 CPU-reference shipped), result submission with M3 attestations, dispute observation/participation, VWC observation+validation, **queueing an L2→L1 exit**, and earnings derived from authoritative state.
+Idempotent-by-txid restart/timeout flows; 43 SDK tests including a 15-test
+privilege-escalation/secret-hygiene suite. The transport that implements the seams ships in Phase 6 (`HttpNode` over the node's opt-in REST API), together with the `jnt-worker run` daemon loop — which gates on the node's live conservation report (`GET /v1/conservation`) before its first pass and refuses a node whose joint L1 + L2 − sink supply is over the joint bound or whose numbers do not re-add. |
+| L2 → L1 exits (Decision 19) | **Shipped (SPEC.md §19.6).** `ExitQueue` on L2, and a proof-authorised sink spend on L1 against the `l2_state_root` committed at the queue block — no signature, because the sink holds no key. The **permissionless crank** is wired into the serve loop, the owner's prepaid `exit_fee_sat` is what makes it griefing-bounded, and `ChainL2` replays a release the way it replays a deposit. Exact funding only: an exit whose sink funding does not sum to its obligation stays queued rather than paying out of a stranger's deposit. The joint conservation check needed **no** exit term — the L1 payment and the L2 debit cancel — so `tests/conservation.rs` passes untouched. Remaining is **configuration** (the profile's `exit_activation_height`), not protocol. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
 | Coverage-guided fuzzing | Shipped: fourteen cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC + Phase-5 `worker_flows`), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
 | License file | Shipped: dual `LICENSE-MIT` / `LICENSE-APACHE` at the repo root, matching `Cargo.toml`'s `MIT OR Apache-2.0`. |
@@ -132,7 +136,7 @@ cargo build --release
 ./target/release/jnt-node status --network mini --data-dir ./chain
 ./target/release/jnt-node verify --network mini --data-dir ./chain
 
-# Run a P2P node daemon.
+# Run a P2P node daemon. The default also mines, so it settles matured exits.
 ./target/release/jnt-node serve  --network mini --data-dir ./chain --listen 127.0.0.1:9833
 ```
 
@@ -141,7 +145,38 @@ UTXO set and supply against stored state. It is the check worth running after
 any change, and `memory.md` records a round-trip where the fee burn reconciled
 to the satoshi.
 
+`status` and `verify` also report the **L2 pipeline** — credits, pending
+deposits, queued exits and value already released to L1 — and `verify` re-derives
+L2 state the same way a peer replays it, so a divergence shows up there rather
+than in production.
+
 Run `jnt-node help` for the full command list; every command accepts `--help`.
+
+### Deposits and exits
+
+On `mini` (which activates exits at height 1) the loop is:
+
+1. **Deposit** — an ordinary L1 payment to the profile's derived sink
+   (`NetworkParams::l2_deposit_sink`). No new transaction type; 1:1 credit after
+   finality depth. SPEC.md §19.5.
+2. **Queue an exit** — the owner signs an `ExitQueue` L2 transaction, which
+   debits `amount + exit_fee + queue_fee` and records
+   `(owner, nonce) → (amount, destination, height)`. SPEC.md §19.6.
+3. **Mature** — after finality depth, the exit is settleable.
+4. **Release** — a **permissionless crank**. Any node's miner builds the claim,
+   proving the record against the root its queue block committed, and the block
+   settles it: the destination gets the principal, the claimant gets the prepaid
+   `exit_fee_sat`, and the sink output is consumed.
+
+The crank needs no operator: consensus pays only the destination the L2 record
+names, and the owner has already paid the claimant's fee at queue time — which is
+why a crank nobody wants to run is simply not run, rather than being a way to
+grief someone.
+
+`mainnet` ships with `exit_activation_height = 0`, which means **never** rather
+than *from genesis*. Until an activation height is configured, mainnet refuses
+both a committed root and an exit claim. That is a deliberate configuration
+state, and it is the remaining launch item for this feature.
 
 ---
 
@@ -150,15 +185,15 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 | Path | Lines | What it is |
 |---|---:|---|
 | [`SPEC.md`](SPEC.md) | — | **Normative.** The protocol specification. Where a disagreement exists, this wins. |
-| `crates/jnt-core/` | 14 900+ | Protocol implementation across 25 modules. All consensus logic. |
+| `crates/jnt-core/` | 23 300+ | Protocol implementation across 33 modules. All consensus logic. |
 | `crates/jnt-core/tests/redteam.rs` | 724 | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
-| `crates/jnt-net/` | 5 100+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
+| `crates/jnt-net/` | 4 800+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
 | `crates/jnt-net/tests/integration.rs` | 500+ | P2P integration tests, including a real-socket end-to-end sync. |
 | `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
-| `crates/jnt-store/` | 2 200+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
-| `crates/jnt-l2/` | 5 400+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates. |
-| `crates/jnt-node/` | 990+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`) with the L2 replay view over accepted blocks. |
-| `crates/jnt-worker/` | — | Worker SDK (Phase 5, SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, earnings. A secret-free CLI: `jnt-worker address`/`generate` for key tooling, and `run` for the worker daemon loop over the node's REST API. |
+| `crates/jnt-store/` | 2 300+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
+| `crates/jnt-l2/` | 10 200+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates, L2→L1 exits. |
+| `crates/jnt-node/` | 9 500+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`) with the L2 replay view over accepted blocks and the exit crank. |
+| `crates/jnt-worker/` | 4 100+ | Worker SDK (SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, L2→L1 exits, earnings. A secret-free CLI: `jnt-worker address`/`generate` for key tooling, and `run` for the worker daemon loop over the node's REST API. |
 | `sim/` | 2 094 | Python: independent protocol reference plus attack, supply and monetary simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
 | [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |
@@ -171,14 +206,14 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 
 ### Crate layout
 
-Five crates in one workspace:
+Six crates in one workspace:
 
 ```
 jnt-core   pure protocol library — no I/O, no clock, no network
 jnt-net    P2P wire protocol, peer state machines, sync and relay
 jnt-store  persistent storage: append-only block log + atomic metadata
-jnt-l2     Layer 2: task contracts, the five L2 transaction types, D3 fees, the dispute engine, VWCs
-jnt-worker worker-side SDK (Phase 5): discovery, claim/execute/submit, disputes, VWC observation, earnings — client only, no consensus
+jnt-l2     Layer 2: task contracts, the six L2 transaction types (incl. ExitQueue), D3 fees, the dispute engine, VWCs, L2 to L1 exits
+jnt-worker worker-side SDK: discovery, claim/execute/submit, disputes, VWC observation, exits, earnings — client only, no consensus
 jnt-node   CLI and node daemon (serve, mine, status, verify)
 ```
 
@@ -554,6 +589,13 @@ hash. Two nodes holding the same set of valid blocks always agree on the tip.
 **Finality.** `finality_depth` blocks below the tip are immutable; a reorg whose
 fork point lands at or below them is rejected as `ReorgWouldCrossFinality`.
 
+**L2 content in a block** (SPEC.md §19.1, §19.6). An L2 trailer is committed by
+the merkle root. Once the profile activates exits, an L2-bearing block **must**
+also commit an `l2_state_root` — an exit cannot be proven without one, so a
+rootless block would silently disable exits. Before activation, a root is refused
+as a second encoding rule the network never agreed to. An exit claim is
+authorised by an inclusion proof against that root, not by a signature.
+
 ---
 
 ## Network profiles
@@ -576,6 +618,7 @@ Selected with `--network`. Same code, different numbers.
 | Initial base fee | 1 000 sat | 100 sat |
 | NN epoch | 50 000 blocks | 2 000 blocks |
 | Puzzle id | 1 | 1 |
+| Exit activation height | **0 = never** | 1 (active from the first block) |
 
 ---
 
@@ -587,33 +630,45 @@ jnt-node <COMMAND> [OPTIONS]
 COMMANDS
   init        Create a chain directory, a miner wallet and the genesis block
   mine        Mine blocks and extend the chain
-  send        Spend from a wallet address into a new block
-  status      Print chain tip, difficulty, supply and wallet balance
+  send        Spend from a wallet address, local or over P2P
+  status      Print chain tip, difficulty, supply, wallet balance, L2 pipeline
   verify      Replay the chain from genesis and diff it against stored state
   show-block  Print one block
   balance     List the unspent outputs of an address
   wallet      Create or list wallets
   export      Write the canonical chain to JSON
+  serve       Run a P2P node: block relay, multi-peer sync, opt-in REST API,
+              and the exit crank
 
 COMMON OPTIONS
   --network <mainnet|mini>   Default: mini
   --data-dir <path>          Default: ./chain
 ```
 
-Per-command options: `--blocks`, `--interval`, `--wallet`, `--amount`, `--to`,
-`--fee`, `--address`, `--height`, `--label`, `--out`, `--new`.
+`send` and `serve` add their own flags.
 
 > `send --amount` is denominated in **satoshis**, while every printed figure is
 > in JNT. This is a known rough edge.
 
 `--help` on any command prints usage without touching the chain directory.
 
+`serve` flags worth knowing:
+
+| Flag | Effect |
+|---|---|
+| `--listen <host:port>` | Accept inbound peers. Omit to be outbound-only |
+| `--api-listen <host:port>` | Start the opt-in REST API (disabled by default; loopback expected — SPEC.md §19.2) |
+| `--connect <host:port>` | Dial an outbound peer; repeatable as CSV |
+| `--peers <n>` | Max total peers (default 125) |
+| `--interval <ms>` | Serve-loop period (default 250) |
+| `--no-mine` | Relay and validate only, never mine — **and never crank exits** |
+
 ---
 
 ## Testing and verification
 
 ```sh
-cargo test --workspace                                   # 468 tests across five crates
+cargo test --workspace                                   # 870 tests across six crates, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings    # 0 warnings
 cargo fmt --all --check
 ```
@@ -684,16 +739,16 @@ accounting. It is **run locally, not in CI** — see [Known limitations](#known-
 `.github/workflows/ci.yml` runs on every push and PR: format check, clippy with
 `-D warnings`, the full test suite, a release build, the vector cross-checks, the
 difficulty-attack containment simulation, the supply cross-check, and a
-`fuzz-smoke` job that runs all thirteen libFuzzer targets for 20 s each on nightly
+`fuzz-smoke` job that runs all fourteen libFuzzer targets for 20 s each on nightly
 + ASan.
 
 ### Fuzzing and invariants
 
-`fuzz/` is a standalone cargo-fuzz crate with **thirteen targets** over the
+`fuzz/` is a standalone cargo-fuzz crate with **fourteen targets** over the
 attacker-controlled boundaries — L1: `tx_decode`, `block_decode`,
 `wire_msg_decode`, `mempool_admit`, `storage_recover`, `checkpoint_validate`,
-`meta_parse`; L2 (Phase 2–4): `l2_payload_decode`, `m3_readers`,
-`dispute_arbitrate`, `l2_state_apply`, `vwc_decode`; worker (Phase 5):
+`checkpoint_codec`, `meta_parse`; L2 (Phase 2–4): `l2_payload_decode`,
+`m3_readers`, `dispute_arbitrate`, `l2_state_apply`, `vwc_decode`; worker:
 `worker_flows` (plan construction/discovery/reconciliation determinism over
 adversarial inputs). They assert capability invariants (exact
 decode→encode inversion, bounded allocation, value conservation under
@@ -707,7 +762,8 @@ hostile length fields, forged and lying-count checkpoints, mutated dispute
 evidence — through the same invariants on stable tooling.
 
 ```sh
-cd fuzz && cargo check --bins       # all thirteen targets compile
+```sh
+cd fuzz && cargo check --bins       # all fourteen targets compile
 cargo test -p jnt-l2 --test fuzz_invariants   # L2 invariants on stable
 ```
 
@@ -832,9 +888,10 @@ every block. Fine at test scale, not at production scale.
 
 **The governance timelock is described but not written.** `SPEC.md` references a
 `docs/roadmap.md` (now present) and a governance timelock that has no
-implementation: Layer 2 is implemented through Phase 3, but the timelock and the
-remaining roadmap items (Phase 4-6) are still design text only. Worth resolving
-before the specification is treated as complete.
+implementation. Layer 2 is implemented through the exit rule, and the P2P
+validator-committee and binding-finality work is ahead — but the timelock that is
+supposed to govern those upgrades still exists only as design text. Worth
+resolving before the specification is treated as complete.
 
 **`Cargo.toml` declares a `repository` URL that does not match the actual
 remote.** Cosmetic, but it is the first thing `cargo publish` would use.
@@ -849,18 +906,18 @@ today — nothing depends on genesis having its own tag — but the spec and the
 implementation disagree, and the spec is the document this project treats as
 normative.
 
-**The long-run issuance schedule is undecided, and supply contracts under
-ordinary usage.** The base fee leaves live supply in full ([Fees and
-burn](#fees-and-burn)) while the reward ladder terminates at height 1 839 600.
-Measured in `sim/tail_emission_sim.py`, at the fee floor (100 sat): 2.0 JNT/block
-leaves supply on a full block and 0.50 JNT/block at 25 % activity — both far above
-the proposed 0.10 JNT/block tail, so **net supply falls**. Break-even is ≈5 %
-activity. At sustained full blocks with the base fee at 1 000 sat the removal is
-20 JNT/block and the modelled net supply reaches zero. A tail-emission candidate is
-documented as a **proposal** ([docs/monetary-redesign.md](docs/monetary-redesign.md));
-**no consensus rule, reward parameter, genesis value, fee parameter or committed
-vector has been changed.** What the long-run supply path should be, and whether
-the fee/burn split should change, is unresolved.
+**The long-run supply path is settled, and supply can fall under ordinary
+usage — the consequences are measured, not fixed.** Decision 18 removed the stock
+cap and put the **rate anchor** in its place (≤ 1 % of issued supply per halving
+period), and the approved tail (M-A…M-C) means issuance never stops: mainnet
+decays 0.50 → 0.25 → 0.125 JNT and holds a permanent **0.1 JNT** floor, reaching
+it at height 2 628 000 (~50 years) instead of terminating at 1 839 600. The base
+fee still leaves live supply in full ([Fees and burn](#fees-and-burn)), while the
+tail reward also falls: at the fee floor (100 sat) `sim/tail_emission_sim.py`
+measures 0.50 JNT/block leaving supply at 25 % activity, so **net supply falls**,
+and break-even is ≈5 % activity. See [Supply](#supply), the sensitivity tables in
+[docs/monetary-redesign.md](docs/monetary-redesign.md) and the recorded values in
+[docs/decisions.md](docs/decisions.md).
 
 **The monetary simulation is not a gated CI check.** `--selftest` passes locally,
 but `.github/workflows/ci.yml` gates only `supply_schedule_sim.py`, the vector
