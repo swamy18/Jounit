@@ -1119,10 +1119,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
 
     println!("press Ctrl-C to stop");
 
-    // Decision 17: when the joint-supply alarm last fired, so the loop can
-    // report continuously without re-running the whole-UTXO check on every
-    // spin (this loop can run with `--interval-ms 0`). See the check below.
-    let mut breach_announced: Option<std::time::Instant> = None;
+    // Decision 17's alarm half. The state machine (and its rate limit, which
+    // exists because this loop can spin with `--interval-ms 0`) lives in
+    // `conservation::BreachAlarm` so its timing rule is unit-testable; see the
+    // poll below.
+    let mut breach_alarm = jnt_node::conservation::BreachAlarm::new();
 
     // Chain thread: mine + relay loop
     loop {
@@ -1138,52 +1139,17 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         // lock drops: announcing needs the P2P node, not the state.
         let relay_now: Vec<Hash> = std::mem::take(&mut sh.tx_to_relay);
 
-        // Decision 17 — the alarm half of the breach response: a breached node
-        // keeps running (a crash-loop would convert a safety alarm into a
-        // liveness loss and destroy the diagnostics) but must never be *quiet*
-        // about it. The refusal half is in the API, on the two funding paths
+        // Decision 17 — the alarm half: a breached node keeps running but must
+        // never be *quiet* about it. The closure is only invoked when the alarm
+        // decides a look is due, so the whole-UTXO report is not recomputed on
+        // every spin. The refusal half is in the API, on the two funding paths
         // only; reads stay up on purpose.
-        //
-        // The re-check is rate-limited to once a second rather than literally
-        // every iteration: this loop spins when `--interval-ms 0`, and a
-        // whole-UTXO scan per spin would turn a breached node into a stalled
-        // one. A breach therefore stays visible for as long as it lasts —
-        // printed again every second until it is cleared — which is what the
-        // decision's "cannot pass silently" requires. Nothing is cached: the
-        // verdict itself is recomputed from live state each time.
-        {
-            const BREACH_ALARM_PERIOD: std::time::Duration =
-                std::time::Duration::from_millis(1_000);
-            let now = std::time::Instant::now();
-            let due = breach_announced
-                .map(|last| now.duration_since(last) >= BREACH_ALARM_PERIOD)
-                .unwrap_or(true);
-            if due {
-                let report = jnt_node::conservation::conservation_report(&sh.chain, &sh.l2);
-                if report.ok() {
-                    if breach_announced.is_some() {
-                        println!("conservation   breach cleared — joint supply conserved again");
-                        breach_announced = None;
-                    }
-                } else {
-                    eprintln!(
-                        "CONSERVATION BREACH — joint {} of {} sat (l1 live {} + l2 held {} - sink {}), \
-                         l2_closed {}, l2_funding_ok {}: {} — funding writes refused, reads still served",
-                        report.supply.joint_sat,
-                        report.supply.bound_sat(),
-                        report.supply.l1_live_sat,
-                        report.supply.l2_held_sat,
-                        report.supply.sink_held_sat,
-                        report.l2_closed,
-                        report.l2_funding_ok(),
-                        report
-                            .first_error()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "conservation check failed".to_string())
-                    );
-                    breach_announced = Some(now);
-                }
+        match breach_alarm.poll(|| jnt_node::conservation::conservation_report(&sh.chain, &sh.l2)) {
+            Some(jnt_node::conservation::BreachNotice::Breach(line)) => eprintln!("{line}"),
+            Some(jnt_node::conservation::BreachNotice::Cleared) => {
+                println!("conservation   breach cleared — joint supply conserved again")
             }
+            None => {}
         }
 
         // Mine one block if we have a miner wallet. `mine_from_pool` selects

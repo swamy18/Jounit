@@ -225,6 +225,105 @@ pub fn verify_conservation(chain: &Chain, l2: &NodeL2) -> Result<JointSupply, Co
     }
 }
 
+/// What the alarm wants printed this iteration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreachNotice {
+    /// The bound is broken: print this, on stderr.
+    Breach(String),
+    /// It was broken last time and is not now.
+    Cleared,
+}
+
+/// The breach line: every supply term plus the first broken check, so the log
+/// alone says what happened without a second lookup.
+pub fn breach_line(report: &ConservationReport) -> String {
+    let why = report
+        .first_error()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "conservation check failed".to_string());
+    format!(
+        "CONSERVATION BREACH — joint {} of {} sat (l1 live {} + l2 held {} - sink {}), \
+         l2_closed {}, l2_funding_ok {}: {why} — funding writes refused, reads still served",
+        report.supply.joint_sat,
+        report.supply.bound_sat(),
+        report.supply.l1_live_sat,
+        report.supply.l2_held_sat,
+        report.supply.sink_held_sat,
+        report.l2_closed,
+        report.l2_funding_ok(),
+    )
+}
+
+/// Decision 17's alarm half: decides *when* the node says something about a
+/// conservation breach, and what it says.
+///
+/// The refusal half is in `api`. This half exists because a breached node that
+/// keeps running *quietly* is worse than one that stops: the condition has to
+/// be audible for as long as it lasts. Halt was rejected — a crash-loop turns a
+/// safety alarm into a liveness loss and destroys the diagnostics.
+///
+/// This is a small state machine rather than inline logging so the timing rule
+/// is testable without sleeping: the clock and the (expensive, whole-UTXO)
+/// check both arrive as arguments. It also owns *whether* to run the check at
+/// all, which is the point of the rate limit — the serve loop can spin with
+/// `--interval-ms 0`, and recomputing a whole-UTXO report on every spin would
+/// stall the very node the alarm is trying to save. A breach is therefore
+/// reported on discovery and then again every `period` until it clears; the
+/// clear is reported exactly once.
+#[derive(Debug)]
+pub struct BreachAlarm {
+    period: std::time::Duration,
+    /// When the last breach was reported. `None` means nothing has been said,
+    /// which is what makes the clearing notice possible.
+    last: Option<std::time::Instant>,
+}
+
+impl Default for BreachAlarm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BreachAlarm {
+    /// Report on discovery, then at most once a second.
+    pub fn new() -> Self {
+        Self::with_period(std::time::Duration::from_millis(1_000))
+    }
+
+    pub fn with_period(period: std::time::Duration) -> Self {
+        BreachAlarm { period, last: None }
+    }
+
+    /// Poll against the real clock. `check` is only invoked when a look is due.
+    pub fn poll(&mut self, check: impl FnOnce() -> ConservationReport) -> Option<BreachNotice> {
+        self.poll_at(check, std::time::Instant::now())
+    }
+
+    /// Poll against a supplied clock. `check` is only invoked when a look is
+    /// due, so the caller pays the whole-UTXO scan at most once per `period`.
+    pub fn poll_at(
+        &mut self,
+        check: impl FnOnce() -> ConservationReport,
+        now: std::time::Instant,
+    ) -> Option<BreachNotice> {
+        let due = self
+            .last
+            .map(|last| now.duration_since(last) >= self.period)
+            .unwrap_or(true);
+        if !due {
+            return None;
+        }
+        let report = check();
+        if report.ok() {
+            // Silence is only correct if nothing was announced; after a breach
+            // the operator needs to hear that it is over.
+            return self.last.take().map(|_| BreachNotice::Cleared);
+        }
+        self.last = Some(now);
+        Some(BreachNotice::Breach(breach_line(&report)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +419,101 @@ mod tests {
                 bound: 100
             })
         ));
+    }
+
+    #[test]
+    fn the_alarm_reports_on_discovery_and_again_every_period() {
+        let broken = report(true, 11, 10, 5, 100);
+        let mut alarm = BreachAlarm::with_period(std::time::Duration::from_millis(1_000));
+        let t0 = std::time::Instant::now();
+
+        // Discovery: an alarmed node cannot be quiet about a fresh breach.
+        let first = alarm.poll_at(|| broken, t0).expect("must report");
+        let BreachNotice::Breach(line) = first else {
+            panic!("the first notice must be a breach")
+        };
+        assert!(line.contains("CONSERVATION BREACH"), "{line}");
+        // The line alone must carry the diagnosis: terms and the broken check.
+        assert!(line.contains("funding anomaly"), "{line}");
+        assert!(line.contains("reads still served"), "{line}");
+
+        // Inside the period nothing is recomputed and nothing is printed — the
+        // check closure would panic if it ran, which pins the rate limit.
+        for offset in [1u64, 500, 999] {
+            let t = t0 + std::time::Duration::from_millis(offset);
+            assert!(
+                alarm
+                    .poll_at(|| panic!("the check must not run inside the period"), t)
+                    .is_none(),
+                "inside the period must stay silent"
+            );
+        }
+
+        // At the boundary it speaks again, so the breach cannot pass silently
+        // however long it lasts.
+        let t = t0 + std::time::Duration::from_millis(1_000);
+        assert!(matches!(
+            alarm.poll_at(|| broken, t),
+            Some(BreachNotice::Breach(_))
+        ));
+    }
+
+    #[test]
+    fn the_alarm_says_nothing_when_nothing_is_wrong() {
+        let healthy = report(true, 10, 10, 5, 100);
+        let mut alarm = BreachAlarm::new();
+        let t0 = std::time::Instant::now();
+        // A healthy node is silent, and its check is still run (once per poll
+        // that is due) so a breach is noticed the moment it appears.
+        for offset in [0u64, 1_000, 2_000] {
+            let t = t0 + std::time::Duration::from_millis(offset);
+            assert!(alarm.poll_at(|| healthy, t).is_none());
+        }
+    }
+
+    #[test]
+    fn the_alarm_reports_the_clear_exactly_once() {
+        let broken = report(true, 11, 10, 5, 100);
+        let healthy = report(true, 10, 10, 5, 100);
+        let mut alarm = BreachAlarm::with_period(std::time::Duration::from_millis(1_000));
+        let t0 = std::time::Instant::now();
+
+        assert!(matches!(
+            alarm.poll_at(|| broken, t0),
+            Some(BreachNotice::Breach(_))
+        ));
+        // Recovery is not silent: the operator has to learn it is over.
+        let t = t0 + std::time::Duration::from_millis(1_000);
+        assert_eq!(alarm.poll_at(|| healthy, t), Some(BreachNotice::Cleared));
+        // ...but only once; a cleared node goes back to being quiet.
+        let t = t0 + std::time::Duration::from_millis(2_000);
+        assert!(alarm.poll_at(|| healthy, t).is_none());
+        // And a second breach is reported immediately, not treated as a
+        // continuation of the first.
+        let t = t0 + std::time::Duration::from_millis(2_001);
+        assert!(matches!(
+            alarm.poll_at(|| broken, t),
+            Some(BreachNotice::Breach(_))
+        ));
+    }
+
+    #[test]
+    fn every_broken_check_produces_an_audible_specific_line() {
+        // The three checks, one at a time: each must name itself in the line.
+        let cases = [
+            (report(false, 11, 10, 200, 100), "l2 conservation broken"),
+            (report(true, 11, 10, 5, 100), "funding anomaly"),
+            (report(true, 10, 10, 101, 100), "exceeds"),
+        ];
+        for (broken, needle) in cases {
+            assert!(!broken.ok());
+            let line = breach_line(&broken);
+            assert!(line.contains(needle), "{needle} missing from: {line}");
+            assert!(line.contains("CONSERVATION BREACH"), "{line}");
+        }
+        // The over-bound case quotes both figures, so the log shows the gap.
+        let line = breach_line(&report(true, 10, 10, 101, 100));
+        assert!(line.contains("joint 101 of 100"), "{line}");
     }
 
     #[test]
