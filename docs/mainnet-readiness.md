@@ -7,7 +7,6 @@ a `config.toml`, a `/metrics` endpoint, a `serve --sync` flag) and a
 pre-launch checklist that marked unrun items ✅. Those are corrected below.
 Mainnet is blocked by three things that are not operational at all — they are
 protocol decisions — and the blockers are named at the end.
-
 ## What is actually implemented
 
 | Area | Implemented |
@@ -194,18 +193,20 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 773 passed, 0 failed |
+| `cargo test --workspace` passes | ✅ 916 passed, 0 failed |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
 | Fuzz: 14 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
 | Deterministic genesis across profiles | ✅ |
 | BLS finality adversarial tests | ✅ (18 checkpoint tests) |
 | L2 end-to-end (deposits, tasks, VWC, reputation) | ✅ (2-process E2E + chaos suite) |
-| **L2 → L1 exits** | ✅ implemented (Decision 19, SPEC.md §19.6) — ❌ `mainnet`'s `exit_activation_height` is still unset (`0` = never, so mainnet user deposits stay closed) |
-| **Stake ledger / mainnet validator committee** | ❌ **blocked** — Decision 8 builds none; `mainnet` has an empty committee so finality fails closed |
-| M2 / M4 activation rules | ❌ **blocked** — each needs a rule that defines fraudulent compute output / how the HBM puzzle is registered |
+| **L2 → L1 exits** | ✅ implemented **and** externally reachable (Decision 19, SPEC.md §19.6 + `GET /v1/exit/crankable`) — ❌ `mainnet`'s `exit_activation_height` is still unset (`0` = never, so mainnet user deposits stay closed) |
+| **Stake ledger / bond / unbond / slash** | ✅ implemented and tested (Decision 20, `bond.rs`, `tests/bond_stake.rs`, `tests/bond_restart.rs`) — ❌ `mainnet` still declares an empty `genesis_validators`, so with no bonded stake either, checkpoint verification fails closed |
+| **Validator committee derivation** | ✅ `BondLedger::committee` (first 21 by bond order) feeds `Chain::committee_keys`, which feeds the finality key set on every canonical advance and reorg |
+| **Checkpoint signing** | ❌ **absent** — no production code builds or signs a checkpoint certificate. Every `Checkpoint { .. }` in the tree is a test or fuzz helper (`validators.rs:sign_checkpoint`). There is also no P2P transport for certificates. Binding finality therefore cannot activate on any real network, `mainnet` or `testnet` |
+| M2 / M4 activation rules | ❌ **M2 closed, M4 open by choice** — M2's rule exists (Decision 21: the canonical reference plus `Verdict::Fraudulent` slashes the worker), but no production code signs or relays a verdict, because that needs a key-custody decision. M4's HBM puzzle is implemented with tests and deliberately **not** registered as a `puzzle_id` |
 | Live conservation surface (`/v1/conservation`, `/metrics` gauges, worker `run` gate) | ✅ |
-| Log shipping, release pipeline, PGP disclosure key | ❌ operational, not built |
+| Log shipping, release pipeline, PGP disclosure key | ⚠️ **partial** — the release workflow exists (`.github/workflows/release.yml`, gated on the same CI checks, three targets, checksums); log shipping and the PGP key are still absent, and artifacts are unsigned because no key is published |
 
 ## Exact blockers preventing mainnet
 
@@ -216,17 +217,28 @@ reached.
    genesis* — so it accepts neither a committed `l2_state_root` nor an exit claim,
    and mainnet user deposits stay closed. Choosing a height is **configuration**,
    not missing protocol.
-2. **No stake ledger and no mainnet committee.** Decision 8 builds no stake
-   transaction, bond, or unbonding; `mainnet` carries an empty
-   `genesis_validators`, so checkpoint verification fails closed and binding
-   finality is untestable on mainnet. Real bonded stake (`min_validator_stake_sat`
-   = 5,000 JNT, unbonding after `finality_depth`) remains required and unbuilt.
-3. **M2 and M4 activation rules are unspecified.** M2 has no rule defining what
-   proves a compute result fraudulent; M4 is not a registered `puzzle_id`.
-4. **Operational gaps** (below) — these do **not** block a testnet, but they
-   block a defensible mainnet: no metrics/log shipping, no release/tagging
-   process, no published PGP key, no reproducible-build tooling.
+2. **No committee exists to sign checkpoints.** The ledger that would hold
+   bonded stake is built and tested (`bond.rs`); what does not exist is a
+   validator. `mainnet` carries an empty `genesis_validators`, no production code
+   signs a `Checkpoint`, and no transport carries one, so `finality_activation_height
+   = 0` keeps the chain on depth-based finality. Real bonded stake
+   (`MIN_VALIDATOR_STAKE_SAT` = 5,000 JNT, unbonding after
+   `UNBONDING_PERIOD_BLOCKS` = 1008) is enforced by code but has no operator.
+   Building a signer is blocked on a key-custody decision recorded in
+   `docs/decisions.md`, which is an organisational choice, not a code gap.
+3. **The arbitration transport does not exist.** Decision 21 defined what proves
+   a compute result fraudulent (`compute_ir::reference_result_hash`) and
+   `DisputeEngine::resolve` computes it itself from the disputed contract, so no
+   caller can dictate a verdict. Nothing signs or relays that verdict. The
+   consequence must be stated plainly: because SPEC §16.4/§16.5 forbid an
+   on-chain interpreter, L2 consensus does **not** re-execute compute — it accepts
+   any non-placeholder result hash, and a *wrong* result is only convicted if
+   somebody challenges it inside the dispute window. An unchallenged one
+   auto-settles `Correct` with a `WindowElapsed` certificate.
+4. **Operational gaps** — these do **not** block a testnet, but they block a
+   defensible mainnet: no log shipping, no published PGP key, and no signed
+   release artifacts. The release workflow and checksums exist; the key does not.
 
 Mainnet readiness is therefore **not claimed**. Testnet is the appropriate
-next milestone, and it too is gated on the operational checklist above (not on
-the three protocol blockers, which are mainnet-only).
+next milestone, and it is blocked by the same two things: no checkpoint signer
+and no key-custody decision.

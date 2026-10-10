@@ -236,12 +236,15 @@ pub struct NetworkParams {
     /// but both shipped profiles carry the constant's value.
     pub l2_deposit_minimum_sat: u64,
     /// Fixed genesis validator committee (Decisions 8 and 11, SPEC.md §14).
-    /// Explicit BLS keys, no stake ledger behind them: Phase 6 has no bonded
-    /// stake, so these keys carry authority by genesis declaration, not by
-    /// bond. `mini` carries deterministic test keys; `mainnet` carries an
-    /// empty list, meaning no committee yet — checkpoints verify against
-    /// nothing and therefore fail closed. Canonically sorted by key bytes at
-    /// construction; every node holding these params derives the same set.
+    /// Explicit BLS keys. Decision 20 added bonded stake, so this is a
+    /// *bootstrap* list rather than the source of authority: `Chain::
+    /// committee_keys` derives the committee from the bond ledger whenever any
+    /// bond exists and falls back to these keys only while none does. `mini` and
+    /// `testnet` carry deterministic keys so the finality path is exercisable;
+    /// `mainnet` carries an empty list, meaning checkpoints verify against
+    /// nothing until a validator actually bonds and therefore fail closed.
+    /// Canonically sorted by key bytes at construction; every node holding these
+    /// params derives the same set.
     pub genesis_validators: Vec<BlsPublicKey>,
     /// Blocks per checkpoint epoch (Decision 11). `mini` uses 10 so finality
     /// observation is exercisable in tests; `mainnet` uses 100.
