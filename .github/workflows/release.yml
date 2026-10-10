@@ -1,0 +1,139 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild artifacts for"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The same gate `ci.yml` runs, on the same commit the tag points at, so a
+  # release cannot be built from a tree that would not pass CI. This is the
+  # "run all tests, fix failures" step of the release checklist in
+  # `docs/mainnet-readiness.md` §7, made non-optional.
+  gate:
+    name: verify the tagged tree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Release artifacts are what operators run, so the artifact build is
+      # itself part of the gate rather than something the build job discovers.
+      - name: Release build
+        run: cargo build --workspace --release
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: jnt-node
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: jnt-node
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: jnt-node.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p jnt-node
+
+      - name: Checksum
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.artifact }}" | sed 's#  *#  #' > SHA256SUMS
+          else
+            # macOS ships shasum rather than sha256sum; the format is identical.
+            shasum -a 256 "${{ matrix.artifact }}" | sed 's#  *#  #' > SHA256SUMS
+          fi
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jnt-node-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}
+            target/${{ matrix.target }}/release/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assets
+        shell: bash
+        run: |
+          {
+            echo 'No release artifacts are signed. This is a deliberate gap,'
+            echo 'not an omission: signing needs a published key, and none is'
+            echo 'published yet (docs/mainnet-readiness.md §4). Verify each'
+            echo 'binary against the SHA256SUMS shipped beside it and build it'
+            echo 'yourself from source if the checksum is not enough.'
+            echo
+            echo 'Checksums:'
+            cat dist/SHA256SUMS
+          } > dist/VERIFICATION.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist/**
+          fail_on_unmatched_files: true
+          body_path: dist/VERIFICATION.txt

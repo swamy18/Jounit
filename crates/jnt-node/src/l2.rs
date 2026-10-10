@@ -431,6 +431,15 @@ impl NodeL2 {
         self.inner.pending_exits()
     }
 
+    /// L1 exit claims this node's L2 view could not back. Empty on a healthy
+    /// node; non-empty means the chain and the replayed L2 state disagree, which
+    /// is an integrity signal an operator must see rather than a detail to hide.
+    /// Surfaced through the API alongside the crankable list because that is
+    /// exactly where a disagreement would show up.
+    pub fn unbacked_claims(&self) -> &[jnt_l2::UnbackedClaim] {
+        self.inner.unbacked_claims()
+    }
+
     /// Matured, unreleased exits this node can settle on L1 right now, as
     /// fully-formed [`ExitClaim`]s ready for a miner to include (approved P1,
     /// E-2). The crank is permissionless: nothing here depends on who calls it,

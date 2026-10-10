@@ -53,10 +53,9 @@
 //! GET  /v1/payment/{id}        recorded payment
 //! POST /v1/receipt             verify + record a service receipt
 //! GET  /v1/receipt/{id}        receipt by id (or by payment id)
+//! GET  /v1/exit/crankable      the exit claims this node could settle now
 //! ```
-
-use axum::extract::DefaultBodyLimit;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -64,6 +63,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1239,10 +1239,72 @@ async fn receipt_submit(
     })?
 }
 
+/// `GET /v1/exit/crankable?claimant=<address>` — the exit claims this node could
+/// settle right now, as encoded bytes ready to drop into a block.
+///
+/// The crank is permissionless by design (SPEC.md §19.6): consensus pays only
+/// the destination the proven L2 record names, and the exit fee was prepaid by
+/// the owner at queue time, so nothing depends on who builds the block. Until
+/// now the only way to obtain a claim was to be the node's own miner. This route
+/// hands them out, so a third party can build a block with them too.
+///
+/// Read-only and secret-free: a claim is authorised by an inclusion proof
+/// against the committed L2 root, never by a signature, so returning one grants
+/// no power it does not already have. `claimant` is where the prepaid fee goes
+/// and is *not* trusted for anything else.
+///
+/// Returns 200 with `crankable` (possibly empty) and `queued`, the number of
+/// exits still awaiting release, because an empty list with exits pending is
+/// the exact-funding case the node cannot help (see `NodeL2::crank_claims`).
+async fn exit_crankable(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let Some(raw) = query.get("claimant") else {
+        return Err(bad("claimant address is required (?claimant=<address>)"));
+    };
+    let claimant = decode_address(raw)?;
+    with_shared(&state, |sh| {
+        if !sh.chain.exit_active_at(sh.chain.height() + 1) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "exits_inactive",
+                "this profile has no exit activation height, so no exit can be claimed \
+                 (exit_activation_height = 0 means never)",
+            ));
+        }
+        let crankable: Vec<Value> = sh
+            .l2
+            .crank_claims(&sh.chain, claimant)
+            .iter()
+            .map(|claim| {
+                json!({
+                    "encoding": "hex",
+                    "bytes": hex::encode(claim.serialize()),
+                    "claim_id": hash_to_hex(&claim.claim_id()),
+                    "owner": address_to_hex(&claim.owner),
+                    "nonce": claim.nonce,
+                    "amount_sat": claim.amount_sat,
+                    "destination": address_to_hex(&claim.destination),
+                    "exit_fee_sat": claim.exit_fee_sat,
+                    "queued_height": claim.queued_height,
+                    "gas_used": claim.gas_used(),
+                })
+            })
+            .collect();
+        Ok(Json(json!({
+            "claimant": address_to_hex(&claimant),
+            "crankable": crankable,
+            "crankable_count": crankable.len(),
+            "queued": sh.l2.pending_exits().len(),
+            "unbacked_claims": sh.l2.unbacked_claims().len(),
+        })))
+    })?
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
-
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
@@ -1270,6 +1332,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/payment/{payment_id}", get(payment_get))
         .route("/v1/receipt", post(receipt_submit))
         .route("/v1/receipt/{receipt_id}", get(receipt_get))
+        .route("/v1/exit/crankable", get(exit_crankable))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

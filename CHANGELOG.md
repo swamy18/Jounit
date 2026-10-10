@@ -14,6 +14,25 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed (2026-10-10, consensus verification only — no rule change)
+
+- **L1/L2 exit disagreements are no longer invisible.** `ChainL2::apply_block`
+  recorded an L1-accepted exit claim that the replayed L2 state could not back
+  only behind a `debug_assertion`, which compiles out of the build a long-running
+  node actually ships. The disagreement is now recorded as an `UnbackedClaim`
+  (height, owner, nonce, named reason) and exposed through
+  `ChainL2::unbacked_claims()`. The watch is still dropped — L1 already
+  released it, so a re-crank would only be refused — but a node that reports
+  non-empty entries now knows its two views disagree instead of silently
+  outliving the divergence.
+- **`verify_canonical_chain` now covers the stake undo records.** It already
+  compared `pscb_undo`; the same blind spot existed for `bond_undo` and
+  `slash_undo`, which meant a wrong reorg unwind of a bond would have left
+  `verify` blind. The ledger comparison proves the applied state, not that a
+  reorg would undo it correctly — now both are checked.
+- `crates/jnt-core/tests/bond_stake.rs`: `a_reorged_bond_leaves_no_undo_record_behind`
+  pins the reorg path that drops the stake undo records with the block.
+
 ### Added (consensus - Decision 19, owner-approved)
 
 - **L2 -> L1 exits (SPEC.md 19.6).** Deposits are no longer one-way.
@@ -203,17 +222,46 @@ step, is recoverable from `git log`; the summary below groups it by area.
 
 ### Known limitations
 
-Recorded as blockers, not oversights, in [docs/decisions.md](docs/decisions.md):
+Recorded as blockers, not oversights, in [docs/decisions.md](docs/decisions.md).
+Resolved items are struck through with the decision that closed them.
 
 - ~~**P1** — L2 → L1 exits are undefined.~~ **Resolved by Decision 19 (see
-- **P2** — no stake/bond ledger and no mainnet validator committee
-  (`mainnet` `genesis_validators` is empty, so binding finality fails closed).
-- **P3** — the M2 activation rule (what proves a compute result fraudulent) is
-  unspecified, so the slash vault stays inert.
-- **P4** — the HBM scratchpad puzzle is not a registered `puzzle_id`; chain
-  security rests on the base puzzle only.
-- **P5** — a task whose escrow is below the 20,000-sat settle fee fails closed
-  (`AmountTooSmallForFee`).
+  Unreleased).** The exit rule, the crank and the reorg unwind all exist; what
+  remains is the *configuration* decision that sets
+  `mainnet.exit_activation_height` (currently `0` = never).
+- ~~**P2** — no stake/bond ledger and no mainnet validator committee.~~
+  **Resolved by Decision 20 (see Unreleased).** Bonding, unbonding, slashing,
+  the bond-order committee and ledger-derived finality keys are implemented and
+  tested. What remains is `mainnet.genesis_validators` being empty: with no
+  committee *and* no bonded stake, `mainnet` finality verification fails closed,
+  which is the honest pre-committee state rather than a missing rule.
+- ~~**P3** — the M2 activation rule (what proves a compute result fraudulent) is
+  unspecified, so the slash vault stays inert.~~ **Resolved by Decision 21 (see
+  Unreleased):** `compute_ir::reference_result_hash` is the canonical reference,
+  `DisputeEngine::resolve` computes it itself from the disputed contract, and
+  `Arbiter::ChallengerCorrect` + `Verdict::Fraudulent` slash the worker and pay
+  a bounty. What remains is *transport*: no production code signs or relays a
+  verdict, because that needs a key-custody decision
+  (`docs/decisions.md`). Note the consequence, which is a design property and
+  not an oversight: L2 consensus does **not** re-execute compute, so it accepts
+  any non-placeholder result hash. A wrong result is only convicted when
+  somebody challenges it in time — an unchallenged one auto-settles `Correct`
+  with a `WindowElapsed` certificate (SPEC §16.4/§16.5 forbid an on-chain
+  interpreter).
+- ~~**P4** — the HBM scratchpad puzzle is not a registered `puzzle_id`; chain
+  security rests on the base puzzle only.~~ **Deliberately left unresolved.**
+  `hbm_pow.rs` implements the memory-hard permutation, its config scaling and
+  nine tests, and it is *not* registered in `puzzle.rs` — activating it would
+  change the consensus puzzle with no independent security review of the memory
+  parameter choice. It stays inert by choice, not by omission.
+- ~~**P5** — a task whose escrow is below the 20,000-sat settle fee fails
+  closed.~~ **Resolved by Decision 23 (see Unreleased):** `settle_fee_sat` is
+  0.1 % of task value with a 1,000-sat floor, so dust tasks settle.
+- **Operational** (not protocol): no signed release/tag pipeline, no published
+  PGP key for the security channel, no log shipping, and the permissionless
+  exit crank has no submission channel outside a miner's own loop — a third
+  party can satisfy the consensus rules but has no transport to hand a claim in
+  with.
 - ~~Monetary parameters beyond the frozen schedule … are **unapproved**.~~
   **Resolved (Decision 18, M-A…M-C, Decision M-E): the tail is approved and
   implemented, `supply_cap_sat` is deleted, and the escrow ceiling is fixed and
