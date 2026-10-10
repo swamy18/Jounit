@@ -121,12 +121,21 @@ have to be at least 4096 bytes per component regardless.
 | Field | Size |
 |---|---|
 | `version` | 4 LE |
-| `tx_type` | 1 (`0` = standard, `1` = coinbase) |
+| `tx_type` | 1 (`0` = standard, `1` = coinbase, `2` = bond, `3` = unbond, `4` = slash; anything else is refused, never interpreted as standard) |
 | `lock_time` | 8 LE |
 | `input_count` | 4 LE |
 | `inputs` | `input_count × (variable)` |
 | `output_count` | 4 LE |
 | `outputs` | `output_count × 28` |
+| `stake` | present only for types 2–4 (see below); standard and coinbase carry no byte here, so their txids are unchanged |
+
+Stake payloads (Decision 20), positional by `tx_type`:
+
+| Type | Payload |
+|---|---|
+| `2` (bond) | `bls_pk` (48) — the BLS key the bond authorizes |
+| `3` (unbond) | `bond_id` (32) — the txid of the `TX_BOND` that created the bond |
+| `4` (slash) | `len_a` (4 LE) + checkpoint A + `len_b` (4 LE) + checkpoint B (each ≤ 2 048 bytes) — two conflicting checkpoints as equivocation evidence |
 
 ### 3.5 Signature and key bundles
 
@@ -514,7 +523,9 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 
 ### 9.2 Transaction
 
-1. `tx_type == 0` (standard) except index 0, which MUST be a coinbase
+1. `tx_type == 0` (standard) except index 0, which MUST be a coinbase; types
+   `2`/`3`/`4` are the bonded-stake operations (§14.6 amendment); anything
+   else is refused (`unknown tx_type`), never interpreted as standard
 2. Coinbase: exactly 1 input with `prevout_hash == prev_hash`, `prevout_index == height`; exactly 1 output
 3. Coinbase txid MUST NOT collide with any other txid in the block (BIP30-style defence)
 4. No duplicate inputs within a transaction; no inputs already spent in the UTXO set
@@ -523,6 +534,21 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 7. Coinbase outputs referencing the same address accumulate — a single miner cannot claim two matured rewards in one block
 8. `coinbase.value ≤ block_reward(height) + tip_total` — miners may **not** over-claim
 9. Standard tx: `lock_time` is advisory in v0.1
+10. Bond (`2`): inputs share exactly one signer (the bonder); BLS key valid
+    and not already bonded; exactly one output pays the derived bond identity
+    `SHA256("jounit/bond-identity/v1" ‖ network_id ‖ bonder ‖ bls_pk)[..20]`
+    with value `≥ 5 000 JNT`; that output is consumed into the bond ledger by
+    the applying block (it never rests in the UTXO set, so a later release
+    cannot double-count it)
+11. Unbond (`3`): bond exists; single signer is the bonder;
+    `height ≥ bond_height + 1008` (7 days at mainnet block time, fixed); the
+    record is deleted and the full amount is recreated as a spendable output
+    to the bonder
+12. Slash (`4`): two checkpoints naming the same height with different hashes,
+    both verifying against the current bond-derived committee with `RealBls`,
+    sharing a signer; permissionless (any fee-paying inputs); the bond is
+    deleted into the M2 vault (half burned at once, half vested to PSCB —
+    an equivocator earns nothing back)
 
 ### 9.3 Maturity, finality
 
@@ -1307,6 +1333,18 @@ byte.
 
 ### 14.6 M5 — Validator-set semantics (DESIGN ONLY — not consensus-active)
 
+> **Amendment (Decision 20 — consensus-active):** the economics below are now
+> decided and implemented. Minimum stake is **5 000 JNT, fixed**; the committee
+> is the **first 21 eligible bonds by `(bond_height, bond_index)`** (bond
+> order, not stake weight; no genesis-fixed identities, no privileged seats);
+> unbonding is **1008 blocks, fixed**; equivocation burns the **full bond**
+> through the M2 vault; there are **no rewards and no fee share**. The bond
+> ledger lives in chain state with per-block undo (reorg-safe like every other
+> state); an empty ledger falls back to the profile's declared committee (the
+> test bootstrap). The library text that follows is unchanged and still
+> describes the pure derivation machinery; the candidate list it derives from
+> is now the bond ledger, and the selection rule in force is bond order.
+
 This section defines the validator-set machinery completely enough to
 implement and attack-test as a **library**, so that the remaining open
 questions are purely economic (who stakes, how much, what the rewards are).
@@ -1662,12 +1700,19 @@ Implicit transitions — a deadline passing, a dispute window closing — charge
 
 ### 15.4 Fees
 
-L2 fees are the flat D3 schedule and ride a path of their own:
-`fees::split_flat_fee(fee)` treats the whole flat fee as `full_base` and applies
-the unchanged M1 50/50 burn/PSCB rule, with the odd satoshi going to `burned`
-exactly as `split_fees` does. The L1 gas floor (`base_fee * gas_used`) is
-untouched and L2 never consults it. There is no exemption and no second fee
-market.
+L2 fees ride a path of their own: `fees::split_flat_fee(fee)` treats the fee
+as `full_base` and applies the unchanged M1 50/50 burn/PSCB rule, with the
+odd satoshi going to `burned` exactly as `split_fees` does. The L1 gas floor
+(`base_fee * gas_used`) is untouched and L2 never consults it. There is no
+exemption and no second fee market.
+
+Post/claim/submit/dispute/exit-queue fees are the flat D3 values. The settle
+fee is proportional (Decision 23): **0.1% of the task's escrow value, minimum
+1 000 sat** (`settle_fee_sat`). A task settles exactly when its escrow covers
+this — below the 1 000-sat floor the fee exceeds the value (refused), at or
+above it the fee is always payable. On `Fraudulent` the fee is computed from
+the escrow but charged against the worker's deposit, so the defrauded
+submitter is refunded whole.
 
 ### 15.5 Value conservation and replay
 
@@ -1834,6 +1879,20 @@ Consequences, stated so they are not discovered later:
 - Floating point is never introduced, in the reference or any backend.
 - The reference does not replace attestation or hardware proof; it determines
   correctness only after a result has been challenged.
+
+### 16.6 The canonical reference (Decision 21 — implemented)
+
+The reference function has exactly one definition:
+`compute_ir::reference_output(task_id, ir_hash, input_hash,
+required_memory_bytes)` (plus `reference_result_hash` over it) — a fixed
+permutation satisfying §16.2, run by worker, challenger and arbitrator alike.
+It takes commitments, not bytecode (the chain stores hashes so blocks stay
+small), and deliberately **no height**: reproducibility demands identical
+inputs across runs at different times, and a height is never identical.
+Replay protection stays with task expiry and attestation heights.
+`DisputeEngine::resolve` computes this itself from the disputed contract; a
+caller-supplied reference hash is not accepted, so no party can dictate the
+verdict it will be judged by.
 
 ---
 

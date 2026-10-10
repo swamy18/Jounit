@@ -456,7 +456,7 @@ impl NodeL2 {
         let binding = chain.finality().binding_finalized_height();
         let depth = self.deposits.maturity_depth;
         let base_fee = chain.expected_base_fee_for_next_block();
-        let available: Vec<(jnt_core::tx::OutPoint, u64)> = chain
+        let mut available: Vec<(jnt_core::tx::OutPoint, u64)> = chain
             .utxo()
             .outputs_for_address(&chain.params().l2_deposit_sink())
             .into_iter()
@@ -495,6 +495,11 @@ impl NodeL2 {
             let Some(inputs) = funded else {
                 continue;
             };
+            // Assigned inputs leave the pool for the remaining exits: two
+            // claims spending the same sink output would make the block
+            // carrying them invalid. Funding is per-exit exact, so removal is
+            // by identity, never by value.
+            available.retain(|(op, _)| !inputs.contains(op));
             claims.push(jnt_core::exit::ExitClaim {
                 owner: watch.owner,
                 nonce: watch.nonce,

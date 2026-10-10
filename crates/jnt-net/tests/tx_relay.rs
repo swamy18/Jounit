@@ -184,6 +184,7 @@ fn admit_locally(peer: &mut Peer, tx: Transaction) -> Result<[u8; 32], String> {
             peer.chain.height() + 1,
             peer.chain.params(),
             peer.chain.expected_base_fee_for_next_block(),
+            peer.chain.bonds(),
         )
         .map_err(|e| e.to_string())
 }

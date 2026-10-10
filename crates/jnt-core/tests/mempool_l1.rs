@@ -113,6 +113,7 @@ fn admit(chain: &Chain, pool: &mut Mempool, tx: Transaction) -> Result<[u8; 32],
         chain.height() + 1,
         chain.params(),
         chain.expected_base_fee_for_next_block(),
+        chain.bonds(),
     )
 }
 

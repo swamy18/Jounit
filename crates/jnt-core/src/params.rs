@@ -46,7 +46,10 @@ pub const FEE_TX_POST_TASK_SAT: u64 = 5_000;
 pub const FEE_TX_CLAIM_TASK_SAT: u64 = 2_000;
 pub const FEE_TX_SUBMIT_RESULT_SAT: u64 = 2_000;
 pub const FEE_TX_DISPUTE_SAT: u64 = 10_000;
-pub const FEE_TX_SETTLE_SAT: u64 = 20_000;
+/// Decision 23 (P5): the settle fee is proportional — 0.1% of task value —
+/// so there is no flat settle constant any more. What remains fixed is the
+/// anti-spam floor every settle pays at least (`settle_fee_sat` in `l2.rs`).
+pub const SETTLE_FEE_MIN_SAT: u64 = 1_000;
 /// Queueing an L2 → L1 exit (approved P1, E-1…E-3). Same tier as claim/submit:
 /// a simple owner-signed debit-and-record, not arbitration. Chosen with the
 /// exit implementation and recorded in `docs/decisions.md` (P1 record); it is a
@@ -55,12 +58,14 @@ pub const FEE_TX_EXIT_QUEUE_SAT: u64 = 2_000;
 
 /// The D3 schedule as one table, so the exact set is asserted in one place and a
 /// future change has a single spot to be checked against the decision record.
+/// `TxSettle` lists the anti-spam floor, not the fee: the actual settle fee is
+/// proportional to task value (Decision 23, `settle_fee_sat` in `l2.rs`).
 pub const L2_FEE_SCHEDULE: &[(&str, u64)] = &[
     ("TxPostTask", FEE_TX_POST_TASK_SAT),
     ("TxClaimTask", FEE_TX_CLAIM_TASK_SAT),
     ("TxSubmitResult", FEE_TX_SUBMIT_RESULT_SAT),
     ("TxDispute", FEE_TX_DISPUTE_SAT),
-    ("TxSettle", FEE_TX_SETTLE_SAT),
+    ("TxSettle", SETTLE_FEE_MIN_SAT),
     ("TxExitQueue", FEE_TX_EXIT_QUEUE_SAT),
 ];
 
@@ -722,7 +727,7 @@ mod tests {
                 ("TxClaimTask", 2_000),
                 ("TxSubmitResult", 2_000),
                 ("TxDispute", 10_000),
-                ("TxSettle", 20_000),
+                ("TxSettle", 1_000),
                 ("TxExitQueue", 2_000),
             ]
         );

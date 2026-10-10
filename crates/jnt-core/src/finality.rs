@@ -131,6 +131,14 @@ impl FinalityManager {
         self.keys.len()
     }
 
+    /// Replace the committee key set (Decision 20). The chain calls this
+    /// whenever canonical bond state advances or rewinds, so certificates are
+    /// always validated against the ledger-derived committee. With no bonds
+    /// the chain passes the profile's declared committee and nothing changes.
+    pub fn set_keys(&mut self, keys: Vec<BlsPublicKey>) {
+        self.keys = keys;
+    }
+
     /// The configured activation height (0 = binding finality never activates).
     pub fn activation_height(&self) -> u64 {
         self.activation_height

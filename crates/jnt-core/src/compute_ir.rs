@@ -203,6 +203,99 @@ impl ComputeTask {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical CPU reference (SPEC.md §16.2, Decision 21 — P3).
+// ---------------------------------------------------------------------------
+
+/// The canonical CPU-reference output for a task: a fixed, dependency-free
+/// 32-round Keccak-style permutation over the task's own commitment hashes.
+///
+/// This is the single definition every party runs — worker, challenger,
+/// arbitrator: same commitments, same bytes, no clock, no RNG, no floating
+/// point, no platform types. It satisfies SPEC §16.2's MUSTs (determinism,
+/// canonical little-endian lanes, wrapping `u64` arithmetic, fixed reduction
+/// order, total termination) by construction.
+///
+/// Two deliberate scope notes, so neither is discovered later:
+///
+/// - The function mixes the *commitments* (hashes), not the IR bytecode: the
+///   chain stores hashes precisely so blocks stay small (see `ComputeTask`),
+///   and SPEC §16.5 forbids an on-chain interpreter. What consensus and the
+///   engine compare is therefore *reproducibility against the commitments* —
+///   a worker whose result differs from this output cannot have run the
+///   reference over the committed task.
+/// - There is deliberately **no height input**. Decision 21 requires
+///   "deterministic CPU re-execution with *identical* inputs": a height is
+///   never identical across the worker's run, the challenger's re-run and a
+///   later arbitration, so mixing one would make honest agreement impossible.
+///   Replay protection stays where it belongs — task expiry and attestation
+///   heights — not inside the reference.
+pub fn reference_output(
+    task_id: &Hash,
+    ir_hash: &Hash,
+    input_hash: &Hash,
+    required_memory_bytes: u64,
+) -> [u8; 64] {
+    let mut state = [0u64; 25];
+    let mut fill = |i: usize, bytes: &[u8]| {
+        for (j, chunk) in bytes.chunks(8).enumerate() {
+            let mut v = [0u8; 8];
+            v[..chunk.len()].copy_from_slice(chunk);
+            state[i * 4 + j % 4] ^= u64::from_le_bytes(v);
+        }
+    };
+    fill(0, task_id);
+    fill(1, ir_hash);
+    fill(2, input_hash);
+    state[12] ^= required_memory_bytes;
+
+    for _round in 0..32 {
+        // θ: parity of each column.
+        let mut par = [0u64; 4];
+        for (i, s) in state.iter().enumerate() {
+            par[i % 4] ^= *s;
+        }
+        for s in state.iter_mut() {
+            *s ^= par[0].rotate_left(1) ^ par[1].rotate_left(7);
+        }
+        // ρ+π (fixed shuffle) and χ (nonlinear step).
+        let mut next = [0u64; 25];
+        for i in 0..25 {
+            next[(i * 7 + 3) % 25] = state[i].rotate_left((i % 8 + 1) as u32);
+        }
+        for i in 0..25 {
+            let a = next[i];
+            let b = next[(i + 1) % 25];
+            let c = next[(i + 4) % 25];
+            state[i] = a ^ (!b & c);
+        }
+        state[0] ^= 0x1F_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    let mut out = [0u8; 64];
+    for (lane, chunk) in state.iter().take(8).zip(out.chunks_mut(8)) {
+        chunk.copy_from_slice(&lane.to_le_bytes());
+    }
+    out
+}
+
+/// The M3 result commitment for the reference output: `SHA-256` of
+/// [`reference_output`]. A result hash "reproduces" a task iff it equals
+/// this — the comparison the dispute engine runs.
+pub fn reference_result_hash(
+    task_id: &Hash,
+    ir_hash: &Hash,
+    input_hash: &Hash,
+    required_memory_bytes: u64,
+) -> Hash {
+    crate::hash::sha256(&[&reference_output(
+        task_id,
+        ir_hash,
+        input_hash,
+        required_memory_bytes,
+    )])
+}
+
+// ---------------------------------------------------------------------------
 // ComputeAttestation: a worker's claim to have completed a task
 // ---------------------------------------------------------------------------
 
@@ -546,5 +639,46 @@ mod tests {
             ComputeAttestation::from_reader(&mut r),
             Err(crate::error::Error::Malformed(_))
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Canonical reference: one definition, reproducible everywhere
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reference_output_is_deterministic_and_sensitive() {
+        let a = reference_output(&dummy_hash(1), &dummy_hash(2), &dummy_hash(3), 4096);
+        let b = reference_output(&dummy_hash(1), &dummy_hash(2), &dummy_hash(3), 4096);
+        assert_eq!(
+            a, b,
+            "identical commitments must reproduce byte-identically"
+        );
+        assert_eq!(a.len(), 64);
+        // Every commitment matters: changing any one changes the output.
+        assert_ne!(
+            a,
+            reference_output(&dummy_hash(9), &dummy_hash(2), &dummy_hash(3), 4096)
+        );
+        assert_ne!(
+            a,
+            reference_output(&dummy_hash(1), &dummy_hash(9), &dummy_hash(3), 4096)
+        );
+        assert_ne!(
+            a,
+            reference_output(&dummy_hash(1), &dummy_hash(2), &dummy_hash(9), 4096)
+        );
+        assert_ne!(
+            a,
+            reference_output(&dummy_hash(1), &dummy_hash(2), &dummy_hash(3), 8192)
+        );
+    }
+
+    #[test]
+    fn reference_result_hash_commits_the_output() {
+        let out = reference_output(&dummy_hash(1), &dummy_hash(2), &dummy_hash(3), 4096);
+        assert_eq!(
+            reference_result_hash(&dummy_hash(1), &dummy_hash(2), &dummy_hash(3), 4096),
+            crate::hash::sha256(&[&out])
+        );
     }
 }

@@ -188,10 +188,24 @@ impl DisputeEngine {
         })
     }
 
-    /// Read the evidence from a contract and arbitrate it.
-    pub fn resolve(contract: &TaskContract, re_execution_result: Hash) -> L2Result<DisputeVerdict> {
+    /// Read the evidence from a contract, run the canonical CPU reference over
+    /// the committed task, and arbitrate (Decision 21 — P3).
+    ///
+    /// The reference is computed here, never supplied by the caller: taking
+    /// it as a parameter would let any caller dictate the verdict. SPEC
+    /// §16.4's shape is preserved — the engine still only compares hashes;
+    /// the pure reference function is data, not a runtime, and no IR is
+    /// interpreted.
+    pub fn resolve(contract: &TaskContract) -> L2Result<DisputeVerdict> {
         let evidence = DisputeEvidence::from_contract(contract)?;
-        Self::arbitrate(&evidence, re_execution_result)
+        let t = &contract.compute_task;
+        let reference = jnt_core::compute_ir::reference_result_hash(
+            &contract.task_id,
+            &t.ir_hash,
+            &t.input_hash,
+            t.required_memory_bytes,
+        );
+        Self::arbitrate(&evidence, reference)
     }
 }
 

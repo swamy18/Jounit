@@ -3260,6 +3260,40 @@ NO-GO.
 
 ---
 
+## 2026-10-10 (later) — Launch decisions implemented (P2/P3/P4/P5 + exit audit)
+
+Owner answers to all 8 questions arrived as Decisions 20–23 (no post-launch
+governance; 5,000 JNT fixed; first-21-by-bond-order, no founder seats; 7 days =
+1008 blocks; CPU re-execution = fraud proof; HBM composes, never replaces;
+0.1% + 1,000-sat floor; exits from genesis only when proven; 3–5 VPS
+bootnodes, operator side). All recorded in decisions.md before any code.
+
+- **P2 (stake):** `TX_BOND`/`TX_UNBOND`/`TX_SLASH` + `bond.rs` + chain
+  integration (ledger/undo/vault/committee/finality-refresh) + mempool +
+  mining filter. `tests/bond_stake.rs` (13) caught a REAL inflation bug
+  pre-commit: bond output left in UTXO set alongside the later release
+  (+5e11 phantom, supply gate refused) — now consumed into the ledger at
+  apply. SPEC §3.3/§9.2/§14.6 amended.
+- **P5 (fee):** `settle_fee_sat` from escrow at apply; fraud charges deposit.
+  All pinned 20k expectations migrated; `settle_fee.rs` stress (boundary,
+  48-task bulk with exact split, fraud-from-value). SPEC §15.4 amended.
+- **P3 (fraud rule):** canonical reference in `compute_ir` (no height —
+  identical inputs demanded), worker delegates, `resolve` self-computes.
+  Quorum path unchanged per SPEC §16.4 (no on-chain execution). Still open:
+  quorum coordination transport needs key-custody decision. SPEC §16.6 added.
+- **P4:** design draft only (`docs/hbm-composition-draft.md`), explicitly not
+  activated — checklist (analysis, benchmarks, vectors, adversarial suite).
+- **Exit audit, height NOT flipped:** 3 new crank tests (re-crank after claim
+  reorg, queue-reorg drops watch, two-exit batch). Batch caught a REAL crank
+  bug (two claims, one sink output — inputs now retire per exit).
+
+Remaining for launch (not code): P6 escrow-scale confirmation; bootnode VPS +
+addresses; release/tag pipeline; alerts/log shipping; PGP key; third-party
+audit. Testnet is the next milestone; mainnet still NO-GO (exit height unset
+by owner instruction).
+
+---
+
 ## 2026-10-10 — Streaming micro-payments (pay-as-you-use, roadmap item 30)
 
 New policy-layer primitive in `crates/jnt-core/src/stream.rs` (952 lines):

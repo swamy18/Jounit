@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::bond::BondLedger;
 use crate::fees::required_fee;
 use crate::hash::Hash;
 use crate::ledger::{check_tx, UtxoSet};
@@ -194,6 +195,7 @@ impl Mempool {
         height: u64,
         params: &NetworkParams,
         base_fee: u64,
+        bonds: &BondLedger,
     ) -> Result<Hash, MempoolError> {
         let txid = tx.txid();
         if self.entries.contains_key(&txid) {
@@ -209,6 +211,22 @@ impl Mempool {
             params.coinbase_maturity,
         )
         .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+
+        // Stake overlay (Decision 20): the pool never holds what a block
+        // would refuse. Full verification including the BLS pairing, like the
+        // ECDSA checks `check_tx` already does at admission — same class of
+        // relay cost, and the alternative (pooling slash txs no block can
+        // include) is pool pollution by construction.
+        if tx.is_stake_tx() {
+            crate::bond::admit_stake_tx(
+                &tx,
+                bonds,
+                &params.network_id,
+                height,
+                &crate::bls::RealBls,
+            )
+            .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+        }
 
         let required = required_fee(base_fee, delta.gas_used);
         if delta.fee_total < required {
@@ -417,6 +435,7 @@ impl Mempool {
     ///
     /// A transaction already present counts as re-admitted: the postcondition is
     /// that it is in the pool, not that this call inserted it.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile(
         &mut self,
         utxo: &UtxoSet,
@@ -425,6 +444,7 @@ impl Mempool {
         base_fee: u64,
         confirmed: &[Transaction],
         disconnected: &[Transaction],
+        bonds: &BondLedger,
     ) -> ReconcileReport {
         let before = self.entries.len();
         self.evict_confirmed(confirmed);
@@ -439,7 +459,7 @@ impl Mempool {
             if tx.is_coinbase() {
                 continue;
             }
-            match self.add(tx.clone(), utxo, height, params, base_fee) {
+            match self.add(tx.clone(), utxo, height, params, base_fee, bonds) {
                 Ok(_) | Err(MempoolError::AlreadyKnown) => report.readmitted += 1,
                 Err(_) => report.refused += 1,
             }
@@ -579,13 +599,14 @@ mod tests {
             H,
             &params(),
             BASE,
+            &BondLedger::default(),
         )
         .unwrap();
 
         let steal = spend(&w, op, FUNDED - fee - 1, [9u8; 20]);
         assert!(
             matches!(
-                pool.add(steal, &set, H, &params(), BASE),
+                pool.add(steal, &set, H, &params(), BASE, &BondLedger::default()),
                 Err(MempoolError::Conflict { .. })
             ),
             "a conflicting transaction was admitted alongside the pooled one"
@@ -604,7 +625,15 @@ mod tests {
         let tx = spend(&w, ops[0], FUNDED - fat_fee(), [9u8; 20]);
         let mut pool = Mempool::default();
         assert!(
-            pool.add(tx, &UtxoSet::new(), H, &params(), BASE).is_err(),
+            pool.add(
+                tx,
+                &UtxoSet::new(),
+                H,
+                &params(),
+                BASE,
+                &BondLedger::default()
+            )
+            .is_err(),
             "a spend of a nonexistent output was pooled"
         );
     }
@@ -632,6 +661,7 @@ mod tests {
                     H,
                     &params(),
                     BASE,
+                    &BondLedger::default(),
                 )
                 .is_ok()
             {
@@ -670,6 +700,7 @@ mod tests {
                 H,
                 &params(),
                 BASE,
+                &BondLedger::default(),
             )
             .unwrap();
         }
@@ -731,8 +762,24 @@ mod tests {
         );
 
         let mut pool = Mempool::default();
-        pool.add(wide.clone(), &set, H, &params(), BASE).unwrap();
-        pool.add(narrow.clone(), &set, H, &params(), BASE).unwrap();
+        pool.add(
+            wide.clone(),
+            &set,
+            H,
+            &params(),
+            BASE,
+            &BondLedger::default(),
+        )
+        .unwrap();
+        pool.add(
+            narrow.clone(),
+            &set,
+            H,
+            &params(),
+            BASE,
+            &BondLedger::default(),
+        )
+        .unwrap();
 
         let wide_entry = pool.get(&wide.txid()).unwrap();
         let narrow_entry = pool.get(&narrow.txid()).unwrap();
@@ -768,11 +815,13 @@ mod tests {
 
         let mut a = Mempool::default();
         for tx in &txs {
-            a.add(tx.clone(), &set, H, &params(), BASE).unwrap();
+            a.add(tx.clone(), &set, H, &params(), BASE, &BondLedger::default())
+                .unwrap();
         }
         let mut b = Mempool::default();
         for tx in txs.iter().rev() {
-            b.add(tx.clone(), &set, H, &params(), BASE).unwrap();
+            b.add(tx.clone(), &set, H, &params(), BASE, &BondLedger::default())
+                .unwrap();
         }
         assert_eq!(
             a.select_for_block(u64::MAX, usize::MAX),
@@ -910,11 +959,12 @@ mod tests {
         let tx = spend(&w, ops[0], FUNDED - fat_fee(), [9u8; 20]);
 
         let mut pool = Mempool::default();
-        pool.add(tx.clone(), &set, H, &params(), BASE).unwrap();
+        pool.add(tx.clone(), &set, H, &params(), BASE, &BondLedger::default())
+            .unwrap();
         pool.evict_confirmed(std::slice::from_ref(&tx));
         assert!(pool.is_empty());
 
-        pool.add(tx, &set, H, &params(), BASE)
+        pool.add(tx, &set, H, &params(), BASE, &BondLedger::default())
             .expect("a re-admitted transaction was refused as a conflict with itself");
     }
 
@@ -931,7 +981,8 @@ mod tests {
             .map(|op| spend(&w, *op, FUNDED - fee, [9u8; 20]))
             .collect();
         for tx in &txs {
-            pool.add(tx.clone(), &set, H, &params(), BASE).unwrap();
+            pool.add(tx.clone(), &set, H, &params(), BASE, &BondLedger::default())
+                .unwrap();
         }
 
         pool.evict_confirmed(std::slice::from_ref(&txs[0]));

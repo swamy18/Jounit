@@ -35,9 +35,10 @@ pub struct TaskRef {
 impl TaskRef {
     /// The net a `Correct` settlement would pay this worker for a claim at
     /// `deposit`, i.e. `payment_sat - settle_fee` (§15.4, fee out of escrow).
+    /// Decision 23 (P5): the proportional fee for this task's escrow.
     pub fn net_payment_sat(&self) -> u64 {
         self.payment_sat
-            .saturating_sub(jnt_core::l2::L2TxType::Settle.fee_sat())
+            .saturating_sub(jnt_core::l2::settle_fee_sat(self.payment_sat))
     }
 }
 
@@ -98,7 +99,7 @@ pub fn available(
     }
     let net = contract
         .payment_sat
-        .saturating_sub(jnt_core::l2::L2TxType::Settle.fee_sat());
+        .saturating_sub(jnt_core::l2::settle_fee_sat(contract.payment_sat));
     if net < f.min_net_payment_sat {
         return false;
     }

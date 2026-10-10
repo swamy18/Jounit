@@ -1060,6 +1060,7 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
             sh.chain.height() + 1,
             sh.chain.params(),
             sh.chain.expected_base_fee_for_next_block(),
+            sh.chain.bonds(),
         );
         match outcome {
             Ok(txid) => {

@@ -1239,3 +1239,104 @@ needs no exit term. `tests/conservation.rs` passing untouched is the evidence.
 `InclusionProof`) at the queue block - the only moment the node's L2 root equals
 the block's committed root. A crank never replays back to `queued_height`, which
 the design had rejected as unviable as a consensus rule.
+
+---
+
+# Launch decisions (approved 2026-10-10, implementation follows)
+
+## Launch principle — no post-launch governance
+
+No governance-controlled parameter and no administrator override exist after
+launch. Every value below is an immutable consensus constant, not a tunable.
+Any future consensus change ships as a new software version adopted voluntarily
+by independent node operators — never by the control of a person or committee.
+(Operational corollary, owner's side not consensus: bootnodes are 3–5
+independently operated, geographically distributed VPS nodes, with their
+addresses published in open-source configuration.)
+
+## Decision 20 — Bonded stake + mainnet committee (P2)
+
+**Status: APPROVED 2026-10-10, IMPLEMENTED 2026-10-10.** Resolves P2's design;
+the mechanism follows as a new L1 rule. Decision 2's economics stand (TopN 21,
+no rewards, no fee share); this decision supplies what Decision 8 deliberately
+left unbuilt.
+
+1. **Minimum stake: 5,000 JNT, fixed in the consensus rules.** Not a parameter,
+   per the launch principle above.
+2. **Committee: the first 21 eligible validators by valid bond-transaction
+   order.** Eligibility = a valid bond of at least the minimum. No
+   genesis-fixed identities, no privileged or permanent founder seats: the
+   committee fills from bond order on a live chain, reproducibly from chain
+   state alone.
+3. **Unbonding: 7 days, fixed in the protocol rules** — 1008 blocks at the
+   mainnet 10-minute block time — after a full finality window, keeping the
+   checkpoint-signing duty until release.
+4. **Equivocation: full-bond burn once a bond exists to burn.** The evidence
+   (`EquivocationEvidence`, Decision 14) already exists; punishment was
+   deferred only for lack of a bond. Adding validator rewards of any kind stays
+   a monetary decision and out of scope (Decision 2 item 3 stands).
+
+## Decision 21 — M2 fraud rule: deterministic CPU re-execution (P3)
+
+**Status: APPROVED 2026-10-10, IMPLEMENTED 2026-10-10.** A compute result is
+fraudulent if and only if deterministic CPU re-execution over the identical
+inputs reproducibly mismatches the claimed output; the mismatch plus the
+execution evidence constitutes the fraud proof.
+
+**Implementation (2026-10-10).** One canonical reference function
+(`compute_ir::reference_output`/`reference_result_hash`, SPEC §16.6) run by
+worker, challenger and arbitrator alike — no height input, since
+reproducibility demands identical inputs and a height is never identical
+(worker `CpuExecutor` delegates; replay protection stays with expiry and
+attestation heights). `DisputeEngine::resolve` computes the reference itself
+from the disputed contract instead of taking a caller hash, so no party can
+dictate the verdict it will be judged by. The quorum-signed verdict →
+slash-record path is unchanged per SPEC §16.4 (no on-chain execution, no
+interpreter). `dispute_flow.rs` now arbitrates real reference outputs
+(worker-correct / challenger-correct / inconclusive worlds); fraud verdicts
+write vault slash records exactly as before. Still operator infra, not built
+here: the quorum coordination transport that carries verdicts to `Settle`
+needs a key-custody decision first.
+
+## Decision 22 — HBM as an additional commitment layer (P4, DRAFT)
+
+**Status: DRAFT — explicitly NOT activated.** The header carries an HBM
+commitment alongside the base §5 PoW, and both verifications are deterministic
+under the consensus rules. The base puzzle is never silently replaced: HBM
+composes with the established mechanism, it does not substitute for it.
+Activation requires a written security analysis and benchmarks first; until
+then chain security rests on §5 alone. Design shape recorded in
+`docs/hbm-composition-draft.md` (2026-10-10): additional header commitment,
+activation checklist, open questions — still no code, still not activated.
+
+## Decision 23 — Proportional settle fee (P5)
+
+**Status: APPROVED 2026-10-10, IMPLEMENTED 2026-10-10.** The rigid 20,000-sat
+floor (`AmountTooSmallForFee`) is replaced by a deterministic protocol rule:
+**0.1% of task value, minimum 1,000 sat** as the anti-spam floor. No
+discretionary fee changes, per the launch principle.
+
+**Implementation (2026-10-10).** `settle_fee_sat` (`l2.rs`) computed from the
+task's escrow at `apply_settle`; fraud charges it against the deposit with the
+submitter still refunded whole. Worker estimators (`earnings_of`,
+`net_payment_sat`, discovery filter) use the proportional fee. All pinned
+20,000-sat expectations migrated; `tests/settle_fee.rs` stress suite covers
+the dust boundary, 48 mixed-size tasks with exact 50/50 split accounting, and
+the fraud-from-task-value path. SPEC §15.4 amended.
+
+## Exit activation (recorded, NOT flipped)
+
+`exit_activation_height = 1` is deliberately **not** set yet. Mainnet exits
+stay closed until the full L2→L1 withdrawal path is verified tested-and-safe;
+the height flips only then, and mainnet does not launch before it is ready.
+Note the semantics from Decision 19: enabling from genesis means `1`, since
+`0` means *never*.
+
+**Exit-path audit (2026-10-10).** `exit_crank.rs` grew three tests: a claim
+block reorged away is re-cranked and settles again (identity unmarked,
+conservation survives); a queue block reorged away drops the watch (no
+phantom claim, even far past finality); two exits crank and settle together
+exactly once each. The batch test caught a real crank bug (two claims funded
+from the same sink output — the crank now retires assigned inputs per exit).
+Full loop, refusals, unwinds and conservation remain green; the height still
+does not flip on this evidence alone.

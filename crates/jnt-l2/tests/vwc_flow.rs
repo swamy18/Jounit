@@ -210,7 +210,7 @@ fn a_quorum_settled_task_issues_one_quorum_certificate() {
             worker_paid,
             ..
         } => {
-            assert_eq!(*worker_paid, 1_000_000 - 20_000);
+            assert_eq!(*worker_paid, 1_000_000 - 1_000);
             *vwc_id
         }
         other => panic!("unexpected effect {other:?}"),
@@ -222,7 +222,7 @@ fn a_quorum_settled_task_issues_one_quorum_certificate() {
     assert_eq!(cert.task_id, id);
     assert_eq!(cert.worker, addr(&w.worker));
     assert_eq!(cert.result_hash, RESULT);
-    assert_eq!(cert.payment_sat, 1_000_000 - 20_000);
+    assert_eq!(cert.payment_sat, 1_000_000 - 1_000);
     assert!(matches!(
         cert.verification,
         VwcVerification::Quorum {
@@ -289,7 +289,7 @@ fn an_implicit_settlement_issues_a_window_elapsed_certificate() {
 #[test]
 fn a_zero_payout_settlement_still_certifies_with_zero_payment() {
     let mut w = world();
-    let post = PostTaskPayload::build(&w.submitter, 1, 20_000, DEADLINE, task(DEADLINE)).unwrap();
+    let post = PostTaskPayload::build(&w.submitter, 1, 1_000, DEADLINE, task(DEADLINE)).unwrap();
     let id = post.task_id;
     w.apply(&L2Transaction::new(L2Payload::Post(post)), 1)
         .unwrap();

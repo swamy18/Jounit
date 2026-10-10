@@ -532,7 +532,7 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
     assert_eq!(cert.task_id, task_id);
     assert_eq!(cert.worker, addr(&worker()));
     assert_eq!(cert.result_hash, result_hash);
-    assert_eq!(cert.payment_sat, COMPUTE_ESCROW_SAT - 20_000);
+    assert_eq!(cert.payment_sat, COMPUTE_ESCROW_SAT - 1_000);
     assert!(
         matches!(cert.verification, VwcVerification::Quorum { .. }),
         "an explicit settle carries the quorum aggregate"
@@ -543,7 +543,7 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
     let e = client.earnings().expect("the node's state is readable");
     assert_eq!(
         e.settled_sat,
-        COMPUTE_ESCROW_SAT - 20_000 + WORKER_DEPOSIT_SAT
+        COMPUTE_ESCROW_SAT - 1_000 + WORKER_DEPOSIT_SAT
     );
     assert_eq!(e.lost_sat, 0);
     assert_eq!(e.pending_sat, 0);

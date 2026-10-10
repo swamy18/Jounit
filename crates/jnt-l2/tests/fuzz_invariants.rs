@@ -535,10 +535,24 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
             }
             // Dispute, with a counter-result guaranteed to differ from the
             // submission so the refusal (when the state is wrong) is not merely
-            // the "dispute agrees" guard.
+            // the "dispute agrees" guard. Half the time the counter IS the
+            // canonical reference, so the later arbitration can actually
+            // convict or acquit instead of always going inconclusive.
             3 => {
                 if let Some(id) = task {
-                    let mut counter = rng.hash();
+                    let mut counter = if rng.byte() % 2 == 0 {
+                        match state.task(&id) {
+                            Some(t) => jnt_core::compute_ir::reference_result_hash(
+                                &t.task_id,
+                                &t.compute_task.ir_hash,
+                                &t.compute_task.input_hash,
+                                t.compute_task.required_memory_bytes,
+                            ),
+                            None => rng.hash(),
+                        }
+                    } else {
+                        rng.hash()
+                    };
                     if Some(counter) == submitted_result {
                         counter[0] ^= 0xFF;
                     }
@@ -555,27 +569,45 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
                             .is_ok()
                         {
                             seen[3] += 1;
+                            // Settle immediately, before the lapse can race:
+                            // when the counter above was the canonical
+                            // reference this convicts or acquits on the spot,
+                            // covering the arbitrated-settle path
+                            // deterministically instead of by timing luck.
+                            let verdict =
+                                state.task(&id).and_then(|t| DisputeEngine::resolve(t).ok());
+                            if let Some(v) = verdict {
+                                if let Ok(payload) =
+                                    v.settle_payload([0xAAu8; 96], bitmap.clone(), quorum as u32)
+                                {
+                                    if state
+                                        .apply(
+                                            &L2Transaction::new(L2Payload::Settle(payload)),
+                                            height,
+                                            &validators,
+                                            &verifier,
+                                        )
+                                        .is_ok()
+                                    {
+                                        seen[4] += 1;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            // Settle along the arbitrated path: ask the engine what a reference
-            // implies, then settle with the verdict it returns.
+            // Settle along the arbitrated path: the engine runs the canonical
+            // reference itself; a random world is almost surely inconclusive
+            // (neither claim reproduces it), which must refuse cleanly.
             4 => {
                 if let Some(id) = task {
-                    let disputed = match state.task(&id).map(|t| &t.state) {
-                        Some(ContractState::Disputed(c)) => {
-                            Some((c.against_result, c.counter_result))
-                        }
-                        _ => None,
-                    };
-                    if let Some((against, counter)) = disputed {
-                        let reference = match rng.byte() % 3 {
-                            0 => against,
-                            1 => counter,
-                            _ => rng.hash(), // likely inconclusive
-                        };
-                        if let Ok(v) = DisputeEngine::resolve(state.task(&id).unwrap(), reference) {
+                    let disputed = matches!(
+                        state.task(&id).map(|t| &t.state),
+                        Some(ContractState::Disputed(_))
+                    );
+                    if disputed {
+                        if let Ok(v) = DisputeEngine::resolve(state.task(&id).unwrap()) {
                             if let Ok(payload) =
                                 v.settle_payload([0xAAu8; 96], bitmap.clone(), quorum as u32)
                             {

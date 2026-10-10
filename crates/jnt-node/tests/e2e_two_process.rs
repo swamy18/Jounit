@@ -372,7 +372,7 @@ fn worker_lifecycle_over_real_http() {
     let earnings = client.earnings().expect("earnings read");
     assert_eq!(
         earnings.pending_sat,
-        COMPUTE_ESCROW_SAT.saturating_sub(jnt_core::l2::L2TxType::Settle.fee_sat()),
+        COMPUTE_ESCROW_SAT.saturating_sub(jnt_core::l2::settle_fee_sat(COMPUTE_ESCROW_SAT)),
         "pending earnings reflect the escrow minus settle fee"
     );
     assert_eq!(earnings.deposits_at_risk_sat, WORKER_DEPOSIT_SAT);

@@ -256,12 +256,14 @@ pub fn earnings_of(state: &L2State, worker: &jnt_core::hash::Address) -> Earning
         available_sat: state.balance(worker),
         ..Default::default()
     };
-    let settle_fee = jnt_core::l2::L2TxType::Settle.fee_sat();
     for contract in state.tasks() {
         let mine = contract.worker.as_ref() == Some(worker);
         if !mine {
             continue;
         }
+        // Decision 23 (P5): pending escrow nets the proportional settle fee,
+        // not the flat schedule value.
+        let settle_fee = jnt_core::l2::settle_fee_sat(contract.payment_sat);
         match &contract.state {
             jnt_l2::ContractState::Open => {}
             jnt_l2::ContractState::InProgress { .. }

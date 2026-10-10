@@ -33,8 +33,8 @@ use jnt_core::bls_checkpoint::{BlsSignature, BlsVerifier, ValidatorSet};
 use jnt_core::fees::split_flat_fee;
 use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
-    ClaimTaskPayload, DisputePayload, ExitQueuePayload, L2Payload, L2Transaction, PostTaskPayload,
-    SettlePayload, SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
+    settle_fee_sat, ClaimTaskPayload, DisputePayload, ExitQueuePayload, L2Payload, L2Transaction,
+    PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
 };
 use jnt_core::ser::{Reader, Writer};
 use jnt_core::slash::SlashVault;
@@ -678,7 +678,7 @@ impl L2State {
             L2Payload::Claim(p) => self.apply_claim(p, height, fee),
             L2Payload::Submit(p) => self.apply_submit(p, height, fee),
             L2Payload::Dispute(p) => self.apply_dispute(p, height, fee),
-            L2Payload::Settle(p) => self.apply_settle(p, txid, height, validators, verifier, fee),
+            L2Payload::Settle(p) => self.apply_settle(p, txid, height, validators, verifier),
             L2Payload::ExitQueue(p) => self.queue_exit(p, height, fee),
         }?;
 
@@ -769,7 +769,6 @@ impl L2State {
         height: u64,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
-        fee: u64,
     ) -> L2Result<L2Effect> {
         // Quorum is three checks, in the order the M5 checkpoint validator uses:
         // the bitmap and the declared count must agree, the count must meet the
@@ -787,6 +786,11 @@ impl L2State {
         }
         let (submitter, worker, challenger, outcome) = {
             let contract = self.tasks.get_mut(&p.task_id).ok_or(L2Error::UnknownTask)?;
+            // Decision 23 (P5): the settle fee is proportional to the task's
+            // escrow, not the flat `tx.fee_sat()` every other type uses. The
+            // static schedule value is only the floor; the contract settles
+            // what the rule says, charged by the existing paths below.
+            let fee = settle_fee_sat(contract.payment_sat);
             let submitter = contract.submitter;
             let worker = contract.worker;
             let challenger = contract.challenger();

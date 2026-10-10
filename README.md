@@ -70,7 +70,7 @@ without weakening the security a hash chain depends on.
 - **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a sovereign BLS aggregate finality gadget (M5). See the M1–M5 table in [Protocol mechanisms](#protocol-mechanisms-m1m5) for what each one does and does not yet affect.
 - **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
 - **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
-- **Layer 2 (`jnt-l2`)**: Task contracts over the six L2 transaction types (incl. `ExitQueue`), D3 flat fees split 50/50 burn/PSCB, escrow accounting, replay protection, a complete **dispute engine** (evidence validation, the M3 CPU-reference arbitration rule per SPEC.md §16, M2 slashing, PSCB whistleblower bounty), and **Verified Work Certificates** (SPEC.md §17): every correctly settled task issues a deterministic, id-derived receipt — `Quorum`-verified for an explicit settle, `WindowElapsed` for an implicit one — with tamper-evident validation against the on-chain registry.
+- **Layer 2 (`jnt-l2`)**: Task contracts over the six L2 transaction types (incl. `ExitQueue`), D3 fees split 50/50 burn/PSCB (flat per type; settle is 0.1% of task value, min 1,000 sat), escrow accounting, replay protection, a complete **dispute engine** (evidence validation, the M3 CPU-reference arbitration rule per SPEC.md §16, M2 slashing, PSCB whistleblower bounty), and **Verified Work Certificates** (SPEC.md §17): every correctly settled task issues a deterministic, id-derived receipt — `Quorum`-verified for an explicit settle, `WindowElapsed` for an implicit one — with tamper-evident validation against the on-chain registry.
 - **Machine/agent layer (`jnt-core`, policy only — no consensus change)**: deterministic agent identity, owner-signed spending policies with offline authorization, the canonical machine-payment format, service receipts, a reputation ledger, the service/payment bridge with settlement batching, a keyless MCP surface (`jnt-mcp`), and **streaming micro-payments** (`stream.rs`): pay-as-you-use at a fixed rate per block under a hard cap, settled by payer-signed receipts.
 
 **Roadmap / Future Work:**
@@ -255,6 +255,7 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 | `puzzle.rs` | 830 | The three PoW stages and the versioned puzzle registry |
 | `validators.rs` | 936 | §14.6 validator-set machinery (deterministic TopN, checkpoint validation) — inert |
 | `chain.rs` | 1 680 | Validation, application, fork choice, reorg, PSCB reserve, mining |
+| `bond.rs` | 560 | Bonded validator stake: bond ledger, committee order, slash evidence (Decision 20) |
 | `agent.rs` | 1 106 | Machine/agent identity + owner-signed spending policies, offline authorization (Decision 16) |
 | `payment.rs` | 787 | Canonical machine/agent payment format + settlement batching |
 | `service.rs` | 912 | Service bridge: payment requests, sessions, authorization binding |

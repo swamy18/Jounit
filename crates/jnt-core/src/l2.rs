@@ -38,7 +38,7 @@ use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Address, Hash};
 use crate::params::{
     FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_EXIT_QUEUE_SAT, FEE_TX_POST_TASK_SAT,
-    FEE_TX_SETTLE_SAT, FEE_TX_SUBMIT_RESULT_SAT,
+    FEE_TX_SUBMIT_RESULT_SAT, SETTLE_FEE_MIN_SAT,
 };
 use crate::ser::{Reader, Writer};
 use crate::sig::{Bundle, Component, SCHEME_SECP256K1_ECDSA, SCHEME_SECP256K1_SCHNORR};
@@ -134,16 +134,30 @@ impl L2TxType {
     }
 
     /// The D3 flat fee for this type, in satoshis.
+    ///
+    /// `Settle` returns the anti-spam floor, not the fee: the actual settle
+    /// fee is proportional to task value — see [`settle_fee_sat`]. Callers
+    /// estimating a settlement must use that function with the task's escrow;
+    /// this floor is only the minimum every settle pays.
     pub fn fee_sat(self) -> u64 {
         match self {
             L2TxType::PostTask => FEE_TX_POST_TASK_SAT,
             L2TxType::ClaimTask => FEE_TX_CLAIM_TASK_SAT,
             L2TxType::SubmitResult => FEE_TX_SUBMIT_RESULT_SAT,
             L2TxType::Dispute => FEE_TX_DISPUTE_SAT,
-            L2TxType::Settle => FEE_TX_SETTLE_SAT,
+            L2TxType::Settle => SETTLE_FEE_MIN_SAT,
             L2TxType::ExitQueue => FEE_TX_EXIT_QUEUE_SAT,
         }
     }
+}
+
+/// Decision 23 (P5): the proportional settle fee — 0.1% of the task's escrow
+/// value, minimum [`SETTLE_FEE_MIN_SAT`] sat. A task settles exactly when its
+/// escrow covers this: below the floor the fee exceeds the value (refused),
+/// at or above it the fee is always payable, since `payment/1000 <= payment`
+/// for every non-zero payment. Deterministic protocol rule, no discretion.
+pub fn settle_fee_sat(payment_sat: u64) -> u64 {
+    (payment_sat / 1000).max(SETTLE_FEE_MIN_SAT)
 }
 
 /// The settlement verdict a validator quorum signs.
@@ -1023,8 +1037,21 @@ mod tests {
         assert_eq!(L2TxType::ClaimTask.fee_sat(), 2_000);
         assert_eq!(L2TxType::SubmitResult.fee_sat(), 2_000);
         assert_eq!(L2TxType::Dispute.fee_sat(), 10_000);
-        assert_eq!(L2TxType::Settle.fee_sat(), 20_000);
+        assert_eq!(L2TxType::Settle.fee_sat(), 1_000);
         assert_eq!(L2TxType::ExitQueue.fee_sat(), 2_000);
+    }
+
+    #[test]
+    fn settle_fee_is_proportional_with_an_anti_spam_floor() {
+        // Decision 23: 0.1% of task value, minimum 1,000 sat.
+        assert_eq!(settle_fee_sat(0), 1_000);
+        assert_eq!(settle_fee_sat(999), 1_000);
+        assert_eq!(settle_fee_sat(1_000), 1_000);
+        assert_eq!(settle_fee_sat(1_000_000), 1_000);
+        assert_eq!(settle_fee_sat(5_000_000), 5_000);
+        assert_eq!(settle_fee_sat(100_000_000), 100_000);
+        // No overflow at the top: division first, then the floor.
+        assert_eq!(settle_fee_sat(u64::MAX), u64::MAX / 1000);
     }
 
     // --- task id --------------------------------------------------------

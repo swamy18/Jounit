@@ -6,9 +6,11 @@
 // on hand-built adversarial inputs, so the properties hold on every `cargo test`
 // run and in CI on stable. If a fuzzer ever finds a crash, the minimizing
 // reproduction belongs here as a regression test.
-
 use jnt_core::bls::RealBls;
+
 use jnt_core::bls_checkpoint::{BlsSignature, Checkpoint, CheckpointPayload};
+
+use jnt_core::bond::BondLedger;
 use jnt_core::hash::{sha256, Hash};
 use jnt_core::ledger::UtxoSet;
 use jnt_core::mempool::Mempool;
@@ -303,7 +305,14 @@ fn mempool_byte_cap_holds_under_adversarial_admission() {
 
     for tx in &hostile {
         // Ok or named rejection — never a panic, never a cap breach.
-        let _ = pool.add(tx.clone(), &utxo, 10_000, &params, 1_000);
+        let _ = pool.add(
+            tx.clone(),
+            &utxo,
+            10_000,
+            &params,
+            1_000,
+            &BondLedger::default(),
+        );
         assert!(
             pool.summary().bytes <= 8_000,
             "pool byte cap must hold under adversarial input"
@@ -329,9 +338,16 @@ fn mempool_admission_is_idempotent_and_clean() {
         }],
     );
 
-    let first = pool.add(tx.clone(), &utxo, 10_000, &params, 1_000);
+    let first = pool.add(
+        tx.clone(),
+        &utxo,
+        10_000,
+        &params,
+        1_000,
+        &BondLedger::default(),
+    );
     let bytes_after_first = pool.summary().bytes;
-    let second = pool.add(tx, &utxo, 10_000, &params, 1_000);
+    let second = pool.add(tx, &utxo, 10_000, &params, 1_000, &BondLedger::default());
     // Whatever the pair of outcomes, the pool must not double-count the tx.
     assert!(
         bytes_after_first >= pool.summary().bytes,

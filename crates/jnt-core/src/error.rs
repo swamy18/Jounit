@@ -91,6 +91,8 @@ pub enum Error {
     AlreadyKnown,
     /// no parent found for a submitted block
     UnknownParent,
+    /// bonded-stake rule violated (bond, unbond or slash refusal names its rule)
+    StakeInvalid(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -187,6 +189,7 @@ impl fmt::Display for Error {
             }
             Error::AlreadyKnown => write!(f, "block already known"),
             Error::UnknownParent => write!(f, "parent block unknown"),
+            Error::StakeInvalid(w) => write!(f, "bonded-stake rule violated: {w}"),
         }
     }
 }

@@ -106,14 +106,55 @@ Versions follow the workspace `version` in `Cargo.toml`.
   transaction type and no consensus rule change. Attack-first suite in
   `crates/jnt-core/tests/payment_stream.rs` (16 tests).
 
+### Added (consensus — Decisions 20–23, owner-approved 2026-10-10)
+
+- **Bonded stake (P2, Decision 20).** `TX_BOND`/`TX_UNBOND`/`TX_SLASH`
+  (`jnt-core/src/tx.rs`, positional stake payloads; unknown `tx_type` values
+  refused, never interpreted as standard) + `jnt-core/src/bond.rs` (bond
+  ledger with bond-order index, pure validators shared by block application
+  and mempool admission, committee = first 21 bonds). Chain integration:
+  per-block undo, M2 vault advance with vesting routed to PSCB,
+  `verify_canonical_chain` covers bonds and vault, finality keys follow the
+  ledger (genesis fallback while empty). Mempool admits only bond-valid
+  transactions; block building re-checks on a scratch ledger and skips stale
+  ones instead of wedging the miner. Attack-first suite
+  `tests/bond_stake.rs` (13 tests) caught a real double-count during
+  development (bond output left in the UTXO set alongside the later release —
+  now consumed into the ledger at apply). SPEC §3.3/§9.2/§14.6 amended.
+- **Proportional settle fee (P5, Decision 23).** `settle_fee_sat` (`l2.rs`):
+  0.1% of task value, minimum 1,000 sat; computed from the escrow at
+  `apply_settle`, charged against the deposit on fraud with the submitter
+  refunded whole. Worker estimators use the proportional fee. All pinned
+  20,000-sat expectations migrated; new stress suite
+  `jnt-l2/tests/settle_fee.rs` (dust boundary, 48 mixed-size tasks with exact
+  50/50 split accounting, fraud-from-task-value). SPEC §15.4 amended.
+- **Canonical CPU reference (P3, Decision 21).**
+  `compute_ir::reference_output`/`reference_result_hash` is the single
+  definition run by worker, challenger and arbitrator (no height input —
+  reproducibility demands identical inputs); worker `CpuExecutor` delegates.
+  `DisputeEngine::resolve` computes the reference itself from the disputed
+  contract instead of taking a caller hash. Quorum-signed verdict →
+  slash-record path unchanged per SPEC §16.4 (no on-chain execution, no
+  interpreter). `dispute_flow.rs` arbitrates real reference outputs;
+  `docs/decisions.md` records what remains (quorum coordination transport
+  needs a key-custody decision). SPEC §16.6 added.
+- **Exit-path audit (height still NOT flipped).** `exit_crank.rs` grew three
+  tests: claim-block reorg re-cranks and settles again; queue-block reorg
+  drops the watch (no phantom claim); two exits crank and settle together
+  exactly once each. The batch test caught a real crank bug (two claims
+  funded from the same sink output — assigned inputs now retire per exit).
+
 ### Notes
 
 - The observability and documentation entries above are the only non-consensus
-  work in this Unreleased block. The Decision-19 `### Added`/`### Changed`
-  sections are the **first** consensus change since 0.1.0 — a new L2 transaction
-  type, L1 `exit_claims`, and the `exit_activation_height` gate. The Decision-18
-  `### Changed` section that follows is the **second**; like it, every historical
-  block still validates identically.
+  work in this Unreleased block besides the policy-layer streaming primitive.
+  The Decision-19 `### Added`/`### Changed` sections were the **first**
+  consensus change since 0.1.0 — a new L2 transaction type, L1 `exit_claims`,
+  and the `exit_activation_height` gate. The Decision-18 `### Changed` section
+  that follows was the **second**; like it, every historical block still
+  validates identically. The Decisions 20–23 `### Added` section above is the
+  **third**: three new L1 transaction types, the bond ledger, the proportional
+  settle fee, and the canonical CPU reference.
 
 ## [0.1.0] — 2026-10-09
 

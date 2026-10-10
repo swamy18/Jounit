@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use crate::error::{Error, Result};
 use crate::hash::{Address, Hash};
 use crate::params::NetworkParams;
-use crate::tx::{OutPoint, Output, Transaction};
+use crate::tx::{OutPoint, Output, Transaction, TX_BOND, TX_SLASH, TX_STANDARD, TX_UNBOND};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Utxo {
@@ -179,6 +179,12 @@ pub fn check_tx(
         return Err(Error::BadCoinbase(
             "use check_coinbase for the coinbase transaction",
         ));
+    }
+    // Transaction versioning discipline (tx.rs): future primitives add new
+    // `tx_type` values, and anything unrecognised is refused rather than
+    // interpreted as a standard spend.
+    if !matches!(tx.tx_type, TX_STANDARD | TX_BOND | TX_UNBOND | TX_SLASH) {
+        return Err(Error::Malformed("unknown tx_type"));
     }
     if tx.inputs.is_empty() {
         return Err(Error::Malformed(

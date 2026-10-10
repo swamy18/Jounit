@@ -221,13 +221,13 @@ fn explicit_settle_credits_exactly_escrow_minus_fee() {
     }
 
     let cert = w.certificate(&id).unwrap().unwrap();
-    assert_eq!(cert.payment_sat, ESCROW - 20_000);
+    assert_eq!(cert.payment_sat, ESCROW - 1_000);
     let e = w.earnings().unwrap();
     // settled includes the returned deposit (worker_paid + deposit_returned).
-    assert_eq!(e.settled_sat, ESCROW - 20_000 + 100_000);
+    assert_eq!(e.settled_sat, ESCROW - 1_000 + 100_000);
     assert_eq!(
         e.available_sat,
-        CREDITED - 100_000 - 2_000 + ESCROW - 20_000 + 100_000 - 2_000
+        CREDITED - 100_000 - 2_000 + ESCROW - 1_000 + 100_000 - 2_000
     );
 }
 

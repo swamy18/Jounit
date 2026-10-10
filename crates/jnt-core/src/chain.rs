@@ -11,6 +11,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::block::{genesis_block, Block, Header};
+use crate::bls::RealBls;
+use crate::bls_checkpoint::BlsPublicKey;
+use crate::bond::{
+    check_bond_tx, check_slash_tx, check_unbond_tx, slash_vesting_period, unwind_bond_op,
+    BondLedger, BondRecord, BondUndoOp, StakeApply,
+};
 use crate::difficulty::{next_difficulty, validate_local_clock, validate_timestamp};
 use crate::error::{Error, Result};
 use crate::exit::ExitClaim;
@@ -21,11 +27,12 @@ use crate::ledger::{check_tx, Undo, Utxo, UtxoSet};
 use crate::mempool::{Mempool, ReconcileReport};
 use crate::params::NetworkParams;
 use crate::puzzle::{PuzzleRegistry, PuzzleSolver, PuzzleSpec};
+use crate::slash::SlashVault;
 use crate::supply::{
     block_reward_sat, check_mint_at_height, cumulative_issuance_sat, max_issuance_sat,
     rate_anchor_allowance,
 };
-use crate::tx::{OutPoint, Output, Transaction, TX_COINBASE};
+use crate::tx::{OutPoint, Output, Transaction, TX_BOND, TX_COINBASE, TX_SLASH, TX_UNBOND};
 
 /// Upper bound on mining attempts for a single block. Difficulty that would need
 /// more work than this is a bug or an attack, not something to hang on.
@@ -42,6 +49,10 @@ struct Snapshot {
     burned_undo: HashMap<Hash, u64>,
     released_exits: HashSet<(Address, u64)>,
     exit_undo: HashMap<Hash, Vec<(Address, u64)>>,
+    bonds: BondLedger,
+    bond_undo: HashMap<Hash, Vec<BondUndoOp>>,
+    slash_vault: SlashVault,
+    slash_undo: HashMap<Hash, SlashVault>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +98,22 @@ pub struct Chain {
     /// Per-block burn deltas, keyed by block hash — rewound exactly like the
     /// PSCB deltas, for the same reason.
     burned_undo: HashMap<Hash, u64>,
+    /// Active validator bonds (Decision 20 — P2). Bond value parks in
+    /// unspendable bond-identity outputs in the UTXO set; the *rights* live
+    /// here, maintained with the same undo discipline as the ledger.
+    bonds: BondLedger,
+    /// Per-block bond inverses, keyed by block hash — rewound exactly like
+    /// the UTXO undo records, for the same reason.
+    bond_undo: HashMap<Hash, Vec<BondUndoOp>>,
+    /// M2 slash vault (Decision 2 item 4, Decision 20 item 4): equivocation
+    /// slashes write full-bond records here — half burned at once, half
+    /// vested to the PSCB reserve over time. Rebuilt by replay like every
+    /// other chain state, rewound per block below.
+    slash_vault: SlashVault,
+    /// Pre-block vault states for blocks that touched the vault, keyed by
+    /// block hash. Stored only when touched: an empty, untouched vault needs
+    /// no undo because there is nothing to restore.
+    slash_undo: HashMap<Hash, SlashVault>,
     /// Non-coinbase transactions the most recent successful reorg rolled back,
     /// oldest block first. Drained by the caller so the mempool can re-admit
     /// them.
@@ -130,6 +157,10 @@ impl Chain {
             pscb_undo: HashMap::new(),
             burned_fees_total: 0,
             burned_undo: HashMap::new(),
+            bonds: BondLedger::default(),
+            bond_undo: HashMap::new(),
+            slash_vault: SlashVault::new(),
+            slash_undo: HashMap::new(),
             released_exits: HashSet::new(),
             exit_undo: HashMap::new(),
             disconnected_txs: Vec::new(),
@@ -551,6 +582,7 @@ impl Chain {
             &mut total_gas,
             &mut total_fees,
         )?;
+        let mut stake_apply = StakeApply::default();
         let outcome = self.apply_body(
             block,
             body,
@@ -559,6 +591,7 @@ impl Chain {
             &mut body_undo,
             &mut total_gas,
             &mut total_fees,
+            &mut stake_apply,
         );
         let split = match outcome {
             Ok(split) => split,
@@ -566,6 +599,7 @@ impl Chain {
                 for u in applied.iter().rev() {
                     self.utxo.undo(u);
                 }
+                self.unwind_stake(&stake_apply);
                 self.unwind_claims(&marked);
                 return Err(e);
             }
@@ -579,6 +613,7 @@ impl Chain {
             for u in applied.iter().rev() {
                 self.utxo.undo(u);
             }
+            self.unwind_stake(&stake_apply);
             self.unwind_claims(&marked);
             return Err(Error::BadFee("coinbase claims more than reward plus tip"));
         }
@@ -599,6 +634,7 @@ impl Chain {
             for u in applied.iter().rev() {
                 self.utxo.undo(u);
             }
+            self.unwind_stake(&stake_apply);
             self.unwind_claims(&marked);
             return Err(e);
         }
@@ -624,21 +660,62 @@ impl Chain {
         }
 
         let hash = block.block_hash();
+        // M2 vesting advance (Decision 20 item 4): vested payouts route to the
+        // PSCB reserve — an equivocator earns nothing back. A snapshot is taken
+        // exactly when the vault is touched (slash event) or holds records
+        // (vesting trickle); an empty, untouched vault needs no undo because
+        // there is nothing to restore.
+        if stake_apply.vault_before.is_none() && !self.slash_vault.records().is_empty() {
+            stake_apply.vault_before = Some(self.slash_vault.clone());
+        }
+        let mut vault_payouts = 0u64;
+        if stake_apply.vault_before.is_some() {
+            for (_, amount) in self.slash_vault.advance_block(height) {
+                vault_payouts = vault_payouts
+                    .checked_add(amount)
+                    .ok_or(Error::ValueOverflow)?;
+            }
+        }
         // Credit the PSCB reserve (M1). Saturate rather than panic: on a
         // pathologically congested chain the accumulated PSCB could notionally
         // exceed u64::MAX over millions of blocks, though in practice the
         // hard-capped fee schedule makes this unreachable.
-        self.pscb_reserve = self.pscb_reserve.saturating_add(split.pscb);
-        self.pscb_undo.insert(hash, split.pscb);
+        //
+        // Vesting payouts fold into the same delta: they are reserve-bound
+        // value like the fee half, so reorgs rewind them together.
+        let pscb_delta = split
+            .pscb
+            .checked_add(vault_payouts)
+            .ok_or(Error::ValueOverflow)?;
+        self.pscb_reserve = self.pscb_reserve.saturating_add(pscb_delta);
+        self.pscb_undo.insert(hash, pscb_delta);
         // The destroyed half, tracked the same way (Stage SA-4): the two
         // halves together are the removal term net-supply reporting needs.
-        self.burned_fees_total = self.burned_fees_total.saturating_add(split.burned);
-        self.burned_undo.insert(hash, split.burned);
+        // Slash burns fold in likewise — removed supply is removed supply.
+        let burned_delta = split
+            .burned
+            .checked_add(stake_apply.slash_burned)
+            .ok_or(Error::ValueOverflow)?;
+        self.burned_fees_total = self.burned_fees_total.saturating_add(burned_delta);
+        self.burned_undo.insert(hash, burned_delta);
+        // Bond inverses for reorgs, rewound exactly like the UTXO undo
+        // records, for the same reason.
+        self.bond_undo
+            .insert(hash, std::mem::take(&mut stake_apply.ops));
+        // Vault pre-state, but only for blocks that touched it (see above).
+        if let Some(vault) = stake_apply.vault_before.take() {
+            self.slash_undo.insert(hash, vault);
+        }
         // Record this block's releases (approved P1): the identities stay
         // marked while the block is canonical and are unmarked by
         // `rollback_block` if a reorg takes it.
         self.exit_undo.insert(hash, marked);
         self.undo.insert(hash, body_undo);
+        // The committee follows the bonds: refresh the finality key set now
+        // that canonical state advanced. Side branches never reach here (only
+        // canonical advancement applies blocks), so the keys always describe
+        // the canonical ledger.
+        self.finality.set_keys(self.committee_keys());
         Ok(())
     }
 
@@ -654,8 +731,9 @@ impl Chain {
         body_undo: &mut Undo,
         total_gas: &mut u64,
         total_fees: &mut u64,
+        stake: &mut StakeApply,
     ) -> Result<FeeSplit> {
-        for tx in body {
+        for (i, tx) in body.iter().enumerate() {
             let delta = check_tx(
                 &self.utxo,
                 tx,
@@ -664,7 +742,17 @@ impl Chain {
                 block.header.base_fee_sat,
                 self.params.coinbase_maturity,
             )?;
-            let undo = self.utxo.apply_tx(tx, height)?;
+            let mut undo = self.utxo.apply_tx(tx, height)?;
+            // Stake overlay (Decision 20): checks run before any ledger write
+            // inside `apply_stake_tx`, so a refusal only needs the UTXO undo
+            // of this one transaction — which is discarded, never pushed.
+            if tx.is_stake_tx() {
+                let tx_index = u32::try_from(i + 1).map_err(|_| Error::ValueOverflow)?;
+                if let Err(e) = self.apply_stake_tx(tx, tx_index, height, &mut undo, stake) {
+                    self.utxo.undo(&undo);
+                    return Err(e);
+                }
+            }
             applied.push(undo.clone());
             body_undo.spent.extend(undo.spent);
             body_undo.created.extend(undo.created);
@@ -682,6 +770,157 @@ impl Chain {
         // Genesis-adjacent blocks pay no base fee on their first transaction;
         // the schedule above already starts at `base_fee_initial_sat`.
         split_fees(*total_gas, *total_fees, block.header.base_fee_sat)
+    }
+
+    /// Bond-ledger effects of one stake transaction (Decision 20). Checks run
+    /// before any ledger write, so a refusal leaves bonds and vault untouched
+    /// and the caller only unwinds the UTXO application. Release outputs ride
+    /// the transaction's own `undo.created`, so the block-level unwind covers
+    /// them with no special case.
+    fn apply_stake_tx(
+        &mut self,
+        tx: &Transaction,
+        tx_index: u32,
+        height: u64,
+        undo: &mut Undo,
+        stake: &mut StakeApply,
+    ) -> Result<()> {
+        match tx.tx_type {
+            TX_BOND => {
+                let draft = check_bond_tx(tx, &self.bonds, &self.params.network_id)?;
+                let id = tx.txid();
+                // Consume the bond output into the ledger: the value parks in
+                // the record, not in the UTXO set. Leaving it in place would
+                // double-count — the output plus a later release would exceed
+                // issuance, which the supply gate refuses. The bond amount is
+                // still declared by the transaction (conservation ran in
+                // `check_tx`); only its resting place changes.
+                let identity = crate::bond::bond_identity(
+                    &self.params.network_id,
+                    &draft.bonder,
+                    &draft.bls_pk,
+                );
+                let pos = tx
+                    .outputs
+                    .iter()
+                    .position(|o| o.address == identity)
+                    .ok_or(Error::StakeInvalid(
+                        "bond needs exactly one bond-identity output",
+                    ))?;
+                let bond_op = OutPoint {
+                    txid: id,
+                    index: u32::try_from(pos).map_err(|_| Error::ValueOverflow)?,
+                };
+                self.utxo
+                    .remove(&bond_op)
+                    .ok_or(Error::StakeInvalid("bond output missing"))?;
+                undo.created.retain(|op| op != &bond_op);
+                self.bonds.insert(
+                    id,
+                    BondRecord {
+                        bonder: draft.bonder,
+                        bls_pk: draft.bls_pk,
+                        amount_sat: draft.amount_sat,
+                        bond_height: height,
+                        bond_index: tx_index,
+                    },
+                );
+                stake.ops.push(BondUndoOp::Inserted(id));
+            }
+            TX_UNBOND => {
+                let (id, record) = check_unbond_tx(tx, &self.bonds, height)?;
+                self.bonds.remove(&id);
+                stake.ops.push(BondUndoOp::Removed(id, record.clone()));
+                let release = OutPoint {
+                    txid: tx.txid(),
+                    index: u32::try_from(tx.outputs.len()).map_err(|_| Error::ValueOverflow)?,
+                };
+                self.utxo.insert(
+                    release,
+                    Utxo {
+                        out: Output {
+                            value: record.amount_sat,
+                            address: record.bonder,
+                        },
+                        height,
+                    },
+                );
+                undo.created.push(release);
+            }
+            TX_SLASH => {
+                let committee: Vec<BlsPublicKey> = self
+                    .bonds
+                    .committee()
+                    .into_iter()
+                    .map(|r| r.bls_pk)
+                    .collect();
+                let (id, record) = check_slash_tx(
+                    tx,
+                    &self.bonds,
+                    &committee,
+                    &self.params.network_id,
+                    height,
+                    &RealBls,
+                )?;
+                self.bonds.remove(&id);
+                stake.ops.push(BondUndoOp::Removed(id, record.clone()));
+                if stake.vault_before.is_none() {
+                    stake.vault_before = Some(self.slash_vault.clone());
+                }
+                let burned = self
+                    .slash_vault
+                    .slash(
+                        tx.txid(),
+                        record.amount_sat,
+                        height,
+                        slash_vesting_period(&self.params.network_id),
+                        record.bonder,
+                    )
+                    .burned;
+                stake.slash_burned = stake
+                    .slash_burned
+                    .checked_add(burned)
+                    .ok_or(Error::ValueOverflow)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Reverse a block's stake effects: ledger inverses in reverse order, then
+    /// the vault's pre-block state. Called on every apply error path alongside
+    /// the UTXO unwind, so a refused block leaves bonds and vault exactly as
+    /// it found them.
+    fn unwind_stake(&mut self, stake: &StakeApply) {
+        for op in stake.ops.iter().rev() {
+            unwind_bond_op(&mut self.bonds, op);
+        }
+        if let Some(vault) = &stake.vault_before {
+            self.slash_vault = vault.clone();
+        }
+    }
+
+    /// Active checkpoint committee (Decision 20 item 2): the first 21 bonds
+    /// by bond order. An empty ledger falls back to the profile's declared
+    /// committee (the Decision 8/13 test bootstrap); mainnet declares none,
+    /// so its committee is purely bond-derived from the first bond on.
+    pub fn committee_keys(&self) -> Vec<BlsPublicKey> {
+        let bonded = self.bonds.committee();
+        if bonded.is_empty() {
+            self.params.genesis_validators.clone()
+        } else {
+            bonded.into_iter().map(|r| r.bls_pk).collect()
+        }
+    }
+
+    /// Read-only access to the bond ledger (mempool admission, views).
+    pub fn bonds(&self) -> &BondLedger {
+        &self.bonds
+    }
+
+    /// Read-only access to the M2 slash vault (views, tests).
+    pub fn slash_vault(&self) -> &SlashVault {
+        &self.slash_vault
     }
 
     /// Validate one exit claim against current state (approved P1, E-1…E-3).
@@ -971,6 +1210,22 @@ impl Chain {
         if let Some(ids) = self.exit_undo.remove(hash) {
             self.unwind_claims(&ids);
         }
+        // Rewind this block's bond effects (Decision 20 reorg correctness): a
+        // rolled-back bond never bonded, so its key leaves the committee — and
+        // an unbond/slash the winner keeps is re-applied when the winner
+        // applies. The vault returns to its pre-block state for the same
+        // reason the PSCB delta is subtracted above.
+        if let Some(ops) = self.bond_undo.remove(hash) {
+            for op in ops.iter().rev() {
+                unwind_bond_op(&mut self.bonds, op);
+            }
+        }
+        if let Some(vault) = self.slash_undo.remove(hash) {
+            self.slash_vault = vault;
+        }
+        // The committee follows the bonds: the ledger just moved, so the key
+        // set moves with it before any checkpoint is validated.
+        self.finality.set_keys(self.committee_keys());
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -984,6 +1239,10 @@ impl Chain {
             burned_undo: self.burned_undo.clone(),
             released_exits: self.released_exits.clone(),
             exit_undo: self.exit_undo.clone(),
+            bonds: self.bonds.clone(),
+            bond_undo: self.bond_undo.clone(),
+            slash_vault: self.slash_vault.clone(),
+            slash_undo: self.slash_undo.clone(),
         }
     }
 
@@ -997,6 +1256,10 @@ impl Chain {
         self.burned_undo = s.burned_undo;
         self.released_exits = s.released_exits;
         self.exit_undo = s.exit_undo;
+        self.bonds = s.bonds;
+        self.bond_undo = s.bond_undo;
+        self.slash_vault = s.slash_vault;
+        self.slash_undo = s.slash_undo;
     }
 
     fn path_to(&self, target: &Hash) -> Option<Vec<Hash>> {
@@ -1501,6 +1764,7 @@ impl Chain {
         let body = pool.select_for_block(self.params.gas_cap, self.params.max_block_bytes);
         // Pool mining is L1-only: the mempool holds L1 transactions. L2
         // transactions arrive through the caller's queue.
+        let body = self.filter_stake_body(body);
         let block = self.build_block(
             miner_address,
             body,
@@ -1575,8 +1839,43 @@ impl Chain {
             self.expected_base_fee_for_next_block(),
             &confirmed,
             &disconnected,
+            &self.bonds,
         );
         (tip_height, report)
+    }
+
+    /// Drop stake transactions the next block could not include (Decision 20).
+    /// Bond state moves under the pool: a bond confirmed since admission turns
+    /// a pooled duplicate invalid, and an unbonded key voids pooled slashes.
+    /// Failing the whole block over one stale transaction would wedge the
+    /// miner, so selection skips them — admission already filtered them once,
+    /// this is the re-check at mining time, in block order, on a scratch
+    /// ledger. Only relative order matters for the committee, and filtering
+    /// preserves it, so the scratch agrees with apply exactly.
+    fn filter_stake_body(&self, body: Vec<Transaction>) -> Vec<Transaction> {
+        let height = self.height() + 1;
+        let mut scratch = self.bonds.clone();
+        let mut kept = Vec::with_capacity(body.len());
+        for (i, tx) in body.into_iter().enumerate() {
+            if !tx.is_stake_tx() {
+                kept.push(tx);
+                continue;
+            }
+            let index = u32::try_from(i + 1).unwrap_or(u32::MAX);
+            if crate::bond::probe_stake_tx(
+                &tx,
+                &mut scratch,
+                &self.params.network_id,
+                height,
+                index,
+                &RealBls,
+            )
+            .is_ok()
+            {
+                kept.push(tx);
+            }
+        }
+        kept
     }
 
     /// Cumulative difficulty of the canonical chain. This is what fork choice
@@ -1735,6 +2034,16 @@ impl Chain {
         // and `verify` would be blind to both.
         if probe.released_exits != self.released_exits {
             return Err(Error::Malformed("released exits diverged on replay"));
+        }
+        // The bond ledger is consensus state (Decision 20): a wrong undo
+        // here would keep a reorged bond validating or drop a live one, and
+        // `verify` would be blind to both — the same blindness M1's reserve
+        // had before it was checked above.
+        if probe.bonds != self.bonds {
+            return Err(Error::Malformed("bond ledger diverged on replay"));
+        }
+        if probe.slash_vault != self.slash_vault {
+            return Err(Error::Malformed("slash vault diverged on replay"));
         }
         Ok(())
     }

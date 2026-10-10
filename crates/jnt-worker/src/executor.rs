@@ -143,49 +143,18 @@ impl Executor for CpuExecutor {
     }
 
     fn execute(&self, work: &ExecutionWork) -> Result<ExecutionOutput, ExecError> {
-        // A fixed, dependency-free 32-round Keccak-style permutation over the
-        // commitments. No floating point (SPEC.md §16.3), no platform types.
-        let mut state = [0u64; 25];
-        let mut fill = |i: usize, bytes: &[u8]| {
-            for (j, chunk) in bytes.chunks(8).enumerate() {
-                let mut v = [0u8; 8];
-                v[..chunk.len()].copy_from_slice(chunk);
-                state[i * 4 + j % 4] ^= u64::from_le_bytes(v);
-            }
-        };
-        fill(0, &work.task_id);
-        fill(1, &work.ir_hash);
-        fill(2, &work.input_hash);
-        state[12] ^= work.required_memory_bytes;
-        state[13] ^= work.current_height;
-
-        for _round in 0..32 {
-            // θ: parity of each column.
-            let mut par = [0u64; 4];
-            for (i, s) in state.iter().enumerate() {
-                par[i % 4] ^= *s;
-            }
-            for s in state.iter_mut() {
-                *s ^= par[0].rotate_left(1) ^ par[1].rotate_left(7);
-            }
-            // ρ+π (fixed shuffle) and χ (nonlinear step).
-            let mut next = [0u64; 25];
-            for i in 0..25 {
-                next[(i * 7 + 3) % 25] = state[i].rotate_left((i % 8 + 1) as u32);
-            }
-            for i in 0..25 {
-                let a = next[i];
-                let b = next[(i + 1) % 25];
-                let c = next[(i + 4) % 25];
-                state[i] = a ^ (!b & c);
-            }
-            state[0] ^= 0x1F_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        }
-
-        let mut out = Vec::with_capacity(64);
-        for lane in state.iter().take(8) {
-            out.extend_from_slice(&lane.to_le_bytes());
-        }
+        // The canonical CPU reference lives in `jnt_core::compute_ir` — one
+        // definition for worker, challenger and arbitrator (Decision 21).
+        // The height this work was projected for is deliberately NOT mixed
+        // in: reproducibility demands identical inputs across runs at
+        // different times, and a height is never identical.
+        let out = jnt_core::compute_ir::reference_output(
+            &work.task_id,
+            &work.ir_hash,
+            &work.input_hash,
+            work.required_memory_bytes,
+        )
+        .to_vec();
         Ok(ExecutionOutput {
             output: out,
             backend: ComputeBackend::Cpu,
@@ -223,5 +192,28 @@ mod tests {
         let e = CpuExecutor::default();
         let out = e.execute(&work(3)).unwrap();
         assert_eq!(result_hash_of(&out.output), sha256(&[&out.output]));
+    }
+
+    #[test]
+    fn worker_output_is_the_canonical_core_reference() {
+        // The SDK holds no second implementation: worker, challenger and
+        // arbitrator run one definition (Decision 21).
+        let e = CpuExecutor::default();
+        let w = work(7);
+        let out = e.execute(&w).unwrap();
+        assert_eq!(
+            out.output,
+            jnt_core::compute_ir::reference_output(
+                &w.task_id,
+                &w.ir_hash,
+                &w.input_hash,
+                w.required_memory_bytes,
+            )
+            .to_vec()
+        );
+        // ...and the height is not an input: runs at different heights agree.
+        let mut later = w.clone();
+        later.current_height = 99_999;
+        assert_eq!(e.execute(&later).unwrap(), out);
     }
 }

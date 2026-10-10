@@ -248,14 +248,14 @@ fn an_explicit_correct_settle_charges_the_d3_fee() {
         L2Effect::Settled { worker_paid, .. } => {
             assert_eq!(
                 worker_paid,
-                1_000_000 - 20_000,
+                1_000_000 - 1_000,
                 "settle fee comes off the escrow"
             );
         }
         other => panic!("unexpected effect {other:?}"),
     }
-    // The settle fee is split 50/50, so PSCB grows by half of 20 000.
-    assert_eq!(w.state.pscb, before_pscb + 10_000);
+    // The settle fee is split 50/50, so PSCB grows by half of 1 000.
+    assert_eq!(w.state.pscb, before_pscb + 500);
     assert_eq!(w.state.conservation_total(), CREDITED);
 }
 
@@ -271,7 +271,7 @@ fn a_dispute_settled_as_fraudulent_slashes_the_workers_deposit() {
     let effect = w
         .settle(id, Verdict::Fraudulent, [0xBBu8; 32], 3, 5)
         .unwrap();
-    let slashed = 100_000 - 20_000;
+    let slashed = 100_000 - 1_000;
     // Phase 3: a successful challenger is paid a 25% bounty from the PSCB
     // reserve, capped by the reserve's balance.
     let bounty = (slashed * 25 / 100).min(pscb_before);
@@ -318,9 +318,9 @@ fn a_failed_challenge_burns_the_deposit_and_pays_the_worker() {
     let effect = w.settle(id, Verdict::Correct, [0xAAu8; 32], 3, 5).unwrap();
     match effect {
         L2Effect::Settled { worker_paid, .. } => {
-            // The worker is right, so they keep the escrow minus the 20 000 sat
+            // The worker is right, so they keep the escrow minus the 1 000 sat
             // settle fee that funded the arbitration.
-            assert_eq!(worker_paid, 1_000_000 - 20_000);
+            assert_eq!(worker_paid, 1_000_000 - 1_000);
         }
         other => panic!("unexpected effect {other:?}"),
     }
@@ -329,7 +329,7 @@ fn a_failed_challenge_burns_the_deposit_and_pays_the_worker() {
     assert_eq!(w.state.balance(&addr(&w.challenger)), 10_000_000 - 60_000);
     assert_eq!(
         w.state.balance(&addr(&w.worker)),
-        10_000_000 - 2_000 - 2_000 + 980_000
+        10_000_000 - 2_000 - 2_000 + 999_000
     );
     assert_eq!(w.state.conservation_total(), CREDITED);
 }

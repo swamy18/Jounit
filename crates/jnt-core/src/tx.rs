@@ -5,8 +5,9 @@
 //! profile parameters; future primitives (bonds, certificates, channels) will
 //! add new `tx_type` values, never a scripting language.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::bls_checkpoint::{BlsPublicKey, Checkpoint};
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Address, Hash, DOM_SIG, DOM_TX, DOM_TXBODY};
 use crate::hexserde;
@@ -14,6 +15,17 @@ use crate::ser::{Reader, Writer};
 
 pub const TX_STANDARD: u8 = 0;
 pub const TX_COINBASE: u8 = 1;
+/// Decision 20 (P2): bonded-stake operations. Each carries a `stake` payload
+/// (see [`StakePayload`]); STANDARD and COINBASE transactions carry no payload
+/// byte, so their encodings — and txids — are unchanged.
+pub const TX_BOND: u8 = 2;
+pub const TX_UNBOND: u8 = 3;
+pub const TX_SLASH: u8 = 4;
+
+/// Maximum bytes of one checkpoint inside a slash payload. Real checkpoints
+/// are a few hundred bytes; the cap only stops a declared length from driving
+/// an allocation off the actual buffer.
+pub const MAX_SLASH_CHECKPOINT_BYTES: usize = 2048;
 
 /// Fixed part of a serialized input: `prev_hash(32) + prev_index(4)`. The
 /// signature and key bundles that follow are variable-length (SPEC.md §3.2),
@@ -152,6 +164,139 @@ pub struct Transaction {
     pub lock_time: u64,
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
+    /// Stake-operation payload. `Some` only for `TX_BOND`/`TX_UNBOND`/`TX_SLASH`
+    /// (see [`StakePayload`]); `None` for STANDARD and COINBASE, whose bytes
+    /// are exactly what they were before this field existed.
+    pub stake: Option<StakePayload>,
+}
+
+/// Stake-operation payload for bonded-stake transactions (Decision 20).
+///
+/// The canonical encoding is positional by `tx_type` — `Bond` is 48 key bytes,
+/// `Unbond` is a 32-byte bond id, `Slash` is two length-prefixed checkpoints —
+/// so there is exactly one byte string per operation. Semantic checks (single
+/// signer, minimum stake, maturity, evidence validity) live in `bond.rs`, not
+/// here: the codec stays dumb and total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StakePayload {
+    /// `TX_BOND`: the BLS key this bond authorizes for checkpoints.
+    Bond { bls_pk: BlsPublicKey },
+    /// `TX_UNBOND`: the bond being released (the BOND transaction's txid).
+    Unbond { bond_id: Hash },
+    /// `TX_SLASH`: two conflicting checkpoints proving equivocation. Boxed:
+    /// two checkpoints are ~400 bytes and every `Transaction` carries this
+    /// enum inline, so the box keeps ordinary transactions small.
+    Slash {
+        first: Box<Checkpoint>,
+        second: Box<Checkpoint>,
+    },
+}
+
+impl StakePayload {
+    /// The `tx_type` this payload belongs to.
+    pub fn tx_type(&self) -> u8 {
+        match self {
+            StakePayload::Bond { .. } => TX_BOND,
+            StakePayload::Unbond { .. } => TX_UNBOND,
+            StakePayload::Slash { .. } => TX_SLASH,
+        }
+    }
+
+    /// Canonical payload bytes (without any tag — `tx_type` says the shape).
+    pub fn body_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match self {
+            StakePayload::Bond { bls_pk } => {
+                w.raw(bls_pk.as_bytes());
+            }
+            StakePayload::Unbond { bond_id } => {
+                w.fixed(bond_id);
+            }
+            StakePayload::Slash { first, second } => {
+                let a = first.serialize();
+                let b = second.serialize();
+                w.u32le(a.len() as u32).raw(&a);
+                w.u32le(b.len() as u32).raw(&b);
+            }
+        }
+        w.into_vec()
+    }
+
+    /// Decode payload bytes produced by [`StakePayload::body_bytes`]. Bounded:
+    /// checkpoint lengths are capped before anything is allocated.
+    pub fn from_reader(r: &mut Reader<'_>, tx_type: u8) -> Result<Self> {
+        match tx_type {
+            TX_BOND => {
+                let raw = r.fixed::<48>().map_err(|_| Error::Malformed("bond key"))?;
+                Ok(StakePayload::Bond {
+                    bls_pk: BlsPublicKey(raw),
+                })
+            }
+            TX_UNBOND => {
+                let bond_id = r.fixed::<32>().map_err(|_| Error::Malformed("bond id"))?;
+                Ok(StakePayload::Unbond { bond_id })
+            }
+            TX_SLASH => {
+                let a_len = r
+                    .u32le()
+                    .map_err(|_| Error::Malformed("slash checkpoint"))?
+                    as usize;
+                if a_len > MAX_SLASH_CHECKPOINT_BYTES {
+                    return Err(Error::Malformed("slash checkpoint too large"));
+                }
+                let a_bytes = r
+                    .fixed_slice(a_len)
+                    .map_err(|_| Error::Malformed("slash checkpoint"))?
+                    .to_vec();
+                let b_len = r
+                    .u32le()
+                    .map_err(|_| Error::Malformed("slash checkpoint"))?
+                    as usize;
+                if b_len > MAX_SLASH_CHECKPOINT_BYTES {
+                    return Err(Error::Malformed("slash checkpoint too large"));
+                }
+                let b_bytes = r
+                    .fixed_slice(b_len)
+                    .map_err(|_| Error::Malformed("slash checkpoint"))?
+                    .to_vec();
+                Ok(StakePayload::Slash {
+                    first: Box::new(Checkpoint::deserialize(&a_bytes)?),
+                    second: Box::new(Checkpoint::deserialize(&b_bytes)?),
+                })
+            }
+            _ => Err(Error::Malformed("stake payload without stake type")),
+        }
+    }
+}
+
+/// Serde form of [`StakePayload`]: the owning `tx_type` plus hex of
+/// [`StakePayload::body_bytes`]. JSON export (the `export` command) needs a
+/// self-describing shape; consensus uses the canonical bytes, never this.
+#[derive(Serialize, Deserialize)]
+struct StakePayloadSer {
+    t: u8,
+    payload: String,
+}
+
+impl Serialize for StakePayload {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        StakePayloadSer {
+            t: self.tx_type(),
+            payload: crate::hash::to_hex(&self.body_bytes()),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StakePayload {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let v = StakePayloadSer::deserialize(deserializer)?;
+        let bytes = crate::hash::from_hex(&v.payload).map_err(serde::de::Error::custom)?;
+        let mut r = Reader::new(&bytes);
+        let p = StakePayload::from_reader(&mut r, v.t).map_err(serde::de::Error::custom)?;
+        r.expect_end().map_err(serde::de::Error::custom)?;
+        Ok(p)
+    }
 }
 
 impl Transaction {
@@ -162,6 +307,7 @@ impl Transaction {
             lock_time: 0,
             inputs,
             outputs,
+            stake: None,
         }
     }
 
@@ -175,11 +321,36 @@ impl Transaction {
                 index: height as u32,
             })],
             outputs: vec![output],
+            stake: None,
+        }
+    }
+
+    /// Bond/unbond/slash transaction with its stake payload. The caller must
+    /// match the payload variant to `tx_type`; [`crate::bond`] refuses a
+    /// mismatch rather than interpreting it.
+    pub fn stake_tx(
+        tx_type: u8,
+        inputs: Vec<Input>,
+        outputs: Vec<Output>,
+        stake: StakePayload,
+    ) -> Self {
+        Transaction {
+            version: 1,
+            tx_type,
+            lock_time: 0,
+            inputs,
+            outputs,
+            stake: Some(stake),
         }
     }
 
     pub fn is_coinbase(&self) -> bool {
         self.tx_type == TX_COINBASE
+    }
+
+    /// True for the three bonded-stake operation types (Decision 20).
+    pub fn is_stake_tx(&self) -> bool {
+        matches!(self.tx_type, TX_BOND | TX_UNBOND | TX_SLASH)
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -194,6 +365,12 @@ impl Transaction {
         w.u32le(self.outputs.len() as u32);
         for o in &self.outputs {
             w.raw(&o.to_bytes());
+        }
+        // Stake payload bytes ride after the outputs, and only for stake
+        // transaction types: STANDARD and COINBASE encodings are byte-identical
+        // to before this field existed, so their txids are unchanged.
+        if let Some(p) = &self.stake {
+            w.raw(&p.body_bytes());
         }
         w.into_vec()
     }
@@ -231,12 +408,20 @@ impl Transaction {
         for _ in 0..n_out {
             outputs.push(Output::from_reader(r)?);
         }
+        // Positional by type: only stake transaction types carry payload bytes.
+        // Anything trailing a STANDARD/COINBASE body is refused by `expect_end`
+        // in `deserialize`, so a smuggled payload cannot hide there.
+        let stake = match tx_type {
+            TX_BOND | TX_UNBOND | TX_SLASH => Some(StakePayload::from_reader(r, tx_type)?),
+            _ => None,
+        };
         Ok(Transaction {
             version,
             tx_type,
             lock_time,
             inputs,
             outputs,
+            stake,
         })
     }
 
@@ -634,6 +819,7 @@ mod tests {
             lock_time: 0x11_22_33_44_55_66_77_88,
             inputs: vec![input.clone()],
             outputs: vec![output],
+            stake: None,
         };
 
         let entries: Vec<(&str, Vec<u8>, usize)> = vec![

@@ -8,7 +8,9 @@
 //! *rejected* dispute leaves the state untouched and the value conserved.
 
 use jnt_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
-use jnt_core::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
+use jnt_core::compute_ir::{
+    reference_result_hash, ComputeAttestation, ComputeBackend, ComputeTask,
+};
 use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
     ClaimTaskPayload, DisputePayload, L2Payload, L2Transaction, PostTaskPayload,
@@ -115,8 +117,47 @@ impl World {
     }
 
     /// The default scenario: post 1 000 000, claim with `deposit`, submit, dispute.
+    /// Fixed garbage results — for tests that never arbitrate through the
+    /// reference (lapse, evidence, replay, authorization).
     fn disputed(&mut self, deposit: u64) -> Hash {
         let id = self.post(1_000_000, 1);
+        self.finish_dispute(id, deposit, SUBMITTED, COUNTER);
+        id
+    }
+
+    /// The canonical CPU reference for a task (Decision 21): what an honest
+    /// worker submits and what a truthful challenger counters with.
+    fn reference(&self, id: Hash) -> Hash {
+        let t = self.state.task(&id).unwrap();
+        reference_result_hash(
+            &t.task_id,
+            &t.compute_task.ir_hash,
+            &t.compute_task.input_hash,
+            t.compute_task.required_memory_bytes,
+        )
+    }
+
+    /// Dispute where the worker ran the reference: the challenger's counter
+    /// is baseless and burns.
+    fn disputed_worker_correct(&mut self, deposit: u64) -> Hash {
+        let id = self.post(1_000_000, 1);
+        let reference = self.reference(id);
+        assert_ne!(reference, COUNTER, "test setup: counter must miss");
+        self.finish_dispute(id, deposit, reference, COUNTER);
+        id
+    }
+
+    /// Dispute where the worker lied and the challenger ran the reference:
+    /// the worker is slashed and the challenger is rewarded.
+    fn disputed_challenger_correct(&mut self, deposit: u64) -> Hash {
+        let id = self.post(1_000_000, 1);
+        let reference = self.reference(id);
+        assert_ne!(reference, SUBMITTED, "test setup: submission must miss");
+        self.finish_dispute(id, deposit, SUBMITTED, reference);
+        id
+    }
+
+    fn finish_dispute(&mut self, id: Hash, deposit: u64, submitted: Hash, counter: Hash) {
         self.apply(
             &L2Transaction::new(L2Payload::Claim(
                 ClaimTaskPayload::build(&self.worker, id, ComputeBackend::Gpu, deposit).unwrap(),
@@ -129,7 +170,7 @@ impl World {
                 SubmitResultPayload::build(
                     &self.worker,
                     id,
-                    attestation(&self.worker, id, SUBMITTED),
+                    attestation(&self.worker, id, submitted),
                 )
                 .unwrap(),
             )),
@@ -141,8 +182,8 @@ impl World {
                 DisputePayload::build(
                     &self.challenger,
                     id,
-                    COUNTER,
-                    attestation(&self.challenger, id, COUNTER),
+                    counter,
+                    attestation(&self.challenger, id, counter),
                     50_000,
                 )
                 .unwrap(),
@@ -150,11 +191,10 @@ impl World {
             4,
         )
         .unwrap();
-        id
     }
 
-    fn arbitrate(&self, id: Hash, reference: Hash) -> Result<DisputeVerdict, L2Error> {
-        DisputeEngine::resolve(self.state.task(&id).unwrap(), reference)
+    fn arbitrate(&self, id: Hash) -> Result<DisputeVerdict, L2Error> {
+        DisputeEngine::resolve(self.state.task(&id).unwrap())
     }
 
     fn settle_verdict(&mut self, v: &DisputeVerdict, height: u64) -> Result<L2Effect, L2Error> {
@@ -175,14 +215,14 @@ impl World {
 #[test]
 fn honest_worker_wins_the_dispute_and_the_baseless_challenge_burns() {
     let mut w = world();
-    let id = w.disputed(100_000);
+    let id = w.disputed_worker_correct(100_000);
     assert!(matches!(
         w.state.task(&id).unwrap().state,
         ContractState::Disputed(_)
     ));
 
     // The reference reproduces the worker's result.
-    let v = w.arbitrate(id, SUBMITTED).unwrap();
+    let v = w.arbitrate(id).unwrap();
     assert_eq!(v.arbiter, Arbiter::WorkerCorrect);
     assert_eq!(v.verdict(), Some(Verdict::Correct));
 
@@ -195,7 +235,7 @@ fn honest_worker_wins_the_dispute_and_the_baseless_challenge_burns() {
             ..
         } => {
             assert_eq!(verdict, Verdict::Correct);
-            assert_eq!(worker_paid, 1_000_000 - 20_000);
+            assert_eq!(worker_paid, 1_000_000 - 1_000);
             assert_eq!(challenger_bonus, 0, "a failed challenge earns no bounty");
         }
         other => panic!("unexpected effect {other:?}"),
@@ -204,7 +244,7 @@ fn honest_worker_wins_the_dispute_and_the_baseless_challenge_burns() {
     // Worker's deposit came back; the challenger lost the deposit and the fee.
     assert_eq!(
         w.state.balance(&addr(&w.worker)),
-        10_000_000 - 2_000 - 2_000 + 980_000
+        10_000_000 - 2_000 - 2_000 + 999_000
     );
     assert_eq!(w.state.balance(&addr(&w.challenger)), 10_000_000 - 60_000);
     assert_eq!(w.state.conservation_total(), CREDITED);
@@ -221,16 +261,16 @@ fn honest_worker_wins_the_dispute_and_the_baseless_challenge_burns() {
 #[test]
 fn fraudulent_worker_is_slashed_and_the_whistleblower_is_rewarded() {
     let mut w = world();
-    let id = w.disputed(100_000);
+    let id = w.disputed_challenger_correct(100_000);
     let pscb_before = w.state.pscb;
 
-    let v = w.arbitrate(id, COUNTER).unwrap();
+    let v = w.arbitrate(id).unwrap();
     assert_eq!(v.arbiter, Arbiter::ChallengerCorrect);
     assert_eq!(v.verdict(), Some(Verdict::Fraudulent));
 
     let effect = w.settle_verdict(&v, 5).unwrap();
-    let slashed = 100_000 - 20_000;
-    // 25% of the slashed amount (20 000) exceeds the 9 500 sat reserve, so the
+    let slashed = 100_000 - 1_000;
+    // 25% of the slashed amount (24 750) exceeds the 9 500 sat reserve, so the
     // bounty is capped at the reserve balance.
     let bounty = ((slashed as u128 * 25 / 100) as u64).min(pscb_before);
     match effect {
@@ -261,19 +301,19 @@ fn fraudulent_worker_is_slashed_and_the_whistleblower_is_rewarded() {
 
 #[test]
 fn a_small_slash_pays_the_uncapped_bounty() {
-    // Deposit 50 000 → 30 000 slashed → 7 500 wanted, under the 9 500 reserve,
+    // Deposit 30 000 → 29 000 slashed → 7 250 wanted, under the 9 500 reserve,
     // so the full 25% is paid rather than the cap.
     let mut w = world();
-    let id = w.disputed(50_000);
+    let id = w.disputed_challenger_correct(30_000);
     let pscb_before = w.state.pscb;
-    let v = w.arbitrate(id, COUNTER).unwrap();
+    let v = w.arbitrate(id).unwrap();
 
     let effect = w.settle_verdict(&v, 5).unwrap();
     match effect {
         L2Effect::Settled {
             challenger_bonus, ..
         } => {
-            assert_eq!(challenger_bonus, 30_000 * 25 / 100);
+            assert_eq!(challenger_bonus, 29_000 * 25 / 100);
             assert!(
                 challenger_bonus < pscb_before,
                 "this case must not hit the cap"
@@ -298,7 +338,7 @@ fn an_inconclusive_reference_settles_nothing() {
         w.state.vault_remaining(),
     );
 
-    let v = w.arbitrate(id, [0xCCu8; 32]).unwrap();
+    let v = w.arbitrate(id).unwrap();
     assert_eq!(v.arbiter, Arbiter::Inconclusive);
     assert_eq!(w.settle_verdict(&v, 5), Err(L2Error::InconclusiveDispute));
 
@@ -357,7 +397,7 @@ fn evidence_is_only_readable_from_a_disputed_contract() {
     let id = w.post(1_000_000, 1);
     // Open: no evidence to read.
     assert!(matches!(
-        DisputeEngine::resolve(w.state.task(&id).unwrap(), SUBMITTED),
+        DisputeEngine::resolve(w.state.task(&id).unwrap()),
         Err(L2Error::IllegalTransition { .. })
     ));
 
@@ -378,7 +418,7 @@ fn evidence_is_only_readable_from_a_disputed_contract() {
     .unwrap();
     // ResultSubmitted but not yet disputed.
     assert!(matches!(
-        DisputeEngine::resolve(w.state.task(&id).unwrap(), SUBMITTED),
+        DisputeEngine::resolve(w.state.task(&id).unwrap()),
         Err(L2Error::IllegalTransition { .. })
     ));
 }
@@ -401,7 +441,7 @@ fn evidence_read_from_a_disputed_contract_is_complete_and_valid() {
 #[test]
 fn a_payment_equal_to_the_settle_fee_settles_with_a_zero_payout() {
     let mut w = world();
-    let id = w.post(20_000, 1);
+    let id = w.post(1_000, 1);
     w.apply(
         &L2Transaction::new(L2Payload::Claim(
             ClaimTaskPayload::build(&w.worker, id, ComputeBackend::Cpu, 100_000).unwrap(),
@@ -447,7 +487,7 @@ fn a_payment_equal_to_the_settle_fee_settles_with_a_zero_payout() {
 #[test]
 fn a_payment_below_the_settle_fee_is_refused_and_not_settled() {
     let mut w = world();
-    let id = w.post(19_999, 1);
+    let id = w.post(999, 1);
     w.apply(
         &L2Transaction::new(L2Payload::Claim(
             ClaimTaskPayload::build(&w.worker, id, ComputeBackend::Cpu, 100_000).unwrap(),
@@ -477,8 +517,8 @@ fn a_payment_below_the_settle_fee_is_refused_and_not_settled() {
     assert_eq!(
         err,
         Err(L2Error::AmountTooSmallForFee {
-            available: 19_999,
-            fee: 20_000
+            available: 999,
+            fee: 1_000
         })
     );
     assert!(matches!(
@@ -648,8 +688,8 @@ fn a_settle_hash_that_does_not_match_the_verdict_is_refused() {
 #[test]
 fn a_task_cannot_be_settled_twice_or_slashed_twice() {
     let mut w = world();
-    let id = w.disputed(100_000);
-    let v = w.arbitrate(id, COUNTER).unwrap();
+    let id = w.disputed_challenger_correct(100_000);
+    let v = w.arbitrate(id).unwrap();
     w.settle_verdict(&v, 5).unwrap();
     assert_eq!(w.state.slash_vault.active_count(), 1);
 
@@ -714,10 +754,17 @@ fn a_challenge_that_agrees_with_the_result_is_refused() {
 
 #[test]
 fn an_arbitrated_settlement_is_deterministic_across_independent_runs() {
-    fn run(reference: Hash) -> (u64, u64, u64, u64, u64, String) {
+    // Each scenario runs twice from a fresh world: identical inputs must
+    // produce identical state, and value must conserve on every path —
+    // worker-correct, challenger-correct, and inconclusive.
+    fn run(worker_correct: Option<bool>) -> (u64, u64, u64, u64, u64, String) {
         let mut w = world();
-        let id = w.disputed(100_000);
-        let v = w.arbitrate(id, reference).unwrap();
+        let id = match worker_correct {
+            Some(true) => w.disputed_worker_correct(100_000),
+            Some(false) => w.disputed_challenger_correct(100_000),
+            None => w.disputed(100_000),
+        };
+        let v = w.arbitrate(id).unwrap();
         // An inconclusive arbitration has no payload to settle with; both runs
         // must fail the same way and leave the same state.
         let outcome = match w.settle_verdict(&v, 5) {
@@ -734,9 +781,9 @@ fn an_arbitrated_settlement_is_deterministic_across_independent_runs() {
         )
     }
 
-    for reference in [SUBMITTED, COUNTER, [0xCCu8; 32]] {
-        let a = run(reference);
-        let b = run(reference);
+    for scenario in [Some(true), Some(false), None] {
+        let a = run(scenario);
+        let b = run(scenario);
         assert_eq!(a, b, "identical inputs must produce identical state");
         assert_eq!(
             a.0 + a.1 + a.2 + a.3 + a.4,
@@ -753,8 +800,8 @@ fn an_arbitrated_settlement_is_deterministic_across_independent_runs() {
 #[test]
 fn a_dispute_verdict_still_needs_a_validator_quorum_to_settle() {
     let mut w = world();
-    let id = w.disputed(100_000);
-    let v = w.arbitrate(id, COUNTER).unwrap();
+    let id = w.disputed_challenger_correct(100_000);
+    let v = w.arbitrate(id).unwrap();
 
     // A payload the *engine* produced, but with too few signers.
     let payload = v
