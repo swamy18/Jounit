@@ -38,6 +38,7 @@ hex_mod!(h16, 16);
 hex_mod!(h20, 20);
 hex_mod!(h32, 32);
 hex_mod!(h33, 33);
+hex_mod!(h48, 48);
 hex_mod!(h64, 64);
 
 /// Variable-length byte vectors, serialized as hex strings.

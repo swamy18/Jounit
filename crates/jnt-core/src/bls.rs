@@ -71,6 +71,13 @@ impl std::error::Error for BlsError {}
 
 /// A BLS secret key. Held un-serialized: keys move as 32-byte scalars, and the
 /// `SecretKey` type refuses to be built from anything else.
+///
+/// Deliberately **not** `PartialEq`/`Eq`: comparing secret keys invites
+/// non-constant-time checks on key material, and nothing in the protocol needs
+/// it — `signing::Committee` compares *public* keys to refuse a duplicate,
+/// which is both sufficient and safe. `Debug` is inherited from the inner type,
+/// so anything holding one must not `Debug`-format it;
+/// `signing::ValidatorKey` redacts for exactly that reason.
 #[derive(Debug, Clone)]
 pub struct SecretKey(min_pk::SecretKey);
 
@@ -104,6 +111,31 @@ impl SecretKey {
     /// The raw scalar, for tests that need to prove two derived keys differ.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
+    }
+
+    /// The raw scalar, so a caller can persist a key. Companion to
+    /// [`Self::from_scalar`]; see that method for why a key file stores this
+    /// rather than the seed it was derived from.
+    pub fn scalar(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
+    /// Rebuild a key from its 32-byte scalar.
+    ///
+    /// The counterpart to a key file: `SecretKey::derive` maps a *seed* through
+    /// the IETF `KeyGen` procedure, which makes the key a pure function of that
+    /// seed. That is right for reproducible fixtures and wrong for custody, so a
+    /// persisted validator key stores the scalar instead and is rebuilt here.
+    ///
+    /// Refuses a scalar that is zero or does not reduce into the group order:
+    /// `blst` would carry it happily into signing and produce certificates that
+    /// no verification accepts, which looks exactly like a network fault.
+    pub fn from_scalar(scalar: &[u8; 32]) -> Result<SecretKey, BlsError> {
+        let sk = min_pk::SecretKey::from_bytes(scalar).map_err(|_| BlsError::BadSeed)?;
+        if sk.to_bytes().iter().all(|b| *b == 0) {
+            return Err(BlsError::BadSeed);
+        }
+        Ok(SecretKey(sk))
     }
 }
 

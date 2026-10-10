@@ -50,6 +50,7 @@ pub mod ser;
 pub mod service;
 pub mod sig;
 pub mod slash;
+pub mod signing;
 pub mod state_root;
 pub mod stream;
 pub mod supply;

@@ -338,6 +338,25 @@ impl P2pNode {
         );
     }
 
+    /// Relay a checkpoint certificate to every peer (M5, Decisions 12/14).
+    ///
+    /// Unlike a block or a transaction this carries the full certificate rather
+    /// than an announcement, because a certificate is meaningless without its
+    /// signature and there is nothing to fetch it by — there is no checkpoint
+    /// store to serve a getdata from.
+    ///
+    /// The caller must have verified the certificate against its own chain first
+    /// (`Chain::apply_checkpoint`), for the same reason `broadcast_tx` takes
+    /// only txids: relaying something the node does not itself hold as valid
+    /// would make it an amplifier. A peer receiving an invalid one refuses it
+    /// the same way and does not re-relay.
+    pub fn broadcast_checkpoint(&self, cp: jnt_core::bls_checkpoint::Checkpoint) {
+        let peers = self.peers.lock().unwrap();
+        for peer in peers.values() {
+            let _ = peer.send(crate::msg::Message::Checkpoint(cp.clone()));
+        }
+    }
+
     /// Announce transaction ids to all peers except `exclude_peer` (§13.14).
     ///
     /// The caller is expected to have admitted these to its own pool first.

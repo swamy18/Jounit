@@ -194,6 +194,21 @@ impl fmt::Display for Error {
     }
 }
 
+impl From<crate::bls::BlsError> for Error {
+    fn from(e: crate::bls::BlsError) -> Self {
+        // Mapped onto `BadKey` rather than a new variant: every `BlsError` is
+        // either unusable key material (`BadSeed`, `BadPoint`) or a rejected
+        // signature, and a caller only ever needs to refuse the operation. The
+        // detail is folded into the message rather than leaked into the variant
+        // list, so `?` on a BLS call stays total without widening `Error`.
+        Error::BadKey(match e {
+            crate::bls::BlsError::BadSeed => "unusable BLS seed or scalar",
+            crate::bls::BlsError::BadPoint { .. } => "not a valid BLS point",
+            crate::bls::BlsError::BadSignature { .. } => "BLS signature rejected",
+        })
+    }
+}
+
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;

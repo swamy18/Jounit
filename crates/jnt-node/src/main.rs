@@ -43,6 +43,7 @@ use jnt_net::relay::RelayManager;
 use jnt_net::syncer::SyncManager;
 use jnt_node::l2::NodeL2;
 use jnt_store::{AppendOutcome, BlockStore};
+use std::io::Write as _;
 
 const USAGE: &str = "\
 jnt-node - Jounit base-layer node
@@ -61,6 +62,7 @@ COMMANDS:
   wallet    Create or list wallets
   export    Write the canonical chain to JSON
   serve     Run a P2P node (block relay, multi-peer sync)
+  validator Manage checkpoint-signing keys (M5 binding finality)
   help      This text
 
 SEND OPTIONS:
@@ -145,6 +147,7 @@ impl Args {
                         | "connect"
                         | "peers"
                         | "relay"
+                        | "label"
                 );
                 if takes_value {
                     let value = raw
@@ -232,6 +235,13 @@ impl Store {
 
     fn wallets_path(&self) -> PathBuf {
         self.dir.join("wallets.json")
+    }
+
+    /// Directory holding validator key files, one per `.json` file. Created on
+    /// demand so `validator add` never fails on a fresh data dir, and never
+    /// confused with `wallets.json`, which holds *spending* keys.
+    fn validator_keys_path(&self) -> PathBuf {
+        self.dir.join("validators")
     }
 
     fn meta_path(&self) -> PathBuf {
@@ -449,6 +459,7 @@ fn run(raw: &[String]) -> Result<(), String> {
         "balance" => cmd_balance(&args),
         "wallet" => cmd_wallet(&args),
         "export" => cmd_export(&args),
+        "validator" => cmd_validator(&args),
         "serve" => cmd_serve(&args),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     }
@@ -985,6 +996,107 @@ fn cmd_balance(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Every validator key in the data dir, as one committee.
+///
+/// `Ok(None)` when the directory holds no key files — the ordinary non-validating
+/// node, which verifies and relays checkpoints and signs nothing. A file that
+/// fails to load is an error, not a skip: an operator who placed a key file
+/// expects it to be used, and silently ignoring it would leave them believing
+/// they were validating.
+fn load_validator_committee(
+    store: &Store,
+    params: &NetworkParams,
+) -> Result<Option<jnt_core::signing::Committee>, String> {
+    let dir = store.validator_keys_path();
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut committee = jnt_core::signing::Committee::new();
+    for entry in fs::read_dir(&dir).map_err(|e| format!("validators dir: {e}"))? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let key = jnt_core::signing::ValidatorKey::from_bytes(&bytes, &params.network_id)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        committee.add(key).map_err(|e| e.to_string())?;
+    }
+    if committee.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(committee))
+}
+
+/// `validator` — manage this node's checkpoint-signing keys (M5).
+///
+/// Keys live in `<data-dir>/validators/*.json`, one file per validator, and are
+/// separate from `wallets.json` by design: a wallet holds funds this node spends,
+/// a validator key signs consensus messages. Mixing them would make a wallet
+/// backup a validator key backup, which is a different risk entirely.
+///
+/// The scalar is written with mode 0600 where the platform supports it, because
+/// the file *is* the key. `validator list` prints public keys only.
+fn cmd_validator(args: &Args) -> Result<(), String> {
+    let store = Store::open(args)?;
+    let params = store.params.clone();
+    let dir = store.validator_keys_path();
+
+    if !args.has("add") {
+        // List: public keys only, never scalars, never the file contents.
+        match load_validator_committee(&store, &params)? {
+            Some(c) => {
+                for pk in c.public_keys() {
+                    println!("{}", hex::encode(pk.as_bytes()));
+                }
+                println!("{} validator(s)", c.len());
+            }
+            None => {
+                println!("no validator keys in {}", dir.display());
+            }
+        }
+        return Ok(());
+    }
+
+    let label = args.str_or("label", "validator");
+    // OS entropy, harvested here rather than inside `jnt-core`, so the consensus
+    // library stays free of any way to reach for randomness.
+    // OS entropy, harvested here rather than inside jnt-core, so the consensus
+    // library stays free of any way to reach for randomness.
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    let sk = jnt_core::bls::SecretKey::derive(&seed).map_err(|e| e.to_string())?;
+    let key = jnt_core::signing::ValidatorKey::new(sk, params.network_id.clone());
+    let file = key.to_file();
+    let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(format!("{label}.json"));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(&bytes).map_err(|e| e.to_string())?;
+
+    println!("created validator `{label}`");
+    println!("  file       {}", path.display());
+    println!("  network    {}", params.network_id);
+    println!(
+        "  public key {}",
+        hex::encode(key.public_key().as_bytes())
+    );
+    println!(
+        "  committee  public key must be bonded on chain before its signature counts"
+    );
+    Ok(())
+}
+
 fn cmd_wallet(args: &Args) -> Result<(), String> {
     let store = Store::open(args)?;
     let mut wallets = store.load_wallets()?;
@@ -1089,6 +1201,13 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let mut relay = RelayManager::new();
     let mut pool_cursor = chain.height();
     let mut relay_seen = (0u64, 0u64);
+    // Validator signing (M5). Empty when no key files are loaded, which is the
+    // normal case for a non-validating node — it verifies and relays what others
+    // produce and signs nothing.
+    let validator_committee = load_validator_committee(&store, &store.params.clone())?;
+    let mut signed_epochs = std::collections::BTreeSet::new();
+    let mut finality_keys_missing_warning = validator_committee.is_none()
+        && store.params.finality_activation_height > 0;
     // L2 follows the tip by replay; nothing L2 is persisted.
     let l2 = NodeL2::replay_from(&chain, &store.params);
     let mut l2_skipped_seen = l2.skipped().len();
@@ -1219,6 +1338,43 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 store.write_meta(&sh.chain).ok();
                 println!("mined height {height}  {}", &hash_to_hex(&hash)[..16]);
                 node.broadcast_block(hash, None);
+            }
+
+            // Sign and broadcast a checkpoint at an epoch boundary (M5,
+            // Decisions 12/14). This is the "a quorum produced this" side of the
+            // protocol: the node only signs a block it just settled as its own
+            // canonical tip, so a certificate can never name a hash this node
+            // does not hold. With no validator keys configured it signs nothing
+            // and says so once, rather than looking like a broken validator.
+            if let Some(committee) = validator_committee.as_ref() {
+                let height = sh.chain.height();
+                let epoch_blocks = sh.chain.params().checkpoint_interval_blocks;
+                let boundary_height = (height / epoch_blocks.max(1)) * epoch_blocks.max(1);
+                if boundary_height > 0 && boundary_height >= height && !signed_epochs.contains(&boundary_height) {
+                    let signer = jnt_core::signing::CheckpointSigner::new(
+                        &sh.chain.params().network_id,
+                        epoch_blocks,
+                    );
+                    if let Some(Ok(cp)) =
+                        signer.sign(boundary_height, sh.chain.tip_hash(), committee)
+                    {
+                        if let Ok(()) = sh.chain.apply_checkpoint(&cp, &jnt_core::bls::RealBls) {
+                            signed_epochs.insert(boundary_height);
+                            node.broadcast_checkpoint(cp.clone());
+                            println!(
+                                "checkpoint   height {boundary_height} signed by {} validators",
+                                cp.signer_count
+                            );
+                        }
+                    }
+                }
+            } else if finality_keys_missing_warning {
+                eprintln!(
+                    "note: binding finality is active for this profile but no validator key \
+                     files are loaded, so this node cannot sign checkpoints. It will still \
+                     verify and relay the ones other validators produce."
+                );
+                finality_keys_missing_warning = false;
             }
         }
 
