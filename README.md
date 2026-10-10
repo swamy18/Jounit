@@ -71,6 +71,7 @@ without weakening the security a hash chain depends on.
 - **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
 - **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
 - **Layer 2 (`jnt-l2`)**: Task contracts over the six L2 transaction types (incl. `ExitQueue`), D3 flat fees split 50/50 burn/PSCB, escrow accounting, replay protection, a complete **dispute engine** (evidence validation, the M3 CPU-reference arbitration rule per SPEC.md §16, M2 slashing, PSCB whistleblower bounty), and **Verified Work Certificates** (SPEC.md §17): every correctly settled task issues a deterministic, id-derived receipt — `Quorum`-verified for an explicit settle, `WindowElapsed` for an implicit one — with tamper-evident validation against the on-chain registry.
+- **Machine/agent layer (`jnt-core`, policy only — no consensus change)**: deterministic agent identity, owner-signed spending policies with offline authorization, the canonical machine-payment format, service receipts, a reputation ledger, the service/payment bridge with settlement batching, a keyless MCP surface (`jnt-mcp`), and **streaming micro-payments** (`stream.rs`): pay-as-you-use at a fixed rate per block under a hard cap, settled by payer-signed receipts.
 
 **Roadmap / Future Work:**
 
@@ -81,6 +82,7 @@ without weakening the security a hash chain depends on.
 Idempotent-by-txid restart/timeout flows; 43 SDK tests including a 15-test
 privilege-escalation/secret-hygiene suite. The transport that implements the seams ships in Phase 6 (`HttpNode` over the node's opt-in REST API), together with the `jnt-worker run` daemon loop — which gates on the node's live conservation report (`GET /v1/conservation`) before its first pass and refuses a node whose joint L1 + L2 − sink supply is over the joint bound or whose numbers do not re-add. |
 | L2 → L1 exits (Decision 19) | **Shipped (SPEC.md §19.6).** `ExitQueue` on L2, and a proof-authorised sink spend on L1 against the `l2_state_root` committed at the queue block — no signature, because the sink holds no key. The **permissionless crank** is wired into the serve loop, the owner's prepaid `exit_fee_sat` is what makes it griefing-bounded, and `ChainL2` replays a release the way it replays a deposit. Exact funding only: an exit whose sink funding does not sum to its obligation stays queued rather than paying out of a stranger's deposit. The joint conservation check needed **no** exit term — the L1 payment and the L2 debit cancel — so `tests/conservation.rs` passes untouched. Remaining is **configuration** (the profile's `exit_activation_height`), not protocol. |
+| Streaming micro-payments | **Shipped (policy layer, no consensus change).** `crates/jnt-core/src/stream.rs` + `crates/jnt-core/tests/payment_stream.rs` (16 attack-first tests): a payer-signed `PaymentStream` (rate per block, window, hard cap), payer-signed `StreamSettlement` receipts, and a fail-closed `StreamBook` (exact-amount, ordered, non-future settlement). Settlement rides the ordinary payment path with `reference` = the stream id. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
 | Coverage-guided fuzzing | Shipped: fourteen cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC + Phase-5 `worker_flows`), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
 | License file | Shipped: dual `LICENSE-MIT` / `LICENSE-APACHE` at the repo root, matching `Cargo.toml`'s `MIT OR Apache-2.0`. |
@@ -253,6 +255,12 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 | `puzzle.rs` | 830 | The three PoW stages and the versioned puzzle registry |
 | `validators.rs` | 936 | §14.6 validator-set machinery (deterministic TopN, checkpoint validation) — inert |
 | `chain.rs` | 1 680 | Validation, application, fork choice, reorg, PSCB reserve, mining |
+| `agent.rs` | 1 106 | Machine/agent identity + owner-signed spending policies, offline authorization (Decision 16) |
+| `payment.rs` | 787 | Canonical machine/agent payment format + settlement batching |
+| `service.rs` | 912 | Service bridge: payment requests, sessions, authorization binding |
+| `receipt.rs` | 736 | Deterministic service receipts + conflict-safe receipt book |
+| `reputation.rs` | 703 | Bounded reputation accumulator with fixed weights |
+| `stream.rs` | 952 | Streaming micro-payments: pay-as-you-use rate, cap and settlement |
 
 ### Key types
 

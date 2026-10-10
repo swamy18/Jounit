@@ -85,6 +85,34 @@ L2:  L2 escrow balance → task posting / settlement payout
 - `reputation::tests::every_event_field_changes_the_event_id`
 - `reputation_flow.rs::a_correct_settlement_gives_the_worker_verified_work`
 
+## Streaming micro-payments (pay-as-you-use, policy layer)
+
+`crates/jnt-core/src/stream.rs` covers continuous usage billing, which the
+three layers above do not: a payer-signed `PaymentStream` (rate per block,
+window, hard cap) accrues `min(rate × blocks, cap)` per height, and the
+recipient withdraws with payer-signed `StreamSettlement` receipts against a
+fail-closed `StreamBook`.
+
+### Properties verified (all in `payment_stream.rs` + `stream.rs` unit tests)
+
+| Property | Test |
+|---|---|
+| Settlement above or below accrual refused | `a_settlement_above_accrual_is_refused_and_settles_nothing`, `a_settlement_below_accrual_is_refused_too` |
+| Same range cannot settle twice | `settling_the_same_height_twice_is_refused`, `a_rewound_through_height_is_refused` |
+| Future (unaccrued) blocks cannot be claimed | `claiming_unaccrued_blocks_is_refused` |
+| Third party cannot mint receipts | `a_settlement_signed_by_another_key_is_refused` |
+| Receipts are stream-bound | `a_settlement_for_another_stream_is_refused` |
+| Overflow refuses instead of wrapping | `overflow_refuses_rather_than_wraps` |
+| Machine payer without policy refused | `a_machine_stream_without_a_policy_is_refused` |
+
+### Notes
+
+- Opening a stream locks nothing on chain: the cap is a signed promise, and
+  the payer's balance is checked at settlement time like any other off-chain
+  authorization. Settlement rides the ordinary payment path (`reference` = the
+  stream id), so no new transaction type exists to audit.
+- A refused receipt commits nothing: budget is consumed only on `Ok`.
+
 ## Risk Assessment
 
 | Risk | Severity | Status |

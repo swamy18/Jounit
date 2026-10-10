@@ -20,6 +20,8 @@
 //!
 //! Machine/agent layer (roadmap items 3, 4, 6, 10 — policy, not consensus):
 //! - deterministic agent identity + reusable authorization policies (`agent.rs`)
+//! - canonical machine/agent payments and settlement batching (`payment.rs`)
+//! - streaming micro-payments for pay-as-you-use (`stream.rs`)
 
 pub mod agent;
 pub mod block;
@@ -48,6 +50,7 @@ pub mod service;
 pub mod sig;
 pub mod slash;
 pub mod state_root;
+pub mod stream;
 pub mod supply;
 pub mod tx;
 pub mod u256;

@@ -95,6 +95,17 @@ Versions follow the workspace `version` in `Cargo.toml`.
   so the monetary parameters sit next to the P2–P5 protocol blockers instead
   of being buried in a long proposal.
 
+### Added (policy layer — no consensus change)
+
+- **Streaming micro-payments (pay-as-you-use).** `crates/jnt-core/src/stream.rs`:
+  a payer-signed `PaymentStream` (rate per block, window, hard cap, recipient,
+  governing policy for non-human payers), payer-signed `StreamSettlement`
+  receipts, and a fail-closed `StreamBook` (exact-amount, strictly-ordered,
+  non-future settlement; accrual is checked, never wrapping). Settlement rides
+  the ordinary payment path with `reference` = the stream id, so no new
+  transaction type and no consensus rule change. Attack-first suite in
+  `crates/jnt-core/tests/payment_stream.rs` (16 tests).
+
 ### Notes
 
 - The observability and documentation entries above are the only non-consensus

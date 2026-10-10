@@ -60,8 +60,15 @@ rules in code would have been the wrong order.
   Decision 16): deterministic network-bound agent identity, owner-signed
   bounded spending policies, fail-closed allow lists, strictly increasing
   nonce anti-replay, tumbling-window cumulative limits, rotation/revocation,
-  and offline-verifiable authorizations. It is **non-consensus**: no block,
-  transaction, UTXO, supply or finality rule changed, and it holds no key.
+   and offline-verifiable authorizations. It is **non-consensus**: no block,
+   transaction, UTXO, supply or finality rule changed, and it holds no key.
+- **Streaming micro-payments are implemented** (`src/stream.rs`, roadmap
+  item 30): payer-signed `PaymentStream` opens (rate per block, window, hard
+  cap), payer-signed `StreamSettlement` receipts withdraw exactly what
+  accrued, and a fail-closed `StreamBook` refuses over/under-claims,
+  rewinds, future claims and replays. 16 attack-first tests in
+  `tests/payment_stream.rs` plus 3 unit tests. Non-consensus, like the rest
+  of the agent layer: settlement rides the ordinary payment path.
 - **Real BLS cryptography is implemented** (`bls.rs` over `blst`): derive,
   sign, aggregate, one-pairing aggregate-verify, deterministic fixtures.
   `verify_checkpoint` with `RealBls` rejects forgeries `MockBls` accepts. This

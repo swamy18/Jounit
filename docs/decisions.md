@@ -866,6 +866,13 @@ validation (that would be a consensus change and needs its own decision);
 (item 12); (d) bridge and reputation layers. The `Authorization` type is the
 seam they will build on.
 
+**Follow-up, no new decision:** streaming micro-payments
+(`crates/jnt-core/src/stream.rs`, roadmap item 30) build on this layer's seam
+without changing it — a payer-signed `PaymentStream` plus payer-signed
+`StreamSettlement` receipts against a fail-closed `StreamBook`, settled
+through the ordinary payment path. No consensus rule is touched, so no
+decision was needed; it is tracked in `docs/roadmap.md` §21 (item 30).
+
 ---
 
 # Pending protocol decisions

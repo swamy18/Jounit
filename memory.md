@@ -3257,3 +3257,25 @@ worker startup) — there is no serve-loop halt, because what a node should DO
 on detected inflation (halt, freeze L2, alarm-only) is an undecided policy.
 The exit rule itself (P1 in decisions.md) remains undecided; mainnet remains
 NO-GO.
+
+---
+
+## 2026-10-10 — Streaming micro-payments (pay-as-you-use, roadmap item 30)
+
+New policy-layer primitive in `crates/jnt-core/src/stream.rs` (952 lines):
+payer-signed `PaymentStream` (rate/block, window, hard cap, governing policy
+for non-human payers), payer-signed `StreamSettlement` receipts, fail-closed
+`StreamBook` (exact-amount, strictly-ordered, non-future settlement; checked
+accrual, never wrapping). Settlement rides the ordinary payment path
+(`reference` = stream id) — no new tx type, no consensus change, no new
+decision needed (recorded as a Decision-16 follow-up in decisions.md).
+
+Tests: `tests/payment_stream.rs` (16 attack-first) + 3 unit. Full `jnt-core`
+suite green (319 lib + all integration), `cargo fmt --all --check` and
+`cargo clippy --all-targets -- -D warnings` clean.
+
+Docs updated: README (Built bullet, roadmap-table row, agent-layer module-map
+rows), CHANGELOG Unreleased, roadmap.md item 30 + honest count,
+micro-payment-audit.md (streaming section), status.md, decisions.md.
+Untouched on purpose: SPEC.md (consensus scope only), sprint-status.md and
+security_audit.md (dated historical records).
