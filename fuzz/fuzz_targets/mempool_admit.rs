@@ -64,7 +64,14 @@ fuzz_target!(|data: &[u8]| {
     // thing the fuzzer exercises; `add` re-checks it anyway.
     let base_fee = 1_000;
 
-    let _ = pool.add(tx.clone(), &utxo, height, &params, base_fee);
+    let _ = pool.add(
+        tx.clone(),
+        &utxo,
+        height,
+        &params,
+        base_fee,
+        &jnt_core::bond::BondLedger::default(),
+    );
 
     // Invariants that must hold after ANY admission attempt:
     assert!(

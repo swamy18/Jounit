@@ -147,28 +147,17 @@ fuzz_target!(|data: &[u8]| {
                     }
                 }
             }
-            // Settle along the arbitrated path: ask the engine what the reference
-            // result implies, then settle with the verdict it returns.
+            // Settle along the arbitrated path: the engine runs the canonical
+            // reference itself; a random world is almost surely inconclusive
+            // (neither claim reproduces it), which must refuse cleanly.
             4 => {
                 if let Some(id) = task {
-                    let disputed = match state.task(&id) {
-                        Some(t) => match &t.state {
-                            ContractState::Disputed(c) => {
-                                Some((c.against_result, c.counter_result))
-                            }
-                            _ => None,
-                        },
-                        None => None,
-                    };
-                    if let Some((against, counter)) = disputed {
-                        let reference = match data[i + 3] % 3 {
-                            0 => [0xCCu8; 32], // matches neither -> inconclusive
-                            1 => counter,      // challenger correct -> Fraudulent
-                            _ => against,      // worker correct -> Correct
-                        };
-                        if let Ok(v) =
-                            DisputeEngine::resolve(state.task(&id).expect("exists"), reference)
-                        {
+                    let disputed = matches!(
+                        state.task(&id).map(|t| &t.state),
+                        Some(ContractState::Disputed(_))
+                    );
+                    if disputed {
+                        if let Ok(v) = DisputeEngine::resolve(state.task(&id).unwrap()) {
                             if let Ok(payload) =
                                 v.settle_payload([0xAAu8; 96], vec![0b0000_0111], 3)
                             {

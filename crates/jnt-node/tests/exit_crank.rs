@@ -252,8 +252,7 @@ fn submit_queue_block(
         .enumerate()
         .map(|(i, _)| {
             L2Transaction::new(L2Payload::ExitQueue(
-                ExitQueuePayload::build(miner, (i + 1) as u64, amounts[i], dest, EXIT_FEE)
-                    .unwrap(),
+                ExitQueuePayload::build(miner, (i + 1) as u64, amounts[i], dest, EXIT_FEE).unwrap(),
             ))
         })
         .collect();
