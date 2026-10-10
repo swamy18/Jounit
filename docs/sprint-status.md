@@ -26,7 +26,7 @@ bottom. Nothing here overrides the historical records in `docs/status.md`,
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | **755 passed, 0 failed** (43 test binaries plus 7 doc-test targets) |
+| `cargo test --workspace` | **870 passed, 0 failed** across the workspace |
 | `cargo fmt --check` | clean |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
 | `cargo build --release --workspace` | succeeded (optimized, 1m32s) |
@@ -64,36 +64,38 @@ requires a decision not yet recorded. **NOT STARTED** = no work.
 | MCP | `jnt-mcp` agent integration | **DONE** | `crates/jnt-mcp`; keyless dispatcher, 8 ops, node transport over the loopback API; `tests/mcp.rs` (9) |
 | 13/14 | End-to-end worker/agent flows | **DONE** | `crates/jnt-node/tests/e2e_journey.rs` drives one scripted journey through the real node path — mined blocks → `Chain::submit` → `NodeL2::sync` — and the real `WorkerClient` over the §18.3 seams: identity → policy → request → authorization → L2 post → claim → execute → submit → dispute → quorum settle → Quorum VWC → payment → receipt → reputation → conservation → finality → persist → restart → byte-identical state. A second test covers the undisputed path (WindowElapsed VWC) and a third a forged claim refused by name with the task untouched |
 | §19.2 | Worker↔node HTTP transport | **DONE** | `jnt-worker/src/http.rs` (`HttpNode`) implements both §18.3 seams over the node's opt-in REST API; `GET /v1/l2/state` serves a versioned deterministic state blob (`state_wire.rs`, 12 tests) and `worker_transport.rs` exercises discover→claim→broadcast over a live socket plus the failure paths. Transport **authentication** is not implemented — the API is an unauthenticated loopback surface by design — see "Gaps" |
-| 15 | L2 production gaps | **PARTIAL** | Deposits, funding, finality and replay are complete and tested; **exits are blocked** (Decision 10) |
+| 15 | L2 production gaps | **DONE** | Deposits, funding, finality, replay **and exits** are complete and tested (Decision 19) |
 | 25 | Adversarial suites | **PARTIAL** | Existing `redteam.rs`, `bls_checkpoint_attack.rs`, per-crate `fuzz_invariants.rs` and the 17-test bridge attack suite pass; no *new* adversarial suite was added this sprint |
 | 26 | Chaos harness | **NOT STARTED** | — |
 | 27 | Benchmarks | **NOT STARTED** | No `benches/` and no perf numbers; nothing was measured, so none is claimed |
 | 28 | SPEC reconciliation | **PARTIAL** | This document; see "SPEC reconciliation" |
-| 29 | Mainnet readiness | **PARTIAL** | See "Mainnet readiness" — operational scaffolding is partly present, and three genuine blockers remain |
+| 29 | Mainnet readiness | **PARTIAL** | four open decisions remain (P2–P5) plus the mainnet `exit_activation_height`; see "Mainnet readiness" — operational scaffolding is partly present, and three genuine blockers remain |
 
 ## Blockers (precise)
 
-1. **L2 → L1 exits are blocked by an unrecorded decision.** Decision 10 records
-   deposits via a burn-to-sink overlay and states *"Explicitly deferred
-   (mainnet blocker): L2→L1 exits … No exit decision is recorded here."* Without
-   exits, L2 holds value users cannot withdraw. **Do not implement exits without
-   a recorded decision**; the mechanism is a new L1 rule, which this sprint was
-   not authorised to invent.
+1. ~~**L2 → L1 exits are blocked by an unrecorded decision.**~~ **Resolved as
+   Decision 19 (2026-10-09, approved and implemented).** Decision 10's deferral
+   is superseded: `ExitQueue` on L2, an inclusion-proof-authorised sink spend on
+   L1, a permissionless crank in the serve loop, and the owner-prepaid
+   `exit_fee_sat`. Remaining for mainnet is the `exit_activation_height`
+   configuration, not protocol.
 2. **Validator economics / bonding are blocked.** Decision 8 records a fixed
    genesis committee with *no* stake transaction, bond or unbonding. Rotating a
    committee without bonded stake is not authorised; Phase 6 is a fixed-committee
    bootstrap by design.
-3. **The 40M supply cap and issuance were frozen *at the time of this sprint*.**
+3. ~~**The 40M supply cap and issuance were frozen *at the time of this sprint*.**~~
    Decisions 7 and 10 then stated the cap, issuance paths, block rewards,
-   halving schedule and both fee schedules were explicitly unchanged. The
-   protocol owner has since approved the tail and escrow decisions
-   (M-A…M-G, 2026-10-09, see `docs/decisions.md`); the cap is now a sanity
-   ceiling and the mint bound is the per-height issuance integral. This
-   paragraph records the sprint's constraint, which no longer matches the
-   shipped code.
+   halving schedule and both fee schedules were explicitly unchanged.
+   **Decision 18 (2026-10-09) removed the cap entirely**: `supply_cap_sat` and
+   `Error::SupplyCapExceeded` are gone, the mint bound is the per-height issuance
+   integral `cumulative_issuance_sat(height)`, and post-ladder issuance is
+   rate-anchored (≤ 1 % of the supply issued at that window's start) with a
+   permanent 0.1 JNT tail floor. This paragraph records the sprint's constraint,
+   which no longer matches the shipped code.
 4. **Local fuzz execution is unavailable in this environment** (no ASan runtime
    for the MSVC target). Fuzz targets compile; representative *execution* is not
-   claimed.
+   claimed. *(Since superseded: campaigns now run under WSL2 + ASan — see
+   `docs/fuzz.md`.)*
 5. **`mainnet` carries no validator committee**, so checkpoint verification fails
    closed there (`NetworkParams::mainnet` has an empty `genesis_validators`).
    This is intentional, and it means binding finality is untestable on mainnet
@@ -153,7 +155,9 @@ tests, and a documented decision log.
 Not built here: monitoring hooks beyond the REST surface, backup/recovery run
 books, versioning/upgrade-compatibility policy, a testnet launch procedure, a
 security-disclosure process, a release checklist, and deterministic/`reproducible`
-build checks. **Mainnet is not declared ready**: blockers 1–3 above are open, and
+build checks. **Mainnet is not declared ready**: the open items are P2–P5 plus the mainnet
+`exit_activation_height` configuration — the exit path itself shipped (Decision 19).
+(was: blockers 1–3 above, and
 blocker 1 alone (no exits) prevents a functional economy.
 
 ## Gaps worth naming
@@ -170,14 +174,16 @@ blocker 1 alone (no exits) prevents a functional economy.
   tests drive a live socket against an in-process server, which is a genuine
   transport test but not a two-process deployment test.
 - No benchmarks exist, so no performance claim is made anywhere in this sprint.
-- `jnt-worker`'s CLI (`address`, `generate`) still exposes no claim/submit/status
-  verb, so the transport is reachable from the SDK and its tests but not yet from
-  the shipped binary surface.
+- ~~`jnt-worker`'s CLI (`address`, `generate`) exposes no claim/submit/status
+  verb~~ — **resolved since:** `jnt-worker run` ships the daemon loop
+  (discover → claim → execute → submit, gated on `/v1/conservation`), exercised
+  by `cli_run.rs` and the two-process E2E. `address`/`generate` remain for key
+  tooling.
 
 ## Commands behind the numbers
 
 ```
-cargo test --workspace                                   # 755 passed, 0 failed
+cargo test --workspace                                   # 870 passed, 0 failed (supersedes older counts)
 cargo fmt --check                                        # clean
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # clean
 cargo build --release --workspace                        # see note below
@@ -207,7 +213,10 @@ execution ran in WSL2. Current measured state:
 | Fuzz campaign (WSL2 nightly + ASan, 14 targets × 30 s) | **9,352,161 executions, 0 crashes** — see `docs/fuzz.md` |
 | Benchmark probes | run, real numbers recorded — see `docs/benchmarks.md` |
 
-The `jnt-worker` CLI limitation noted above still stands (no claim/submit/status
-verb in the binary). The three blockers listed earlier are unchanged; the exit
-blocker is restated with a full design in `docs/l2-exit-design.md` and a pending
-decision record in `docs/decisions.md` (*Pending* P1).
+The `jnt-worker run` daemon verb shipped since, so the CLI limitation above no
+longer stands. The exit blocker is **closed** by Decision 19 (approved and
+implemented, SPEC.md §19.6) — `docs/l2-exit-design.md` is the record of the
+approved design rather than a pending one, and P1 is no longer in the
+*Pending* section. Local fuzz execution is available in WSL2. Remaining
+blockers: P2 (stake ledger / mainnet committee), P3, P4, P5, and the mainnet
+`exit_activation_height` configuration.

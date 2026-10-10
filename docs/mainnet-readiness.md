@@ -201,7 +201,7 @@ reached.
 | Deterministic genesis across profiles | ✅ |
 | BLS finality adversarial tests | ✅ (18 checkpoint tests) |
 | L2 end-to-end (deposits, tasks, VWC, reputation) | ✅ (2-process E2E + chaos suite) |
-| **L2 → L1 exits** | ❌ **blocked** — no recorded decision (`docs/l2-exit-design.md`) |
+| **L2 → L1 exits** | ✅ implemented (Decision 19, SPEC.md §19.6) — ❌ `mainnet`'s `exit_activation_height` is still unset (`0` = never, so mainnet user deposits stay closed) |
 | **Stake ledger / mainnet validator committee** | ❌ **blocked** — Decision 8 builds none; `mainnet` has an empty committee so finality fails closed |
 | M2 / M4 activation rules | ❌ **blocked** — each needs a rule that defines fraudulent compute output / how the HBM puzzle is registered |
 | Live conservation surface (`/v1/conservation`, `/metrics` gauges, worker `run` gate) | ✅ |
@@ -209,10 +209,13 @@ reached.
 
 ## Exact blockers preventing mainnet
 
-1. **L2 → L1 exits are undefined.** Decision 10 explicitly defers them. The
-   deposit sink is unspendable, so an exit needs a new L1 release rule that no
-   decision authorises. Without it, mainnet deposits would trap user funds.
-   (`docs/l2-exit-design.md`.)
+1. **Mainnet exit activation is unconfigured.** Decision 19 implemented the exit
+   rule (SPEC.md §19.6) and superseded Decision 10's deferral: `ExitQueue` on L2,
+   an inclusion-proof-authorised sink spend on L1, and a permissionless crank.
+   `mainnet` currently carries `exit_activation_height = 0` — *never*, not *from
+   genesis* — so it accepts neither a committed `l2_state_root` nor an exit claim,
+   and mainnet user deposits stay closed. Choosing a height is **configuration**,
+   not missing protocol.
 2. **No stake ledger and no mainnet committee.** Decision 8 builds no stake
    transaction, bond, or unbonding; `mainnet` carries an empty
    `genesis_validators`, so checkpoint verification fails closed and binding
@@ -222,7 +225,7 @@ reached.
    proves a compute result fraudulent; M4 is not a registered `puzzle_id`.
 4. **Operational gaps** (below) — these do **not** block a testnet, but they
    block a defensible mainnet: no metrics/log shipping, no release/tagging
-   process, no CHANGELOG, no published PGP key, no reproducible-build tooling.
+   process, no published PGP key, no reproducible-build tooling.
 
 Mainnet readiness is therefore **not claimed**. Testnet is the appropriate
 next milestone, and it too is gated on the operational checklist above (not on

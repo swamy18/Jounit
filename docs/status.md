@@ -29,7 +29,7 @@ rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — **650 tests pass (current count; older sections of
+- `cargo test --workspace` — **870 tests pass, 0 failures** across the workspace.
   this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):**
   - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite,, the 30-test real-BLS suite in
@@ -152,7 +152,7 @@ attacker-controlled counts larger than the remaining buffer before allocating,
 `value_in` already used `checked_add`, `fees.rs` uses saturating operations
 throughout, `apply_tx` records undo data that makes rollback an exact inverse,
 and `apply_block` does verify the coinbase against `reward + tip` (chain.rs)
-before the supply-cap check — so the inflation path is closed there. The one gap
+before the mint-bound check — so the inflation path is closed there. The one gap
 it did turn up was block-level fee accumulation using `+=`, which panics in
 debug and wraps in release, feeding a wrong total into the burn/tip split. Now
 `checked_add`.
@@ -285,8 +285,9 @@ failure, so no snapshot is needed and the happy path stays O(1) in UTXO size.
 **The chain halted permanently once the reward ladder ran out.** `apply_block`
 rejected a zero-value coinbase unconditionally, but SPEC.md §7 says the coinbase
 collects the tips only and tips are legitimately zero on an empty block. Every
-such block was refused, so the chain stopped dead at a fixed, known height
-(mainnet `8 x 262 800`). The zero-value check is gone; a zero-value coinbase is
+such block was refused, so the chain would have stopped dead at the mainnet
+ladder-exhaustion height 1,839,600. (Decision 18’s tail keeps paying past that
+height, so a zero-reward block is no longer reachable on mainnet.) The zero-value check is gone; a zero-value coinbase is
 simply not recorded in the UTXO set, since `check_tx` already refuses to spend a
 zero-value output and recording it would only grow the set with unspendable
 entries. `rollback_block` now identifies the coinbase output directly instead of
@@ -1246,7 +1247,7 @@ No new decision** — this builds Decision 7 exactly as recorded; the escrow
 amounts and grantees are parameters under that decision, listed below.
 
 **The model.** The escrow fits in the sats the L1 ladder provably can never
-mint (the unmintable gap: 6,076 JNT on `mini`, 788,476 JNT on `mainnet`; since
+the explicit `escrow_ceiling_sat` parameter per profile. There is no unmintable
 M-E it is bounded by the explicit `escrow_ceiling_sat`, not by the gap rule).
 `NetworkParams` fixes per profile: `l2_genesis_escrow_sat` (`mini` 10 JNT,
 `mainnet` 100,000 JNT, no mainnet grants) and `l2_genesis_grants` (`mini`:
@@ -1254,7 +1255,7 @@ M-E it is bounded by the explicit `escrow_ceiling_sat`, not by the gap rule).
 remainder parks with the derived protocol escrow identity
 (`SHA256("jounit/l2-escrow/v1" ‖ network_id)[..20]`), inert until a later
 milestone authorises disbursement. `validate()` refuses zero/over-total/
-duplicate/escrow-named/zero grants and any escrow above the gap — so combined
+duplicate/escrow-named/zero grants and any escrow above `escrow_ceiling_sat` — so combined
 L1 + L2 money can never exceed the cap, with zero L1 rule change.
 
 **Application.** `L2State::apply_genesis` releases the allocation once per
@@ -1272,7 +1273,7 @@ appears, balance drops by exactly payment + fee); unfunded accounts still fail
 closed; same bytes in two blocks apply once (`Replay` refusal); restart and
 reorg keep funding exactly once with no kept losing history; two independent
 replays agree on balances, escrow, tasks, funding and skip records;
-incremental agrees with replay; joint supply stays under the cap while mining.
+incremental agrees with replay; the joint conservation check holds while mining.
 The `l2_state_apply` fuzz target additionally asserts the funded-total
 invariant per operation (no new target: no new parser boundary).
 
@@ -1280,7 +1281,9 @@ invariant per operation (no new target: no new parser boundary).
 +9 L2 genesis, +7 node funding); fmt clean; `clippy -D warnings` clean
 workspace-wide; release build clean; 13 fuzz targets compile; sim suite clean.
 
-**Still ahead, unchanged:** user deposits and L2-to-L1 exits (deferred by
+**Still ahead after M2:** user deposits, L2-to-L1 exits, worker–node transport,
+the validator committee, binding finality and the testnet profile — all of which
+have since shipped (Decision 10, Decision 19, Decisions 12–15).
 Decision 7 — needs its own decision before mainnet), M3 transport, M4
 committee + finality, M5 testnet. No claim of testnet, finality, or mainnet
 readiness.
@@ -1319,7 +1322,8 @@ survive its block.
 
 **Conservation.** The M2 joint check grew its sink term (sink outputs stay in
 the L1 UTXO set while their twins live in L2):
-`L1 live + L2 held − sink-held ≤ cap`, asserted by `verify` alongside
+`L1 live + L2 held − sink-held ≤ cumulative_issuance_sat(height) + escrow_ceiling_sat`,
+asserted by `verify` alongside
 `funded == escrow + deposits` and self-checked conservation. `verify` also
 names pending (with spendable height) and ignored (with reason) deposits.
 
@@ -1337,7 +1341,10 @@ unaffected (custom-funded states, invariant intact).
 `clippy -D warnings` clean workspace-wide; release build clean; 13 fuzz
 targets compile; sim suite clean.
 
-**Still ahead, unchanged:** L2-to-L1 exits (no decision recorded — deposits
+**Still ahead after M3:** L2-to-L1 exits, the committee + finality and the
+testnet profile — all since shipped (Decision 19, Decisions 12–15). Mainnet
+stays closed by `exit_activation_height = 0` until the owner configures a height.
+(was: **Still ahead, unchanged:** L2-to-L1 exits (no decision recorded — deposits
 without exits trap funds, so mainnet stays blocked by design), M4 committee +
 finality, M5 testnet. No claim of testnet, finality, or mainnet readiness.
 
@@ -1386,7 +1393,10 @@ non-binding reorg proof. Plus a new `checkpoint_codec` fuzz target (14 targets).
 clippy clean; release build clean; 14 fuzz targets compile; sim suite clean
 (36 wire values cross-checked).
 
-**Still ahead, unchanged:** bonded stake / unbonding / rewards (mainnet-gated,
+**Still ahead after M4:** bonded stake / unbonding / rewards (mainnet-gated,
+D8 → now P2), validator rotation, equivocation slashing. Exits and the testnet
+profile have since shipped (Decision 19, Decisions 12–15). (was: **Still
+ahead, unchanged:** bonded stake / unbonding / rewards (mainnet-gated,
 D8), validator rotation, equivocation slashing, L2-to-L1 exits, M5 testnet. No
 claim of testnet, binding finality, or mainnet readiness.
 ---
@@ -1503,7 +1513,7 @@ design decision (see `docs/l2-exit-design.md`).
 
 ## Phase 6 final status — 2026-10-08
 
-**Tests:** **773 passing, 0 failed, 1 ignored** (was 625 at Phase 5 end; +148). The
+**Tests:** **870 passing, 0 failed, 1 ignored** across the workspace. The
 ignored test is the intentional `vwc_perf_probe` performance re-measurement point.
 
 New tests added this phase:
@@ -1514,7 +1524,7 @@ New tests added this phase:
 
 **Security audit:** `docs/security_audit.md` — no critical or high-severity findings.
 All identified threat surfaces covered by tests and/or fuzzing. Fuzz report:
-`docs/fuzz.md` — 14 targets, ~22.6M executions, 0 crashes (WSL nightly + ASan campaigns).
+`docs/fuzz.md` — 14 targets, 9,352,161 executions, 0 crashes (WSL2 nightly + ASan, measured 2026-10-09).
 
 **SPEC reconciliation:** `docs/roadmap.md` updated — 14/14 Phase 6 items implemented.
 SPEC.md §14.2 L2 payload types now match `crates/jnt-core/src/l2.rs` exactly.
@@ -1530,6 +1540,9 @@ graduation criteria.
 
 **Documentation:** Added `docs/benchmarks.md`, `docs/fuzz.md`,
 `docs/monetary-policy.md`, `docs/micro-payment-audit.md`, `docs/l2-exit-design.md`.
-The exit design is **blocked on a decision not yet recorded** — the exit deferral
+The exit design was **approved as Decision 19 and implemented** (SPEC §19.6,
+2026-10-09); an earlier revision of this line cited a 'Decision 21' that does not
+exist, and a later one still listed it as pending. (was: The exit design is
+**blocked on a decision not yet recorded** — the exit deferral
 in Decision 10 (`docs/decisions.md` *Pending* P1); an earlier revision of this
 line cited a "Decision 21" that does not exist in the repository.

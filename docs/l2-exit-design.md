@@ -1,75 +1,78 @@
 # L2 Exit Design
 
-**Status: BLOCKED — DESIGN + RECOMMENDATION. No exit mechanism is implemented,
-and none may be implemented until a protocol decision is recorded.**
+**Status: IMPLEMENTED (Decision 19, SPEC.md §19.6).** The exit rule shipped on
+2026-10-09: `ExitQueue` on L2, a proof-authorised sink spend on L1, a
+permissionless crank in the serve loop, and L2 replay absorbing the release.
+What remains for mainnet is **configuration** — `exit_activation_height` — plus
+the open decisions P2–P5. This document is kept as the design record the
+implementation followed, and every recommendation below is now a decision.
 
 Two things changed since the first revision of this document, and both are
 evidence rather than opinion:
 
-1. **The blocker is now proven in code, not asserted.**
-   `crates/jnt-core/tests/sink_unspendable.rs` drives the real L1 spend rule and
-   shows a sink output has no valid spender — including the depositor trying to
-   reclaim its own coins. An exit therefore requires a **new L1 consensus rule**;
-   there is no implementation-only path.
-2. **The negative halves of an exit are pinned by tests** so an exit cannot
-   arrive by accident (see *What is implemented today*). Those tests are
-   expected to change when the rule is approved, and that is the point: a change
-   that breaks them is a consensus change and should be impossible to make
-   silently.
-
-This document evaluates the three proposed approaches, states the required
-design, **recommends one option per open question**, and lists exactly what a
-decision must settle. The recommendation is a recommendation: it is not
-approval, and implementing against it before the owner records a decision would
-be inventing a consensus rule.
+1. **The blocker was proven in code, then satisfied by a rule.**
+   `crates/jnt-core/tests/sink_unspendable.rs` still drives the real L1 spend
+   rule and shows a sink output has no valid *signature* spender — including the
+   depositor trying to reclaim its own coins. Decision 19 added the L1 rule that
+   makes that irrelevant: a claim is authorised by an **inclusion proof against
+   the committed `l2_state_root`**, not by a signature. So the sink's keylessness
+   no longer blocks an exit, and the sink was deliberately **not** replaced by a
+   validator-threshold escrow.
+2. **The negative halves of an exit were replaced by positive tests.**
+   `exit_unavailable.rs` (the "exactly five type bytes" assertion) is gone;
+   `jnt-l2/tests/exit_flow.rs`, `jnt-l2/tests/exit_claim.rs` and
+   `jnt-node/tests/exit_crank.rs` now pin the exit behaviour directly.
+   `sink_unspendable.rs` survives unchanged, because the signature refusal it
+   pins is still true.
 
 Related records: `docs/decisions.md` — **Decision 10** (user deposits via
-burn-to-sink, which explicitly states *"Explicitly deferred (mainnet blocker):
-L2→L1 exits … No exit decision is recorded here."*). There is no "Decision 21"
-in this repository; an earlier revision of this file cited one that does not
-exist. The blocker is Decision 10's deferral, and this file is where the
-consequences of that deferral are worked out.
+burn-to-sink; its exit deferral is *superseded* by Decision 19), **Decision 19**
+(the exit rule, APPROVED + IMPLEMENTED), and **Decision 18** (which deleted the
+stock cap the old accounting text below assumed). There is no "Decision 21" in
+this repository; an earlier revision of this file cited one that does not exist.
 
 ## Problem
 
 L2 value enters through two paths, both now implemented and tested:
 
-1. **Genesis escrow** (Decision 7): `l2_genesis_escrow_sat`, a reallocation of
-   coins already inside the unmintable gap. Credited at L2 genesis.
+1. **Genesis escrow** (Decision 7): `l2_genesis_escrow_sat`, a reallocation
+   bounded by the explicit `escrow_ceiling_sat` parameter. Credited at L2 genesis.
 2. **User deposits** (Decision 10): an ordinary STANDARD L1 payment to
    `NetworkParams::l2_deposit_sink`, read by L2 replay and credited 1:1 after
    maturity.
 
-Neither path has a return route. A user who deposits JNT, or a worker who is
-paid in L2 for settled work, holds an `L2State` account balance with no
-protocol-defined way to move that value back to L1. **Until an exit exists,
-mainnet deposits would trap user funds.** Testnet deposits are functional
-because testnet value is not expected to be recoverable; that is a testnet
-property and is not mainnet readiness.
+Both paths have a return route since Decision 19. A user who deposits JNT, or a
+worker paid in L2 for settled work, queues an `ExitQueue` transaction; after
+finality the value is released on L1 by a proof-authorised claim. On `mini` and
+`testnet` (`exit_activation_height = 1`) that path is live end to end;
+`mainnet` ships `0`, meaning *never*, so mainnet deposits are closed by
+configuration until an owner picks a height.
 
-## The binding constraint: the sink cannot release funds
+## The binding constraint: no signature can spend the sink
 
-This is the finding that determines the whole design, and it is why the
+This is the finding that determined the whole design, and it is why the
 approaches below cannot be adopted as written.
 
 `l2_deposit_sink = SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]`
 holds **no key**. It is derived, not owned. L1 consensus will never validate a
 signature that spends a sink output, so:
 
-- **Sink outputs stay in the L1 UTXO set forever.** They are provably burned
-  for spend purposes. SPEC.md §19.5 states this: *"sink outputs remain in the
-  L1 UTXO set … the sum is constant across deposits and falls on burns."*
-- **Consequently, no exit can "release the funds from the sink".** The value is
-  not sitting in a spendable address; it is destroyed-for-spending but still
-  counted, exactly so the joint conservation check
-  (`L1 live + L2 held − sink-held ≤ cap`) does not read every deposit as
-  inflation.
+- **A sink output has no signature spender.** `sink_unspendable.rs` proves the
+  depositor's own reclaim, a stranger's and an unsigned spend all fail. SPEC.md §19.5
+  states the consequence: *"sink outputs remain in the L1 UTXO set … the sum is
+  constant across deposits and falls on burns."*
+- **So no exit can be authorised by a key.** Decision 19 added an authorisation
+  that does not use one: a claim whose inputs are sink outputs covered by a
+  valid, matured, unreleased **inclusion proof** is a legal L1 transaction, and
+  the sink term falls by exactly the released amount. The joint conservation
+  check (`L1 live + L2 held − sink-held`) is unchanged and needed **no exit
+  term**; §19.5's `cap` is now the joint bound `cumulative_issuance_sat(height)
+  + escrow_ceiling_sat` (Decision 18 removed the stock cap).
 
-Therefore *every* viable exit requires a **new L1 rule** that either (a) lets
-consensus move value out of sink outputs, or (b) replaces the unspendable sink
-with an escrow whose spend authority is the validator set. Both are consensus
-changes. Neither is authorised by any decision on record. **No fake withdrawal
-path and no minting path may be built in the meantime** — minting on exit would
+Therefore an exit requires a **new L1 rule** that lets consensus move value out
+of sink outputs. Option (a) was authorised (Decision 19) and implemented; the
+sink was **not** replaced by a validator-threshold escrow. **No fake withdrawal
+path and no minting path may be built** — minting on exit would
 break the cap invariant, and "releasing" from the sink without a new rule is
 not expressible.
 
@@ -99,11 +102,12 @@ is binding.
 **Mechanism:** a withdrawal is queued on L2; after the carrying L1 block is
 final, value is paid out of the escrow sink.
 
-**Assessment:** Simplest to reason about and predictable for users. **But the
-premise is wrong as written** — the sink is unspendable, so "paid out of the
-sink" is not a legal L1 transaction. It would have to become either a
-validator-threshold-signed release (introducing a key the current model
-deliberately does not have) or a new consensus rule for sink outputs. It also
+**Assessment:** Simplest to reason about and predictable for users. **Adopted
+as the user-facing layer.** The scheduled-withdrawal queue *is* the user-facing
+API; the "paid out of the sink" half needed the rule above, not a second one —
+the claim is authorised by an inclusion proof rather than a key. A
+validator-threshold-signed release was rejected because it introduces a key the
+model deliberately does not hold.
 needs a queue structure with its own replay/finality semantics (below).
 
 ### Option C — Emergency withdrawal
@@ -115,44 +119,39 @@ trust in governance and, like A and B, still needs a consensus release rule.
 It should not be the primary path, and it cannot be specified while the release
 rule is undefined.
 
-**Conclusion.** The safest architecture compatible with the *existing* sink is:
-a **consensus-authorised release rule** as the primitive, with a
-**scheduled withdrawal** as the user-facing queue on top of it, and an
-**emergency pause** as a bounded safety valve. The primitive is the decision;
-A, B and C are policies layered on it. **None of this is implemented.**
+**Conclusion (as adopted).** The consensus-authorised release rule is the
+primitive, the scheduled withdrawal is the queue on top of it, and there is no
+emergency pause in v1. This is exactly what Decision 19 approved and what
+`crates/jnt-core/src/exit.rs`, `jnt-l2`'s `queue_exit` and
+`NodeL2::crank_claims` implement.
 
-## What is implemented today (safe, non-consensus)
-
-These are the parts of an exit that can be built, tested and merged without
-approving a single consensus parameter. They exist so that the eventual rule is
-smaller, and so that the current one-way behaviour is a tested property rather
-than an assumption.
+## What the tests pin today
 
 | Test file | What it pins |
 |---|---|
-| `crates/jnt-core/tests/sink_unspendable.rs` | A sink output has no valid spender: the depositor's own reclaim is `WrongAddress`, a stranger's is `WrongAddress`, an unsigned spend is `EmptySignatureBundle` (refused *before* the ownership check), and the sink/escrow identities are distinct derived addresses. |
-| `crates/jnt-l2/tests/exit_unavailable.rs` | The L2 wire admits exactly five type bytes — exhaustively, over all 256 — and every other byte is refused by name; a withdrawal-shaped envelope fails at decode time; `funded_total` is unchanged across a full funded post → claim → submit → quorum settle lifecycle, so value never leaves L2; L2 fees burn/PSCB inside L2 rather than exiting. |
-| `crates/jnt-node/src/conservation.rs` (+ `tests/conservation.rs`) | The joint L1 + L2 supply check is now one tested function. It exercises the **sink term** specifically: a deposit is counted once pending and twice once matured, and the subtraction removes exactly one copy — the accounting an exit must not break. Also catches L2 funding from an unauthorized path by name. |
-| `crates/jnt-node/tests/api.rs` | An unsupported withdrawal is refused explicitly at the service surface: a withdrawal-shaped payload to `POST /v1/l2/broadcast` is a clean `400` naming `unknown L2 transaction type`, and nothing is queued. |
+| `crates/jnt-core/tests/sink_unspendable.rs` | A sink output has no **signature** spender: the depositor's own reclaim is `WrongAddress`, a stranger's is `WrongAddress`, an unsigned spend is `EmptySignatureBundle` (refused *before* the ownership check), and the sink/escrow identities are distinct derived addresses. Still normative — the release is authorised by a proof, not a key. |
+| `crates/jnt-l2/tests/exit_flow.rs` | The sixth type byte `0x15 = ExitQueue` is a real transaction: the codec, the D3 fee mapping, activation gating, third-party-destination refusal, replay and rewound-nonce refusal, and `exited_total` accounting. |
+| `crates/jnt-l2/tests/exit_claim.rs` | The L1 half: proof against the committed root, exact funding, idempotency by exit identity, maturity, reorg unwind, and that a block carrying any of it is still a valid block by every pre-exit rule. |
+| `crates/jnt-node/tests/exit_crank.rs` | The node can drive the whole loop with nobody hand-building the claim, the crank settles nothing before maturity, and a profile on `exit_activation_height = 0` (mainnet) refuses both a root and a claim. |
+| `crates/jnt-node/src/conservation.rs` (+ `tests/conservation.rs`) | The joint L1 + L2 supply check is one tested function. It exercises the **sink term** specifically: a deposit is counted once pending and twice once matured, and the subtraction removes exactly one copy. It passes **unchanged** across the exit rule — the L1 payment and the L2 debit cancel, so no exit term was needed. |
 
-None of this releases funds. **Deposits remain one-way**: value that enters L2
-has no route back to L1 until the rule below is approved and implemented.
+Deposits are no longer one-way. Value queued on L2 returns to L1 after finality
+through a proof-authorised claim; `mainnet` has the path compiled and tested but
+switched off by its own configuration (`exit_activation_height = 0`).
 
-## Recommended design (for owner approval)
+## The approved design (Decision 19, implemented)
 
-The following is the exact shape a decision must approve. Values in `⟨…⟩` are
-the open parameters the decision must fix; each carries a recommendation below
-and **none is chosen here**.
+The shape Decision 19 approved and the code implements: bracketed values are
+recorded parameters, not open questions.
 
 ### 1. Required state transitions
 
 L2 side (additive to `L2State`):
 
 ```
-Queued    : account debited by amount; pending-exit record { (owner, nonce) → (amount, destination, queued_height) }
+Queued    : account debited by amount + exit_fee + queue fee; pending-exit record { (owner, nonce) → (amount, destination, exit_fee, queued_height) }
 Matured   : queued_height such that the carrying L1 block is final (see §4)
 Released  : value leaves L2 accounting and is paid on L1 by the release rule
-Cancelled : (only if the decision allows) returns value to the L2 account, atomically
 ```
 
 L1 side: one new consensus-authorised operation that moves `amount` from
@@ -208,9 +207,10 @@ any block; a release that could be reorged away is not representable.
   the release rule must reduce the outstanding sink claim, not create a second
   claim on already-counted coins. Getting this wrong double-counts and is an
   inflation primitive; the conservation test suite must cover it explicitly.
-- The supply cap is untouched: exits move existing value, never mint. Any
-  design that computes an exit amount from anything other than the committed
-  L2 debit is rejected.
+- The mint bound is untouched: exits move existing value and never mint. The
+  bound is the per-height issuance integral plus the post-ladder rate anchor
+  (Decision 18), neither of which an exit can touch. Any design that computes an
+  exit amount from anything other than the committed L2 debit is rejected.
 
 ### 6. Failure / reorg behaviour
 
@@ -419,32 +419,43 @@ adds no new authority to anyone.
   height. Below that height nothing changes, and `TxExitClaim` is simply an
   unknown transaction type, which the decoder must refuse exactly as it refuses
   an unknown L2 type byte today.
-- **Activation requires a network-upgrade mechanism.** None exists yet: there is
-  no version bits, no activation height mechanism in general, and
-  `finality_activation_height` is the only height-gated rule in the codebase and
-  it is profile data rather than a negotiated upgrade. A real activation
-  mechanism is a prerequisite and is currently **undecided**.
+- **Activation requires a network-upgrade mechanism.** None exists. There is no
+  version bits, and the height-gated rules that *do* exist —
+  `finality_activation_height`, `exit_activation_height` and the Decision 18
+  `tail_activation_height` — are profile data rather than negotiated upgrades. A
+  real activation mechanism is a prerequisite for changing any of them on an
+  existing chain, and is currently **undecided**.
 - **Vectors must not move.** Existing serialization, puzzle and supply vectors
   are pinned; the exit rule adds new shapes and must add new vectors rather than
   perturb old ones. A changed existing vector would mean the rule altered
   historical validity, which is a bug, not an upgrade.
-- **Mainnet deposits stay closed until the rule ships.** Until then the sink is a
-  one-way sink, and **mainnet must not accept user deposits** (Decision 10's
-  deferral is the reason). Testnet deposits are functional precisely because
-  testnet value is not expected to be recoverable.
-- **The tests in this repository are the migration checklist.**
-  `sink_unspendable.rs` must be *replaced* (a sink output becomes spendable under
-  proof); `exit_unavailable.rs` must gain the exit type and lose its
-  "exactly five" assertion; `conservation.rs` should keep passing unchanged,
-  which is the strongest signal the accounting was done right.
+- **Mainnet deposits stay closed by configuration.** `mainnet` carries
+  `exit_activation_height = 0` (*never*), so it accepts neither a committed
+  `l2_state_root` nor an exit claim, and mainnet must not accept user deposits
+  until the owner sets a height. On `mini`/`testnet` (`= 1`) deposits are
+  functional **and** withdrawable.
+- **How the migration checklist actually went.**
+  `sink_unspendable.rs` was **kept** — its claim is about signatures, which still
+  cannot spend a sink output; the exit is authorised by an inclusion proof instead.
+  `exit_unavailable.rs` was **deleted** and replaced by `exit_flow.rs` /
+  `exit_claim.rs`. `conservation.rs` passes **unchanged**, which is the strongest
+  signal the accounting was done right: the joint check needed no exit term at all.
 
 ## References
 
-- `SPEC.md` §14.2 (L2 payload types), §15.2 (`Auth::verify_as`), §19.5
-  (deposits, sink, conservation term, processing order)
-- `docs/decisions.md` — Decision 7 (genesis escrow), Decision 10 (deposits,
-  exit deferral), Decision 15 (stronger-of-two finality)
-- `crates/jnt-l2/src/` — `deposits.rs`, `state.rs`, `ChainL2::{replay, pending_deposits}`
+- `SPEC.md` §14.2 (L2 payload types), §15.2 (`Auth::verify_as`), §19.1
+  (`l2_state_root` commitment), §19.5 (deposits, sink, conservation term,
+  processing order), §19.6 (exits, normative)
+- `docs/decisions.md` — Decision 7 (genesis escrow), Decision 10 (deposits),
+  Decision 15 (stronger-of-two finality), **Decision 18** (removed the stock cap
+  the old accounting text assumed), **Decision 19** (the exit rule)
+- `crates/jnt-l2/src/` — `deposits.rs`, `state.rs`,
+  `ChainL2::{replay, pending_deposits, pending_exits}`
+- `crates/jnt-core/src/exit.rs` — claim codec, proof verification, identity, gas
+- `crates/jnt-l2/tests/{exit_flow,exit_claim}.rs`,
+  `crates/jnt-node/tests/exit_crank.rs`,
+  `crates/jnt-worker/src/exit.rs` (`queue_exit`, `queue_exit_plan`, `ExitPlan`),
+  `jnt-node/src/l2.rs::crank_claims`
 - `crates/jnt-core/src/params.rs` — `l2_deposit_sink`, `l2_escrow_address`,
   `l2_genesis_escrow_sat`, `l2_deposit_minimum_sat`
 - `docs/micro-payment-audit.md` (Layer 1 asset flow), `docs/monetary-policy.md`

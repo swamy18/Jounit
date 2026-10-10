@@ -18,11 +18,11 @@ it says so explicitly.
 | L1 node (`jnt-node`) with P2P | **Implemented** — `serve` with `--listen`, `--connect`, `--no-mine`, `--api-listen` |
 | L1 transaction relay over P2P | **Implemented** (SPEC §13.14, `msg_type = 10`) |
 | L2 deposits | **Implemented** — burn-to-sink, maturity by depth **and** binding finality (Decisions 10/15) |
-| L2 exits | **NOT implemented** — blocked on a recorded decision (`docs/l2-exit-design.md`). Testnet value is intentionally not withdrawable. |
+| L2 exits | **Implemented** (Decision 19, SPEC §19.6) — a sink-output claim authorised by an inclusion proof, released by the permissionless crank, with `jnt_worker::{queue_exit, ExitPlan}` for owners. Active only where `exit_activation_height > 0`; check that value in `NetworkParams::testnet()` before assuming withdrawals work. |
 | L2 task lifecycle / VWC / reputation | **Implemented** — driven by L2 replay; exercised by `crates/jnt-node/tests/e2e_journey.rs` |
 | Opt-in REST API | **Implemented** — `--api-listen`; loopback by default; **unauthenticated** |
 | `jnt-worker` run loop | **Implemented** — `jnt-worker run --from-file <wallet> --node <url>` drives discover → claim → execute → submit over the node's REST API, using the production `RealBls` verifier. Bounded by `--iterations`; otherwise runs until the process is terminated (no portable signal handler — the node's own `serve` loop has none either). Covered by `crates/jnt-worker/tests/cli_run.rs` and the two-process E2E test. Gates on `GET /v1/conservation` before the first pass |
-| Live conservation surface | **Implemented** — `GET /v1/conservation` reports the joint L1 + L2 − sink supply against the cap with all three check verdicts (the `jnt-node verify` arithmetic, served live); `/metrics` exports `jounit_joint_supply_sat` and `jounit_conservation_ok`; `jnt-worker run` refuses to start against a node reporting a breach or unreadable numbers (an unreachable or non-reporting node warns and continues). Covered by `crates/jnt-node/tests/conservation_api.rs` and the `cli_run.rs` gate tests |
+| Live conservation surface | **Implemented** — `GET /v1/conservation` reports the joint L1 + L2 − sink supply against the joint bound (issuance integral + escrow ceiling) with all three check verdicts (the `jnt-node verify` arithmetic, served live); `/metrics` exports `jounit_joint_supply_sat` and `jounit_conservation_ok`; `jnt-worker run` refuses to start against a node reporting a breach or unreadable numbers (an unreachable or non-reporting node warns and continues). Covered by `crates/jnt-node/tests/conservation_api.rs` and the `cli_run.rs` gate tests |
 | `/metrics` (Prometheus) | **Implemented** — `GET /metrics` serves `text/plain; version=0.0.4` gauges (height, finality, peers, base fee, supply, PSCB reserve, mempool, relay/queue depths, L2 counters). `/v1/status` JSON remains for the richer view |
 | Node config file | **NOT implemented** — the node is CLI-flags-only; no `config.toml` is read |
 
@@ -113,7 +113,7 @@ rejected as an unexpected argument.
 
 | Issue | Consequence / workaround |
 |---|---|
-| L2 → L1 exits are not implemented | Deposited L2 value cannot be withdrawn on testnet — by design, pending a decision (`docs/l2-exit-design.md`). Do not deposit value you expect back. |
+| L2 → L1 exits are activation-gated, not missing | Withdrawal works only where the profile's `exit_activation_height > 0`. Check the value in `NetworkParams::testnet()`; if it is `0`, deposited L2 value cannot be withdrawn on testnet — by configuration, not because the protocol lacks the path. |
 | M2 (Anti-Collusion slash vault) inactive | The vault exists; no rule triggers it. |
 | M4 (HBM scratchpad) not a registered `puzzle_id` | Chain security rests on the §5 double-PoW puzzle only. |
 | No stake ledger / validator rotation | The committee is fixed at genesis (Decision 8); bonding/unbonding are mainnet-gated. |
@@ -157,7 +157,8 @@ Unchanged and still unmet:
 6. Security sign-off on the attack-surface review.
 7. Community audit window opened and closed.
 
-**Mainnet remains blocked independently of these** by the L2-exit decision
-(`docs/l2-exit-design.md`), the absent stake ledger / mainnet committee
-(Decision 8, `docs/decisions.md`), and M2/M4 activation rules. See
-`docs/mainnet-readiness.md`.
+**Mainnet remains blocked independently of these** by `mainnet`'s
+`exit_activation_height` being unset (Decision 19 implemented the rule but the
+profile has chosen no height), the absent stake ledger / mainnet committee
+(Decision 8 / P2, `docs/decisions.md`), and the M2/M4 activation rules (P3/P4).
+P5 (settle-fee vs small task) is also open. See `docs/mainnet-readiness.md`.

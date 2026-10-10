@@ -15,7 +15,7 @@ documentation changes (see §13/§15); no commits were created.
 ## 2. Tests passed / failed
 
 ```
-cargo test --workspace     → 773 passed, 0 failed, 1 ignored (vwc_perf_probe), 52 test binaries
+cargo test --workspace     → 870 passed, 0 failed, 1 ignored (vwc_perf_probe)   # supersedes the 773 snapshot below
 cargo fmt --all --check    → clean
 cargo clippy --workspace --all-targets --all-features -- -D warnings → clean
 cargo build --workspace --release → succeeded
@@ -142,10 +142,12 @@ reproducible-build tooling.
 
 ## 11. Exact blockers preventing public testnet
 
-1. **L2 deposits are one-way** (P1). Testnet value is intentionally not
-   withdrawable; operators must be told not to deposit value they expect back.
-2. **No worker daemon binary** — `jnt-worker` exposes only `address`/`generate`;
-   the run loop is library + tests.
+1. ~~**L2 deposits are one-way** (P1).~~ **Resolved by Decision 19:** exits are
+   implemented (SPEC.md §19.6), so testnet value is withdrawable wherever
+   `exit_activation_height > 0`. Operators should still confirm that value before
+   assuming it.
+2. ~~**No worker daemon binary**~~ — `jnt-worker run` ships the daemon loop over
+   the node's REST API, gated on `/v1/conservation`.
 3. **API is unauthenticated** — loopback/tunnel only.
 4. **No metrics/log shipping** — monitoring is `/v1/status` polling.
 
@@ -190,11 +192,11 @@ Classification of the work:
 
 | Bucket | Contents |
 |---|---|
-| **DONE** | L1 core, P2P + tx relay, L2 (contract, 5 payloads, dispute, VWC), deposits + maturity, M5 binding finality on `testnet`, machine/agent identity + authorization, payments, receipts, reputation, bridge, MCP, worker SDK + HTTP transport, two-process E2E, chaos suite, 14 fuzz targets (executed clean), vector cross-checks, monetary reconciliation, exit **design** |
+| **DONE** | L1 core, P2P + tx relay, L2 (contract, six payloads, dispute, VWC), deposits + maturity, M5 binding finality on `testnet`, machine/agent identity + authorization, payments, receipts, reputation, bridge, MCP, worker SDK + HTTP transport + run daemon, two-process E2E, chaos suite, 14 fuzz targets (executed clean), vector cross-checks, monetary reconciliation, exit **rule (Decision 19)** |
 | **NEEDS VERIFICATION** | Multi-node sync at real testnet scale; a third-party security audit; long fuzz campaigns on the capability-bound targets |
-| **BLOCKED BY DECISION** | L2 → L1 exits (P1); stake ledger + mainnet committee (P2); M2 rule (P3); M4 registration (P4); settle-fee interaction (P5) |
-| **IMPLEMENTATION REQUIRED** | Exits, stake/bond ledger, M2/M4 rules, worker daemon verb, benchmark harnesses — all gated on the decisions above |
-| **OPERATIONAL REQUIRED** | Metrics, config file, log shipping, release pipeline, CHANGELOG, PGP key, reproducible builds |
+| **BLOCKED BY DECISION** | Stake ledger + mainnet committee (P2); M2 rule (P3); M4 registration (P4); settle-fee interaction (P5). *(P1 — the exit rule — is implemented; what remains for mainnet is the `exit_activation_height` configuration.)* |
+| **IMPLEMENTATION REQUIRED** | Stake/bond ledger, M2/M4 rules, the mainnet exit activation height, worker `queue_exit` polish, benchmark harnesses — gated on the decisions above |
+| **OPERATIONAL REQUIRED** | Metrics, config file, log shipping, release pipeline, PGP key, reproducible builds |
 
 **Bottom line: this is a defensible public-testnet candidate for the L1/L2 task
 and payment flow, and it is not mainnet-ready.** The core is implemented and

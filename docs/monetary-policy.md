@@ -123,9 +123,18 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
   read by L2 replay as a deposit, credited 1:1 after
   `finality_depth` (mini/testnet 20, mainnet 100 blocks). Sink outputs stay
   in the L1 UTXO set forever.
-- **Exits:** none exist. L2→L1 withdrawal is a recorded mainnet blocker
-  (`docs/l2-exit-design.md`; deferred by Decision 10). No exit path may mint or
-  release value until that decision is recorded.
+- **Exits (Decision 19, SPEC.md §19.6): implemented.** An `ExitQueue` L2
+  transaction debits the owner and records the exit; a block `exit_claim`
+  consumes **sink outputs** authorised by an inclusion proof against the
+  `l2_state_root` committed at the queue height — not a signature, because the
+  sink holds no key. The crank is permissionless, and the owner prepays the
+  claimant's fee at queue time so an unfunded crank cannot exist. Per exit the
+  L2 debit equals the L1 release 1:1 and the joint check of §19.4 needs **no new
+  term** (the L1 payment and the L2 debit cancel while the sink term falls by the
+  same amount) — `tests/conservation.rs` passes unchanged, which is the evidence.
+  Activation is `NetworkParams::exit_activation_height`: `mini`/`testnet` = 1,
+  `mainnet` = 0 meaning **never** until an owner picks a height. Choosing that
+  height, plus P2–P5, is the remaining mainnet work.
 
 ## Conservation laws (tested)
 

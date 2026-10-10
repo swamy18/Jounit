@@ -1,9 +1,12 @@
 # Jounit Monetary Policy — Long-Term Design and Recommendation
 
-**Status: PROPOSAL. NOT IMPLEMENTED. NOT MAINNET READY.**
-No consensus code, reward parameter, fee, genesis value, committed vector or
-protocol invariant has been changed. This document designs; a later phase
-implements, in small reviewable commits, after explicit approval.
+**Status: ANALYSIS RECORD — its proposals are now decisions and are
+implemented.** The tail (Decisions M-A…M-C) and the rate anchor (Decision 18)
+were approved on 2026-10-09 and shipped in `supply.rs`, `params.rs` and
+`chain.rs`; `tests/vectors/supply_vectors.json` was regenerated with the anchor
+fields. This document survives as the analysis, formula and sensitivity record
+behind that policy — it is no longer a proposal, and no part of it remains open.
+For the live state see `docs/monetary-policy.md` and `docs/decisions.md`.
 
 Reproduce every number with:
 
@@ -74,7 +77,7 @@ security floor*; it does not buy an inflation target.
 | `target_block_time_ms` | 600,000 (10 min) | 1,000 (1 s) | [params.rs:291](crates/jnt-core/src/params.rs#L291), [:337](crates/jnt-core/src/params.rs#L337), [:409](crates/jnt-core/src/params.rs#L409) |
 | `halving_period` | 262,800 | 2,000 | params.rs |
 | `start_reward_sat` | 76 JNT | 76 JNT | params.rs |
-| `supply_cap_sat` | **39,945,600 JNT** | **304,000 JNT** | params.rs |
+| `supply_cap_sat` | **DELETED 2026-10-09 (Decision 18)** — was 39,945,600 JNT | **DELETED** — was 304,000 JNT | gone |
 | `base_fee_initial_sat` / `min` / `max` | 1,000 / 100 / 50,000,000 | 100 / 10 / 1,000,000 | params.rs |
 | `gas_cap` | 2,000,000 | 2,000,000 | params.rs |
 | `coinbase_maturity` | 100 | 10 | params.rs |
@@ -447,8 +450,11 @@ history — rejected.
 ### 5.5 Migration / upgrade assumptions
 
 - No genesis change (still mints nothing); no new profile; no new network magic.
-- `supply_cap_sat` is retained as a **sanity ceiling only** (or removed and
-  replaced by `max_supply_sat`); it must not stay load-bearing.
+- `supply_cap_sat` was **removed** (Decision 18), and deliberately *not* replaced
+  by `max_supply_sat`: the mint bound is the per-height issuance integral
+  `cumulative_issuance_sat(height)`, and the post-ladder ceiling is the **rate
+  anchor** (≤ 1 % of the supply issued at that window's start), enforced in
+  `supply::check_mint_at_height`.
 - Committed vectors: only `supply_vectors.json` gains fields; the other four
   vector files must not move.
 - Rollback: the change is a reward-schedule rule, so reverting means reverting
@@ -551,7 +557,7 @@ the *L1 floor*, which is a deliberate anti-spam constant.
 
 | Subsystem | Interaction |
 |---|---|
-| **L2 → L1 withdrawals** | Still **undefined** (`docs/l2-exit-design.md`, P1). The sink is unspendable, so no exit can release funds without a new L1 rule. The monetary policy does not change this, and must not be used to justify a fake release path. |
+| **L2 → L1 withdrawals** | **Implemented (Decision 19, SPEC §19.6).** A claim consumes sink outputs and is authorised by an inclusion proof against the `l2_state_root` committed at the queue height — no signature, because the sink holds no key. Released by the permissionless crank. Gated by `exit_activation_height`: `mainnet` = 0 today, so mainnet exits stay closed until configured. |nds without a new L1 rule. The monetary policy does not change this, and must not be used to justify a fake release path. |
 | **Escrow settlement** | Escrow is a genesis allocation, not issuance; the new `escrow_ceiling` replaces the `cap − max_issuance` gap. L2 disputes/bounties draw from PSCB (fee-derived), untouched. |
 | **Validator staking/bonding** | **No validator issuance and no fee share** (Decision 2.3). A tail is *miner* emission. If staking is ever rewarded, that is a separate decision and would need its own funding source. |
 | **Agent spending policies** | Denominations unchanged (`SpendPolicy` limits are in sat/JNT); a tail does not alter tumbling-window semantics. |
@@ -632,13 +638,13 @@ M1 decision ──► M2 model+vectors ──► M3 consensus ──► M4 spec/
      └─► escrow_ceiling (D.2) ──► unblocks L2 escrow rules
 
 Independent workstreams (from the remaining-work audit):
-W1 L2→L1 exit        BLOCKED-BY-DECISION (P1)  ──► mainnet deposits
+W1 L2→L1 exit        IMPLEMENTED (Decision 19) — mainnet awaiting `exit_activation_height`
 W2 stake/committee   BLOCKED-BY-DECISION (P2)  ──► mainnet finality
 W3 M2 slashing       BLOCKED-BY-DECISION (P3)  ──► depends on W2
 W4 M4 registration   BLOCKED-BY-DECISION (P4)
 W5 small-task fees   BLOCKED-BY-DECISION (P5)  ──► L2 only
 W6 ops (metrics/config/release/repro/audit)    OPERATIONAL
-W7 agent payments/identity/recovery            IMPLEMENTATION REQUIRED
+W7 agent payments/identity/recovery            DONE (service/payment/receipt/reputation + jnt-mcp)
 W8 testnet + economic stress + launch          OPERATIONAL, needs W1–W6
 ```
 

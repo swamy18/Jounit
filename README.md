@@ -17,9 +17,10 @@ without weakening the security a hash chain depends on.
 > state is rebuilt from the chain (**SPEC.md §19.1**); the node replays it on
 > every accepted block (`status`/`verify` surface it). M2 funds L2 from a
 > genesis escrow (**SPEC.md §19.4**), and `verify` proves joint L1+L2 supply
-> stays under the joint bound (issuance integral + escrow ceiling). M3 adds user
-> deposits (**SPEC.md §19.5**): an ordinary L1 payment to a derived sink credits
-> the depositor after finality depth, 1:1, with no new transaction type.
+> stays under the joint bound (issuance integral + escrow ceiling). User
+> deposits (Decision 10, **SPEC.md §19.5**): an ordinary L1 payment to a derived
+> sink credits the depositor after finality depth, 1:1, with no new transaction
+> type.
 > **L2→L1 exits are implemented end to end (Decision 19, SPEC.md §19.6):**
 > `ExitQueue` on L2, a proof-authorised sink spend on L1 against the committed
 > L2 state root, a permissionless miner crank, and L2 replay absorbing the
@@ -206,15 +207,16 @@ state, and it is the remaining launch item for this feature.
 
 ### Crate layout
 
-Six crates in one workspace:
+Seven crates in one workspace:
 
 ```
 jnt-core   pure protocol library — no I/O, no clock, no network
 jnt-net    P2P wire protocol, peer state machines, sync and relay
 jnt-store  persistent storage: append-only block log + atomic metadata
-jnt-l2     Layer 2: task contracts, the six L2 transaction types (incl. ExitQueue), D3 fees, the dispute engine, VWCs, L2 to L1 exits
+jnt-l2     Layer 2: task contracts, the six L2 transaction types (incl. ExitQueue), D3 fees, the dispute engine, VWCs, L2→L1 exits
 jnt-worker worker-side SDK: discovery, claim/execute/submit, disputes, VWC observation, exits, earnings — client only, no consensus
 jnt-node   CLI and node daemon (serve, mine, status, verify)
+jnt-mcp    keyless MCP surface over agent identity, payments, receipts and reputation
 ```
 
 All consensus logic lives in `jnt-core`. The `mini` network profile is **the same
@@ -239,8 +241,8 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 | `bls.rs` | 523 | blst-backed BLS12-381: derive/sign/verify/aggregate, IETF keygen |
 | `bls_checkpoint.rs` | 561 | M5: Sovereign BLS aggregate signature checkpoint finality gadget |
 | `l2.rs` | 1 051 | L2: six transaction payload types (incl. `ExitQueue`), actor auth, signing hashes, D3 fee mapping |
-| `exit.rs` | — | L2 → L1 exit claims: proof-authorised sink spend, canonical codec, claim id, gas |
-| `supply.rs` | 335 | Halving ladder, cumulative issuance, the cap invariant |
+| `exit.rs` | 267 | L2 → L1 exit claims: proof-authorised sink spend, canonical codec, claim id, gas |
+| `supply.rs` | 680 | Halving ladder, cumulative issuance integral, rate-anchor allowance |
 | `wallet.rs` | 362 | Keys, addresses, transaction building and signing |
 | `block.rs` | 465 | Header, block, merkle root, genesis block |
 | `difficulty.rs` | 570 | LWMA retarget, median-time rule, local-clock policy |
@@ -292,7 +294,7 @@ bytes ──▶ Reader (bounds-checked) ──▶ Block/Transaction
                                             ▼
                                           apply_block ──▶ check_tx per body tx
                                             │           ──▶ split_fees
-                                            │           ──▶ reward + tip ≤ cap
+                                             │           ──▶ reward + tip ≤ block_reward(height) + tip_total
                                             ▼
                                      UTXO set + undo records
 ```
@@ -311,10 +313,11 @@ long-term AI compute infrastructure. **Only M1 is consensus-active today** —
 that is, only M1 can change whether an L1 node accepts a block. Phase 2–3 gave
 M2, M3 and M5 their first real *consumers* at Layer 2 (L2 fraud slashes vest
 through the M2 vault, L2 transactions carry M3 envelopes, L2 settlement verifies
-an M5-shaped quorum aggregate), but an L2 transaction is not yet carried in an
-L1 block, so L1 chain state is untouched. M4 still needs its rule (whether the
-HBM puzzle replaces or composes with §5). SPEC.md §14 and §16 record that
-status, and this list is repeated in `docs/status.md`.
+an M5-shaped quorum aggregate), and L2 transactions now ride inside L1 blocks
+(SPEC.md §19.1) with L2 state derived by replay from the canonical chain — no L1
+block rule changed. M4 still needs its rule (whether the HBM puzzle replaces or
+composes with §5). SPEC.md §14 and §16 record that status, and this list is
+repeated in `docs/status.md`.
 
 | # | Mechanism | Consensus-active | Module |
 |---|---|---|---|
@@ -356,7 +359,7 @@ Describes deterministic finality on top of probabilistic deepest-chain PoW:
 - **BLS12-381 Aggregate Signatures:** 96-byte aggregate signatures over 48-byte validator public keys.
 - **2/3 Supermajority Quorum:** `ceil(n × 2/3)` validator agreement with compact bitmask signers.
 - **Absolute Immutability:** once a checkpoint is accepted by `CheckpointChain`, the boundary is permanent.
-- **`BlsVerifier` is a trait and only a mock implements it** — no pairing is performed anywhere in this repository, so the finality guarantee is *not* in force. `blst` is the production path.
+- **`RealBls` (blst) performs real BLS12-381 pairing checks** and is what the node runs; `MockBls` is a structural verifier kept for CI-only unit tests. What is *not* in force is L1 consensus activation: nothing in `Chain::submit` consults a `BlsVerifier`, and binding finality runs only on the profile with a non-zero `finality_activation_height` (today `testnet`).
 
 ---
 
@@ -668,14 +671,14 @@ COMMON OPTIONS
 ## Testing and verification
 
 ```sh
-cargo test --workspace                                   # 870 tests across six crates, 0 failures
+cargo test --workspace                                   # 870 tests across the workspace, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings    # 0 warnings
 cargo fmt --all --check
 ```
 
 ### Consensus vectors
 
-`tests/vectors/` holds four files. A language implementation is correct only if
+`tests/vectors/` holds five files. A language implementation is correct only if
 it reproduces them byte for byte.
 
 | File | Covers |
@@ -683,7 +686,8 @@ it reproduces them byte for byte.
 | `puzzle_vectors.json` | Header serialization, stage 1 seed, stage 2 activation digest, stage 3 final, work-share accounting |
 | `ser_vectors.json` | Input, output, transaction and header byte layouts |
 | `difficulty_vectors.json` | LWMA output, timestamp clamp behaviour |
-| `supply_vectors.json` | Reward ladder, cumulative supply, cap invariant |
+| `net_vectors.json` | Frame envelope, every `msg_type` payload, `VERSION` layout, locator construction (§13.12) |
+| `supply_vectors.json` | Reward ladder, cumulative issuance, rate-anchor allowance |
 
 ```sh
 python sim/verify_vectors.py --check    # present, self-consistent, cross-checked
@@ -719,10 +723,12 @@ merely self-consistent with the code implementing it.
 
 ### Monetary and supply analysis
 
-`sim/tail_emission_sim.py` models the shipped fixed-cap schedule against four
-long-term issuance candidates, per network profile, and is the evidence behind
-[docs/monetary-redesign.md](docs/monetary-redesign.md). That document is a
-**proposal**; the simulation is analysis only and has no consensus effect.
+`sim/tail_emission_sim.py` models the shipped schedule — the whole-JNT ladder,
+the approved M-A…M-C tail and the rate anchor — against four long-term issuance
+candidates, per network profile, and is the evidence behind
+[docs/monetary-redesign.md](docs/monetary-redesign.md). The tail that document
+proposed is now approved and implemented (M-A…M-C); the simulation itself is
+analysis only and has no consensus effect.
 
 ```sh
 python sim/tail_emission_sim.py             # comparative issuance / burn tables
@@ -812,10 +818,13 @@ declared difficulty of everything stored. An attacker could bank chain weight no
 reorganization could realize: fork choice kept picking the dead branch and
 rejected honest blocks.
 
-**The chain halted permanently once the reward ladder ran out.** A zero-value
-coinbase was rejected unconditionally, but `SPEC.md` §7 says the coinbase collects
-tips only and tips are legitimately zero on an empty block. Mainnet would have
-stopped dead at height 2 102 400.
+**The chain halted once the reward ladder ran out.** A zero-value coinbase was
+rejected unconditionally, but `SPEC.md` §7 says the coinbase collects tips only
+and tips are legitimately zero on an empty block. Under the pre-tail ladder
+mainnet would have stopped dead once the last non-zero rung ended at height
+1 839 600; with the approved tail (§7) issuance continues to the permanent
+0.1 JNT floor at height 2 628 000, so a zero-reward block is no longer reachable
+on mainnet.
 
 **`apply_block` was not atomic.** It wrote to the UTXO set transaction by
 transaction, so a failure partway through left earlier ones applied. Writes are
@@ -899,12 +908,13 @@ remote.** Cosmetic, but it is the first thing `cargo publish` would use.
 **Vector coverage is finite by construction.** The crosscheck exercises seven
 header/epoch combinations; a bug outside those cases would not be caught by it.
 
-**`SPEC.md` documents a domain tag the code does not implement.** The tag table
-in §0 lists ten, including `DOM_GENESIS` (`jounit/genesis/v1`). Only nine exist:
-the genesis block is hashed through the ordinary `DOM_BLOCK` path. Harmless
-today — nothing depends on genesis having its own tag — but the spec and the
-implementation disagree, and the spec is the document this project treats as
-normative.
+**`SPEC.md` documents domain tags the code does not implement.** The tag table
+in §0 lists eleven; only nine exist in code. `DOM_GENESIS` is missing (the
+genesis block is hashed through the ordinary `DOM_BLOCK` path), and so is
+`DOM_NET_HANDSHAKE`, which §13.2 says backs a handshake challenge while §13.4
+defines none — the handshake is a nonce echo with no hash. Harmless today, but
+the spec and the implementation disagree, and the spec is the document this
+project treats as normative.
 
 **The long-run supply path is settled, and supply can fall under ordinary
 usage — the consequences are measured, not fixed.** Decision 18 removed the stock

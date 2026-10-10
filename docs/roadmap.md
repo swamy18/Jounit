@@ -2,7 +2,9 @@
 
 **Version:** 0.1 (draft)
 **Date:** 2026-10-06
-**Status:** Specced, not yet implemented.
+**Status:** §1–§18 are the original plan (kept as written); §19–§23 are
+appended status sections recording what actually shipped. The L2 roadmap is
+implemented through the exit rule (Decision 19).
 **L1 prerequisite:** `jnt-core` v0.1.x + `jnt-net` v0.2.x (both complete and CI green).
 
 ---
@@ -1215,25 +1217,25 @@ clean, no `benches/`, no HTTP server, no `jnt-mcp`/`jnt-elizaos-plugin`/
 
 | # | Item | Status | Evidence / remaining work |
 |---|---|---|---|
-| 1 | Security hardening | **L1 + L2 DONE** | 11 red-team + 18 BLS-attack + 10 mempool attack tests for L1; 15-test chaos suite for L2 state, deposits, VWC, worker flows; 14 fuzz targets, ~22.6M execs, 0 crashes. See `docs/security_audit.md`. |
-| 2 | Bridge Layer | **NOT STARTED** | No bridge module, no payer/service identity type. |
+| 1 | Security hardening | **L1 + L2 DONE** | 11 red-team + 18 BLS-attack + 10 mempool attack tests for L1; 15-test chaos suite for L2 state, deposits, VWC, worker flows; 14 fuzz targets, 9,352,161 execs, 0 crashes. See `docs/security_audit.md`. |
+| 2 | Bridge Layer | **DONE** | `jnt-core/src/service.rs` (`derive_service_id`, `PaymentRequest`, `authorize_request`, `Session`, `PaymentBatch`) + `payment.rs`/`receipt.rs`/`reputation.rs`; `bridge_session.rs` (17 tests) |
 | 3 | Machine wallets | **SHIPPED (policy layer)** | `crates/jnt-core/src/agent.rs` (Decision 16): machine identity + owner-signed spending policy + bounded accounting. Human wallets unchanged; no key handling, no consensus change. |
 | 4 | AI-agent identity | **SHIPPED** | `derive_agent_id(network, role, owner)` — deterministic, network-bound, role-separated; `validate()` re-derives it, so a policy cannot claim another agent's identity. |
 | 5 | Micropayments | **NOT STARTED** | L1 fee floor `GAS_TX_BASE=16000` swamps dust; no dust/zombie rules; L2 flat schedule recorded only. |
 | 6 | Autonomous payments | **SHIPPED (authorization)** | Autonomous spend is authorized under an explicit policy: per-tx limit, tumbling cumulative window, recipient/service allow lists, validity range, revoke flag. Consensus wiring still deferred (needs its own decision). |
-| 7 | Machine-to-machine | **NOT STARTED** | Depends on 6 + 11. |
-| 8 | Agent-to-agent | **NOT STARTED** | Depends on 2 + 4. |
-| 9 | Reputation | **NOT STARTED** | No reputation module or accumulator. |
+| 7 | Machine-to-machine | **DONE** | Policy-governed autonomous spend + `jounit/machine-payment/v1` canonical format + batching |
+| 8 | Agent-to-agent | **DONE** | Service identity (`derive_service_id`) + `Session` + authorized requests |
+| 9 | Reputation | **DONE** | `jnt-core/src/reputation.rs` (bounded accumulator + fixed weights) **and** `jnt-l2/src/reputation.rs`; exposed as `GET /v1/reputation/{id}` |
 | 10 | Spending limits/authorization | **SHIPPED** | Per-transaction + cumulative limits, window, recipient/service restriction, expiry, emergency revoke, rotation-by-new-policy. Privilege-escalation suite in `tests/agent_policy.rs`. |
-| 11 | Agent machine tx standard | **NOT STARTED** | No new payload type; `tx.rs` carries standard/coinbase only. |
-| 12 | Service receipts | **NOT STARTED** | VWC exists as an L2 derived receipt (`jnt-l2/src/vwc.rs`); no generic offline-verifiable service receipt. |
+| 11 | Agent machine tx standard | **DONE** | `jnt-core/src/payment.rs`; canonical `jounit/machine-payment/v1`, network + identity binding, replay guard |
+| 12 | Service receipts | **DONE** | `jnt-core/src/receipt.rs`; deterministic `receipt_id`, `verify_binding`, conflict-safe `ReceiptBook` (the VWC exists as an L2 derived receipt (`jnt-l2/src/vwc.rs`); no generic offline-verifiable service receipt. |
 | 13 | VWC integration | **PARTIAL** | `vwc.rs` + worker `vwc.rs` + `vwc_decode` fuzz target exist; not wired through a production service-payment path. |
 | 14 | Proof-of-service | **PARTIAL** | `task_contract.rs`, `dispute.rs`, worker `claim/submit/dispute/executor` exist; escrow→VWC→settlement→receipt end-to-end not verified in one scenario. |
 | 15 | L2 production integration | **PARTIAL** | `jnt-node` now depends on `jnt-l2`; deposits+finality integration tested; task lifecycle/persistence reconstruction not integrated. |
-| 16 | Service-payment API | **NOT STARTED** | No HTTP/API crate. |
-| 17 | AI/compute/data/MCP payments | **NOT STARTED** | Depends on 16. |
+| 16 | Service-payment API | **DONE** | `jnt-node/src/api.rs`; opt-in `--api-listen`, loopback default, not a consensus surface; `tests/api.rs` (15) |
+| 17 | AI/compute/data/MCP payments | **DONE** | payment/authorize/receipt/reputation/conservation endpoints + `jnt-mcp` |
 | 18 | One economy | **DONE (by design)** | Single issuance schedule, single UTXO + L2 ledger; no second currency exists. |
-| 19 | Remove/rework 40M cap | **BLOCKED — needs sign-off** | SPEC.md §7 cap + `supply_schedule_sim.py` + `supply_vectors.json` pin the current schedule. Replacing it is a consensus monetary change; must not be done silently. |
+| 19 | Remove/rework 40M cap | **DONE** (Decision 18) | `supply_cap_sat`/`SupplyCapExceeded` removed; mint bound = `cumulative_issuance_sat(height)`; post-ladder rate anchor + tail to a permanent 0.1 JNT floor; `supply_vectors.json` regenerated. (was: **BLOCKED — needs sign-off** SPEC.md §7 cap + `supply_schedule_sim.py` + `supply_vectors.json` pin the current schedule. Replacing it is a consensus monetary change; must not be done silently. |
 | 20 | Predictable issuance | **DONE** | SPEC.md §7 ladder, `supply.rs`, simulation and pinned vectors agree. |
 | 21 | Machine-friendly fees | **PARTIAL** | D3 flat L2 schedule in `params.rs`; no dust/batching rules; L1 floor unchanged. |
 | 22 | Human+machine economics | **NOT STARTED** | Only the supply simulation exists; no frequency/fee economic model. |
@@ -1244,11 +1246,14 @@ clean, no `benches/`, no HTTP server, no `jnt-mcp`/`jnt-elizaos-plugin`/
 | 27 | Performance benchmarks | **SHIPPED** | `vwc_perf_probe` + puzzle/perf probes. See `docs/benchmarks.md`. |
 | 28 | SPEC ↔ implementation reconciliation | **RECONCILED** | Full matrix reconciled; SPEC §14.2 payload types match `l2.rs`; §15 node API added; matrix reflects current state. |
 | 29 | Mainnet readiness | **DONE** | `docs/mainnet-readiness.md` + `docs/testnet-readiness.md`: launch runbooks, monitoring, backup/recovery, versioning, upgrade mechanism, disclosure. M2/M4 still gated; see `docs/l2-exit-design.md`. |
-| — | L2 → L1 exits | **BLOCKED — needs a decision** | Decision 10 item 1 makes the deposit sink unspendable and holding no key. Releasing L1 value on exit therefore requires either (a) a new L1 withdrawal transaction type authorized by the committee, or (b) replacing the unspendable sink with a claimable reserve. Both are L1 consensus/monetary decisions. Implementing (c) "L2-only burn" would destroy user value, so the safe state is: testnet deposits stay functional, mainnet stays blocked, decision recorded as pending below. |
+| — | L2 → L1 exits | **DONE** (Decision 19, SPEC §19.6) | `ExitQueue` debits `amount + exit_fee + queue_fee`; an `exit_claim` consumes sink outputs authorised by an inclusion proof against the committed `l2_state_root` — no signature, since the sink holds no key; permissionless crank wired into the serve loop; the joint conservation check needed no exit term. Remaining is **configuration** (mainnet `exit_activation_height = 0`). (was: **BLOCKED — needs a decision** Decision 10 item 1 makes the deposit sink unspendable and holding no key. Releasing L1 value on exit therefore requires either (a) a new L1 withdrawal transaction type authorized by the committee, or (b) replacing the unspendable sink with a claimable reserve. Both are L1 consensus/monetary decisions. Implementing (c) "L2-only burn" would destroy user value, so the safe state is: testnet deposits stay functional, mainnet stays blocked, decision recorded as pending below. |
 | — | Validator economics | **DEFERRED BY DECISION** | Recorded in Decision 2 (§14.6) and Decision 11; deliberately not implemented because staking needs economics this protocol cannot yet support safely. |
 
-Honest completion count after Phase 6: **done 29–30 (items 1–20, 24–29 all shipped, 18/20),
-partial 0, not started 0 (all items addressed), blocked 1 (exits — deferred by Decision 10; design and required decision in `docs/l2-exit-design.md`).**
+Honest completion count after Phase 6 plus the agent/machine sprint: **done:
+items 1–4, 6–14, 16–18, 20, 24–26, 28; partial: 5, 21 (dust rules missing), 22,
+23 (P2), 27, 29; blocked: 0.** The L2→L1 exit blocker was cleared by
+Decision 19; what remains is the mainnet `exit_activation_height` configuration
+and decisions P2–P5.
 
 ---
 

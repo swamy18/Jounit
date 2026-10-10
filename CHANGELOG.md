@@ -8,7 +8,7 @@ Versions follow the workspace `version` in `Cargo.toml`.
 > **Status:** Jounit is an unreleased development snapshot. There are **no git
 > tags and no published release artifacts**. `0.1.0` below describes the state
 > of `main` at the date shown; it is a development snapshot, not a release.
-> Nothing here should be read as a mainnet-readiness claim â€” see
+> Nothing here should be read as a mainnet-readiness claim — see
 > [docs/final-report.md](docs/final-report.md) and
 > [docs/mainnet-readiness.md](docs/mainnet-readiness.md).
 
@@ -64,12 +64,12 @@ Versions follow the workspace `version` in `Cargo.toml`.
   and a claim. Migrated the tests that mined rootless L2 blocks; the
   undefined-type boundary moved from `0x15` to `0x16`.
 
-### Changed (consensus â€” Decision 18, owner-approved 2026-10-09)
+### Changed (consensus — Decision 18, owner-approved 2026-10-09)
 
 - **The stock supply cap is gone.** `NetworkParams::supply_cap_sat` is deleted
   (all profiles) and the deprecated `Error::SupplyCapExceeded` variant is
   removed. The mint bound is the issuance integral alone; the replacement
-  ceiling is the **rate anchor** â€” gross issuance in any post-ladder halving
+  ceiling is the **rate anchor** — gross issuance in any post-ladder halving
   period may not exceed 1 % of the supply issued at that window's start
   (`supply::check_mint_at_height`, ladder era grandfathered). The approved tail
   sits ~3Ã— under it. `tests/vectors/supply_vectors.json` is regenerated with
@@ -89,21 +89,22 @@ Versions follow the workspace `version` in `Cargo.toml`.
   mempool size, L1 relay queue depth, L2
   include queue depth, and L2 height/applied/skipped/pending-deposit gauges.
   Gauges only, one static `network` label, no key material or per-user data.
-- `docs/decisions.md`: a *Pending monetary decisions* section (M-A â€¦ M-G) that
-  reduces `docs/monetary-redesign.md` to a sign-off surface, so the
-  unapproved monetary parameters are visible next to the P1â€“P6 protocol
-  blockers instead of buried in a 43 KB proposal.
-- This changelog.
+- `docs/decisions.md`: a *Pending monetary decisions* section (M-A … M-G) that
+- `docs/decisions.md`: a *Monetary decisions* section (M-A…M-C — the tail
+  decisions), which reduces `docs/monetary-redesign.md` to an analysis surface,
+  so the monetary parameters sit next to the P2–P5 protocol blockers instead
+  of being buried in a long proposal.
 
 ### Notes
 
-- The Unreleased work above this entry was observability and documentation
-  only (no consensus change). The Decision-18 `### Changed` section above it
-  is the first consensus change since 0.1.0: it deletes a parameter and an
-  error variant, loosens the mint bound (integral only), and adds the rate
-  anchor â€” every historical block still validates identically.
+- The observability and documentation entries above are the only non-consensus
+  work in this Unreleased block. The Decision-19 `### Added`/`### Changed`
+  sections are the **first** consensus change since 0.1.0 — a new L2 transaction
+  type, L1 `exit_claims`, and the `exit_activation_height` gate. The Decision-18
+  `### Changed` section that follows is the **second**; like it, every historical
+  block still validates identically.
 
-## [0.1.0] â€” 2026-10-09
+## [0.1.0] — 2026-10-09
 
 Development snapshot. The full build order, with the commit that landed each
 step, is recoverable from `git log`; the summary below groups it by area.
@@ -121,9 +122,9 @@ step, is recoverable from `git log`; the summary below groups it by area.
 - **P2P** (`jnt-net`): TCP framing, magic/network-id handshake isolation,
   block and transaction relay, locator-based sync, and a bounded orphan pool.
 - **L2** (`jnt-l2`): task contracts with a five-state machine, five L2
-  transaction types, the D3 flat fee schedule, dispute arbitration, and
-  Verified Work Certificates.
-- **L2 settlement on L1**: L2 transactions ride inside L1 blocks and L2 state
+- **L2** (`jnt-l2`): task contracts with a five-state machine, six L2
+  transaction types (`ExitQueue` added by Decision 19), the D3 flat fee
+  schedule, dispute arbitration, and Verified Work Certificates.
   is derived by replay from canonical blocks alone; genesis-funded protocol
   escrow; user deposits via a burn-to-sink overlay.
 - **Finality (M5)**: BLS12-381 aggregate checkpoint gadget with a real `blst`
@@ -135,7 +136,7 @@ step, is recoverable from `git log`; the summary below groups it by area.
 - **Worker SDK** (`jnt-worker`): claim/submit/dispute/VWC client flows over
   injected seams, and an HTTP transport over the node's REST API.
 - **Service API** (`jnt-node`): opt-in (`--api-listen`), loopback by default,
-  read/write view only â€” never a consensus surface, and never a signing
+  read/write view only — never a consensus surface, and never a signing
   surface.
 - **Verification harness**: 14 `cargo-fuzz` targets, independent Python
   cross-checks of the supply schedule, difficulty retarget, puzzle and wire
@@ -143,7 +144,7 @@ step, is recoverable from `git log`; the summary below groups it by area.
 
 ### Security
 
-- 50/50 anti-collusion slash vault (M2) â€” **inert**: no rule triggers it, by
+- 50/50 anti-collusion slash vault (M2) — **inert**: no rule triggers it, by
   decision.
 - Red-team regression suite pinning fork-choice determinism, finality,
   apply/rollback atomicity, and input-count bounds.
@@ -152,19 +153,18 @@ step, is recoverable from `git log`; the summary below groups it by area.
 
 Recorded as blockers, not oversights, in [docs/decisions.md](docs/decisions.md):
 
-- **P1** â€” L2 â†’ L1 exits are undefined. The deposit sink holds no key, so an
-  exit needs a new L1 consensus rule. Deposits are one-way until then.
-- **P2** â€” no stake/bond ledger and no mainnet validator committee
+- ~~**P1** — L2 → L1 exits are undefined.~~ **Resolved by Decision 19 (see
+- **P2** — no stake/bond ledger and no mainnet validator committee
   (`mainnet` `genesis_validators` is empty, so binding finality fails closed).
-- **P3** â€” the M2 activation rule (what proves a compute result fraudulent) is
+- **P3** — the M2 activation rule (what proves a compute result fraudulent) is
   unspecified, so the slash vault stays inert.
-- **P4** â€” the HBM scratchpad puzzle is not a registered `puzzle_id`; chain
+- **P4** — the HBM scratchpad puzzle is not a registered `puzzle_id`; chain
   security rests on the base puzzle only.
-- **P5** â€” a task whose escrow is below the 20,000-sat settle fee fails closed
+- **P5** — a task whose escrow is below the 20,000-sat settle fee fails closed
   (`AmountTooSmallForFee`).
-- Monetary parameters beyond the frozen schedule (tail emission, tail floor,
-  per-network tail, `supply_cap_sat` fate, `escrow_ceiling`, the fee-burn
-  design) are **unapproved** â€” see *Pending monetary decisions* in
-  [docs/decisions.md](docs/decisions.md).
+- ~~Monetary parameters beyond the frozen schedule … are **unapproved**.~~
+  **Resolved (Decision 18, M-A…M-C, Decision M-E): the tail is approved and
+  implemented, `supply_cap_sat` is deleted, and the escrow ceiling is fixed and
+  validated by `NetworkParams::validate`.** No monetary parameter remains open.
 
 [Unreleased]: https://github.com/swamy18/Jounit/commits/main
