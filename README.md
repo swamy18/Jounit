@@ -3,35 +3,36 @@
 An AI-native cryptocurrency: mining that pulls compute onto GPU and AI hardware
 without weakening the security a hash chain depends on.
 
-> **Status: Layer 1 base layer + P2P networking + Layer 2 core implemented,
-> including the L2↔L1 exit loop.** The core protocol includes hybrid hash +
-> neural PoW, 5 protocol mechanisms (PSCB fee split, Time-Locked slash reserve,
-> canonical compute IR, HBM scratchpad PoW, and BLS finality gadget), `jnt-net`
-> block relay and sync, and a working Layer 2 (`jnt-l2`): task contracts, the six
-> L2 transaction types (incl. `ExitQueue`), D3 fees, a complete dispute engine
-> with M2 slashing and M1 PSCB accounting, and Verified Work Certificates for
-> settled work. The worker SDK (`jnt-worker`, Phase 6): a task-economy client for
-> humans, AI agents and machines — discover, claim, execute, submit, dispute
-> participation, certificate observation, queue an **L2→L1 exit**, and earnings
-> derived from protocol state. L2 transactions ride inside L1 blocks and L2
-> state is rebuilt from the chain (**SPEC.md §19.1**); the node replays it on
-> every accepted block (`status`/`verify` surface it). M2 funds L2 from a
-> genesis escrow (**SPEC.md §19.4**), and `verify` proves joint L1+L2 supply
-> stays under the joint bound (issuance integral + escrow ceiling). User
-> deposits (Decision 10, **SPEC.md §19.5**): an ordinary L1 payment to a derived
-> sink credits the depositor after finality depth, 1:1, with no new transaction
-> type.
-> **L2→L1 exits are implemented end to end (Decision 19, SPEC.md §19.6):**
-> `ExitQueue` on L2, a proof-authorised sink spend on L1 against the committed
-> L2 state root, a permissionless miner crank, and L2 replay absorbing the
-> release. What remains before mainnet is **configuration, not protocol**: the
-> profile's `exit_activation_height`, and the still-open P2–P5 decisions
-> (validator bonded stake, M2 activation, M4 registration, settle-fee floor).
-> The genesis validator committee and binding finality are likewise ahead.
-> Monetary policy is settled: the approved tail (M-A…M-C) pays issuance forever,
-> the stock cap is gone — replaced by the rate anchor (Decision 18, ≤ 1 % of
-> issued per halving period) — and the surfaces report net supply (issuance
-> minus burns). See [Supply](#supply). Read [Status](#status).
+> **Status: Layer 1 + P2P networking + Layer 2 core + bonded-stake validator
+> machinery implemented, and the four protocol blockers (P2–P5) are closed by
+> Decisions 20–23.** The core protocol includes hybrid hash + neural PoW, five
+> protocol mechanisms (PSCB fee split, anti-collusion slash vault, canonical
+> compute IR, HBM scratchpad PoW, BLS finality), `jnt-net` block and transaction
+> relay, and a working Layer 2 (`jnt-l2`): task contracts, six L2 transaction
+> types (incl. `ExitQueue`), D3 fees, a complete dispute engine with M2 slashing
+> and PSCB accounting, and Verified Work Certificates. The worker SDK
+> (`jnt-worker`) covers discovery, claim/execute/submit, dispute participation,
+> certificate observation and L2→L1 exits. L2 state is rebuilt from the chain by
+> replay (**SPEC.md §19.1**), and `verify` proves joint L1+L2 supply stays under
+> the joint bound.
+>
+> **P2–P5 are closed, not merely described:** bonded stake with a bond ledger and
+> ledger-derived committee (Decision 20), the canonical CPU reference that decides
+> fraud (Decision 21), the proportional settle fee (Decision 23), and the
+> HBM puzzle deliberately left unregistered (see [Protocol
+> mechanisms](#protocol-mechanisms-m1m5)). Checkpoint **signing** now exists —
+> `jnt-node validator add` and the serve loop — so M5's producer side is no longer
+> missing. Exits are implemented end to end and reachable by anyone, not just a
+> node's own miner (`GET /v1/exit/crankable`).
+>
+> What remains before mainnet is **not protocol**: choosing
+> `mainnet.exit_activation_height` and `finality_activation_height`, a real bonded
+> committee operated by independent validators, an independent security review,
+> and the operational surface (bootnodes, log shipping, a published PGP key).
+> `docs/mainnet-readiness.md` records each one with its reason. Monetary policy
+> is settled: the approved tail (M-A…M-C) pays issuance forever, the stock cap is
+> gone — replaced by the rate anchor (Decision 18, ≤ 1 % of issued per halving
+> period) — and the surfaces report net supply. Read [Status](#status).
 
 ---
 
@@ -56,6 +57,7 @@ without weakening the security a hash chain depends on.
 - [Network profiles](#network-profiles)
 - [Deposits and exits](#deposits-and-exits)
 - [Node CLI reference](#node-cli-reference)
+- [Validators and checkpoints](#validators-and-checkpoints)
 - [Testing and verification](#testing-and-verification)
 - [Security: defects found and fixed](#security-defects-found-and-fixed)
 - [Known limitations](#known-limitations)
@@ -65,13 +67,16 @@ without weakening the security a hash chain depends on.
 
 ## Status
 
-**Built:** a complete, tested, specification-first L1 core and P2P networking layer:
+**Built:** a complete, tested, specification-first L1 core, P2P networking layer,
+Layer 2, and the bonded-stake machinery:
 - **L1 Core (`jnt-core`)**: Hybrid hash + neural proof of work, UTXO ledger with undo, LWMA difficulty adjustment, EIP-1559 base fee with 50/50 PSCB split, rate-anchored halving supply schedule (no stock cap), and deepest-chain fork choice.
-- **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), hardware-agnostic canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a sovereign BLS aggregate finality gadget (M5). See the M1–M5 table in [Protocol mechanisms](#protocol-mechanisms-m1m5) for what each one does and does not yet affect.
-- **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, and bounded orphan pool.
-- **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon.
-- **Layer 2 (`jnt-l2`)**: Task contracts over the six L2 transaction types (incl. `ExitQueue`), D3 fees split 50/50 burn/PSCB (flat per type; settle is 0.1% of task value, min 1,000 sat), escrow accounting, replay protection, a complete **dispute engine** (evidence validation, the M3 CPU-reference arbitration rule per SPEC.md §16, M2 slashing, PSCB whistleblower bounty), and **Verified Work Certificates** (SPEC.md §17): every correctly settled task issues a deterministic, id-derived receipt — `Quorum`-verified for an explicit settle, `WindowElapsed` for an implicit one — with tamper-evident validation against the on-chain registry.
-- **Machine/agent layer (`jnt-core`, policy only — no consensus change)**: deterministic agent identity, owner-signed spending policies with offline authorization, the canonical machine-payment format, service receipts, a reputation ledger, the service/payment bridge with settlement batching, a keyless MCP surface (`jnt-mcp`), and **streaming micro-payments** (`stream.rs`): pay-as-you-use at a fixed rate per block under a hard cap, settled by payer-signed receipts.
+- **5 Protocol Mechanisms (M1–M5)**: 50/50 fee split (M1 — the only consensus-active one), 50% anti-collusion slash vault + 1-year time-locked compute reserve (M2), canonical compute IR (M3), memory-bound HBM scratchpad PoW (M4), and a BLS aggregate finality gadget (M5) whose **signing** side now exists too. See the M1–M5 table in [Protocol mechanisms](#protocol-mechanisms-m1m5) for what each one does and does not yet affect.
+- **Bonded stake (`bond.rs`, Decision 20)**: `TX_BOND`/`TX_UNBOND`/`TX_SLASH`, a bond ledger with a bond-order index, pure validators shared by block application and mempool admission, a committee of the first 21 bonds by bond order, per-block undo that survives reorg, and finality keys that follow the ledger (genesis keys as the bootstrap list). Minimum stake is the immutable constant `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, never a tunable parameter.
+- **Checkpoint signing (`signing.rs`)**: `jnt-node validator add|list` manages keys in `<data-dir>/validators/`, one JSON file per validator, mode 0600 on unix, separate from `wallets.json` by design. The serve loop signs a checkpoint at each epoch boundary for a block it holds as its own canonical tip and broadcasts it; `jnt-net` relays it to every peer and refuses to propagate one that failed verification. Node keys and spending keys are deliberately distinct types.
+- **P2P Networking (`jnt-net`)**: TCP framing, handshake isolation, peer lifecycle, locator-based sync, bounded orphan pool, block and transaction relay, and checkpoint-certificate relay.
+- **Node Server (`jnt-node serve`)**: Multi-peer P2P node daemon that mines, settles matured exits, and — with validator keys configured — signs and broadcasts checkpoints.
+- **Layer 2 (`jnt-l2`)**: Task contracts over the six L2 transaction types (incl. `ExitQueue`), D3 fees split 50/50 burn/PSCB (flat per type; settle is 0.1% of task value, min 1 000 sat), escrow accounting, replay protection, a complete **dispute engine** (evidence validation, the M3 CPU-reference arbitration rule per SPEC.md §16, M2 slashing, PSCB whistleblower bounty), and **Verified Work Certificates** (SPEC.md §17). A certificate's verification kind is load-bearing: `Quorum` carries a real BLS aggregate a third party can check offline, while `WindowElapsed` is a receipt for an *uncontested* settlement and is refused by `validate_verified` — see [Known limitations](#known-limitations) for why that distinction cannot be removed.
+- **Machine/agent layer (`jnt-core`, policy only — no consensus change)**: deterministic agent identity, owner-signed spending policies with offline authorization, the canonical machine-payment format, service receipts, a reputation ledger, the service/payment bridge with settlement batching, a keyless MCP surface (`jnt-mcp`), and **streaming micro-payments** (`stream.rs`).
 
 **Roadmap / Future Work:**
 
@@ -81,7 +86,11 @@ without weakening the security a hash chain depends on.
 | Worker SDK | Shipped (Phase 6): [`crates/jnt-worker`](crates/jnt-worker) — a worker-side SDK over two injected node seams (`L2NodeView`/`L2Broadcaster`; no wire protocol invented). `WorkerClient` covers discovery, claim, a pluggable `Executor` (§16 CPU-reference shipped), result submission with M3 attestations, dispute observation/participation, VWC observation+validation, **queueing an L2→L1 exit**, and earnings derived from authoritative state.
 Idempotent-by-txid restart/timeout flows; 43 SDK tests including a 15-test
 privilege-escalation/secret-hygiene suite. The transport that implements the seams ships in Phase 6 (`HttpNode` over the node's opt-in REST API), together with the `jnt-worker run` daemon loop — which gates on the node's live conservation report (`GET /v1/conservation`) before its first pass and refuses a node whose joint L1 + L2 − sink supply is over the joint bound or whose numbers do not re-add. |
-| L2 → L1 exits (Decision 19) | **Shipped (SPEC.md §19.6).** `ExitQueue` on L2, and a proof-authorised sink spend on L1 against the `l2_state_root` committed at the queue block — no signature, because the sink holds no key. The **permissionless crank** is wired into the serve loop, the owner's prepaid `exit_fee_sat` is what makes it griefing-bounded, and `ChainL2` replays a release the way it replays a deposit. Exact funding only: an exit whose sink funding does not sum to its obligation stays queued rather than paying out of a stranger's deposit. The joint conservation check needed **no** exit term — the L1 payment and the L2 debit cancel — so `tests/conservation.rs` passes untouched. Remaining is **configuration** (the profile's `exit_activation_height`), not protocol. |
+| L2 → L1 exits (Decision 19) | **Shipped (SPEC.md §19.6).** `ExitQueue` on L2, and a proof-authorised sink spend on L1 against the `l2_state_root` committed at the queue block — no signature, because the sink holds no key. The **permissionless crank** is wired into the serve loop, the owner's prepaid `exit_fee_sat` is what makes it griefing-bounded, and `ChainL2` replays a release the way it replays a deposit. Exact funding only: an exit whose sink funding does not sum to its obligation stays queued rather than paying out of a stranger's deposit. The relief valve is `GET /v1/exit/crankable`, which hands the settled-able claims to any third party — the consensus rule was always permissionless, but until now only a node's own miner could obtain a claim to build a block with. |
+| Bonded validator stake (Decision 20, was P2) | **Shipped (`bond.rs`, `signing.rs`).** Three L1 transaction types (`TX_BOND`/`TX_UNBOND`/`TX_SLASH`), a bond ledger with a bond-order index, a committee of the first 21 bonds, per-block undo for reorgs, and finality keys derived from the ledger rather than declared. Mempool and block building both validate on a shared pure validator, and a stalled stake transaction is skipped rather than wedging the miner. `crates/jnt-core/tests/bond_stake.rs` (15 tests) and `bond_restart.rs` (proving a restart rebuilds the ledger from stored blocks). |
+| Canonical CPU reference (Decision 21, was P3) | **Shipped (`compute_ir.rs`, `dispute.rs`).** `reference_result_hash` is the single definition worker, challenger and arbitrator all derive from the same task fields; `DisputeEngine::resolve` computes it from the disputed contract rather than accepting a caller-supplied hash, so no caller can dictate a verdict. The M2 fraud-slash path is complete. What remains is *transport* — nothing signs or relays a verdict yet, because that needs a key-custody decision. |
+| HBM scratchpad puzzle (Decision 22, was P4) | **Deliberately not activated.** `hbm_pow.rs` implements the memory-hard permutation, its parameter scaling and nine tests, and it is **not** registered as a `puzzle_id`. Registering it would change the consensus puzzle without an independent security review of the memory parameters, so base PoW (`puzzle_id = 1`) remains the active mechanism. This is a decision, not an omission. |
+| Proportional settle fee (Decision 23, was P5) | **Shipped (`l2.rs`).** `settle_fee_sat` is 0.1 % of task value with a 1 000-sat floor, computed from the escrow at settlement, so dust tasks settle instead of failing closed. |
 | Streaming micro-payments | **Shipped (policy layer, no consensus change).** `crates/jnt-core/src/stream.rs` + `crates/jnt-core/tests/payment_stream.rs` (16 attack-first tests): a payer-signed `PaymentStream` (rate per block, window, hard cap), payer-signed `StreamSettlement` receipts, and a fail-closed `StreamBook` (exact-amount, ordered, non-future settlement). Settlement rides the ordinary payment path with `reference` = the stream id. |
 | Persisted UTXO indexing | Currently replays from genesis or fast-bootstraps via local state. |
 | Coverage-guided fuzzing | Shipped: fourteen cargo-fuzz targets (L1 wire/tx/block/mempool/storage/checkpoint + L2 codec/M3 readers/dispute/state/VWC + Phase-5 `worker_flows`), with deterministic `fuzz_invariants` suites on every `cargo test` and a CI fuzz-smoke job. |
@@ -122,7 +131,7 @@ epoch starts.
 ## Quick start
 
 Requires **Rust 1.75+** (`rust-version` in `Cargo.toml`; developed and tested
-against 1.95) and **Python 3.11+** for the simulations.
+against 1.99) and **Python 3.11+** for the simulations.
 
 ```sh
 git clone https://github.com/swamy18/Jounit.git
@@ -132,21 +141,25 @@ cargo build --release
 
 ```sh
 # Create a chain directory and a miner wallet.
-./target/release/jnt-node init --network mini --data-dir ./chain
+./target/release/jnt-node init --network testnet --data-dir ./chain
 
 # Mine, spend, and verify.
-./target/release/jnt-node mine   --network mini --data-dir ./chain --blocks 30
-./target/release/jnt-node status --network mini --data-dir ./chain
-./target/release/jnt-node verify --network mini --data-dir ./chain
+./target/release/jnt-node mine   --network testnet --data-dir ./chain --blocks 25
+./target/release/jnt-node status --network testnet --data-dir ./chain
+./target/release/jnt-node verify --network testnet --data-dir ./chain
 
-# Run a P2P node daemon. The default also mines, so it settles matured exits.
-./target/release/jnt-node serve  --network mini --data-dir ./chain --listen 127.0.0.1:9833
+# Optional: sign checkpoints as a validator (needs a bonded committee to count).
+./target/release/jnt-node validator --network testnet --data-dir ./chain --add --label my-key
+
+# Run a P2P node daemon. The default also mines, so it settles matured exits and
+# signs checkpoints when keys are configured.
+./target/release/jnt-node serve  --network testnet --data-dir ./chain --listen 127.0.0.1:9833
 ```
 
 `verify` replays the whole canonical chain from genesis and diffs the resulting
-UTXO set and supply against stored state. It is the check worth running after
-any change, and `memory.md` records a round-trip where the fee burn reconciled
-to the satoshi.
+UTXO set, supply and — when a checkpoint exists — the binding-finalized point
+against stored state. It is the check worth running after any change, and
+`memory.md` records a round-trip where the fee burn reconciled to the satoshi.
 
 `status` and `verify` also report the **L2 pipeline** — credits, pending
 deposits, queued exits and value already released to L1 — and `verify` re-derives
@@ -158,7 +171,6 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 ### Deposits and exits
 
 On `mini` (which activates exits at height 1) the loop is:
-
 1. **Deposit** — an ordinary L1 payment to the profile's derived sink
    (`NetworkParams::l2_deposit_sink`). No new transaction type; 1:1 credit after
    finality depth. SPEC.md §19.5.
@@ -176,6 +188,14 @@ names, and the owner has already paid the claimant's fee at queue time — which
 why a crank nobody wants to run is simply not run, rather than being a way to
 grief someone.
 
+A third party that is not a miner can obtain the claims with
+`GET /v1/exit/crankable?claimant=<address>` and build a block with them. The
+consensus rule was always permissionless; before this route existed the only way
+to get a claim was to be the node's own miner, so in practice it was not. The
+`claimant` parameter is who the owner-prepaid fee pays and is trusted for nothing
+else — the destination is bound inside the proven leaf, so a caller cannot
+redirect it.
+
 `mainnet` ships with `exit_activation_height = 0`, which means **never** rather
 than *from genesis*. Until an activation height is configured, mainnet refuses
 both a committed root and an exit claim. That is a deliberate configuration
@@ -188,18 +208,19 @@ state, and it is the remaining launch item for this feature.
 | Path | Lines | What it is |
 |---|---:|---|
 | [`SPEC.md`](SPEC.md) | — | **Normative.** The protocol specification. Where a disagreement exists, this wins. |
-| `crates/jnt-core/` | 23 300+ | Protocol implementation across 33 modules. All consensus logic. |
-| `crates/jnt-core/tests/redteam.rs` | 724 | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
-| `crates/jnt-net/` | 4 800+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool. |
+| `crates/jnt-core/` | 21 600+ | Protocol implementation across 35 modules. All consensus logic. |
+| `crates/jnt-core/tests/redteam.rs` | 724+ | Adversarial regression suite (see [red-team suite](#red-team-suite)). |
+| `crates/jnt-net/` | 3 000+ | P2P networking layer: wire framing, handshakes, peer sync, orphan pool, checkpoint relay. |
 | `crates/jnt-net/tests/integration.rs` | 500+ | P2P integration tests, including a real-socket end-to-end sync. |
 | `crates/jnt-net/tests/net_vectors.rs` | 300+ | Wire-format vectors (§13.12). |
-| `crates/jnt-store/` | 2 300+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
-| `crates/jnt-l2/` | 10 200+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates, L2→L1 exits. |
-| `crates/jnt-node/` | 9 500+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `serve`) with the L2 replay view over accepted blocks and the exit crank. |
-| `crates/jnt-worker/` | 4 100+ | Worker SDK (SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, L2→L1 exits, earnings. A secret-free CLI: `jnt-worker address`/`generate` for key tooling, and `run` for the worker daemon loop over the node's REST API. |
+| `crates/jnt-store/` | 1 900+ | Persistence: append-only checksummed block log, atomic metadata, crash recovery. |
+| `crates/jnt-l2/` | 4 700+ | Layer 2: `TaskContract` lifecycle, `L2State` accounting, D3 flat fees, the dispute engine, M2 slashing, PSCB bounty, Verified Work Certificates, L2→L1 exits. |
+| `crates/jnt-node/` | 3 800+ | CLI and daemon runner (`init`, `mine`, `status`, `verify`, `validator`, `serve`) with the L2 replay view over accepted blocks, the exit crank, and checkpoint signing. |
+| `crates/jnt-worker/` | 2 800+ | Worker SDK (SPEC.md §18): `WorkerClient`, node seams, discovery/claim/execute/submit, dispute participation, VWC observation, L2→L1 exits, earnings. A secret-free CLI: `jnt-worker address`/`generate` for key tooling, and `run` for the worker daemon loop over the node's REST API. |
 | `sim/` | 2 094 | Python: independent protocol reference plus attack, supply and monetary simulations. |
 | `tests/vectors/` | — | Consensus vectors. Generated from source, never hand-edited. |
 | [`docs/status.md`](docs/status.md) | — | What is verified, what is broken, what is missing. |
+| [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md) | — | The mainnet gate: what is implemented, what is tested, and the exact blockers with their reasons. |
 | [`docs/monetary-redesign.md`](docs/monetary-redesign.md) | 754 | **Proposal, not implemented.** Long-term issuance analysis, the corrected fee-burn accounting, and the open monetary decisions. |
 | [`memory.md`](memory.md) | — | Working notes from the audits and implementations. Not normative. |
 
@@ -212,12 +233,12 @@ state, and it is the remaining launch item for this feature.
 Seven crates in one workspace:
 
 ```
-jnt-core   pure protocol library — no I/O, no clock, no network
-jnt-net    P2P wire protocol, peer state machines, sync and relay
+jnt-core   pure protocol library — no I/O, no clock, no network; all consensus logic
+jnt-net    P2P wire protocol, peer state machines, sync, block/tx/checkpoint relay
 jnt-store  persistent storage: append-only block log + atomic metadata
 jnt-l2     Layer 2: task contracts, the six L2 transaction types (incl. ExitQueue), D3 fees, the dispute engine, VWCs, L2→L1 exits
 jnt-worker worker-side SDK: discovery, claim/execute/submit, disputes, VWC observation, exits, earnings — client only, no consensus
-jnt-node   CLI and node daemon (serve, mine, status, verify)
+jnt-node   CLI and node daemon (serve, mine, status, verify, validator, exit crank)
 jnt-mcp    keyless MCP surface over agent identity, payments, receipts and reputation
 ```
 
@@ -230,20 +251,21 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 | Module | Lines | Responsibility |
 |---|---:|---|
 | `lib.rs` | 46 | Crate root and protocol scope statement |
-| `error.rs` | 196 | `Error` — 41 consensus-visible failure modes |
-| `params.rs` | 331 | `NetworkParams`: mainnet and mini profiles, magic bytes, network IDs, L2 fee schedule |
+| `error.rs` | 200+ | `Error` — consensus-visible failure modes, plus `From<BlsError>` so `?` on a BLS call stays total |
+| `params.rs` | 331 | `NetworkParams`: mainnet, testnet and mini profiles, magic bytes, network IDs, L2 fee schedule |
 | `hash.rs` | 87 | SHA-256 helpers and domain-separation tags |
 | `ser.rs` | 194 | `Reader`/`Writer` — canonical byte encoding with non-chaining aliases |
-| `hexserde.rs` | 58 | Serde helpers for hex-encoded types |
+| `hexserde.rs` | 62 | Serde helpers for hex-encoded types (fixed 16/20/32/33/48/64-byte arrays) |
 | `u256.rs` | 212 | 256-bit target arithmetic by long division. No floating point |
 | `fees.rs` | 299 | M1: 50/50 base-fee split (50% burn, 50% PSCB reserve) + miner tips, `split_flat_fee` (D3) |
 | `slash.rs` | 329 | M2: 50% Anti-collusion slash burn + 1-year linear vesting Compute Reserve |
 | `compute_ir.rs` | 550 | M3: Hardware-agnostic canonical compute IR (GPU/NPU/TPU/Photonic) + bounded decoders |
 | `hbm_pow.rs` | 285 | M4: Memory-bound HBM/GDDR scratchpad latency PoW puzzle |
-| `bls.rs` | 523 | blst-backed BLS12-381: derive/sign/verify/aggregate, IETF keygen |
+| `bls.rs` | 545 | blst-backed BLS12-381: derive/sign/verify/aggregate, IETF keygen, scalar round-trip for key files |
 | `bls_checkpoint.rs` | 561 | M5: Sovereign BLS aggregate signature checkpoint finality gadget |
 | `l2.rs` | 1 051 | L2: six transaction payload types (incl. `ExitQueue`), actor auth, signing hashes, D3 fee mapping |
 | `exit.rs` | 267 | L2 → L1 exit claims: proof-authorised sink spend, canonical codec, claim id, gas |
+| `signing.rs` | 560 | Validator key custody + production checkpoint signing: key files, committee aggregation, `CheckpointSigner` |
 | `supply.rs` | 680 | Halving ladder, cumulative issuance integral, rate-anchor allowance |
 | `wallet.rs` | 362 | Keys, addresses, transaction building and signing |
 | `block.rs` | 465 | Header, block, merkle root, genesis block |
@@ -253,7 +275,7 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
 | `sig.rs` | 636 | Signature schemes and hybrid post-quantum bundles |
 | `tx.rs` | 704 | Transactions, inputs, outputs, sighash |
 | `puzzle.rs` | 830 | The three PoW stages and the versioned puzzle registry |
-| `validators.rs` | 936 | §14.6 validator-set machinery (deterministic TopN, checkpoint validation) — inert |
+| `validators.rs` | 936 | §14.6 validator-set machinery (deterministic TopN, checkpoint validation, the six clauses) |
 | `chain.rs` | 1 680 | Validation, application, fork choice, reorg, PSCB reserve, mining |
 | `bond.rs` | 560 | Bonded validator stake: bond ledger, committee order, slash evidence (Decision 20) |
 | `agent.rs` | 1 106 | Machine/agent identity + owner-signed spending policies, offline authorization (Decision 16) |
@@ -280,13 +302,21 @@ mini is the production code path. (`SPEC.md` §10, design doc Section 17.)
   accounts/escrow/replay layer, and arbitration. `TaskContract` holds transitions only (no
   balances, no crypto); `L2State` is the only thing that debits an account or consults a
   validator set; `DisputeEngine` compares result hashes and never executes task code.
-- **`VerifiedWorkCertificate`** (`jnt-l2::vwc`) — the receipt for verified correct work,
-  issued automatically at settlement. Its id is derived from its canonical encoding (never
-  serialized), and `Quorum` certificates carry the settle payload's own BLS aggregate, so a
-  third party can verify the decision offline against the validator set.
-- **`Error`** — 41 variants. Every one is *deterministic and consensus-visible*:
-  two conforming nodes evaluating the same block must produce the same variant,
-  because callers branch on it.
+- **`VerifiedWorkCertificate`** (`jnt-l2::vwc`) — the receipt for work that settled
+  `Correct`, issued automatically at settlement. Its id is derived from its canonical
+  encoding (never serialized), and `Quorum` certificates carry the settle payload's
+  own BLS aggregate, so a third party can verify the decision offline against the
+  validator set. `WindowElapsed` certificates carry no aggregate and are read as
+  *uncontested*, not verified — [Known limitations](#known-limitations) explains why
+  that state is reachable and what a relying party must do about it.
+- **`ValidatorKey` / `Committee` / `CheckpointSigner`** (`jnt-core::signing`) — a
+  validator's signing key (redacted in `Debug`, loaded from a file bound to one
+  `network_id`), a set of such keys aggregating into one certificate, and the pure
+  payload-then-sign step. Signing grants no privilege: acceptance is decided by
+  verification against the chain-derived committee.
+- **`Error`** — the consensus-visible failure modes. Every one is
+  *deterministic*: two conforming nodes evaluating the same block must produce the
+  same variant, because callers branch on it.
 
 ### Data flow
 
@@ -319,14 +349,15 @@ the PSCB bounty. Task code is never executed on-chain (SPEC.md §16).
 
 Jounit defines five protocol-level mechanisms to align economic incentives with
 long-term AI compute infrastructure. **Only M1 is consensus-active today** —
-that is, only M1 can change whether an L1 node accepts a block. Phase 2–3 gave
-M2, M3 and M5 their first real *consumers* at Layer 2 (L2 fraud slashes vest
-through the M2 vault, L2 transactions carry M3 envelopes, L2 settlement verifies
-an M5-shaped quorum aggregate), and L2 transactions now ride inside L1 blocks
-(SPEC.md §19.1) with L2 state derived by replay from the canonical chain — no L1
-block rule changed. M4 still needs its rule (whether the HBM puzzle replaces or
-composes with §5). SPEC.md §14 and §16 record that status, and this list is
-repeated in `docs/status.md`.
+that is, only M1 can change whether an L1 node accepts a block. Layers 2–3 gave
+M2, M3 and M5 real *consumers* (L2 fraud slashes vest through the M2 vault, L2
+transactions carry M3 envelopes, L2 settlement verifies an M5-shaped quorum
+aggregate, and M5 certificates are signed and relayed by `jnt-net`), and L2
+transactions now ride inside L1 blocks (SPEC.md §19.1) with L2 state derived by
+replay from the canonical chain — no L1 block rule changed. M4 is deliberately
+left unregistered pending an independent security review of its memory
+parameters. SPEC.md §14 and §16 record that status, and this list is repeated in
+`docs/status.md`.
 
 | # | Mechanism | Consensus-active | Module |
 |---|---|---|---|
@@ -334,7 +365,7 @@ repeated in `docs/status.md`.
 | M2 | Anti-collusion slash vault | No — but holds L2 fraud slashes | `slash.rs` |
 | M3 | Hardware-agnostic compute IR | No — envelopes carried by L2; §16 CPU reference | `compute_ir.rs` |
 | M4 | Memory-bound HBM scratchpad PoW | No | `hbm_pow.rs` |
-| M5 | BLS aggregate finality | No — L2 settle verifies the quorum trait; L1 finality inert | `bls_checkpoint.rs` |
+| M5 | BLS aggregate finality | No on `mainnet` (activation 0) — L2 settle verifies the quorum trait; **signing, relay and verification all exist** (`bls_checkpoint.rs`, `signing.rs`) |
 
 ### M1 — 50/50 PSCB Base Fee Split (`fees.rs`, `chain.rs`)
 Base fees collected in each block are split equally:
@@ -349,26 +380,29 @@ Protects against malicious or fabricated compute results submitted to the networ
 - **50% Instant Burn (Anti-Collusion):** Eliminates self-slashing arbitrage where colluding parties reclaim 100% of slashed funds.
 - **50% Time-Locked Vesting (Compute Reserve):** Slashed stake vests linearly per block over 1 year (52,560 blocks on mainnet, 2,000 on mini) into the community compute reserve.
 - Supports validator-level penalty tracking and vault pruning.
+- **Live consumer:** an L2 fraud verdict (`Verdict::Fraudulent`, which requires a canonical-reference challenge) routes its slash through this vault. The *rule* that decides what proves a compute result fraudulent now exists (Decision 21); what does not exist yet is the transport that signs and relays a verdict, which is a key-custody decision rather than a rule.
 
 ### M3 — Universal Hardware-Agnostic Canonical Compute IR (`compute_ir.rs`)
 Prevents vendor lock-in by abstracting computation across heterogeneous hardware targets:
 - **Hardware Targets:** CUDA/ROCm GPUs, Apple Neural Engine (ANE), Google TPUs, and optical photonic chips.
 - **Deterministic Quantization:** Quantized execution rules (INT8/FP16) ensuring zero floating-point nondeterminism.
 - **Attestation Envelope:** Deterministic serialization and SHA-256 domain-separated task hashing (`DOM_COMPUTE_TASK`, `DOM_COMPUTE_ATTEST`).
+- **Canonical CPU reference:** `reference_output` is a fixed-round permutation over `(task_id, ir_hash, input_hash, required_memory_bytes)` — commitments only, no IR bytecode — and `reference_result_hash` is the single value every honest worker, challenger and arbitrator derives. It commits to the *task*, never to a caller's claim. SPEC.md §16.4/§16.5 forbid an on-chain interpreter, so this reference is computed off-chain by whoever builds a verdict; L2 consensus accepts the resulting decision and does not re-execute.
 
 ### M4 — Memory-Bound HBM Scratchpad PoW (`hbm_pow.rs`)
 Hardens mining against ASIC centralization and pure-compute bypasses:
 - **HBM / High-Bandwidth Memory Latency:** Miners traverse a deterministic pseudorandom scratchpad using cache-line-aligned (32-byte) memory hops.
 - Guarantees that mining performance is bound to actual hardware memory bus bandwidth (HBM3/GDDR6) rather than pure ALU arithmetic.
-- **Not registered as a `puzzle_id`**, so it validates nothing today.
+- **Not registered as a `puzzle_id`, so it validates nothing today — deliberately.** Registration would change the consensus puzzle, and doing that without an independent security review of the memory parameters and an activation-compatibility analysis would be the actual mistake. `docs/decisions.md` records the dependency; base PoW (`puzzle_id = 1`) is the active mechanism.
 
-### M5 — Sovereign BLS Aggregate Finality Gadget (`bls_checkpoint.rs`)
-Describes deterministic finality on top of probabilistic deepest-chain PoW:
-- **Checkpoints:** every `CHECKPOINT_INTERVAL` (100 blocks on mainnet, 10 on mini).
-- **BLS12-381 Aggregate Signatures:** 96-byte aggregate signatures over 48-byte validator public keys.
-- **2/3 Supermajority Quorum:** `ceil(n × 2/3)` validator agreement with compact bitmask signers.
-- **Absolute Immutability:** once a checkpoint is accepted by `CheckpointChain`, the boundary is permanent.
-- **`RealBls` (blst) performs real BLS12-381 pairing checks** and is what the node runs; `MockBls` is a structural verifier kept for CI-only unit tests. What is *not* in force is L1 consensus activation: nothing in `Chain::submit` consults a `BlsVerifier`, and binding finality runs only on the profile with a non-zero `finality_activation_height` (today `testnet`).
+### M5 — Sovereign BLS Aggregate Finality Gadget (`bls_checkpoint.rs`, `signing.rs`)
+Deterministic finality on top of probabilistic deepest-chain PoW:
+- **Checkpoints**: every `CHECKPOINT_INTERVAL` (100 blocks on mainnet, 10 on mini/testnet).
+- **BLS12-381 Aggregate Signatures**: 96-byte aggregate signatures over 48-byte validator public keys, one pairing check regardless of signer count.
+- **2/3 Supermajority Quorum**: `ceil(n × 6667 / 10000)` validator agreement with a compact bitmask signer set, 21 members maximum.
+- **Absolute Immutability**: once a checkpoint is accepted by `CheckpointChain`, the boundary is permanent.
+- **Both sides exist.** Verification (`RealBls`/`blst` pairing checks, six clauses, binding to the canonical block at the certificate's height) and now **signing** — `signing.rs` produces a certificate from a key file, the node signs at each epoch boundary for a block it holds, and `jnt-net` relays it while refusing to propagate one that failed. This mattered: with no producer, binding finality could not activate anywhere, because nothing ever signed a certificate for a node to verify.
+- **L1 consensus activation is still off.** `finality_activation_height` is `0` on `mainnet` and non-zero on `testnet`, so a node on mainnet keeps depth-based finality until a committee exists and a height is chosen. `MockBls` is a structural verifier kept for CI-only unit tests; production runs `RealBls`.
 
 ---
 
@@ -614,23 +648,30 @@ authorised by an inclusion proof against that root, not by a signature.
 
 Selected with `--network`. Same code, different numbers.
 
-| | `mainnet` | `mini` |
-|---|---|---|
-| Target block time | 600 000 ms (10 min) | 1 000 ms |
-| Halving period | 262 800 blocks | 2 000 blocks |
-| Start reward | 76 JNT | 76 JNT |
-| Stock cap | none (rate anchor: ≤ 1 % of issued per period) | none (same rule) |
-| Difficulty window | 60 | 60 |
-| Change limit | ±10% / block | ±10% / block |
-| Genesis difficulty | 1 | 1 |
-| Max difficulty | 2^96 | 2^40 |
-| Coinbase maturity | 100 blocks | 10 blocks |
-| Finality depth | 100 blocks | 20 blocks |
-| Gas cap | 2 000 000 | 2 000 000 |
-| Initial base fee | 1 000 sat | 100 sat |
-| NN epoch | 50 000 blocks | 2 000 blocks |
-| Puzzle id | 1 | 1 |
-| Exit activation height | **0 = never** | 1 (active from the first block) |
+| | `mainnet` | `testnet` | `mini` |
+|---|---|---|---|
+| Target block time | 600 000 ms (10 min) | 1 000 ms | 1 000 ms |
+| Halving period | 262 800 blocks | 2 000 blocks | 2 000 blocks |
+| Start reward | 76 JNT | 76 JNT | 76 JNT |
+| Stock cap | none (rate anchor: ≤ 1 % of issued per period) | none (same rule) | none (same rule) |
+| Difficulty window | 60 | 60 | 60 |
+| Change limit | ±10% / block | ±10% / block | ±10% / block |
+| Genesis difficulty | 1 | 1 | 1 |
+| Max difficulty | 2^96 | 2^40 | 2^40 |
+| Coinbase maturity | 100 blocks | 10 blocks | 10 blocks |
+| Finality depth | 100 blocks | 20 blocks | 20 blocks |
+| Gas cap | 2 000 000 | 2 000 000 | 2 000 000 |
+| Initial base fee | 1 000 sat | 100 sat | 100 sat |
+| NN epoch | 50 000 blocks | 2 000 blocks | 2 000 blocks |
+| Puzzle id | 1 | 1 | 1 |
+| Genesis validators | **none** (fails closed) | 4 deterministic keys | 4 deterministic keys |
+| Finality activation height | **0 = never** | 20 | 0 (depth only) |
+| Exit activation height | **0 = never** | 1 | 1 |
+
+`testnet` is the profile that exercises binding finality end to end — a
+deterministic four-key committee, activation at height 20, quorum 3 of 4.
+`mainnet` carries no committee and no activation, both by choice, so mainnet
+fails closed rather than verifying against nothing.
 
 ---
 
@@ -648,16 +689,18 @@ COMMANDS
   show-block  Print one block
   balance     List the unspent outputs of an address
   wallet      Create or list wallets
+  validator   Add or list checkpoint-signing keys (M5 binding finality)
   export      Write the canonical chain to JSON
   serve       Run a P2P node: block relay, multi-peer sync, opt-in REST API,
-              and the exit crank
+              the exit crank, and checkpoint signing when keyed
 
 COMMON OPTIONS
-  --network <mainnet|mini>   Default: mini
+  --network <mainnet|testnet|mini>   Default: mini
   --data-dir <path>          Default: ./chain
 ```
 
-`send` and `serve` add their own flags.
+`send` and `serve` add their own flags; `validator` takes `--add --label <name>`
+and otherwise lists what is configured.
 
 > `send --amount` is denominated in **satoshis**, while every printed figure is
 > in JNT. This is a known rough edge.
@@ -675,14 +718,48 @@ COMMON OPTIONS
 | `--interval <ms>` | Serve-loop period (default 250) |
 | `--no-mine` | Relay and validate only, never mine — **and never crank exits** |
 
+### Validators and checkpoints
+
+Keys live in `<data-dir>/validators/`, one JSON file per validator, mode 0600
+on unix — deliberately **not** in `wallets.json`, which holds *spending* keys.
+Backing up a wallet is then never the same act as backing up a consensus key:
+
+```sh
+jnt-node validator --network testnet --data-dir ./chain --add --label my-key
+jnt-node validator --network testnet --data-dir ./chain          # public keys only
+```
+
+`serve` then loads them and signs a checkpoint at each epoch boundary, but only
+for a block it holds as its own canonical tip, and broadcasts it to peers. A key
+file's `network_id` is checked on load, so a `mini` key cannot sign `testnet`
+checkpoints even though the file layout is otherwise identical.
+
+Two honest limits. A node with no keys signs nothing and prints one note — it
+still verifies and relays what others produce, which is the ordinary case.
+And signing is not a consensus privilege: a certificate is accepted only if a
+quorum of the *chain-derived* committee signed the *chain's own* hash, so a
+signer that signs a block nobody holds produces bytes every peer rejects.
+
 ---
 
 ## Testing and verification
 
 ```sh
-cargo test --workspace                                   # 870 tests across the workspace, 0 failures
+cargo test --workspace                                   # 949 tests across the workspace, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings    # 0 warnings
-cargo fmt --all --check
+cargo fmt --all --check                                  # clean
+python sim/verify_vectors.py --check                     # vectors present and cross-checked
+```
+
+Targeted suites, for the fast loops:
+
+```sh
+cargo test -p jnt-core --test bond_stake        # bonded-stake attack-first suite
+cargo test -p jnt-core --test cp_signing_nodes  # quorum, conflicts, restart determinism
+cargo test -p jnt-l2  --test unverified_result  # the unchallenged-result guarantee
+cargo test -p jnt-node --test exit_crank_api    # deposit → queue → mature → claim, over HTTP
+cargo test -p jnt-store --test bond_restart     # a restart rebuilds the bond ledger
+cargo test -p jnt-core --test redteam
 ```
 
 ### Consensus vectors
@@ -757,6 +834,12 @@ difficulty-attack containment simulation, the supply cross-check, and a
 `fuzz-smoke` job that runs all fourteen libFuzzer targets for 20 s each on nightly
 + ASan.
 
+`.github/workflows/release.yml` runs on a `v*` tag: it re-runs the same CI gate
+**on the tagged tree** first, so a release cannot be built from a tree that would
+not pass CI, then builds `jnt-node` for three targets and publishes them with
+checksums. Artifacts are unsigned and the release body says so plainly — signing
+needs a published key, and none is published yet.
+
 ### Fuzzing and invariants
 
 `fuzz/` is a standalone cargo-fuzz crate with **fourteen targets** over the
@@ -784,7 +867,7 @@ cargo test -p jnt-l2 --test fuzz_invariants   # L2 invariants on stable
 
 ### Red-team suite
 
-`crates/jnt-core/tests/redteam.rs` holds 11 adversarial integration tests, written
+`crates/jnt-core/tests/redteam.rs` holds 12 adversarial integration tests, written
 attack-first. Each builds the hostile input a peer would send and asserts the
 node refuses it; each was confirmed to fail against the code it now guards.
 
@@ -888,6 +971,46 @@ depth, for the case where an attacker reaches 50% and can move the median itself
 ---
 
 ## Known limitations
+
+**An unchallenged compute result is paid, and that cannot be made into
+verification.** `correct_settlement_hash` returns the worker's own submitted hash
+once the dispute window closes — no reference is computed, by design, because
+re-executing arbitrary compute on-chain is what SPEC.md §16.4/§16.5 forbids. So a
+worker who submits a *wrong* result and is not challenged in time auto-settles
+`Correct`, is paid, and a certificate naming that result is minted. The payment
+is correct protocol behaviour: the timeout economics requires a challenge to
+overturn a settlement, or a griefer could stall every task forever.
+
+What the protocol does guarantee is that the outcome is never *represented* as
+verified. `VwcVerification::WindowElapsed` is a receipt for an uncontested
+settlement, `VerifiedWorkCertificate::asserts_correctness()` is `false` for it,
+and `validate_verified` / `L2State::validate_vwc_verified` refuse it by name.
+A relying party that needs independent proof must use those and can only be
+satisfied by a `Quorum` certificate, which carries a real BLS aggregate.
+`crates/jnt-l2/tests/unverified_result.rs` drives that reachable state end to
+end in both directions. The residual risk is economic, not cryptographic: an
+unchallenged wrong result earns its payment, and the only correction is a
+challenger with a deposit and enough time.
+
+**Nothing signs or relays an arbitration verdict yet.** Decision 21 defined what
+proves a compute result fraudulent (the canonical CPU reference plus
+`Arbiter::ChallengerCorrect`), and `DisputeEngine::resolve` computes the
+reference from the disputed contract so no caller can dictate a verdict. What is
+missing is the transport that carries a quorum's decision into a `Settle`, and
+that is blocked on a key-custody decision (`docs/decisions.md`), not on a rule.
+
+**`mainnet` declares an empty validator committee and no activation heights.**
+`genesis_validators` is empty and both `finality_activation_height` and
+`exit_activation_height` are 0, so on mainnet checkpoint verification fails
+closed and exits refuse outright. The ledger that would hold bonded stake is
+built and tested; what does not exist is a validator — an operator running a
+key and bonding 5 000 JNT. `testnet` is the profile that activates both.
+
+**No independent security review of the consensus and cryptographic code.** The
+HBM puzzle is left unregistered specifically because registration would change
+the consensus puzzle, and that is not something to do before review. The same
+applies to the base puzzle's integer arithmetic, the supply integral and the
+BLS gadget: an internal test suite is not a substitute for an external audit.
 
 **Wedges the node under a finality-crossing heavier branch.** A valid branch that
 forks below `finality_depth` and carries more work than the tip is retained, and
