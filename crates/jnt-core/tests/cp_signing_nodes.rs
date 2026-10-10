@@ -25,7 +25,6 @@ use jnt_core::finality::FinalityManager;
 use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
 use jnt_core::signing::{CheckpointSigner, Committee, ValidatorKey};
-use jnt_core::tx::Output;
 
 fn params() -> NetworkParams {
     // `testnet`, where binding finality actually activates (height 20). The
@@ -106,7 +105,10 @@ fn a_quorum_certificate_finalizes_on_an_independent_verifier() {
     let mut m = FinalityManager::new(&p);
     m.set_keys(committee.public_keys());
     m.accept(&cp, Some(tip), &jnt_core::bls::RealBls).unwrap();
-    assert!(m.is_finalized(MINE_TO), "a valid certificate finalizes its height");
+    assert!(
+        m.is_finalized(MINE_TO),
+        "a valid certificate finalizes its height"
+    );
     assert_eq!(m.binding_finalized_hash(), tip);
     let _ = chain;
 }
@@ -168,7 +170,10 @@ fn a_short_of_quorum_certificate_is_refused_and_records_nothing() {
     peer.accept(&cp, Some(tip), &jnt_core::bls::RealBls)
         .expect_err("3 of 5 is below quorum");
     assert!(!peer.is_finalized(20));
-    assert!(peer.evidence().is_empty(), "a short certificate is not an attack");
+    assert!(
+        peer.evidence().is_empty(),
+        "a short certificate is not an attack"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +219,14 @@ fn two_conflicting_certificates_cannot_both_finalize() {
     );
 
     let signer = CheckpointSigner::new(&net, p.checkpoint_interval_blocks);
-    let first = signer.sign(MINE_TO + 1, honest.block_hash(), &committee).unwrap().unwrap();
-    let second = signer.sign(MINE_TO + 1, rival.block_hash(), &committee).unwrap().unwrap();
+    let first = signer
+        .sign(MINE_TO + 1, honest.block_hash(), &committee)
+        .unwrap()
+        .unwrap();
+    let second = signer
+        .sign(MINE_TO + 1, rival.block_hash(), &committee)
+        .unwrap()
+        .unwrap();
 
     let mut peer = verifier(&committee.public_keys());
     peer.accept(&first, Some(honest.block_hash()), &jnt_core::bls::RealBls)
@@ -265,8 +276,15 @@ fn signing_is_identical_after_a_restart_from_stored_blocks() {
     }
     assert_eq!(rebuilt.tip_hash(), tip, "the replay reached the same tip");
 
-    let after = signer.sign(20, rebuilt.tip_hash(), &committee).unwrap().unwrap();
-    assert_eq!(before.serialize(), after.serialize(), "signing must be deterministic");
+    let after = signer
+        .sign(20, rebuilt.tip_hash(), &committee)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.serialize(),
+        after.serialize(),
+        "signing must be deterministic"
+    );
     assert_eq!(before.signer_bitmap, after.signer_bitmap);
     assert_eq!(before.signer_count, after.signer_count);
     assert_eq!(before.payload.epoch, after.payload.epoch);
@@ -295,6 +313,7 @@ fn a_committee_that_lost_a_member_signs_without_it() {
     // And the four-signer one verifies against its own committee, so the
     // difference is quantifiable rather than a silent degradation.
     let mut peer = verifier(&full.public_keys());
-    peer.accept(&whole, Some(tip), &jnt_core::bls::RealBls).unwrap();
+    peer.accept(&whole, Some(tip), &jnt_core::bls::RealBls)
+        .unwrap();
     assert!(peer.is_finalized(20));
 }

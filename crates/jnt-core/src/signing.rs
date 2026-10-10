@@ -114,8 +114,8 @@ impl ValidatorKey {
     /// hand-edited, and signing with it produces certificates every peer rejects
     /// while the operator believes they are participating.
     pub fn from_bytes(bytes: &[u8], network_id: &str) -> Result<Self, Error> {
-        let file: ValidatorKeyFile =
-            serde_json::from_slice(bytes).map_err(|_| Error::Malformed("validator key is not JSON"))?;
+        let file: ValidatorKeyFile = serde_json::from_slice(bytes)
+            .map_err(|_| Error::Malformed("validator key is not JSON"))?;
         Self::from_file(file, network_id)
     }
 
@@ -137,13 +137,19 @@ impl ValidatorKey {
                 "validator key file's public key does not follow from its scalar",
             ));
         }
-        Ok(ValidatorKey { key, network_id: network_id.to_string() })
+        Ok(ValidatorKey {
+            key,
+            network_id: network_id.to_string(),
+        })
     }
 
     /// Wrap an existing key for a network. Used by tests and by operators who
     /// already hold a key in some other form.
     pub fn new(key: SecretKey, network_id: impl Into<String>) -> Self {
-        ValidatorKey { key, network_id: network_id.into() }
+        ValidatorKey {
+            key,
+            network_id: network_id.into(),
+        }
     }
 
     /// The compressed G1 public key, as it appears in the committee.
@@ -217,7 +223,9 @@ impl Committee {
     /// produce a bitmap that disagrees with `signer_count`.
     pub fn add(&mut self, key: ValidatorKey) -> Result<(), Error> {
         if self.keys.iter().any(|k| k.public_key() == key.public_key()) {
-            return Err(Error::Malformed("committee already holds this validator key"));
+            return Err(Error::Malformed(
+                "committee already holds this validator key",
+            ));
         }
         self.keys.push(key);
         Ok(())
@@ -298,7 +306,10 @@ pub struct CheckpointSigner {
 
 impl CheckpointSigner {
     pub fn new(network_id: impl Into<String>, epoch_blocks: u64) -> Self {
-        CheckpointSigner { network_id: network_id.into(), epoch_blocks }
+        CheckpointSigner {
+            network_id: network_id.into(),
+            epoch_blocks,
+        }
     }
 
     /// Build the payload for a height and its canonical block hash.
@@ -332,7 +343,6 @@ impl CheckpointSigner {
         committee.sign(&payload)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -477,8 +487,12 @@ mod tests {
         // And the forward one must actually verify, which pins the order itself.
         let mut m = manager();
         m.set_keys(forward.public_keys());
-        m.accept(&forward.sign(&payload).unwrap().unwrap(), Some([0xEEu8; 32]), &RealBls)
-            .expect("a committee of the declared keys must be accepted");
+        m.accept(
+            &forward.sign(&payload).unwrap().unwrap(),
+            Some([0xEEu8; 32]),
+            &RealBls,
+        )
+        .expect("a committee of the declared keys must be accepted");
     }
 
     #[test]
@@ -525,9 +539,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            manager()
-                .accept(&cp, Some([0xEEu8; 32]), &RealBls)
-                .is_err(),
+            manager().accept(&cp, Some([0xEEu8; 32]), &RealBls).is_err(),
             "a certificate signed for another network must not be accepted"
         );
     }
@@ -562,9 +574,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            manager()
-                .accept(&cp, Some([0xFFu8; 32]), &RealBls)
-                .is_err(),
+            manager().accept(&cp, Some([0xFFu8; 32]), &RealBls).is_err(),
             "a certificate naming a block the node does not hold must be refused"
         );
     }
@@ -598,9 +608,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            manager()
-                .accept(&cp, Some([0xEEu8; 32]), &RealBls)
-                .is_err(),
+            manager().accept(&cp, Some([0xEEu8; 32]), &RealBls).is_err(),
             "height 105 is not an epoch boundary for a 10-block epoch"
         );
     }

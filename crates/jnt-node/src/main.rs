@@ -147,7 +147,6 @@ impl Args {
                         | "connect"
                         | "peers"
                         | "relay"
-                        | "label"
                 );
                 if takes_value {
                     let value = raw
@@ -1087,13 +1086,8 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
     println!("created validator `{label}`");
     println!("  file       {}", path.display());
     println!("  network    {}", params.network_id);
-    println!(
-        "  public key {}",
-        hex::encode(key.public_key().as_bytes())
-    );
-    println!(
-        "  committee  public key must be bonded on chain before its signature counts"
-    );
+    println!("  public key {}", hex::encode(key.public_key().as_bytes()));
+    println!("  committee  public key must be bonded on chain before its signature counts");
     Ok(())
 }
 
@@ -1206,8 +1200,8 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // produce and signs nothing.
     let validator_committee = load_validator_committee(&store, &store.params.clone())?;
     let mut signed_epochs = std::collections::BTreeSet::new();
-    let mut finality_keys_missing_warning = validator_committee.is_none()
-        && store.params.finality_activation_height > 0;
+    let mut finality_keys_missing_warning =
+        validator_committee.is_none() && store.params.finality_activation_height > 0;
     // L2 follows the tip by replay; nothing L2 is persisted.
     let l2 = NodeL2::replay_from(&chain, &store.params);
     let mut l2_skipped_seen = l2.skipped().len();
@@ -1350,7 +1344,10 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 let height = sh.chain.height();
                 let epoch_blocks = sh.chain.params().checkpoint_interval_blocks;
                 let boundary_height = (height / epoch_blocks.max(1)) * epoch_blocks.max(1);
-                if boundary_height > 0 && boundary_height >= height && !signed_epochs.contains(&boundary_height) {
+                if boundary_height > 0
+                    && boundary_height >= height
+                    && !signed_epochs.contains(&boundary_height)
+                {
                     let signer = jnt_core::signing::CheckpointSigner::new(
                         &sh.chain.params().network_id,
                         epoch_blocks,
