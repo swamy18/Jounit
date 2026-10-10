@@ -144,7 +144,7 @@ impl BondLedger {
 }
 
 /// Inverse of one ledger mutation, for reorg unwinds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BondUndoOp {
     /// A bond this block created: delete it on unwind.
     Inserted(BondId),

@@ -2045,6 +2045,15 @@ impl Chain {
         if probe.slash_vault != self.slash_vault {
             return Err(Error::Malformed("slash vault diverged on replay"));
         }
+        // The stake undo records themselves, for the same reason the PSCB ones
+        // are checked above: the ledger comparison proves the applied state,
+        // not that a reorg would undo it correctly.
+        if probe.bond_undo != self.bond_undo {
+            return Err(Error::Malformed("bond undo records diverged on replay"));
+        }
+        if probe.slash_undo != self.slash_undo {
+            return Err(Error::Malformed("slash vault undo diverged on replay"));
+        }
         Ok(())
     }
 

@@ -95,6 +95,27 @@ pub struct ExitWatch {
     pub proof: InclusionProof,
 }
 
+/// An L1 exit claim that this node's L2 state cannot account for.
+///
+/// L1 accepted and released the claim, so the value has already left L2 from
+/// the chain's point of view. Reaching that state without a matching queued L2
+/// record means this node's replayed L2 view disagrees with the chain it just
+/// accepted — an integrity problem, not a payload problem. It is recorded rather
+/// than swallowed so a release build reports it too: a `debug_assert` compiles
+/// out exactly where a long-running node would be, which is the one place the
+/// disagreement matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnbackedClaim {
+    /// Height of the block that carried the claim.
+    pub height: u64,
+    /// Owner named by the claim.
+    pub owner: Address,
+    /// Nonce named by the claim.
+    pub nonce: u64,
+    /// The named reason the local L2 state refused it.
+    pub error: L2Error,
+}
+
 /// The L2 view of one canonical L1 chain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainL2 {
@@ -113,6 +134,9 @@ pub struct ChainL2 {
     /// Queued exits still awaiting an L1 release, newest last. Re-derived on
     /// every replay; a release removes its entry, a reorg replays.
     watches: Vec<ExitWatch>,
+    /// L1 exit claims this node's L2 state could not back. Empty in a healthy
+    /// replay; non-empty means L1 and L2 disagree and the node is wrong.
+    unbacked: Vec<UnbackedClaim>,
 }
 
 impl ChainL2 {
@@ -142,6 +166,7 @@ impl ChainL2 {
             ignored: Vec::new(),
             deposits_applied: 0,
             watches: Vec::new(),
+            unbacked: Vec::new(),
         }
     }
 
@@ -265,14 +290,19 @@ impl ChainL2 {
         // the authority — it already proved maturity, exact funding and the
         // identity — so this mirrors it rather than re-deciding. A claim with no
         // record here means this node's L2 state disagrees with the chain it
-        // replayed; failing closed here would silently un-credit a real debit,
-        // so the disagreement is surfaced instead of being swallowed.
+        // replayed. The watch is dropped either way (L1 already released, so a
+        // re-crank would only be refused), but the disagreement is recorded
+        // instead of being swallowed: `debug_assert` alone compiles out of the
+        // release build, which is the build a real node runs in.
         for claim in &block.exit_claims {
-            let released = self.state.note_release(&claim.owner, claim.nonce);
-            debug_assert!(
-                released.is_ok(),
-                "an L1-accepted claim must have a queued record on L2"
-            );
+            if let Err(error) = self.state.note_release(&claim.owner, claim.nonce) {
+                self.unbacked.push(UnbackedClaim {
+                    height,
+                    owner: claim.owner,
+                    nonce: claim.nonce,
+                    error,
+                });
+            }
             self.watches
                 .retain(|w| !(w.owner == claim.owner && w.nonce == claim.nonce));
         }
@@ -414,6 +444,16 @@ impl ChainL2 {
     /// order. Never a reason to reject a block.
     pub fn ignored_deposits(&self) -> &[IgnoredDeposit] {
         &self.ignored
+    }
+
+    /// L1 exit claims this node's L2 state could not back, in block order.
+    ///
+    /// Empty on a healthy node. A non-empty list is a real integrity signal,
+    /// not noise: it means the chain accepted an exit release for an identity
+    /// this replay never queued, so the two views disagree. Surfaced here so a
+    /// release build reports it — see [`UnbackedClaim`].
+    pub fn unbacked_claims(&self) -> &[UnbackedClaim] {
+        &self.unbacked
     }
 
     /// Deposits credited (matured and applied).

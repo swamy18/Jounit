@@ -748,3 +748,52 @@ fn stake_transaction_codec_round_trips_exactly() {
     let back = Transaction::deserialize(&plain.serialize()).unwrap();
     assert_eq!(back, plain);
 }
+
+#[test]
+fn a_reorged_bond_leaves_no_undo_record_behind() {
+    let (mut chain, w, ops) = rich_chain();
+    let bonder = w.address().unwrap();
+    let (_, pk) = bls_pair(9);
+    let bond = bond_tx(&chain, &w, &ops[..66], pk);
+
+    // Fork with the bond, then out-work it. The bond block is briefly
+    // canonical, so it owns a `bond_undo` entry; once the reorg unwinds it that
+    // entry must go with it, or `verify_canonical_chain` — which replays only
+    // the canonical path — diverges forever after.
+    let fork_at = chain.height();
+    let mut fork = Chain::new(NetworkParams::mini()).unwrap();
+    for h in 1..=fork_at {
+        let b = fork.mine_block(bonder, vec![], ts(h)).unwrap();
+        fork.submit(b).unwrap();
+    }
+    let forked = fork
+        .mine_block(bonder, vec![bond], ts(fork_at + 1))
+        .unwrap();
+    chain.submit(forked).unwrap();
+    assert_eq!(chain.bonds().len(), 1, "the fork won first");
+
+    let rival_miner = wallet(2).address().unwrap();
+    let mut rival = Chain::new(NetworkParams::mini()).unwrap();
+    for h in 1..=fork_at {
+        let b = rival.mine_block(bonder, vec![], ts(h)).unwrap();
+        rival.submit(b).unwrap();
+    }
+    let r1 = rival
+        .mine_block(rival_miner, vec![], ts(fork_at + 1))
+        .unwrap();
+    rival.submit(r1.clone()).unwrap();
+    let r2 = rival
+        .mine_block(rival_miner, vec![], ts(fork_at + 2))
+        .unwrap();
+    rival.submit(r2.clone()).unwrap();
+    chain.submit(r1).unwrap();
+    chain.submit(r2).unwrap();
+
+    assert!(
+        chain.bonds().is_empty(),
+        "the reorged bond must unwind from the ledger"
+    );
+    // The stake undo records are consensus state and are checked by replay:
+    // this is the assertion that fails if the reorg path forgets to drop them.
+    chain.verify_canonical_chain().unwrap();
+}
