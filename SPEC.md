@@ -1,8 +1,8 @@
 # JOUNIT PROTOCOL SPECIFICATION
 
-**Version:** 0.2 (foundation + P2P transport)
-**Status:** Draft — §0–§12 normative for `jnt-core` v0.1.x; §13 normative for `jnt-net` v0.2.x; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today
-**Scope:** Layer 1 only (base layer). Layer 2 (useful work / Verified Work Certificates) is specced in `docs/roadmap.md`, not implemented here. §13 covers block relay between nodes; transaction relay is deferred (§13.13).
+**Version:** 0.1.0 (the workspace version in `Cargo.toml`)
+**Status:** Draft — §0–§12 normative for `jnt-core`; §13 normative for `jnt-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `jnt-l2`; §18 for `jnt-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested.
+**Scope:** Layer 1 (base layer, §0–§13), the M1–M5 protocol mechanisms (§14), Layer 2 and the worker SDK (§15–§18), and L1↔L2 integration including deposits and exits (§19). §13 covers block and transaction relay between nodes.
 
 This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
 
@@ -395,7 +395,7 @@ Per Section 16. `SAT_PER_JNT = 100_000_000`.
 | `halving_period` | `262 800` blocks (5 years at 10 min) |
 | `start_reward` | `76 JNT` = `7_600_000_000 sat` |
 | `supply_cap` | **none** — Decision 18 (2026-10-09) replaced the stock cap with the rate anchor below |
-| `tail_emission` | `0` (v0.1; Section 11 notes tail emission as an option) |
+| `tail_emission` | **approved + implemented** — mainnet `0.50`, `0.25`, `0.125` JNT then the permanent `0.1` JNT floor; `mini`/`testnet` a constant `1 sat`/block (Decisions M-A…M-C) |
 
 ```
 halvings  = height / halving_period
@@ -412,7 +412,7 @@ reward(h) = tail(halvings)                                // once rung == 0
 ```
 
 Reward ladder: `76, 38, 19, 9, 4, 2, 1`, then the approved tail (Decisions
-M-A…M-G, `docs/decisions.md`): mainnet `0.50, 0.25, 0.125` JNT and the
+M-A…M-C, `docs/decisions.md`): mainnet `0.50, 0.25, 0.125` JNT and the
 permanent `0.1 JNT` floor; mini/testnet a constant `1 sat` per block. The tail
 activates at each profile's ladder exhaustion (mainnet `1 839 600`, mini and
 testnet `14 000`) and leaves **every historical block byte-identical** — the
@@ -565,10 +565,20 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `checkpoint_interval_blocks` | `100` | `10` | `10` |
 | `finality_activation_height` | `0` | `0` | `20` |
 | `genesis_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
+| `exit_activation_height` | `0` (**never**) | `1` | `1` |
+| `l2_genesis_escrow_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
+| `escrow_ceiling_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
 
 `testnet` shares the mini ladder and block schedule but has its own magic/id,
 its own deterministic committee (distinct derivation), and the §14.8
 activation height. No profile carries a stock supply cap (Decision 18).
+
+**`exit_activation_height` gates the whole exit rule of §19.6, and `0` means
+*never*, not *from genesis*.** A profile on `0` accepts neither a committed
+`l2_state_root` nor an exit claim, and an L2-bearing block on it must therefore
+carry no root. `mainnet` ships `0` deliberately: the rule is compiled and
+tested, but the profile has chosen no height, so mainnet user deposits stay
+closed by configuration rather than by a missing mechanism.
 
 ---
 
@@ -603,7 +613,7 @@ The genesis block is **not** a premine: it contains zero value and no spendable 
 |---|---|---|---|
 | `puzzle_vectors.json` | header serialization, stage 1 seed, stage 2 activation digest, stage 3 final, work-share accounting | `UPDATE_PUZZLE_VECTORS=1 cargo test -p jnt-core` | `puzzle_vectors_are_stable`, `sim/puzzle_crosscheck.py` |
 | `ser_vectors.json` | input / output / tx / header byte layouts | `UPDATE_SER_VECTORS=1 cargo test -p jnt-core` | `serialization_vectors_are_stable` |
-| `supply_vectors.json` | reward ladder, cumulative supply, cap invariant | `sim/supply_schedule_sim.py` | `a_supply_vector_file_exists_to_show_the_pattern`, `sim/verify_vectors.py` |
+| `supply_vectors.json` | reward ladder, cumulative issuance integral, rate-anchor allowance | `sim/supply_schedule_sim.py` | `a_supply_vector_file_exists_to_show_the_pattern`, `sim/verify_vectors.py` |
 | `difficulty_vectors.json` | LWMA next-difficulty, timestamp clamp behaviour | `UPDATE_DIFFICULTY_VECTORS=1 cargo test -p jnt-core` | `difficulty_vectors_are_stable` |
 | `net_vectors.json` | frame envelope, every `msg_type` payload, `VERSION` layout, locator construction (§13.12) | `UPDATE_NET_VECTORS=1 cargo test -p jnt-net` | `net_vectors_are_stable` |
 
@@ -1110,8 +1120,12 @@ authoritative statement of which are **consensus-active today** — meaning a
 node's validation or state machine depends on them — and which are defined
 data structures with no effect on consensus yet. The distinction is stated here
 because the alternative, a document that lists all five as shipped, hides the
-most important fact about them: **only M1, plus M5's binding finality on an
-activated profile (§14.8), can change what a node accepts.**
+most important fact about them: **only M1 can change what an L1 node accepts.**
+M5's binding finality is an exception worth naming precisely: on a profile with
+`finality_activation_height > 0` (today `testnet`), a checkpoint that
+`validators.rs` accepts does move `finalized_height`, and therefore does change
+which reorgs `adopt()` refuses. That is the §14.8 activation, not a different
+model.
 
 | # | Mechanism | Module | Consensus-active | § |
 |---|---|---|---|---|
@@ -1195,11 +1209,11 @@ can be swapped for a real implementation (`blst`) without touching the chain.
 `blst`-backed `RealBls` verifier performs actual pairing checks, and
 `verify_checkpoint` with `RealBls` rejects forgeries that `MockBls` (kept for
 CI-only structural tests) would accept. What is still missing for M5 to be
-consensus-active is §14.6: who the validators are, how the set rotates, and
-how checkpoints enter blocks. Until that is resolved, nothing in
-`Chain::submit` consults any `BlsVerifier`, and no absolute-finality guarantee
-is in force. Treat §14.4 + §14.5 as a real cryptographic core attached to an
-inactive gadget.
+**economic** consensus is §14.6: who the validators are is decided (Decision 11 —
+a declared genesis set, no stake ledger), but bonded stake, rotation, rewards and
+equivocation slashing are not. Until those land, treat §14.4 + §14.5 as a real
+cryptographic core attached to a gadget whose *authority* is declared rather
+than purchased.
 
 ### 14.5 M5 — Real BLS signatures (blst): wire and protocol semantics
 
@@ -1410,7 +1424,7 @@ with the grace-period drop), and the checkpoint clause checks as
 `validate_checkpoint_against_set` returning the failed clause. Tests attack
 every clause; none of it is reachable from consensus.
 
-### 14.7 M4 — Validator set + finality foundation (Decision 11, non-binding)
+### 14.7 M5 — Validator set + finality foundation (Decision 11, non-binding)
 
 Decision 11 resolves the §14.6 open items for Phase 6 by **scoping, not
 inventing**: the economics (bonded stake, rewards, slashing) remain open and
@@ -1433,12 +1447,15 @@ activated; a future milestone that wants it needs its own decision.
   certificates only. A receiver verifies against its local committee and relays
   if valid; consensus never consults it. `Checkpoint`/`CheckpointPayload`
   gained bounded `deserialize`.
-- **Observation, not activation.** `jnt_core::finality::FinalityManager` records
-  what the committee signed and reports it. `Chain::submit`, fork choice and
-  `finalized_height` are untouched: a reorg crossing an observed checkpoint
-  still applies, and that is pinned by
-  `finality_m4::a_reorg_crossing_an_observed_checkpoint_still_applies`. L2
-  `Settle` quorums are untouched — they belong to task arbitration, not the L1
+- **Observation, before activation (Decision 11).** `jnt_core::finality::FinalityManager`
+  records what the committee signed and reports it, and at that stage
+  `finalized_height` and fork choice did not consult it. **Superseded by §14.8:**
+  once a profile's `finality_activation_height` is reached, `adopt()` refuses any
+  branch forking at or below the binding-finalized height, and
+  `Chain::finalized_height()` is the stronger of the depth and binding rules. On
+  `testnet` (activation height 20) that is enforced; on `mini`/`mainnet` (0) it
+  is not, and the observation-only behaviour above is what remains. L2 `Settle`
+  quorums are untouched either way — they belong to task arbitration, not the L1
   checkpoint committee.
 
 ### 14.8 M5 — Binding finality, testnet profile, equivocation (Decisions 12–14)
@@ -1542,24 +1559,29 @@ refuses every settlement by name.
 
 ---
 
-## 15. Layer 2: task contracts and the five L2 transaction types (Phase 2)
+## 15. Layer 2: task contracts and the six L2 transaction types
 
 Layer 2 is the verified-work marketplace: a submitter posts a compute task with
 a locked payment, a worker claims and runs it, and settlement releases the
-payment against a verdict. This section specifies the Phase-2 slice — the
-payload types, the task state machine, and the fee path. It is **normative for
-the `jnt-l2` crate and `jnt_core::l2`**, and it deliberately stops short of
+payment against a verdict. A sixth payload type, `ExitQueue`, moves value the
+other way — out of L2 and back to L1 (§19.6). This section specifies the payload
+types, the task state machine, and the fee path. It is **normative for the
+`jnt-l2` crate and `jnt_core::l2`**, and it deliberately stops short of L1
 consensus:
 
-- These payloads are **not yet carried inside an L1 block**. How an L2
-  transaction enters a block is Phase 6, and inventing it now would mean
-  specifying a block rule above a state machine nobody had exercised.
-- Nothing here changes `Chain::submit`, fork choice, `finalized_height`,
-  issuance, or the block wire format. The L1 test vectors are untouched.
+- These payloads are carried inside L1 blocks as a length-prefixed trailer
+  committed by the merkle root (§19.1 — implemented). An L2-free block still
+  encodes byte-identically to the pre-§19.1 format, which is why the frozen L1
+  vectors are untouched.
+- Nothing here changes `Chain::submit`, fork choice, `finalized_height`, issuance,
+  the L1 fee floor or the L1 gas model. An L2 payload that fails to apply is
+  recorded by the replayer and skipped deterministically; it never turns an L1
+  block invalid. That separation is what keeps this integration out of
+  `Chain::submit`.
 
 ### 15.1 Transaction types and wire codes
 
-Five payload types, each with an explicit wire code. The `0x10` base is
+Six payload types, each with an explicit wire code. The `0x10` base is
 deliberate: L1 uses `0` (`STANDARD`) and `1` (`COINBASE`), so an unknown L1 type
 is refused as an L1 type rather than silently read as an L2 one.
 
@@ -1570,6 +1592,7 @@ is refused as an L1 type rather than silently read as an L2 one.
 | `SubmitResult` | `0x12` | 2 000 | worker |
 | `Dispute` | `0x13` | 10 000 | challenger |
 | `Settle` | `0x14` | 20 000 | validator quorum |
+| `ExitQueue` | `0x15` | 2 000 | exit owner (§19.6) |
 
 The first four carry an explicit actor address and a signature bundle over a
 domain-separated signing hash. The signing hash covers the payload **including
@@ -1709,15 +1732,19 @@ challenge earns nothing and burns the deposit.
 
 ### 15.9 What is not specified here
 
-- How L2 transactions reach a block (Phase 6).
+- *Nothing outstanding:* how an L2 transaction reaches a block is specified and
+  implemented in §19.1.
 - Verified Work Certificate issuance, representation and validation — now
   specified in §17. The `vwc_hash` field of a settlement remains the value that
   a certificate commits to: `result_hash` for `Correct`, the counter-result for
   `Fraudulent`, and all-zero (`VWC_HASH_EXPIRED`) for `Expired`; only a `Correct`
   settlement issues a certificate.
 - The off-chain mechanics of producing `re_execution_result` (scheduling the
-  arbitrator set, distributing the IR and input bytes) — Phase 5/6.
-- Binding BLS finality activation (end of Phase 6).
+  arbitrator set, distributing the IR and input bytes) — the off-chain
+  arbitration path, still unspecified.
+- *Nothing outstanding:* §14.8 (Decision 12) defines the binding-finality
+  activation rule, and `testnet` carries `finality_activation_height = 20`.
+  `mainnet` carries `0` with an empty committee, so it fails closed.
 
 ---
 
@@ -1803,7 +1830,7 @@ Consequences, stated so they are not discovered later:
 ### 16.5 Non-goals
 
 - No on-chain IR execution, and no interpreter in `jnt-core` or `jnt-l2`.
-- No gas metering of IR here (a Phase 5/6 concern for the worker SDK).
+- No gas metering of IR here — out of scope for the shipped worker SDK too.
 - Floating point is never introduced, in the reference or any backend.
 - The reference does not replace attestation or hardware proof; it determines
   correctness only after a result has been challenged.
@@ -1973,12 +2000,12 @@ behaviour.
   authentication reuses the existing M5 aggregate and `BlsVerifier`. No custom
   cryptography, no new key ceremony.
 - **No on-chain VWC transactions, no transfer semantics, no marketplace.** A
-  certificate is a receipt; what third parties do with it is Phase 5+.
+  certificate is a receipt; what third parties do with it is out of scope here.
 - **No claim of physical execution.** See §17.1.
 
 ---
 
-## 18. Worker SDK (Phase 5, `crates/jnt-worker`)
+## 18. Worker SDK (Phase 6, `crates/jnt-worker`)
 
 A worker is any actor that claims tasks from the L2 marketplace, executes them,
 and submits results: a human-operated process, an AI agent, an autonomous
@@ -1998,7 +2025,7 @@ protocol effect that the L2 state machine did not authorize.
   reused from `jnt-core` and `jnt-l2` verbatim. The SDK MUST NOT reimplement,
   re-derive or relax any of them.
 - **No new transaction type, fee, or authorization path.** Every wire artifact
-  the SDK produces is one of the five L2 payloads of §15.1, signed by the
+  the SDK produces is one of the six L2 payloads of §15.1, signed by the
   §15.2 hybrid `Auth`.
 - **Not a consensus participant.** The SDK never arbitrates, never settles
   (`Settle` has no single signer, §15.1) and never certifies (§17.4).
@@ -2028,11 +2055,11 @@ protocol effect that the L2 state machine did not authorize.
       fn broadcast(&mut self, tx: &L2Transaction) -> Result<(), BroadcastError>;
   }
   ```
-- Rationale: this build has no L2 wire transport yet (`jnt-net` carries only the
-  §13 P2P message set; the roadmap §13 REST API is unbuilt). Defining the seams
-  as traits lets a local node, an embedded `L2State`, or a future REST/WS client
-  implement them without changing the SDK, and keeps every protocol rule
-  testable without a socket.
+- Rationale: the seams keep the SDK transport-agnostic. `jnt-net` carries only
+  the §13 P2P message set, so the shipped transport is `jnt_worker::HttpNode`
+  over the node's opt-in REST API (§19.2). A local node or an embedded `L2State`
+  can implement the same traits instead, without changing the SDK, which keeps
+  every protocol rule testable without a socket.
 - The SDK treats node responses as **untrusted data**: state views it cannot
   parse are errors, defaults are never guessed, and a malformed or stale view
   fails closed (§18.11).
@@ -2243,8 +2270,10 @@ regression tests assert that over every public error and debug path.
 
 ### 18.17 Non-goals
 
-- No REST/WS transport of its own. When the roadmap §13 REST API exists, it
-  implements §18.3's traits; the SDK itself stays transport-agnostic.
+- No REST/WS transport of its own. The shipped transport, `jnt_worker::HttpNode`,
+  is a *client* of the node's opt-in REST API (§19.2) and implements §18.3's
+  traits; the SDK itself stays transport-agnostic, so a local node or an
+  embedded `L2State` can implement the same traits instead.
 - No executor implementations beyond the §16 CPU-reference shape used by
   tests and dispute observation; no scheduler, no ops UI.
 - No worker reputation, scoring or registry beyond the protocol's.
@@ -2254,12 +2283,14 @@ regression tests assert that over every public error and debug path.
 
 ---
 
-## 19. Phase 6: L1↔L2 integration (specified in four parts)
+## 19. Phase 6: L1↔L2 integration (specified in six parts)
 
-§15.9 left "how L2 transactions reach a block" deliberately unspecified. This
-section specifies it. **§19.1, §19.2, §19.4 and §19.5 describe behaviour that
-is implemented and tested; §19.3 is specified but not yet built**, and is
-marked so rather than being folded in with the implemented part.
+§19.1 specifies how an L2 transaction reaches a block — §15.9 left it
+deliberately unspecified until the state machine underneath had been exercised.
+**§19.1, §19.2, §19.4, §19.5 and §19.6 describe behaviour that is implemented
+and tested.** §19.3 was specified but not built when this section was first
+written; it has since been superseded, and is marked as such rather than being
+folded in with the implemented parts.
 
 ### 19.1 L2 transactions in L1 blocks — IMPLEMENTED, normative
 
@@ -2328,9 +2359,10 @@ summary.
 `jnt_core::chain::Chain::mine_block_with_l2` (producing a block that carries
 L2), `jnt_l2::replay::{ChainL2, SkippedL2}` (replay and the incremental path),
 `jnt_node::l2::NodeL2` (the node's view: replay on startup, incremental while
-the tip extends, full replay when history is rewritten; settlements checked
-against the empty set with the production BLS verifier until the M4 genesis
-committee exists). `jnt-node status` reports L2 height/applied/skipped;
+the tip extends, full replay when history is rewritten; settlements verified
+against the profile's declared `genesis_validators` committee with the
+production BLS verifier — empty on `mainnet`, which therefore refuses every
+settlement by name, see §15.1). `jnt-node status` reports L2 height/applied/skipped;
 `jnt-node verify` asserts replay determinism (two replays agree, incremental
 agrees with replay) and names the skipped payloads.
 
@@ -2360,7 +2392,7 @@ needs, so §13 itself is not edited.
 `GET /v1/tasks/open`, `GET /v1/vwc/{task_id}` (the certificate plus its
 `vwc_hex`) and `POST /v1/l2/broadcast`. `GET /v1/conservation` additionally
 serves the live joint-supply report of §19.4–§19.5 (L1 live + L2 held −
-deposit sink, against the cap, with all three check verdicts) — the same
+deposit sink, against the joint bound (issuance integral + escrow ceiling), with all three check verdicts) — the same
 arithmetic `jnt-node verify` prints — and the `jnt-worker run` verb gates on
 it before its first pass, recomputing the verdict from the terms rather than
 trusting the node's `ok` flag. `jnt-worker::HttpNode` is a client of the API
@@ -2386,26 +2418,28 @@ credential. This bullet of §19.2 is therefore satisfied by the operator's
 binding choice alone, and a non-loopback deployment is not authenticated by
 this specification.
 
-### 19.3 Specified only when its decision lands
+### 19.3 Superseded — genesis validator committee and checkpoints (Decisions 11–14)
 
-One Phase 6 obligation is **not** specified here, on purpose, because its
-decision is recorded but its mechanism is not yet built. Nothing may be
-inferred about it from this section:
+This subsection once reserved the genesis validator committee and the
+checkpoint machinery as "specified only when its decision lands". All three
+parts are now decided, specified and built:
 
-- **The genesis validator committee and checkpoints** (Decisions 2 and 8): the
-  fixed genesis set, the checkpoint message type (a §13.5 `msg_type` decision),
-  and which checkpoint validator is authoritative.
+- **The fixed genesis set** — `NetworkParams::genesis_validators`, the declared
+  committee, listed in the §10 profile table (§14.7).
+- **The checkpoint message type** — `msg_type = 11 CHECKPOINT` on the §13.5 set.
+- **The single authoritative validator** — `validators::validate_checkpoint_against_set`.
 
-It is not a precondition for §19.1 or §19.4, which is what makes the ordering
-here safe: carriage, replay and funding can be verified against a chain with
-no validators, and they are.
+Binding finality is activated per §14.8: `testnet` carries
+`finality_activation_height = 20` and enforces it, while `mainnet` (empty
+committee, `0`) fails closed. Nothing is outstanding here.
 
 ### 19.4 L2 genesis funding (Decision 7) — IMPLEMENTED, normative
 
 L2 value enters through a genesis-funded protocol escrow. There is no deposit
-transaction, no lock transaction, and no new L1 transaction type: user-facing
-deposits and L2→L1 exits are deferred past M2, and building either needs its
-own decision. What exists is the one production funding event, at L2 genesis.
+There is no deposit transaction, no lock transaction, and no new L1 transaction
+type for funding: user deposits ride an ordinary L1 payment to the derived sink
+(§19.5), and L2→L1 exits ride `exit_claims` authorised by an inclusion proof
+(§19.6). The one production **genesis** funding event is below.
 
 **The allocation.** Two `NetworkParams` fields fix it per profile:
 
@@ -2444,9 +2478,10 @@ no block-carried funding to replay twice.
 (genesis, or a unit-test credit); `conservation_total` counts every satoshi
 still in the system. Their equality is checked after every transition: fees,
 burns, slashes, bounties and refunds move value between buckets but never
-change the sum. `jnt-node verify` additionally asserts `funded_total` equals
-the profile's escrow total (no unauthorized funding happened) and that live L1
-supply plus L2 held stays under the cap.
+change the sum. `jnt-node verify` additionally asserts `funded_total` equals the profile's
+escrow total plus credited deposits minus `exited_total` (no unauthorized
+funding happened) and that live L1 supply plus L2 held stays under
+`cumulative_issuance_sat(height) + escrow_ceiling_sat`.
 
 **Failure behaviour.** A payload from an unfunded account is still refused with
 `InsufficientBalance`, recorded as skipped, and retryable — unchanged from M1.
@@ -2493,7 +2528,7 @@ winning chain.
 **Maturity.** Detected at acceptance, spendable once **both** required safety
 conditions hold (Decision 15):
 
-1. **depth** — the M3 rule, unchanged: `tip − deposit_height ≥ finality_depth`
+1. **depth** — the §9.3 `finality_depth` rule, unchanged: `tip − deposit_height ≥ finality_depth`
    (20 on `mini`/`testnet`, 100 on `mainnet`); and
 2. **binding finality** — once the chain has a binding checkpoint (§14.8), the
    deposit's own height must be at or below the binding-finalized height.
@@ -2522,11 +2557,14 @@ extending would leave the deposit pending forever while a replay would credit
 it). The binding floor is read from the L1 chain's own finality layer on every
 sync; L2 keeps no checkpoint view of its own.
 
-**Conservation.** Per deposit, L1 sink value equals L2 credited value. Globally
-the M2 joint check grows a sink term, because sink outputs remain in the L1
-UTXO set while their twins live in L2: `L1 live + L2 held − sink-held ≤ cap`.
-Without the term every deposit would read as inflation; with it the sum is
-constant across deposits and falls on burns.
+**Conservation.** Per deposit, L1 sink value equals L2 credited value, 1:1, no
+rate and no fee on the credit itself. Globally the joint check of §19.4 grows a
+sink term, because sink outputs remain in the L1 UTXO set while their twins live
+in L2: `L1 live + L2 held − sink-held ≤ cumulative_issuance_sat(height) +
+escrow_ceiling_sat`. Without the term every deposit would read as inflation;
+with it the sum is constant across deposits and falls on burns. (§19.6 adds the
+exit direction: the L1 payment and the L2 debit cancel, so the same check holds
+with no new term.)
 
 **Failure behaviour.** Ineligible sink outputs (mixed owners, dust) are burns
 without credit, recorded with named reasons. Duplicates are refused by name.
