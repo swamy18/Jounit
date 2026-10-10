@@ -13,9 +13,26 @@
 //!   and one-way, so a `Correct` settlement can never be overturned later —
 //!   exactly the condition that would make revocation necessary (§17.8).
 //! - **No claim of physical execution.** `Quorum` verification proves a quorum
-//!   signed the decision; `WindowElapsed` proves the protocol accepted the
-//!   result unchallenged. Neither says a machine physically ran anything
-//!   (§17.1).
+//!   signed the decision; `WindowElapsed` proves only that the protocol accepted
+//!   the result unchallenged (§17.1).
+//!
+//! # Why `WindowElapsed` is not a correctness claim
+//!
+//! The dispute window expiring proves that *nobody objected*, not that the
+//! result is right. A worker who submits a wrong result and is not challenged
+//! inside the window still auto-settles `Correct` and is still paid — the
+//! timeout economics requires that a challenge be made to overturn a
+//! settlement, otherwise a griefer could stall every task forever.
+//!
+//! What must never happen is that payment being mistaken for verification. So a
+//! `WindowElapsed` certificate is a **receipt for an uncontested settlement**,
+//! and the type makes the difference unmissable rather than a doc comment:
+//! [`VerifiedWorkCertificate::asserts_correctness`] is `false` for it, and
+//! [`VerifiedWorkCertificate::validate_verified`] refuses it. A relying party
+//! that needs independent proof must call the latter, and there is no argument
+//! by which the weak one satisfies it. `jnt-worker::vwc::is_offline_verifiable`
+//! is a re-export of the single definition here, not a second implementation
+//! (§18.1).
 
 use jnt_core::bls_checkpoint::{BlsSignature, BlsVerifier, ValidatorSet};
 use jnt_core::hash::{sha256_dom, Address, Hash};
@@ -37,6 +54,11 @@ const KIND_WINDOW_ELAPSED: u8 = 2;
 /// offline-verifiable against the validator set, `WindowElapsed` is not — its
 /// strength is the on-chain record, and a party who needs more MUST demand
 /// `Quorum`.
+///
+/// `WindowElapsed` carries **no** correctness evidence. It records that the
+/// dispute window closed with no challenge, which is an economic fact about
+/// whether anybody looked, not a fact about whether the result is right. See
+/// the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VwcVerification {
     /// An explicit `Settle` transaction: the payload's quorum aggregate, reused
@@ -49,7 +71,20 @@ pub enum VwcVerification {
     },
     /// An implicit settlement (auto-settle or dispute lapse, §15.7): no
     /// aggregate exists for a transition no one transacted.
+    ///
+    /// **Not a correctness claim.** An unchallenged wrong result settles this
+    /// way. See the module docs for why that is unavoidable and what a relying
+    /// party must do about it.
     WindowElapsed,
+}
+
+impl VwcVerification {
+    /// True when this variant carries cryptographic evidence a third party can
+    /// check offline, which is only ever `Quorum`. This is the single definition;
+    /// `jnt-worker` re-exports it rather than repeating the `matches!`.
+    pub fn is_offline_verifiable(&self) -> bool {
+        matches!(self, VwcVerification::Quorum { .. })
+    }
 }
 
 impl VwcVerification {
@@ -224,6 +259,12 @@ impl VerifiedWorkCertificate {
     /// Total and deterministic; every failure is named. Structural validity is
     /// not acceptance: a certificate that is not in the issuing state's registry
     /// was never issued, which [`crate::L2State::validate_vwc`] checks.
+    ///
+    /// This is the *weak* entry point: it accepts a `WindowElapsed` certificate,
+    /// because such a certificate is real and well-formed. It answers "is this a
+    /// genuine certificate of the kind it claims", **not** "is this result
+    /// verified". [`Self::validate_verified`] is the entry point for the second
+    /// question, and there is no argument by which this one's `Ok` answers it.
     pub fn validate(&self, validators: &ValidatorSet, verifier: &dyn BlsVerifier) -> L2Result<()> {
         // Identity: a hand-built or copied struct whose id does not follow from
         // its fields is refused before anything else is believed.
@@ -282,6 +323,49 @@ impl VerifiedWorkCertificate {
             }
         }
         Ok(())
+    }
+
+    /// Validate a certificate **as a verification of the result it names**.
+    ///
+    /// This is the entry point every relying party must use when it is about to
+    /// treat a result as correct. It runs everything [`Self::validate`] runs and
+    /// then refuses any certificate whose basis is not offline-verifiable.
+    ///
+    /// The refusal exists because of a specific, reachable state: a worker
+    /// submits a wrong result, nobody files a challenge inside the dispute
+    /// window, the contract auto-settles `Correct`, the worker is paid, and a
+    /// certificate naming that wrong result is minted with `WindowElapsed`. The
+    /// payment is correct protocol behaviour — the timeout economics requires a
+    /// challenge to overturn a settlement, or a griefer could stall every task
+    /// forever. What is *not* acceptable is the certificate that comes out of it
+    /// reading as verification. There is no key, no aggregate and no re-execution
+    /// behind it, so this method refuses it by name rather than letting a caller
+    /// assume.
+    pub fn validate_verified(
+        &self,
+        validators: &ValidatorSet,
+        verifier: &dyn BlsVerifier,
+    ) -> L2Result<()> {
+        self.validate(validators, verifier)?;
+        if !self.asserts_correctness() {
+            return Err(L2Error::VwcInvalid(
+                "certificate is a receipt for an uncontested settlement, not a verification: \
+                 the challenge window closed with nobody objecting, which says nothing about \
+                 whether the result is correct",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this certificate carries evidence its result is correct.
+    ///
+    /// `false` means the opposite of "invalid": the certificate is genuine and
+    /// the settlement really happened, it just rests on nobody having disputed
+    /// it in time. Always pair this with
+    /// [`Self::validate_verified`] — a relying party that checks the wrong one
+    /// gets no signal at all.
+    pub fn asserts_correctness(&self) -> bool {
+        self.verification.is_offline_verifiable()
     }
 
     /// True when this certificate is exactly the one the given settle payload

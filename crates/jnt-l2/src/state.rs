@@ -950,25 +950,38 @@ impl L2State {
                     .apply_settlement(submitter, worker, challenger, outcome, [0u8; 32], height)
                     .unwrap_or(0);
                 // An implicit settlement carries no aggregate (nothing was
-                // transacted), so its certificate is `WindowElapsed` (§17.5). A
-                // task settles once, so a duplicate issuance here is impossible;
-                // recording nothing would mean a corrupt state, not a lost fee.
-                let vwc_id = worker.zip(result).and_then(|(w, r)| {
-                    match VerifiedWorkCertificate::from_settlement(
+                // transacted), so its certificate is `WindowElapsed` (§17.5).
+                //
+                // That certificate is a receipt for an uncontested settlement
+                // and nothing more: the dispute window closing says nobody
+                // objected, not that the result is right. A worker who submits
+                // a wrong result and is never challenged reaches exactly here.
+                // The settlement and the payment are correct either way — the
+                // timeout economics requires a challenge to overturn one, or a
+                // griefer could stall every task forever — so what must not
+                // happen is the certificate reading as verification. It is
+                // registered as `WindowElapsed`, `asserts_correctness()` is
+                // false for it, and `validate_verified` refuses it by name.
+                //
+                // A task settles once, so a duplicate issuance is impossible;
+                // `expect` rather than `unwrap_or(0)`/`Err(_) => None` because
+                // silently recording nothing here would mean a corrupt state,
+                // and a lost certificate is exactly the kind of drift that
+                // makes two nodes disagree about a settled task.
+                let vwc_id = worker.zip(result).map(|(w, r)| {
+                    let cert = VerifiedWorkCertificate::from_settlement(
                         id,
                         w,
                         r,
                         height,
                         outcome.worker_paid,
                         VwcVerification::WindowElapsed,
-                    ) {
-                        Ok(cert) => {
-                            let cert_id = cert.id;
-                            let _ = self.issue_vwc(cert);
-                            Some(cert_id)
-                        }
-                        Err(_) => None,
-                    }
+                    )
+                    .expect("an implicit settlement has a real worker, result and height");
+                    let cert_id = cert.id;
+                    self.issue_vwc(cert)
+                        .expect("a task settles once, so issuance cannot collide");
+                    cert_id
                 });
                 effects.push(L2Effect::Settled {
                     task_id: id,
@@ -1031,6 +1044,10 @@ impl L2State {
     /// (§17.6 check 4) — the certificate must be the one this state issued, byte
     /// for byte. A structurally valid certificate that no state issued proves
     /// nothing.
+    ///
+    /// This accepts a `WindowElapsed` certificate. Use
+    /// [`Self::validate_vwc_verified`] when the question is whether the *result*
+    /// is verified rather than whether the certificate is genuine.
     pub fn validate_vwc(
         &self,
         cert: &VerifiedWorkCertificate,
@@ -1043,6 +1060,25 @@ impl L2State {
             Some(_) => Err(L2Error::VwcInvalid("differs from the issued certificate")),
             None => Err(L2Error::VwcInvalid("was never issued by this state")),
         }
+    }
+
+    /// The registry check **plus** the requirement that the certificate actually
+    /// verifies its result.
+    ///
+    /// A relying party that is about to pay for, publish, or otherwise act on a
+    /// compute result must call this. The only difference from
+    /// [`Self::validate_vwc`] is that a certificate resting on an unchallenged
+    /// dispute window is refused — see
+    /// [`crate::vwc::VerifiedWorkCertificate::validate_verified`] for why that
+    /// state is reachable and what it does and does not prove.
+    pub fn validate_vwc_verified(
+        &self,
+        cert: &VerifiedWorkCertificate,
+        validators: &ValidatorSet,
+        verifier: &dyn BlsVerifier,
+    ) -> L2Result<()> {
+        self.validate_vwc(cert, validators, verifier)?;
+        cert.validate_verified(validators, verifier)
     }
 
     /// Record a certificate. Exactly one per task, ever: a second issuance for

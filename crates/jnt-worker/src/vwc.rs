@@ -8,8 +8,9 @@
 
 use jnt_core::bls_checkpoint::{BlsVerifier, ValidatorSet};
 use jnt_core::hash::{Address, Hash};
+use jnt_l2::error::L2Error;
 use jnt_l2::state::L2State;
-use jnt_l2::vwc::{VerifiedWorkCertificate, VwcVerification};
+use jnt_l2::vwc::VerifiedWorkCertificate;
 
 use crate::error::{WorkerError, WorkerResult};
 
@@ -20,6 +21,15 @@ use crate::error::{WorkerError, WorkerResult};
 /// exist only after settlement, `Fraudulent`/`Expired` settle without one);
 /// a certificate that fails validation is an error, never a silent
 /// downgrade — a tampered receipt must not pass for income.
+///
+/// **What the returned certificate is and is not.** It is genuine and this state
+/// really did settle that task. Whether it verifies the *result* is a separate
+/// question, and the honest answer can be no: a worker may submit a wrong
+/// result, go unchallenged through the dispute window, get paid, and hold a
+/// `WindowElapsed` certificate. Check
+/// [`VerifiedWorkCertificate::asserts_correctness`] before treating it as
+/// evidence the computation was right — or call
+/// [`observe_verified_certificate`], which refuses the weak basis outright.
 pub fn observe_certificate(
     state: &L2State,
     task_id: &Hash,
@@ -42,6 +52,36 @@ pub fn observe_certificate(
     Ok(Some(cert))
 }
 
+/// Observe the certificate for `task_id` **only if it verifies its result**.
+///
+/// The entry point for a caller about to act on a compute result — paying for
+/// it, publishing it, or chaining work onto it. Unlike
+/// [`observe_certificate`], a certificate that rests on an unchallenged dispute
+/// window is an error rather than a returned receipt, because such a
+/// certificate says nobody objected in time and nothing about whether the
+/// result is correct. A worker who submits a wrong result and is not
+/// challenged genuinely holds one.
+///
+/// `Ok(None)` still means "not settled as Correct". The refusal is the third
+/// state, and it is the one `observe_certificate` cannot express.
+pub fn observe_verified_certificate(
+    state: &L2State,
+    task_id: &Hash,
+    validators: &ValidatorSet,
+    verifier: &dyn BlsVerifier,
+) -> WorkerResult<Option<VerifiedWorkCertificate>> {
+    let Some(cert) = observe_certificate(state, task_id, validators, verifier)? else {
+        return Ok(None);
+    };
+    if !cert.asserts_correctness() {
+        return Err(WorkerError::Protocol(L2Error::VwcInvalid(
+            "certificate rests on an unchallenged dispute window, which is not verification: \
+             nobody disputed the result in time, which says nothing about whether it is correct",
+        )));
+    }
+    Ok(Some(cert))
+}
+
 /// Every certificate naming `worker`, sorted by task id — the worker's
 /// certified-history view (§18.13). Unlike `observe_certificate` these are
 /// read straight from the registry without re-validation: the protocol
@@ -60,6 +100,11 @@ pub fn certificates_for_worker<'a>(
 
 /// Whether the certificate's verification kind makes it offline-verifiable
 /// (§17.5): a relying party who needs independent proof MUST demand `Quorum`.
+///
+/// A re-export of the one definition in `jnt_l2::vwc`, not a second
+/// implementation (§18.1). `false` means "rests on nobody having disputed it",
+/// not "invalid" — and an unchallenged **wrong** result does reach this state,
+/// which is why `observe_certificate` refuses to present one as verified.
 pub fn is_offline_verifiable(cert: &VerifiedWorkCertificate) -> bool {
-    matches!(cert.verification, VwcVerification::Quorum { .. })
+    cert.verification.is_offline_verifiable()
 }
