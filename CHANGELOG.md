@@ -14,6 +14,43 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed (security)
+
+Full write-up in [docs/security-audit-2026-10-11.md](docs/security-audit-2026-10-11.md).
+
+- **A worker-chosen deposit made a fraud verdict unreachable, which meant a
+  dishonest worker could take the whole escrow.** `TaskContract::claim` accepted
+  any deposit above zero, but the settle fee is derived from the escrow
+  (Decision 23), and the `Fraudulent` arm of `settle_inner` refuses when
+  `deposit < fee`. A worker could claim with a dust deposit, submit a wrong
+  result, and become structurally unslashable: once a result is submitted,
+  `Expired` is no longer reachable either, leaving the free auto-settle `Correct`
+  as the only settlement left. The worker collected the entire escrow for work
+  that is provably wrong, and the penalty was a number they chose themselves.
+  `claim` now refuses a deposit below `settle_fee_sat(payment_sat)`, so a fraud
+  verdict is always reachable. `payment_sat` is fixed at post time, so the floor
+  cannot be dodged later.
+- **Miner and validator disagreed on the next base fee, wedging the chain after
+  any exit claim.** `build_block` and `expected_base_fee_for_next_block` folded
+  the parent's `claims_gas_used()` into the next block's base fee; `apply_block`
+  used `total_gas_used()` alone. After a block carrying a claim - which
+  `check_claim` makes permissionless - the miner produced a strictly higher fee
+  than the validator expected and the node rejected its own next block with
+  `BadFee`. `apply_block` now counts claim gas, matching the miner term for term.
+  A `next_base_fee` clamp hides this while the fee sits at its bounds, so no
+  existing test caught it.
+
+### Known issues
+
+- **L1 does not recompute the committed L2 state root** (`check_claim` trusts
+  `block.l2_state_root` rather than matching it against an L2 replay), so a
+  miner can commit a root over a state nobody else holds and prove a fabricated
+  exit record against it. Not fixed here: `jnt-l2` depends on `jnt-core`, so
+  closing it needs a dependency inversion or a consensus-path change rather than
+  a surgical patch. `mainnet.exit_activation_height` is `0`, so the sink is not
+  exposed on mainnet as shipped - **testnet and mini are**. See the audit
+  document for detail.
+
 ### Added (attribution)
 
 - **Authorship is now recorded throughout the project.** The code carried no

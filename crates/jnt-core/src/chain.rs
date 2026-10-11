@@ -527,11 +527,18 @@ impl Chain {
         let expected_base_fee = if height == 1 {
             self.params.base_fee_initial_sat
         } else {
-            next_base_fee(
-                &self.params,
-                parent.header.base_fee_sat,
-                parent.total_gas_used()?,
-            )
+            // Claims are ordinary block space (approved P1), so their gas feeds
+            // the next block's base fee exactly like body gas. This must match
+            // `build_block` and `expected_base_fee_for_next_block` term for
+            // term: a validator that omitted claim gas here would compute a
+            // lower floor than the miner produced and reject a block that every
+            // other node accepts, a consensus split reachable by anyone who
+            // cranks a single exit claim.
+            let parent_gas = parent
+                .total_gas_used()?
+                .checked_add(parent.claims_gas_used()?)
+                .ok_or(Error::ValueOverflow)?;
+            next_base_fee(&self.params, parent.header.base_fee_sat, parent_gas)
         };
         if block.header.base_fee_sat != expected_base_fee {
             return Err(Error::BadFee("base fee does not follow the schedule"));
@@ -2146,6 +2153,60 @@ mod tests {
             );
         }
         chain.verify_canonical_chain().unwrap();
+    }
+
+    /// The validator's next-base-fee computation must count claim gas, exactly as
+    /// the miner's does.
+    ///
+    /// Claims are ordinary block space (approved P1), so `build_block` and
+    /// `expected_base_fee_for_next_block` both fold the parent's
+    /// `claims_gas_used()` into the parent's gas. `apply_block` computed the
+    /// same schedule from `total_gas_used()` alone, so after any block carrying
+    /// a claim it expected a strictly lower base fee than the miner produced
+    /// and rejected the node's own next block with `BadFee`. One permissionless
+    /// exit crank was enough to wedge every honest miner on an exit-enabled
+    /// network.
+    ///
+    /// A `next_base_fee` clamp hides this whenever the fee sits at a bound, so
+    /// the regime here sits strictly inside `[min, max]`: high enough that the
+    /// downward pressure from claim gas cannot floor it, and with a tight gas
+    /// cap so the two gas figures land on different sides of the target.
+    #[test]
+    fn claim_gas_changes_the_next_base_fee_and_must_be_counted() {
+        let mut params = NetworkParams::mini();
+        params.base_fee_initial_sat = 1_000_000;
+        params.base_fee_min_sat = 1;
+        params.base_fee_max_sat = 100_000_000;
+        params.gas_cap = 100_000;
+
+        let mut chain = Chain::new(params).unwrap();
+        let miner = addr(1);
+        for h in 1..=4u64 {
+            let b = chain.mine_block(miner, vec![], ts(h)).unwrap();
+            chain.submit(b).unwrap();
+        }
+
+        let parent = chain.tip().clone();
+        let body_gas = parent.total_gas_used().unwrap();
+        // One claim's worth of block space on top of the body's.
+        let claim_gas = 17_500u64;
+        let total_gas = body_gas.checked_add(claim_gas).unwrap();
+        assert!(
+            total_gas <= chain.params().gas_cap,
+            "the block must stay valid under the tightened cap"
+        );
+
+        let params = chain.params().clone();
+        let with_claims =
+            crate::fees::next_base_fee(&params, parent.header.base_fee_sat, total_gas);
+        let body_only = crate::fees::next_base_fee(&params, parent.header.base_fee_sat, body_gas);
+
+        // The regime must discriminate, or this test proves nothing: with the
+        // fee clamped, the two agree and the bug hides.
+        assert_ne!(
+            with_claims, body_only,
+            "claim gas must move the base fee once the fee is clear of its clamp"
+        );
     }
 
     #[test]

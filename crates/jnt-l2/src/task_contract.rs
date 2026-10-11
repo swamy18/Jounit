@@ -242,6 +242,26 @@ impl TaskContract {
         if claim.worker_deposit_sat == 0 {
             return Err(L2Error::ZeroAmount("worker_deposit_sat"));
         }
+        // The deposit is the *entire* penalty available for a fraud verdict, so
+        // it must always be able to cover the settle fee. If it were not, a
+        // worker could claim with a dust deposit, submit a wrong result, and
+        // then be structurally unslashable: the `Fraudulent` arm of
+        // `settle_inner` refuses when `deposit < fee`, and once a result is
+        // submitted `Expired` is no longer reachable either, leaving
+        // auto-settle `Correct` as the only settlement left. The worker would
+        // collect the whole escrow for work that is provably wrong, and the
+        // penalty would be a number they chose in advance.
+        //
+        // `settle_fee_sat` is the same function `apply_settle` charges from, and
+        // `payment_sat` is fixed at post time, so the floor is stable for the
+        // life of the contract and this check cannot be dodged later.
+        let min_deposit = jnt_core::l2::settle_fee_sat(self.payment_sat);
+        if claim.worker_deposit_sat < min_deposit {
+            return Err(L2Error::AmountTooSmallForFee {
+                available: claim.worker_deposit_sat,
+                fee: min_deposit,
+            });
+        }
         self.worker = Some(actor);
         self.worker_deposit_sat = claim.worker_deposit_sat;
         self.state = ContractState::InProgress {
@@ -992,7 +1012,7 @@ mod tests {
     fn happy_path_open_to_settled() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         assert!(matches!(c.state, ContractState::InProgress { .. }));
         assert_eq!(c.worker, Some(addr(2)));
 
@@ -1006,7 +1026,7 @@ mod tests {
 
         let outcome = c.settle(Verdict::Correct, [0xAAu8; 32], 9, 20_000).unwrap();
         assert_eq!(outcome.worker_paid, 5_000_000 - 20_000);
-        assert_eq!(outcome.worker_deposit_returned, 1_000);
+        assert_eq!(outcome.worker_deposit_returned, 10_000);
         assert_eq!(outcome.fee_burned + outcome.fee_pscb, 20_000);
         assert!(matches!(c.state, ContractState::Settled(_)));
         assert_eq!(c.locked_total(), 0);
@@ -1016,9 +1036,9 @@ mod tests {
     fn a_double_claim_is_refused() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         assert!(matches!(
-            c.claim(addr(3), &claim(addr(3), id, 1_000), 3),
+            c.claim(addr(3), &claim(addr(3), id, 10_000), 3),
             Err(L2Error::IllegalTransition { .. })
         ));
         assert_eq!(c.worker, Some(addr(2)));
@@ -1029,7 +1049,7 @@ mod tests {
         let mut c = open_contract();
         let id = c.task_id;
         assert!(matches!(
-            c.claim(addr(2), &claim(addr(2), id, 1_000), 101),
+            c.claim(addr(2), &claim(addr(2), id, 10_000), 101),
             Err(L2Error::TaskExpired)
         ));
     }
@@ -1038,7 +1058,7 @@ mod tests {
     fn only_the_claiming_worker_may_submit() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         assert!(matches!(
             c.submit_result(addr(3), &submit(addr(3), id, [1u8; 32]), 3),
             Err(L2Error::BadAuthorization)
@@ -1056,7 +1076,7 @@ mod tests {
     fn a_result_after_the_deadline_is_refused() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         assert!(matches!(
             c.submit_result(addr(2), &submit(addr(2), id, [1u8; 32]), 101),
             Err(L2Error::TaskExpired)
@@ -1067,7 +1087,7 @@ mod tests {
     fn a_dispute_after_the_window_is_refused_but_inside_it_is_accepted() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
             .unwrap();
 
@@ -1084,7 +1104,7 @@ mod tests {
     fn a_dispute_that_agrees_with_the_result_is_refused() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
             .unwrap();
         assert!(matches!(
@@ -1097,7 +1117,7 @@ mod tests {
     fn settling_before_the_window_closes_is_refused() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
             .unwrap();
         assert!(matches!(
@@ -1110,7 +1130,7 @@ mod tests {
     fn a_settle_hash_that_does_not_match_the_verdict_is_refused() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
             .unwrap();
         assert!(matches!(
@@ -1127,7 +1147,7 @@ mod tests {
         // the defrauded submitter is owed.
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
             .unwrap();
         c.file_dispute(addr(4), &dispute(addr(4), id, [0xBBu8; 32], 500), 4)
@@ -1136,7 +1156,7 @@ mod tests {
         assert_eq!(
             c.settle(Verdict::Fraudulent, [0xBBu8; 32], 5, 20_000),
             Err(L2Error::AmountTooSmallForFee {
-                available: 1_000,
+                available: 10_000,
                 fee: 20_000
             })
         );
@@ -1168,7 +1188,7 @@ mod tests {
     fn a_failed_challenge_burns_the_challenger_deposit() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
             .unwrap();
         c.file_dispute(addr(4), &dispute(addr(4), id, [0xBBu8; 32], 500), 4)
@@ -1179,7 +1199,7 @@ mod tests {
         assert_eq!(outcome.challenger_deposit_burned, 500);
         assert_eq!(outcome.challenger_refunded, 0);
         assert_eq!(outcome.worker_paid, 5_000_000);
-        assert_eq!(outcome.worker_deposit_returned, 1_000);
+        assert_eq!(outcome.worker_deposit_returned, 10_000);
     }
 
     #[test]
@@ -1197,10 +1217,10 @@ mod tests {
     fn an_in_progress_task_that_lapses_burns_the_worker_deposit() {
         let mut c = open_contract();
         let id = c.task_id;
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
         let outcome = c.try_expire(101).expect("expires the block after");
         assert_eq!(outcome.submitter_refunded, 5_000_000);
-        assert_eq!(outcome.worker_deposit_burned, 1_000);
+        assert_eq!(outcome.worker_deposit_burned, 10_000);
     }
 
     #[test]
@@ -1214,19 +1234,77 @@ mod tests {
         assert!(!c.due_for_auto_settle(200));
     }
 
+    /// A claim deposit below the settle fee is refused at claim time.
+    ///
+    /// Without this rule the worker picks its own penalty. A dust deposit makes
+    /// the `Fraudulent` arm of `settle_inner` unreachable (`deposit < fee`), and
+    /// once a result is submitted `Expired` is unreachable too — so the only
+    /// settlement left is the free auto-settle `Correct`. The worker then keeps
+    /// the entire escrow for work that is provably wrong, and the penalty is a
+    /// number they chose before doing anything.
+    #[test]
+    fn a_claim_deposit_that_cannot_cover_the_settle_fee_is_refused() {
+        let mut c = open_contract(); // payment 5_000_000 -> settle fee 5_000
+        let id = c.task_id;
+        assert_eq!(jnt_core::l2::settle_fee_sat(c.payment_sat), 5_000);
+
+        // One satoshi under the fee: enough to post, not enough to be slashed.
+        assert_eq!(
+            c.claim(addr(2), &claim(addr(2), id, 4_999), 2),
+            Err(L2Error::AmountTooSmallForFee {
+                available: 4_999,
+                fee: 5_000,
+            })
+        );
+        assert!(
+            matches!(c.state, ContractState::Open),
+            "a refused claim must leave the task claimable"
+        );
+
+        // Exactly the fee is the floor, and a fraud verdict against it now works
+        // rather than being structurally impossible.
+        c.claim(addr(2), &claim(addr(2), id, 5_000), 2).unwrap();
+        c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
+            .unwrap();
+        c.file_dispute(addr(4), &dispute(addr(4), id, [0xBBu8; 32], 500), 4)
+            .unwrap();
+        let outcome = c
+            .settle(Verdict::Fraudulent, [0xBBu8; 32], 5, 5_000)
+            .unwrap();
+        assert_eq!(outcome.submitter_refunded, 5_000_000);
+        assert_eq!(outcome.worker_deposit_slashed, 0);
+    }
+
+    /// The floor tracks the escrow, so a large task demands a real stake.
+    #[test]
+    fn the_deposit_floor_scales_with_the_escrow() {
+        // payment 500_000_000 -> 0.1% = 500_000 sat, well above the 1_000 floor.
+        let p = post(addr(1), 1, 500_000_000, 100);
+        let mut c = TaskContract::new(&p, 1, 5).unwrap();
+        let id = c.task_id;
+        assert_eq!(
+            c.claim(addr(2), &claim(addr(2), id, 499_999), 2),
+            Err(L2Error::AmountTooSmallForFee {
+                available: 499_999,
+                fee: 500_000,
+            })
+        );
+        c.claim(addr(2), &claim(addr(2), id, 500_000), 2).unwrap();
+    }
+
     #[test]
     fn locked_total_tracks_every_held_leg() {
         let mut c = open_contract();
         let id = c.task_id;
         assert_eq!(c.locked_total(), 5_000_000);
-        c.claim(addr(2), &claim(addr(2), id, 1_000), 2).unwrap();
-        assert_eq!(c.locked_total(), 5_001_000);
+        c.claim(addr(2), &claim(addr(2), id, 10_000), 2).unwrap();
+        assert_eq!(c.locked_total(), 5_010_000);
         c.submit_result(addr(2), &submit(addr(2), id, [0xAAu8; 32]), 3)
             .unwrap();
-        assert_eq!(c.locked_total(), 5_001_000);
+        assert_eq!(c.locked_total(), 5_010_000);
         c.file_dispute(addr(4), &dispute(addr(4), id, [0xBBu8; 32], 500), 4)
             .unwrap();
-        assert_eq!(c.locked_total(), 5_001_500);
+        assert_eq!(c.locked_total(), 5_010_500);
         c.settle(Verdict::Fraudulent, [0xBBu8; 32], 5, 0).unwrap();
         assert_eq!(c.locked_total(), 0);
     }
