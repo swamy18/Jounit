@@ -3313,3 +3313,95 @@ rows), CHANGELOG Unreleased, roadmap.md item 30 + honest count,
 micro-payment-audit.md (streaming section), status.md, decisions.md.
 Untouched on purpose: SPEC.md (consensus scope only), sprint-status.md and
 security_audit.md (dated historical records).
+
+---
+
+## 2026-10-11 - Mainnet launch gate: the three remaining tasks
+
+The code work is complete. 993 tests pass, fmt and clippy are clean, CI is green
+on the exact commit, and every mechanism described in the README exists as
+described. What remains is not protocol.
+
+**Jounit is NOT launch-ready. Mainnet stays NO-GO until all three tasks below
+are done.** This is not a formality - each one is a real precondition, and none
+of the three can be satisfied by writing more code.
+
+### 1. Stand up a real bonded validator committee
+
+`mainnet` declares `genesis_validators: Vec::new()` (params.rs). The bond ledger
+that would hold stake is built and tested - `TX_BOND` / `TX_UNBOND` /
+`TX_SLASH`, a bond-order index, committee = first 21 bonds, per-block undo that
+survives reorg, finality keys derived from the ledger. The machinery works.
+
+What does not exist is a validator. Someone must bond
+`MIN_VALIDATOR_STAKE_SAT` = 5,000 JNT, run a node with its key in
+`<data-dir>/validators/`, and stay online. Until then `mainnet` checkpoint
+verification fails closed, because an empty committee verifies nothing - which
+is the honest pre-committee state rather than a bug.
+
+Also still open under this heading: who runs the **arbitrators**. The
+fraud-arbitration transport is built and tested end to end (signed votes, P2P
+relay, quorum tally, quorum-signed settlement applied through the existing
+settle path), but key custody for arbitrators is an organisational decision, not
+a code gap.
+
+### 2. Get an independent security review done
+
+993 passing tests are not an external audit, and this cannot be self-certified by
+anyone - least of all by the author of the code. The things most worth a reviewer's
+time:
+
+- the integer-only PoW arithmetic and the 30-50% cost model
+- the supply integral, the rate anchor, and the mint bound
+- the BLS checkpoint gadget and the quorum rule
+- the canonical compute reference and the dispute/arbitration path
+- the exit claim proof binding and the exact-funding rule
+
+Related and deliberately deferred: **M4 (HBM)** stays unregistered and therefore
+inert. Activating a new consensus puzzle without a review of its memory
+parameters is the mistake, not the omission - `hbm_pow.rs` ships implemented with
+ten tests and simply is not a registered `puzzle_id`.
+
+One further item in the same family: the slash transaction that would turn
+recorded **arbitration equivocation** (`ArbitrationEquivocation`, retained by the
+tally) into an actual bond burn is not wired. The evidence is collected; the
+punishment path is not built.
+
+### 3. Choose the mainnet activation heights
+
+Both are currently `0`, which means **never**, not *from genesis*:
+
+    exit_activation_height: 0        withdrawals inactive, mainnet deposits stay closed
+    finality_activation_height: 0     binding finality inactive, depth fallback only
+
+These are left off on purpose. They must not be set to an arbitrary number to
+make a checklist look complete. The order is: rehearse the complete withdrawal
+path and the quorum-finality path on the **launch candidate**, then pick heights
+that follow from that rehearsal, then freeze them for release. Setting them
+earlier is how users' funds get pointed at a path that has not been proven.
+
+### Also outstanding (operational, listed so the three are not read as the whole set)
+
+These do not block a testnet, and none is a protocol rule:
+
+- bootnodes: 3-5, independently operated, with stable addresses and a runbook
+- log shipping and structured-log rotation; the alert rules are specified in
+  docs/mainnet-readiness.md but the collectors are not deployed
+- a published PGP key for the security-disclosure channel - the channel is not
+  operational until a real key owner supplies and verifies one
+- signed release artifacts: the release workflow exists and produces checksums,
+  but nothing is signed because no signing key is published
+- a multi-node launch rehearsal on real hosts
+
+### How to tell the difference
+
+Worked, and safe to build on: the consensus layer, the supply schedule, the
+withdrawal mechanism, the dispute engine, the vote transport, checkpoint signing,
+the policy layer.
+
+Not done, and therefore not claimable: running validators, an external audit,
+activated mainnet parameters, and the operational surface above.
+
+`docs/mainnet-readiness.md` carries the same gate with per-item evidence. Any
+statement that Jounit is mainnet-ready is wrong until all three tasks are
+closed and recorded.

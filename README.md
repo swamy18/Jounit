@@ -513,7 +513,7 @@ applies.
 ### Why M4 is off, deliberately
 
 `hbm_pow.rs` implements the memory-hard permutation, its parameter scaling and
-nine tests. It is **not** registered as a `puzzle_id`, so it validates nothing.
+ten tests. It is **not** registered as a `puzzle_id`, so it validates nothing.
 Registering it would change the consensus puzzle without an independent security
 review of the memory parameters — that is not a mistake worth making before a
 review. Base PoW (`puzzle_id = 1`) is the active mechanism.
