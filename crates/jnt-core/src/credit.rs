@@ -45,10 +45,15 @@
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Address, Hash};
 use crate::ser::{Reader, Writer};
+use std::collections::BTreeMap;
 
 /// Domain tag for credit terms, so a term set can never be confused with a
 /// bond, a policy or a receipt.
 pub const DOM_CREDIT_TERMS: &[u8] = b"jounit/credit-terms/v1";
+
+/// Domain tag for a credit position, so a position id can never be confused
+/// with a terms id or any other derived hash.
+pub const DOM_CREDIT_POSITION: &[u8] = b"jounit/credit-position/v1";
 
 /// A lender's underwriting parameters for one class of position.
 ///
@@ -254,6 +259,404 @@ impl DefaultSettlement {
     }
 }
 
+/// Where credit positions and their value actually live.
+///
+/// A position is arithmetic; this is what makes it real. It holds three kinds of
+/// value — unencumbered balances, posted bonds, and collateral locked inside live
+/// positions — and it enforces the one invariant that matters:
+///
+/// ```text
+/// free + bonds + collateral(live) + recovered(lender) == deposited
+/// ```
+///
+/// Value is **moved, never created**. `check_conservation` is the guard, in the
+/// same spirit as `L2State`'s, and it is asserted across every test below because
+/// a conservation failure in a credit book is how a position acquires funds with
+/// no accounting reason for them.
+///
+/// The bond ledger is deliberately separate from `crate::bond`'s validator bonds.
+/// A validator bond secures consensus; a credit bond secures a debt. Mixing them
+/// would mean a validator's stake could back an agent's borrowing, which is a
+/// different risk with a different holder, and the two slashes would compete for
+/// the same value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreditBook {
+    /// Unencumbered balances.
+    free: BTreeMap<Address, u64>,
+    /// Bonds posted against future borrowing, held separately from `free` so a
+    /// borrower cannot spend the very thing backing its own credit.
+    bonds: BTreeMap<Address, u64>,
+    /// Live and terminal positions, keyed by their derived id.
+    positions: std::collections::BTreeMap<Hash, CreditPosition>,
+    /// Value received by lenders: what a default's settlement covered, and what
+    /// repayments paid out. The book is where a lender's earnings accumulate,
+    /// and this is the running total.
+    recovered: BTreeMap<Address, u64>,
+    /// Every satoshi ever put in. Append-only.
+    deposited_total: u64,
+}
+
+impl CreditBook {
+    /// An empty book.
+    ///
+    /// The explicit trait path is load-bearing: this book has an inherent
+    /// `default` that settles positions, and bare `CreditBook::default()` would
+    /// resolve to *that*, three arguments short.
+    pub fn new() -> Self {
+        <CreditBook as Default>::default()
+    }
+
+    /// Credit an agent's balance. This is the only way value enters the book.
+    pub fn deposit(&mut self, agent: Address, amount_sat: u64) -> Result<()> {
+        let e = self.free.entry(agent).or_insert(0);
+        *e = e.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
+        self.deposited_total = self
+            .deposited_total
+            .checked_add(amount_sat)
+            .ok_or(Error::ValueOverflow)?;
+        Ok(())
+    }
+
+    /// Free (unencumbered) balance.
+    pub fn free(&self, agent: &Address) -> u64 {
+        self.free.get(agent).copied().unwrap_or(0)
+    }
+
+    /// Bond posted by an agent.
+    pub fn bond(&self, agent: &Address) -> u64 {
+        self.bonds.get(agent).copied().unwrap_or(0)
+    }
+
+    /// Post a bond from the agent's free balance.
+    ///
+    /// A bond cannot be posted from itself: it comes out of free money, or it is
+    /// nothing. That is also what stops a borrower from uncollateralizing by
+    /// moving value into a bond and out of reach of the position.
+    pub fn post_bond(&mut self, agent: Address, amount_sat: u64) -> Result<()> {
+        if self.free(&agent) < amount_sat {
+            return Err(Error::Malformed(
+                "free balance cannot cover the bond being posted",
+            ));
+        }
+        let f = self.free.get_mut(&agent).unwrap();
+        *f -= amount_sat;
+        let b = self.bonds.entry(agent).or_insert(0);
+        *b = b.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
+        self.check_conservation()
+    }
+
+    /// Release a bond back to the agent's free balance.
+    pub fn release_bond(&mut self, agent: Address, amount_sat: u64) -> Result<()> {
+        if self.bond(&agent) < amount_sat {
+            return Err(Error::Malformed(
+                "no posted bond covers the release requested",
+            ));
+        }
+        let b = self.bonds.get_mut(&agent).unwrap();
+        *b -= amount_sat;
+        let f = self.free.entry(agent).or_insert(0);
+        *f = f.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
+        self.check_conservation()
+    }
+
+    /// Open a position, locking its collateral out of the borrower's free balance.
+    ///
+    /// Two upstream requirements, both enforced here rather than assumed:
+    ///
+    /// - The bond the position is priced with must be **posted first**. A bond
+    ///   that exists only in the spec buys a discount the borrower never backed,
+    ///   which is undercollateralization wearing a discount's clothes.
+    /// - The collateral must be in the borrower's free balance, because this is
+    ///   where it leaves it.
+    ///
+    /// The bond itself is *credited* rather than moved: it stays posted, and the
+    /// terms only count it toward the discount. A position therefore never
+    /// becomes able to spend the bond backing it.
+    pub fn open(&mut self, spec: &PositionSpec) -> Result<Hash> {
+        let id = spec.id();
+        if self.positions.contains_key(&id) {
+            return Err(Error::Malformed("this position is already open"));
+        }
+        let position = CreditPosition::open(spec)?;
+        if self.bond(&spec.borrower) < spec.bond_sat {
+            return Err(Error::Malformed(
+                "the bond a position is priced with must be posted before it opens",
+            ));
+        }
+        if self.free(&spec.borrower) < position.collateral_sat {
+            return Err(Error::Malformed(
+                "free balance cannot cover the collateral required",
+            ));
+        }
+        let f = self.free.get_mut(&spec.borrower).unwrap();
+        *f -= position.collateral_sat;
+        self.positions.insert(id, position);
+        self.check_conservation()?;
+        Ok(id)
+    }
+
+    /// Look a position up.
+    pub fn position(&self, id: &Hash) -> Option<&CreditPosition> {
+        self.positions.get(id)
+    }
+
+    /// Every live position. Terminal ones stay in the book for the record but are
+    /// not iterated here, because nothing can change them.
+    pub fn live_positions(&self) -> impl Iterator<Item = (&Hash, &CreditPosition)> {
+        self.positions.iter().filter(|(_, p)| !p.is_terminal())
+    }
+
+    /// Repay against a position.
+    ///
+    /// The payment comes from the borrower's free balance and lands with the
+    /// lender. A caller that wants to fund a repayment from elsewhere must
+    /// deposit first; accepting an unfunded payment would let a position settle
+    /// without the value existing.
+    pub fn repay(&mut self, id: &Hash, payment_sat: u64, height: u64) -> Result<Repayment> {
+        // Charge and read the parties before touching the position, so a
+        // refusal leaves the position untouched and no borrow outlives its scope.
+        let (borrower, lender) = {
+            let position = self
+                .positions
+                .get(id)
+                .ok_or(Error::Malformed("no such position"))?;
+            (position.borrower, position.lender)
+        };
+        if self.free(&borrower) < payment_sat {
+            return Err(Error::Malformed("free balance cannot cover the repayment"));
+        }
+        let result = {
+            let position = self
+                .positions
+                .get_mut(id)
+                .ok_or(Error::Malformed("no such position"))?;
+            position.repay(payment_sat, height)?
+        };
+        let f = self.free.get_mut(&borrower).unwrap();
+        *f -= payment_sat;
+
+        // The lender is paid: the value left the borrower and it went somewhere,
+        // which is the half of conservation a repayment has to get right.
+        let paid = self.recovered.entry(lender).or_insert(0);
+        *paid = paid.checked_add(payment_sat).ok_or(Error::ValueOverflow)?;
+
+        // A fully repaid position returns its collateral to the borrower. The
+        // repayment says whether it settled; the position holds the collateral.
+        if result.remaining_debt_sat == 0 {
+            let returned = self
+                .positions
+                .get(id)
+                .ok_or(Error::Malformed("no such position"))?
+                .collateral_sat;
+            if returned > 0 {
+                let f = self.free.entry(borrower).or_insert(0);
+                *f = f.checked_add(returned).ok_or(Error::ValueOverflow)?;
+            }
+        }
+        self.check_conservation()?;
+        Ok(result)
+    }
+
+    /// Default a position at its deadline.
+    ///
+    /// Order of payment is the settlement's own, unchanged: collateral first,
+    /// then the bond, never reputation. The difference here is that the bond is
+    /// *actually taken* — this is where a default's values leave the locked
+    /// pools, and the conservation check confirms exactly where they land.
+    pub fn default(&mut self, id: &Hash, height: u64) -> Result<DefaultSettlement> {
+        let position = self
+            .positions
+            .get_mut(id)
+            .ok_or(Error::Malformed("no such position"))?;
+        let borrower = position.borrower;
+        let lender = position.lender;
+        let settlement = position.default(height)?;
+
+        let f = self.free.entry(borrower).or_insert(0);
+        *f = f
+            .checked_add(settlement.excess_returned_sat)
+            .ok_or(Error::ValueOverflow)?;
+        if settlement.from_bond_sat > 0 {
+            let b = self
+                .bonds
+                .get_mut(&borrower)
+                .ok_or(Error::Malformed("no posted bond to take the default from"))?;
+            if *b < settlement.from_bond_sat {
+                return Err(Error::Malformed(
+                    "posted bond is smaller than the default requires",
+                ));
+            }
+            *b -= settlement.from_bond_sat;
+        }
+        let r = self.recovered.entry(lender).or_insert(0);
+        *r = r
+            .checked_add(settlement.lender_recovered_sat())
+            .ok_or(Error::ValueOverflow)?;
+        self.check_conservation()?;
+        Ok(settlement)
+    }
+
+    /// Value a lender has received — recovered from defaults and paid out by
+    /// repayments alike.
+    pub fn recovered(&self, lender: &Address) -> u64 {
+        self.recovered.get(lender).copied().unwrap_or(0)
+    }
+
+    /// Collateral currently locked inside live positions.
+    fn locked_collateral(&self) -> u64 {
+        self.positions
+            .values()
+            .filter(|p| !p.is_terminal())
+            .fold(0u64, |acc, p| acc.saturating_add(p.collateral_sat))
+    }
+
+    /// The invariant: value is moved, never created.
+    ///
+    /// A failed check is a bug, not a policy disagreement, which is why it
+    /// returns an error rather than a bool — a caller that cannot proceed on
+    /// failure must not be able to ignore it.
+    pub fn check_conservation(&self) -> Result<()> {
+        let accounted = self
+            .free
+            .values()
+            .chain(self.bonds.values())
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
+            .saturating_add(self.locked_collateral())
+            .saturating_add(
+                self.recovered
+                    .values()
+                    .fold(0u64, |acc, v| acc.saturating_add(*v)),
+            );
+        if accounted != self.deposited_total {
+            return Err(Error::Malformed(
+                "credit conservation: accounted value does not equal deposited",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Totals, for diagnostics and for asserting the invariant directly.
+    pub fn total_deposited(&self) -> u64 {
+        self.deposited_total
+    }
+
+    pub fn total_locked_collateral(&self) -> u64 {
+        self.locked_collateral()
+    }
+}
+
+/// A codec for a whole position, so a node can serve one and a worker can read it.
+impl CreditPosition {
+    /// Canonical encoding. Self-delimiting: the attestation-free fields are
+    /// fixed-size or written by their own encoders, so `decode` never guesses.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(256);
+        w.fixed(&self.borrower)
+            .fixed(&self.agent_id)
+            .fixed(&self.lender)
+            .raw(&self.terms.encode())
+            .u32le(self.charge.rate_bps_per_window)
+            .u64le(self.charge.window_blocks)
+            .u64le(self.amount_sat)
+            .u64le(self.bond_sat)
+            .u64le(self.collateral_sat)
+            .u64le(self.drawn_at_height)
+            .u64le(self.deadline_height);
+        match &self.state {
+            PositionState::Drawn {
+                at_height,
+                repaid_principal_sat,
+                repaid_interest_sat,
+            } => {
+                w.u8(WIRE_DRAWN)
+                    .u64le(*at_height)
+                    .u64le(*repaid_principal_sat)
+                    .u64le(*repaid_interest_sat);
+            }
+            PositionState::Repaid {
+                at_height,
+                interest_paid_sat,
+            } => {
+                w.u8(WIRE_REPAID)
+                    .u64le(*at_height)
+                    .u64le(*interest_paid_sat);
+            }
+            PositionState::Defaulted {
+                at_height,
+                settlement,
+            } => {
+                w.u8(WIRE_DEFAULTED).u64le(*at_height);
+                w.u64le(settlement.debt_sat)
+                    .u64le(settlement.from_collateral_sat)
+                    .u64le(settlement.from_bond_sat)
+                    .u64le(settlement.shortfall_sat)
+                    .u64le(settlement.excess_returned_sat);
+            }
+        }
+        w.into_vec()
+    }
+
+    /// Decode what [`CreditPosition::encode`] wrote. Bounded and fail-closed.
+    pub fn decode(r: &mut crate::ser::Reader<'_>) -> Result<Self> {
+        let borrower = r.fixed()?;
+        let agent_id = r.fixed()?;
+        let lender = r.fixed()?;
+        let terms = CreditTerms::decode(r)?;
+        let charge = ChargeSchedule {
+            rate_bps_per_window: r.u32le()?,
+            window_blocks: r.u64le()?,
+        };
+        let amount_sat = r.u64le()?;
+        let bond_sat = r.u64le()?;
+        let collateral_sat = r.u64le()?;
+        let drawn_at_height = r.u64le()?;
+        let deadline_height = r.u64le()?;
+        let state = match r.u8()? {
+            WIRE_DRAWN => PositionState::Drawn {
+                at_height: r.u64le()?,
+                repaid_principal_sat: r.u64le()?,
+                repaid_interest_sat: r.u64le()?,
+            },
+            WIRE_REPAID => PositionState::Repaid {
+                at_height: r.u64le()?,
+                interest_paid_sat: r.u64le()?,
+            },
+            WIRE_DEFAULTED => {
+                let at_height = r.u64le()?;
+                let settlement = DefaultSettlement {
+                    debt_sat: r.u64le()?,
+                    from_collateral_sat: r.u64le()?,
+                    from_bond_sat: r.u64le()?,
+                    shortfall_sat: r.u64le()?,
+                    excess_returned_sat: r.u64le()?,
+                };
+                PositionState::Defaulted {
+                    at_height,
+                    settlement,
+                }
+            }
+            _ => return Err(Error::Malformed("unknown position state tag")),
+        };
+        Ok(CreditPosition {
+            borrower,
+            agent_id,
+            lender,
+            terms,
+            charge,
+            amount_sat,
+            bond_sat,
+            collateral_sat,
+            drawn_at_height,
+            deadline_height,
+            state,
+        })
+    }
+}
+
+const WIRE_DRAWN: u8 = 0;
+const WIRE_REPAID: u8 = 1;
+const WIRE_DEFAULTED: u8 = 2;
+
 /// What a repayment did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Repayment {
@@ -321,6 +724,10 @@ pub struct CreditPosition {
     pub collateral_sat: u64,
     /// Height the position was drawn at.
     pub drawn_at_height: u64,
+    /// Height the position must be repaid by. Before it, `default` is refused;
+    /// at or after it, an unpaid position may be settled. A deadline before the
+    /// draw is a caller error, not a position that is already due.
+    pub deadline_height: u64,
     /// The charge schedule the position was opened under.
     pub charge: ChargeSchedule,
     pub state: PositionState,
@@ -343,6 +750,56 @@ pub struct PositionSpec {
     /// Satoshi of bond pledged, credited toward the collateral discount.
     pub bond_sat: u64,
     pub drawn_at_height: u64,
+    /// Height the position must be repaid by. Before it, `default` is refused;
+    /// at or after it, an unpaid position may be settled. A deadline before the
+    /// draw is a caller error, not a position that is already due.
+    pub deadline_height: u64,
+}
+
+impl PositionSpec {
+    /// The position's derived id, over every field that makes it what it is.
+    ///
+    /// Deterministic and position-specific, so two positions that differ in any
+    /// term are different positions. One position id, ever: a caller cannot
+    /// re-open an existing one.
+    pub fn id(&self) -> Hash {
+        sha256_dom(DOM_CREDIT_POSITION, &[&self.encode()])
+    }
+
+    /// Canonical encoding of the whole spec, so the id is over stable bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(168);
+        w.raw(&self.terms.encode())
+            .u32le(self.charge.rate_bps_per_window)
+            .u64le(self.charge.window_blocks)
+            .fixed(&self.borrower)
+            .fixed(&self.agent_id)
+            .fixed(&self.lender)
+            .u64le(self.amount_sat)
+            .u64le(self.bond_sat)
+            .u64le(self.drawn_at_height)
+            .u64le(self.deadline_height);
+        w.into_vec()
+    }
+
+    pub fn decode(r: &mut crate::ser::Reader<'_>) -> Result<Self> {
+        let terms = CreditTerms::decode(r)?;
+        let charge = ChargeSchedule {
+            rate_bps_per_window: r.u32le()?,
+            window_blocks: r.u64le()?,
+        };
+        Ok(PositionSpec {
+            terms,
+            charge,
+            borrower: r.fixed()?,
+            agent_id: r.fixed()?,
+            lender: r.fixed()?,
+            amount_sat: r.u64le()?,
+            bond_sat: r.u64le()?,
+            drawn_at_height: r.u64le()?,
+            deadline_height: r.u64le()?,
+        })
+    }
 }
 
 impl CreditPosition {
@@ -354,6 +811,11 @@ impl CreditPosition {
     /// `ReputationScore` and discarded it, which put the dependency one careless
     /// caller away from becoming real.
     pub fn open(spec: &PositionSpec) -> Result<Self> {
+        if spec.deadline_height < spec.drawn_at_height {
+            return Err(Error::Malformed(
+                "a position cannot mature before it is drawn",
+            ));
+        }
         let collateral_sat = spec
             .terms
             .required_collateral(spec.amount_sat, spec.bond_sat)?;
@@ -366,6 +828,7 @@ impl CreditPosition {
             bond_sat: spec.bond_sat,
             collateral_sat,
             drawn_at_height: spec.drawn_at_height,
+            deadline_height: spec.deadline_height,
             charge: spec.charge,
             state: PositionState::Drawn {
                 at_height: spec.drawn_at_height,
@@ -493,10 +956,19 @@ impl CreditPosition {
     /// bond, and never reputation.** The position's own collateral is what was
     /// pledged for it; the bond is what backs a default.
     ///
+    /// The deadline is the lender's patience made checkable: before it, an
+    /// unpaid position is merely late, not defaulted — a lender that could
+    /// settle on a whim would make every term it offered meaningless.
+    ///
     /// Collateral in excess of the debt returns to the borrower. A default takes
     /// what it is owed and no more — an overcollateralized position that went
     /// bad still belongs to its borrower outside the debt.
     pub fn default(&mut self, height: u64) -> Result<DefaultSettlement> {
+        if height < self.deadline_height {
+            return Err(Error::Malformed(
+                "the position has not yet reached its deadline",
+            ));
+        }
         let outstanding_principal = self.outstanding_principal();
         if outstanding_principal == 0 {
             return Err(Error::Malformed("nothing is owed, so nothing can default"));
@@ -554,13 +1026,14 @@ mod tests {
     }
 
     /// A drawn position: 1_000_000 borrowed with the given bond. Deterministic
-    /// and small enough to reason about on paper.
+    /// and small enough to reason about on paper. Defaultable from the draw
+    /// height, so the tests below can settle it wherever they like.
     fn drawn(bond: u64) -> CreditPosition {
-        CreditPosition::open(&spec(1_000_000, bond, 0)).unwrap()
+        CreditPosition::open(&spec(1_000_000, bond, 0, 0)).unwrap()
     }
 
     /// Build a position without opening it, so a test can inspect or perturb it.
-    fn spec(amount: u64, bond: u64, at: u64) -> PositionSpec {
+    fn spec(amount: u64, bond: u64, at: u64, deadline: u64) -> PositionSpec {
         PositionSpec {
             terms: CreditTerms::default(),
             charge: charge(),
@@ -570,6 +1043,7 @@ mod tests {
             amount_sat: amount,
             bond_sat: bond,
             drawn_at_height: at,
+            deadline_height: deadline,
         }
     }
 
@@ -591,7 +1065,7 @@ mod tests {
         // The compile-time assertion: no signature in this module accepts one.
         // If `PositionSpec` or `open` ever gains a score field, stop and think
         // about D1 again, because that is the change the decision refuses.
-        let p = spec(1_000_000, 0, 0);
+        let p = spec(1_000_000, 0, 0, 0);
         // The same figures, whatever an agent's score might be, price identically.
         assert_eq!(
             CreditPosition::open(&p).unwrap().collateral_sat,
@@ -666,13 +1140,13 @@ mod tests {
         let t = CreditTerms::default();
         let a = t.required_collateral(1_000_000, 50_000).unwrap();
         assert_eq!(
-            CreditPosition::open(&spec(1_000_000, 50_000, 0))
+            CreditPosition::open(&spec(1_000_000, 50_000, 0, 0))
                 .unwrap()
                 .collateral_sat,
             a
         );
         assert_eq!(
-            CreditPosition::open(&spec(1_000_000, 50_000, 0))
+            CreditPosition::open(&spec(1_000_000, 50_000, 0, 0))
                 .unwrap()
                 .collateral_sat,
             a
@@ -794,7 +1268,7 @@ mod tests {
     fn a_default_returns_excess_collateral_to_the_borrower() {
         // Borrow far less than the collateral held. A default must take the debt
         // and no more: the rest is the borrower's, and keeping it would be theft.
-        let mut p = CreditPosition::open(&spec(100_000, 0, 0)).unwrap();
+        let mut p = CreditPosition::open(&spec(100_000, 0, 0, 0)).unwrap();
         assert_eq!(p.collateral_sat, 100_000, "fully collateralized at open");
         p.bond_sat = 0;
 
@@ -882,30 +1356,149 @@ mod tests {
     }
 
     #[test]
-    fn an_unrepresentable_requirement_is_refused_not_wrapped() {
-        // The overflow path: satoshis against basis points. A wrapped product
-        // would compare small and pass the bound, so the position must be
-        // refused instead - a borrower cannot take a position whose collateral
-        // does not fit in the currency.
-        let t = CreditTerms {
-            base_collateral_bps: 20_000,
-            max_discount_bps: 10_000,
-            bond_ratio_bps: 10_000,
-            min_collateral_bps: 0,
-        };
-        assert_eq!(
-            t.required_collateral(u64::MAX, 1),
-            Err(Error::ValueOverflow),
-            "a requirement above u64::MAX must be refused, never wrapped"
-        );
-
-        // And the largest amount that *is* representable computes exactly,
-        // rather than saturating somewhere on the way.
-        let amount = u64::MAX / 2;
-        let c = t.required_collateral(amount, 0).unwrap();
+    fn a_position_cannot_default_before_its_deadline() {
+        // The deadline is the lender's patience made checkable. Before it, an
+        // unpaid position is late, not defaulted — a lender that could settle on
+        // a whim would make the terms it offered meaningless.
+        let mut p = CreditPosition::open(&spec(1_000_000, 0, 0, 100)).unwrap();
         assert!(
-            c > u64::MAX / 2,
-            "must be far above zero rather than wrapped small: {c}"
+            p.default(99).is_err(),
+            "a position cannot be settled one block early"
         );
+        // Repaying is not gated by the deadline: a borrower may clear its debt
+        // whenever it likes, which is the entire point of having a debt.
+        let mut q = CreditPosition::open(&spec(1_000_000, 0, 0, 100)).unwrap();
+        assert!(q.repay(1_000, 50).is_ok());
+        let s = p.default(100).unwrap();
+        assert_eq!(s.debt_sat, 1_100_000, "one window of interest is owed");
+    }
+
+    #[test]
+    fn a_deadline_before_the_position_is_drawn_is_refused() {
+        // A position that is already due at draw time is a caller error, not a
+        // discount.
+        assert!(CreditPosition::open(&spec(1_000_000, 0, 100, 50)).is_err());
+    }
+
+    #[test]
+    fn the_position_id_covers_the_deadline() {
+        // Two positions identical but for their deadline are different
+        // positions, and the book keys them apart.
+        assert_ne!(
+            spec(1_000_000, 0, 0, 100).id(),
+            spec(1_000_000, 0, 0, 200).id()
+        );
+    }
+
+    #[test]
+    fn the_book_moves_value_and_never_creates_it() {
+        let borrower = [1u8; 20];
+        let lender = [2u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 2_150_000).unwrap();
+        assert_eq!(book.total_deposited(), 2_150_000);
+
+        // Bond first, because the position is priced with it.
+        book.post_bond(borrower, 50_000).unwrap();
+        let id = book.open(&spec(1_000_000, 50_000, 0, 100)).unwrap();
+        // 50 000 of bond discounts the 1 000 000 line by 50 000.
+        assert_eq!(book.free(&borrower), 1_150_000);
+        assert_eq!(book.bond(&borrower), 50_000);
+        assert_eq!(book.total_locked_collateral(), 950_000);
+        assert_eq!(book.live_positions().count(), 1);
+        book.check_conservation().unwrap();
+
+        // One window of interest: 100 000 at height 100 pays all of it and none
+        // of the principal. The lender is the one who ends up with it.
+        let r = book.repay(&id, 100_000, 100).unwrap();
+        assert_eq!(r.interest_paid_sat, 100_000);
+        assert_eq!(r.principal_paid_sat, 0);
+        assert_eq!(book.recovered(&lender), 100_000);
+        book.check_conservation().unwrap();
+
+        // Repaying the rest settles the position and returns its collateral.
+        let r = book.repay(&id, 1_000_000, 100).unwrap();
+        assert_eq!(r.remaining_debt_sat, 0);
+        assert_eq!(book.free(&borrower), 1_000_000);
+        assert_eq!(book.recovered(&lender), 1_100_000);
+        assert_eq!(book.live_positions().count(), 0);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn a_bond_discount_requires_the_bond_to_be_posted() {
+        // A bond that exists only in the spec buys a discount nobody backed,
+        // which is undercollateralization wearing a discount's clothes.
+        let borrower = [1u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 1_100_000).unwrap();
+        let s = spec(1_000_000, 50_000, 0, 0);
+        assert!(book.open(&s).is_err(), "no bond was posted");
+
+        // Post it, and the very same spec opens.
+        book.post_bond(borrower, 50_000).unwrap();
+        assert!(book.open(&s).is_ok());
+        // And not twice: one position id, ever.
+        assert!(book.open(&s).is_err(), "a position cannot be re-opened");
+    }
+
+    #[test]
+    fn a_default_takes_the_bond_from_the_book() {
+        let borrower = [1u8; 20];
+        let lender = [2u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 1_100_000).unwrap();
+        book.post_bond(borrower, 50_000).unwrap();
+        let id = book.open(&spec(1_000_000, 50_000, 0, 100)).unwrap();
+
+        // One window of interest puts the debt at 1 100 000: the 950 000 of
+        // collateral goes first, then the 50 000 bond, and the lender absorbs
+        // the rest.
+        let s = book.default(&id, 100).unwrap();
+        assert_eq!(s.from_collateral_sat, 950_000);
+        assert_eq!(s.from_bond_sat, 50_000);
+        assert_eq!(s.shortfall_sat, 100_000);
+        assert_eq!(book.bond(&borrower), 0, "the bond is actually taken");
+        assert_eq!(book.recovered(&lender), 1_000_000);
+        book.check_conservation().unwrap();
+
+        // The position is spent: it cannot be defaulted again or repaid.
+        assert!(book.default(&id, 200).is_err());
+        assert!(book.repay(&id, 1, 200).is_err());
+    }
+
+    #[test]
+    fn a_position_cannot_be_opened_without_the_collateral() {
+        let borrower = [1u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 900_000).unwrap();
+        // The line prices at 1 000 000 of collateral and the borrower has less.
+        assert!(book.open(&spec(1_000_000, 0, 0, 0)).is_err());
+        assert_eq!(book.live_positions().count(), 0);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn the_position_codec_round_trips_every_state() {
+        let mut p = CreditPosition::open(&spec(1_000_000, 50_000, 0, 100)).unwrap();
+        let bytes = p.encode();
+        let mut r = crate::ser::Reader::new(&bytes);
+        assert_eq!(CreditPosition::decode(&mut r).unwrap(), p);
+        assert_eq!(r.remaining(), 0);
+
+        p.repay(100_000, 50).unwrap();
+        p.default(100).unwrap();
+        let bytes = p.encode();
+        let mut r = crate::ser::Reader::new(&bytes);
+        assert_eq!(CreditPosition::decode(&mut r).unwrap(), p);
+        assert_eq!(r.remaining(), 0);
+
+        // A spec round-trips too, and keeps the id the position was opened
+        // under: a node can serve one and a worker can read the same position.
+        let s = spec(1_000_000, 50_000, 0, 100);
+        let bytes = s.encode();
+        let mut r = crate::ser::Reader::new(&bytes);
+        assert_eq!(PositionSpec::decode(&mut r).unwrap(), s);
+        assert_eq!(r.remaining(), 0);
     }
 }

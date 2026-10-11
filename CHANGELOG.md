@@ -14,6 +14,25 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added (library)
+
+- **Agent credit gains the position deadline and the book that holds positions.**
+  Roadmap item 2 (locked decision D1) is library-complete: no consensus change, no
+  L2 transaction type. New in `credit.rs`:
+  - A **deadline** on every position. `default` before it is refused — a lender
+    cannot settle a merely late position on a whim — while repayment stays
+    ungated, so a borrower may clear its debt whenever it likes. A deadline before
+    the draw is refused as the caller error it is.
+  - **`CreditBook`**, which holds free balances, posted bonds and collateral
+    locked inside live positions, and asserts after every mutation that
+    `free + bonds + locked collateral + recovered == deposited`: value is moved,
+    never created. Repayments pay the lender; defaults take collateral first, then
+    the bond, and return any excess to the borrower. A bond must be posted before
+    the position it discounts opens, so no discount is ever unbacked.
+  - Canonical, fail-closed codecs for `PositionSpec` and `CreditPosition`, and a
+    position id derived over the whole spec — so one position id is ever issued and
+    a node can serve a position a worker can read.
+
 ### Fixed (security)
 
 Full write-up in [docs/security-audit-2026-10-11.md](docs/security-audit-2026-10-11.md).

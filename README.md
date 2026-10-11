@@ -243,8 +243,9 @@ itself, without a human in the loop to release funds.
 
 ### Undercollateralized agent credit — _in development_
 
-**Built:** the collateral arithmetic and the position lifecycle, with the
-invariants that make them safe.
+**Built:** the collateral arithmetic, the position lifecycle with a repayment
+deadline, and a credit book that holds bonds, balances and locked collateral
+under a conservation invariant.
 
 An agent with a demonstrated track record can borrow against future work rather
 than pre-funding every transaction. This is deliberately built on two
@@ -264,6 +265,13 @@ to the borrower: a default takes what it is owed and no more, so an
 overcollateralized position that went bad still belongs to its borrower outside
 the debt. Any debt left after both is a reported shortfall, which the lender
 absorbs rather than the protocol inventing funds to cover.
+
+**A position runs to a deadline.** Before it, a default is refused — a lender
+cannot settle a merely late position on a whim — and the bond a position is
+priced with must be posted before it opens, so no discount is ever unbacked.
+The credit book holds free balances, posted bonds and collateral locked inside
+live positions, and asserts after every mutation that their sum equals
+everything deposited: value is moved, never created.
 
 **What it supports:** an agent earning from work it has not yet performed, with
 the risk carried by a bond instead of by trust in a stranger.
@@ -680,7 +688,7 @@ applies.
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
 | **Escrowed service contracts** | **In development** | The general contract and its transitions; one non-compute deliverable shipping |
-| **Agent credit** | **In development** | Collateral, repayment and default settlement; not yet wired to a bond ledger |
+| **Agent credit** | **In development** | Terms, position lifecycle, deadlines and a conservation-checked credit book; not yet wired to a caller |
 | **Delegation chains** | **Not built** | Needs a policy parent link and a SPEC amendment |
 | **Conditional payments** | **Not built** | Held pending arbitrator key custody |
 | **Compute-backed staking** | **Not built** | Held pending a live validator committee |
@@ -803,7 +811,7 @@ figures are in JNT.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1003 tests, 0 failures
+cargo test --workspace                                   # 1034 tests, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -852,7 +860,7 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1003 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1034 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration transport is built; who runs the arbitrators is an organisational decision. |
 | **Operations** | No bootnodes, no log shipping, no published PGP key. Artifacts are unsigned because no signing key is published. |

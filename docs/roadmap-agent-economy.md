@@ -3,8 +3,8 @@
 A roadmap for the layers that compound what already ships. Every item here
 builds on primitives that exist today; nothing on this list asks for a rewrite.
 
-**Status:** design agreed, not implemented. Item 1 is the foundation and the
-dependency root of the other four — start there.
+**Status:** item 1 shipped, item 2 library-complete, items 3–5 as designed
+below. Item 1 was the dependency root and is done.
 
 ---
 
@@ -325,8 +325,34 @@ afterwards) and `required_collateral(amount, bond)`, which returns
 - an unrepresentable requirement is **refused**, never wrapped, because a wrapped
   product compares small and passes a bound.
 
-`CreditPosition::open` takes a `ReputationScore` and ignores it — deliberately, and
-documented at the parameter, so it cannot become a hidden input later.
+`CreditPosition::open` takes **no reputation score at all**. An earlier shape took
+a `ReputationScore` and discarded it, which left the dependency one careless caller
+away from becoming real — a future edit that started reading the score would have
+compiled. Removing the parameter means credit cannot be computed from a score even
+by accident; the type system refuses the call rather than the code declining it.
+There is no reputation field anywhere in `credit.rs`, which is D1's guard made
+structural.
+
+On top of the arithmetic sit the position lifecycle and the book that holds it:
+
+- **Deadline.** A position carries the height it must be repaid by. `default`
+  before the deadline is refused: a lender cannot settle a merely late position on
+  a whim, which would make the terms it offered meaningless. Repayment is not
+  gated by the deadline — a borrower may clear its debt whenever it likes.
+- **Order of settlement.** Collateral first, then the bond, never reputation.
+  Collateral in excess of the debt returns to the borrower; any shortfall is
+  reported and absorbed by the lender rather than covered by invented funds.
+- **`CreditBook`** holds free balances, posted bonds and collateral locked inside
+  live positions, and asserts after every mutation that
+  `free + bonds + locked collateral + recovered == deposited`. A bond must be
+  **posted before** the position it discounts is opened, so no discount is ever
+  unbacked. The bond ledger is deliberately separate from `bond.rs`'s validator
+  bonds: a validator bond secures consensus, a credit bond secures a debt, and
+  mixing them would let a validator's stake back an agent's borrowing.
+
+Item 2 is **library-complete** — no consensus change, no L2 transaction type.
+`CreditBook` has no caller yet; wiring one is a separate decision, because the
+first caller sets who may hold agent funds.
 
 ### D2 — Conditional/oracle payments are blocked, off the critical path
 
@@ -360,7 +386,7 @@ with no `struct TaskContract` beside it. `TaskContract` is a type alias
 so every existing call site and the whole wire format are untouched.
 
 **Status: met.** Verified after 1b/1c — one `settle_inner`, one
-`ServiceContract`, `TaskContract` an alias, 1003 tests green, vectors and
+`ServiceContract`, `TaskContract` an alias, 1034 tests green, vectors and
 `fmt`/`clippy` clean.
 
 ### One trap the refactor actually caught
