@@ -20,6 +20,8 @@ the *Jounit* name, `JNT` ticker and logos are his trademarks — see
 - [Quick start](#quick-start)
 - [Supply](#supply)
 - [What the chain is for](#what-the-chain-is-for)
+- [Capabilities the project is building](#capabilities-the-project-is-building)
+- [What makes this different](#what-makes-this-different)
 - [Machines, agents and robots](#machines-agents-and-robots)
 - [Verified Work Certificates](#verified-work-certificates)
 - [How fraud is detected](#how-fraud-is-detected)
@@ -179,6 +181,157 @@ The six L2 transaction types are the whole vocabulary:
 
 A task moves through six states: `Open → InProgress → ResultSubmitted →
 Disputed? → Settled`, with `Expired` as the timeout branch.
+
+---
+
+## Capabilities the project is building
+
+The base layer above is complete and running. The following capabilities are in
+active development, each one generalizing machinery that already ships. They are
+listed in dependency order, because several of them are only meaningful once the
+first exists.
+
+### Escrowed service contracts
+
+The task economy above is a *specific case* of a general primitive: party A
+commits to a deliverable and bonds against it, party B escrows payment,
+settlement fires when the deliverable is verified. Refactoring that into a
+standalone **ServiceContract** means the same escrow, bonding and dispute
+machinery serves any computation with an admissible verifier — not only a neural
+network task.
+
+The design constraint is what makes it work: the verifier must be a
+deterministic function of committed inputs, free of height, clock and randomness.
+Work already covers the general form, and the compute task is one instantiation
+of it rather than the only one.
+
+**What it supports:** any task where one party can produce a result that another
+can check without re-running it.
+
+### Attenuated delegation chains
+
+Multi-agent systems need an owner to grant an agent a subset of their own
+spending authority, and that agent to do the same downward. Each level inherits a
+**strict subset** of its parent's spend policy — never a wider one — so authority
+narrows as it travels.
+
+**What it supports:** machine fleets and agent hierarchies where the operator
+must bound what any single agent can spend, without re-authorizing each
+transaction by hand.
+
+### Conditional and oracle-gated payments
+
+Payment that releases against a stated condition rather than a manual approval:
+"release when the result matches," "release when latency stayed under a
+threshold." This is designed so that only conditions a third party can evaluate
+deterministically are admitted, which is the discipline that keeps the escrow from
+acquiring a trusted party. Conditions that genuinely require an oracle are held
+until the protocol answers who operators the oracle.
+
+**What it supports:** pay-as-you-use and outcome-based pricing that settles
+itself, without a human in the loop to release funds.
+
+### Undercollateralized agent credit
+
+An agent with a demonstrated track record can borrow against future work rather
+than pre-funding every transaction. This is deliberately built on two
+constraints: reputation is published as a deterministic **view** read off
+on-chain events, and credit is **always collateralized** — a posted bond
+discounts the requirement, never replaces it.
+
+The design is explicit that reputation is not a consensus input. A credit limit
+computed on-chain from a mutable score would make every reputation update a
+consensus event and make fresh identities farmable, which is the cheapest attack
+against the gate.
+
+**What it supports:** an agent earning from work it has not yet performed, with
+the risk carried by a bond instead of by trust in a stranger.
+
+### Compute-backed validator staking
+
+Validators that also serve verified work earn more, which ties the protocol's
+security budget and its utility budget into one budget. The condition is that
+what a validator is paid for is *verified* work, where verified means a quorum
+proved it — not work that was merely submitted and left unchallenged.
+
+**What it supports:** making the neural stage of mining economically useful
+rather than merely elegant, and aligning the interests that secure the chain with
+the work the chain exists to sell.
+
+---
+
+## What makes this different
+
+These are properties verifiable in this repository, not aspirations.
+
+### A verifier that cannot be talked out of its answer
+
+The canonical reference that decides fraud is computed by the arbitration engine
+from the task's own committed fields. It is never accepted as an argument, so no
+caller can dictate the verdict. This is a structural property rather than a
+policy — see
+[How fraud is detected](#how-fraud-is-detected).
+
+### A receipt that is not mistaken for verification
+
+When a result goes unchallenged, the protocol pays it and issues a certificate —
+and that certificate states plainly that it proves nothing. A `WindowElapsed`
+certificate is a record that nobody objected; `validate_verified()` refuses it by
+name, and `asserts_correctness()` returns `false`. Relying parties that need
+independent proof must demand the quorum basis, and there is no argument by which
+the weak one satisfies it.
+
+The distinction is structural rather than documented, which is the point: the
+weak basis is unmissable rather than a convention a caller can forget.
+
+### Consensus with no floating point anywhere
+
+The consensus core computes in integers end to end: weights derive from the epoch
+id by SHA-256, forward passes accumulate in `i64` and wrap to `i32`, difficulty
+and supply use explicit arithmetic with every overflow refused rather than
+wrapped. A wrapped sum would compare small and pass a bound — this is a security
+property, not a style preference.
+
+Two separate implementations, in two languages, produce identical digests. The
+Python reference under `sim/` was written from the specification rather than from
+the Rust, and reproduces the puzzle digests the chain uses. That agreement is
+evidence the specification is unambiguous rather than merely self-consistent.
+
+### Work that cannot be precomputed
+
+Mining weights derive from the epoch id, so no miner can compute them before an
+epoch starts. The neural stage is a cost model with a bounded contribution rather
+than the load-bearing part of the proof — the SHA-256 chain carries the security,
+so the neural work can never become the weak link it is meant to make useful.
+
+---
+
+## What the chain is for
+
+These are the things a UTXO chain with a task economy on top of it can do that
+the two layers alone cannot.
+
+**Settlement for work nobody re-runs.** Someone pays for a result; someone else
+checks it without re-doing it. The chain holds the escrow and decides the
+outcome, so the two sides need no prior relationship and no arbitrator they both
+trust.
+
+**Machines spending under a written policy.** An owner authorizes once, offline,
+and every later spend is checked against it with the owner offline — bounded per
+transaction, bounded per window, to named recipients and named services, with a
+nonce that makes an authorization unreplayable and a kill switch.
+
+**Payment for what a machine produced, not what it claimed.** A verified-work
+certificate is a derived consequence of a settled task, never a claim an actor
+makes, so it can be shown to a third party as evidence.
+
+**Reputation that travels with the identity and cannot be bought.** An event
+carries no weight of its own, so a differently-shaped event cannot forge a
+better score, and losing a dispute costs three times what winning one earns.
+
+**Value that comes back.** Deposits are not one-way. An owner can bring value
+back to Layer 1 through a queue, a maturity period and a proof-authorised release
+that anyone can crank.
 
 **What this is for, concretely.** If a machine can produce a result that anyone
 else can check without re-running it, that machine can be paid for it without
@@ -504,7 +657,12 @@ applies.
 | **A live validator committee** | **Does not exist** | No operator is bonding 5 000 JNT |
 | Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
-| Worker SDK | **Shipped** | 43 tests including privilege-escalation suite |
+| Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
+| **Escrowed service contracts** | **In development** | Generalizing the task escrow; see [above](#capabilities-the-project-is-building) |
+| **Delegation chains** | **In development** | Needs a policy parent link and a SPEC amendment |
+| **Agent credit** | **Not built** | Collateralized by design; reputation stays a view |
+| **Conditional payments** | **Not built** | Held pending arbitrator key custody |
+| **Compute-backed staking** | **Not built** | Held pending a live validator committee |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |
 | M3 compute IR | Provides the reference | Envelopes carried, no interpreter |
@@ -624,7 +782,7 @@ figures are in JNT.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 993 tests, 0 failures
+cargo test --workspace                                   # 1003 tests, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -673,7 +831,7 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 993 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1003 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration transport is built; who runs the arbitrators is an organisational decision. |
 | **Operations** | No bootnodes, no log shipping, no published PGP key. Artifacts are unsigned because no signing key is published. |

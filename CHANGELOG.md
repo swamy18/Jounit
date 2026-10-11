@@ -51,6 +51,17 @@ Full write-up in [docs/security-audit-2026-10-11.md](docs/security-audit-2026-10
   exposed on mainnet as shipped - **testnet and mini are**. See the audit
   document for detail.
 
+### Documentation
+
+- **README now describes the capabilities in development, and what makes the
+  project distinct.** A "Capabilities the project is building" section describes
+  the five agent-economy primitives and what each supports, in dependency order;
+  a "What makes this different" section states the properties that are verifiable
+  in this repository rather than aspirational; and use cases are grouped under
+  "What the chain is for".
+- The README test count is corrected from the stale 993 to the measured 1003, and
+  the worker SDK count from 43 to 44.
+
 ### Added (attribution)
 
 - **Authorship is now recorded throughout the project.** The code carried no
