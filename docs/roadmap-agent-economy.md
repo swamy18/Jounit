@@ -310,6 +310,24 @@ agent choosing to lend against reputation can read the same deterministic view.
 That is a market, not a protocol rule, and it is the right place for a judgement
 call that the chain should not be making.
 
+**Implementation status:** the arithmetic exists and is pinned. `credit.rs` holds
+`CreditTerms` (a lender's parameters, set before a position opens and immutable
+afterwards) and `required_collateral(amount, bond)`, which returns
+`max(base - discount, floor)`. Its invariants are tested rather than asserted:
+
+- a bond discounts the requirement **satoshi for satoshi**, capped at
+  `max_discount_bps` of the amount — applying a rate *as well* would charge a
+  borrower for their own collateral twice, which was the first bug in this
+  module;
+- the requirement never rises as more bond is posted, and is monotone in the
+  amount borrowed;
+- it never reaches zero, and never falls below `min_collateral_bps`;
+- an unrepresentable requirement is **refused**, never wrapped, because a wrapped
+  product compares small and passes a bound.
+
+`CreditPosition::open` takes a `ReputationScore` and ignores it — deliberately, and
+documented at the parameter, so it cannot become a hidden input later.
+
 ### D2 — Conditional/oracle payments are blocked, off the critical path
 
 **Decided.** Item 4 is parked as **blocked on arbitrator key custody**.
