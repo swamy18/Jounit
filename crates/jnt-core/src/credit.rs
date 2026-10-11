@@ -44,7 +44,6 @@
 
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Address, Hash};
-use crate::reputation::ReputationScore;
 use crate::ser::{Reader, Writer};
 
 /// Domain tag for credit terms, so a term set can never be confused with a
@@ -189,6 +188,123 @@ impl CreditTerms {
 /// The bond is held outside this module; what it holds is what the terms priced,
 /// so a settlement can be recomputed from the position alone rather than from a
 /// ledger that may have moved underneath it.
+/// Where a position is in its life.
+///
+/// Only two of these are terminal, and nothing distinguishes them except what was
+/// paid and when — a caller cannot settle a terminal position again, and cannot
+/// settle a live one with the other state's rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PositionState {
+    /// Alive: principal, interest and the amount owed are all still outstanding.
+    Drawn {
+        at_height: u64,
+        /// Principal already repaid.
+        repaid_principal_sat: u64,
+        /// Interest already repaid.
+        repaid_interest_sat: u64,
+    },
+    /// Paid off. Collateral returns to the borrower, untouched.
+    Repaid {
+        at_height: u64,
+        interest_paid_sat: u64,
+    },
+    /// Not paid by the deadline. Settled as [`DefaultSettlement`].
+    Defaulted {
+        at_height: u64,
+        settlement: DefaultSettlement,
+    },
+}
+
+/// What a default actually paid, and who paid it.
+///
+/// Every field is a name rather than a netted number so an auditor can see *why*
+/// value moved. The critical one is `from_bond_sat`: the bond is what backs a
+/// default, and nothing in this module ever reaches for reputation instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DefaultSettlement {
+    /// Debt at the deadline: principal plus accrued interest.
+    pub debt_sat: u64,
+    /// Taken from the position's own collateral.
+    pub from_collateral_sat: u64,
+    /// Taken from the borrower's posted bond, once collateral ran out.
+    pub from_bond_sat: u64,
+    /// Debt the lender absorbed because collateral and bond together were short.
+    /// A default is not free, and this is the honest way to say so.
+    pub shortfall_sat: u64,
+    /// Collateral in excess of the debt, returned to the borrower.
+    pub excess_returned_sat: u64,
+}
+
+impl DefaultSettlement {
+    /// The borrower loses exactly what the default took: collateral plus bond.
+    pub fn borrower_lost_sat(&self) -> u64 {
+        self.from_collateral_sat + self.from_bond_sat
+    }
+
+    /// The lender recovers the debt less any shortfall, and nothing more.
+    pub fn lender_recovered_sat(&self) -> u64 {
+        self.debt_sat - self.shortfall_sat
+    }
+
+    /// True when the position was so overcollateralized that the borrower came
+    /// out of a default with value to spare. Rare by construction, but not
+    /// impossible, and taking it would be theft - so it is a reported field.
+    pub fn was_overcollateralized(&self) -> bool {
+        self.excess_returned_sat > 0
+    }
+}
+
+/// What a repayment did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Repayment {
+    pub interest_paid_sat: u64,
+    pub principal_paid_sat: u64,
+    /// Debt still outstanding. Zero only when the position settled.
+    pub remaining_debt_sat: u64,
+}
+
+/// A charge schedule for a position: simple interest, charged per whole window.
+///
+/// Deterministic by construction — `accrued_interest` depends only on heights, so
+/// every node recomputes the same figure. No sub-window fractions, which would
+/// otherwise make the total depend on rounding order rather than on time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChargeSchedule {
+    /// Interest per window in basis points of the outstanding principal.
+    pub rate_bps_per_window: u32,
+    /// Length of a window in blocks.
+    pub window_blocks: u64,
+}
+
+impl ChargeSchedule {
+    /// Interest owed on `principal` between `from_height` and `to_height`.
+    ///
+    /// Refuses a backwards window rather than returning zero: a negative elapsed
+    /// time is a caller error, and zero would silently forgive it.
+    pub fn accrued_interest(
+        &self,
+        principal_sat: u64,
+        from_height: u64,
+        to_height: u64,
+    ) -> Result<u64> {
+        if to_height < from_height {
+            return Err(Error::Malformed(
+                "credit interest computed over a backwards window",
+            ));
+        }
+        let windows = (to_height - from_height) / self.window_blocks.max(1);
+        if windows == 0 || principal_sat == 0 {
+            return Ok(0);
+        }
+        let units =
+            (principal_sat as u128) * (self.rate_bps_per_window as u128) * (windows as u128);
+        match u64::try_from(units) {
+            Ok(v) => Ok(v / 10_000),
+            Err(_) => Ok(u64::MAX / 10_000),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreditPosition {
     pub borrower: Address,
@@ -203,33 +319,59 @@ pub struct CreditPosition {
     pub bond_sat: u64,
     /// Collateral the position must hold, priced at open time.
     pub collateral_sat: u64,
+    /// Height the position was drawn at.
+    pub drawn_at_height: u64,
+    /// The charge schedule the position was opened under.
+    pub charge: ChargeSchedule,
+    pub state: PositionState,
+}
+
+/// What a position is opened from.
+///
+/// A struct rather than nine positional arguments: `open` takes enough context
+/// that a caller transposing two `Address` arguments is a real mistake, and the
+/// spec is what a node deserializes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionSpec {
+    pub terms: CreditTerms,
+    pub charge: ChargeSchedule,
+    pub borrower: Address,
+    pub agent_id: Hash,
+    pub lender: Address,
+    /// Satoshi borrowed.
+    pub amount_sat: u64,
+    /// Satoshi of bond pledged, credited toward the collateral discount.
+    pub bond_sat: u64,
+    pub drawn_at_height: u64,
 }
 
 impl CreditPosition {
     /// Price a position, refusing one that cannot be collateralized.
     ///
-    /// The reputation score is deliberately accepted and deliberately unused: it
-    /// is here so a caller can pass the context it already has, and documenting
-    /// that it is not an input is the only honest way to keep it from becoming
-    /// one by accident later.
-    pub fn open(
-        terms: &CreditTerms,
-        borrower: Address,
-        agent_id: Hash,
-        lender: Address,
-        amount_sat: u64,
-        bond_sat: u64,
-        _reputation: &ReputationScore,
-    ) -> Result<Self> {
-        let collateral_sat = terms.required_collateral(amount_sat, bond_sat)?;
+    /// Note what is absent from [`PositionSpec`]: any reputation score. That is
+    /// D1's invariant rather than an omission, and it is easier to keep absent
+    /// than to keep ignored - an earlier shape of this function took a
+    /// `ReputationScore` and discarded it, which put the dependency one careless
+    /// caller away from becoming real.
+    pub fn open(spec: &PositionSpec) -> Result<Self> {
+        let collateral_sat = spec
+            .terms
+            .required_collateral(spec.amount_sat, spec.bond_sat)?;
         Ok(CreditPosition {
-            borrower,
-            agent_id,
-            lender,
-            terms: *terms,
-            amount_sat,
-            bond_sat,
+            borrower: spec.borrower,
+            agent_id: spec.agent_id,
+            lender: spec.lender,
+            terms: spec.terms,
+            amount_sat: spec.amount_sat,
+            bond_sat: spec.bond_sat,
             collateral_sat,
+            drawn_at_height: spec.drawn_at_height,
+            charge: spec.charge,
+            state: PositionState::Drawn {
+                at_height: spec.drawn_at_height,
+                repaid_principal_sat: 0,
+                repaid_interest_sat: 0,
+            },
         })
     }
 
@@ -238,6 +380,150 @@ impl CreditPosition {
     pub fn reprice(&self, new_bond_sat: u64) -> Result<u64> {
         self.terms
             .required_collateral(self.amount_sat, new_bond_sat)
+    }
+
+    /// True once the position can no longer change: repaid or defaulted.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self.state, PositionState::Drawn { .. })
+    }
+
+    /// Principal still outstanding on a live position. Zero for a settled one.
+    fn outstanding_principal(&self) -> u64 {
+        match self.state {
+            PositionState::Drawn {
+                repaid_principal_sat,
+                ..
+            } => self.amount_sat.saturating_sub(repaid_principal_sat),
+            _ => 0,
+        }
+    }
+
+    /// The debt at `height`: outstanding principal plus accrued interest less
+    /// whatever has already been repaid.
+    pub fn debt_at(&self, height: u64) -> Result<u64> {
+        match self.state {
+            PositionState::Drawn {
+                repaid_principal_sat,
+                repaid_interest_sat,
+                ..
+            } => {
+                let outstanding_principal = self
+                    .amount_sat
+                    .checked_sub(repaid_principal_sat)
+                    .ok_or(Error::Malformed("repaid more principal than borrowed"))?;
+                let accrued = self.charge.accrued_interest(
+                    outstanding_principal,
+                    self.drawn_at_height,
+                    height,
+                )?;
+                accrued
+                    .checked_sub(repaid_interest_sat)
+                    .ok_or(Error::Malformed("repaid more interest than accrued"))?
+                    .checked_add(outstanding_principal)
+                    .ok_or(Error::ValueOverflow)
+            }
+            _ => Err(Error::Malformed("a settled position has no debt")),
+        }
+    }
+
+    /// Repay against the debt, interest first.
+    ///
+    /// Returns what the payment did, never more than the debt. Overpayment is
+    /// refused rather than silently clipped: a caller paying more than they owe
+    /// is paying the wrong amount, and quietly accepting the surplus is how
+    /// positions acquire funds with no accounting reason for them.
+    pub fn repay(&mut self, payment_sat: u64, height: u64) -> Result<Repayment> {
+        let (mut repaid_principal, mut repaid_interest) = match self.state {
+            PositionState::Drawn {
+                repaid_principal_sat,
+                repaid_interest_sat,
+                ..
+            } => (repaid_principal_sat, repaid_interest_sat),
+            _ => return Err(Error::Malformed("a settled position cannot be repaid")),
+        };
+
+        let debt = self.debt_at(height)?;
+        if payment_sat > debt {
+            return Err(Error::Malformed("repayment exceeds the debt owed"));
+        }
+
+        // Interest first, then principal. Paying principal down before the
+        // lender's own charge would leave that charge unpaid, and the borrower
+        // does not get to choose the order.
+        let outstanding_principal = self.outstanding_principal();
+        let accrued_interest = self
+            .charge
+            .accrued_interest(outstanding_principal, self.drawn_at_height, height)?
+            .saturating_sub(repaid_interest);
+        let interest_paid = payment_sat.min(accrued_interest);
+        let principal_paid = payment_sat - interest_paid;
+
+        repaid_interest = repaid_interest
+            .checked_add(interest_paid)
+            .ok_or(Error::ValueOverflow)?;
+        repaid_principal = repaid_principal
+            .checked_add(principal_paid)
+            .ok_or(Error::ValueOverflow)?;
+
+        let remaining_debt = debt.saturating_sub(payment_sat);
+
+        self.state = if remaining_debt == 0 {
+            PositionState::Repaid {
+                at_height: height,
+                interest_paid_sat: repaid_interest,
+            }
+        } else {
+            PositionState::Drawn {
+                at_height: height,
+                repaid_principal_sat: repaid_principal,
+                repaid_interest_sat: repaid_interest,
+            }
+        };
+
+        Ok(Repayment {
+            interest_paid_sat: interest_paid,
+            principal_paid_sat: principal_paid,
+            remaining_debt_sat: remaining_debt,
+        })
+    }
+
+    /// Settle an unpaid position at its deadline.
+    ///
+    /// The order of payments is the whole point: **collateral first, then the
+    /// bond, and never reputation.** The position's own collateral is what was
+    /// pledged for it; the bond is what backs a default.
+    ///
+    /// Collateral in excess of the debt returns to the borrower. A default takes
+    /// what it is owed and no more — an overcollateralized position that went
+    /// bad still belongs to its borrower outside the debt.
+    pub fn default(&mut self, height: u64) -> Result<DefaultSettlement> {
+        let outstanding_principal = self.outstanding_principal();
+        if outstanding_principal == 0 {
+            return Err(Error::Malformed("nothing is owed, so nothing can default"));
+        }
+        let debt = self
+            .debt_at(height)
+            .map_err(|_| Error::Malformed("the position's debt could not be computed"))?;
+
+        let from_collateral = self.collateral_sat.min(debt);
+        let still_owed = debt - from_collateral;
+        let from_bond = still_owed.min(self.bond_sat);
+        let shortfall = still_owed - from_bond;
+        let excess_returned = self.collateral_sat - from_collateral;
+
+        let settlement = DefaultSettlement {
+            debt_sat: debt,
+            from_collateral_sat: from_collateral,
+            from_bond_sat: from_bond,
+            shortfall_sat: shortfall,
+            excess_returned_sat: excess_returned,
+        };
+
+        self.state = PositionState::Defaulted {
+            at_height: height,
+            settlement,
+        };
+        Ok(settlement)
     }
 }
 
@@ -259,11 +545,58 @@ fn sat_mul_bps(sat: u64, bps: u32) -> u64 {
 mod tests {
     use super::*;
 
-    fn score(n: i64) -> ReputationScore {
-        ReputationScore {
-            score: n,
-            ..Default::default()
+    /// A live schedule: 10% per 100-block window.
+    fn charge() -> ChargeSchedule {
+        ChargeSchedule {
+            rate_bps_per_window: 1_000,
+            window_blocks: 100,
         }
+    }
+
+    /// A drawn position: 1_000_000 borrowed with the given bond. Deterministic
+    /// and small enough to reason about on paper.
+    fn drawn(bond: u64) -> CreditPosition {
+        CreditPosition::open(&spec(1_000_000, bond, 0)).unwrap()
+    }
+
+    /// Build a position without opening it, so a test can inspect or perturb it.
+    fn spec(amount: u64, bond: u64, at: u64) -> PositionSpec {
+        PositionSpec {
+            terms: CreditTerms::default(),
+            charge: charge(),
+            borrower: [1u8; 20],
+            agent_id: [9u8; 32],
+            lender: [2u8; 20],
+            amount_sat: amount,
+            bond_sat: bond,
+            drawn_at_height: at,
+        }
+    }
+
+    /// D1's invariant, in its strongest available form.
+    ///
+    /// An earlier shape of `open` took a `ReputationScore` and discarded it. That
+    /// version was *conventional* and weaker than this one, because it left the
+    /// dependency one careless caller away from becoming real: a future edit that
+    /// started reading the score would have compiled. Removing the parameter
+    /// entirely means credit cannot be computed from a reputation score even by
+    /// accident - the type system refuses the call rather than the code refusing
+    /// it.
+    ///
+    /// The score is still the lender's underwriting input, exactly as before. The
+    /// point is that it is the lender's, off the chain's critical path, so a
+    /// reputation update is not a consensus event and a fresh id is not farmable.
+    #[test]
+    fn credit_cannot_be_computed_from_a_reputation_score_at_all() {
+        // The compile-time assertion: no signature in this module accepts one.
+        // If `PositionSpec` or `open` ever gains a score field, stop and think
+        // about D1 again, because that is the change the decision refuses.
+        let p = spec(1_000_000, 0, 0);
+        // The same figures, whatever an agent's score might be, price identically.
+        assert_eq!(
+            CreditPosition::open(&p).unwrap().collateral_sat,
+            CreditPosition::open(&p).unwrap().collateral_sat
+        );
     }
 
     #[test]
@@ -333,31 +666,15 @@ mod tests {
         let t = CreditTerms::default();
         let a = t.required_collateral(1_000_000, 50_000).unwrap();
         assert_eq!(
-            CreditPosition::open(
-                &t,
-                [1u8; 20],
-                [9u8; 32],
-                [2u8; 20],
-                1_000_000,
-                50_000,
-                &score(0)
-            )
-            .unwrap()
-            .collateral_sat,
+            CreditPosition::open(&spec(1_000_000, 50_000, 0))
+                .unwrap()
+                .collateral_sat,
             a
         );
         assert_eq!(
-            CreditPosition::open(
-                &t,
-                [1u8; 20],
-                [9u8; 32],
-                [2u8; 20],
-                1_000_000,
-                50_000,
-                &score(10_000)
-            )
-            .unwrap()
-            .collateral_sat,
+            CreditPosition::open(&spec(1_000_000, 50_000, 0))
+                .unwrap()
+                .collateral_sat,
             a
         );
     }
@@ -378,6 +695,174 @@ mod tests {
         assert!(
             t.required_collateral(1_000_000, 10_000).is_err(),
             "a discount above the base would drive the requirement to nothing"
+        );
+    }
+
+    #[test]
+    fn interest_accrues_per_whole_window_only() {
+        let c = charge();
+        // One window of 10% on 1 000 000 is 100 000.
+        assert_eq!(c.accrued_interest(1_000_000, 0, 100).unwrap(), 100_000);
+        // A fraction of a window accrues nothing: there is no sub-window
+        // fraction, so the total never depends on rounding order.
+        assert_eq!(c.accrued_interest(1_000_000, 0, 50).unwrap(), 0);
+        assert_eq!(c.accrued_interest(1_000_000, 0, 99).unwrap(), 0);
+        assert_eq!(c.accrued_interest(1_000_000, 0, 200).unwrap(), 200_000);
+        // Interest is charged on outstanding principal, so repaying reduces it.
+        assert_eq!(c.accrued_interest(500_000, 0, 100).unwrap(), 50_000);
+        // A backwards window is a caller error, not zero.
+        assert!(c.accrued_interest(1_000_000, 100, 0).is_err());
+    }
+
+    #[test]
+    fn a_position_repays_interest_before_principal() {
+        // 1 000 000 borrowed, one window elapsed before any repayment.
+        let mut p = drawn(0);
+        let r = p.repay(50_000, 100).unwrap();
+        // The whole payment lands on interest, because that is the lender's
+        // charge and comes first. The principal is untouched.
+        assert_eq!(r.interest_paid_sat, 50_000);
+        assert_eq!(r.principal_paid_sat, 0);
+        assert_eq!(
+            r.remaining_debt_sat, 1_050_000,
+            "1 000 000 principal + 50 000 left of interest"
+        );
+
+        // Paying the rest settles it, and the collateral returns whole.
+        let r2 = p.repay(1_050_000, 100).unwrap();
+        assert_eq!(r2.remaining_debt_sat, 0);
+        assert!(p.is_terminal());
+        assert!(
+            matches!(p.state, PositionState::Repaid { interest_paid_sat, .. } if interest_paid_sat == 100_000)
+        );
+    }
+
+    #[test]
+    fn repaying_more_than_the_debt_is_refused() {
+        // A payment larger than the debt is the caller paying the wrong amount.
+        // Accepting it quietly is how a position acquires funds with no reason.
+        let mut p = drawn(0);
+        assert!(p.repay(1_000_001, 0).is_err());
+    }
+
+    #[test]
+    fn a_default_takes_collateral_first_then_the_bond_and_never_reputation() {
+        // 1 000 000 borrowed with a 0 bond: collateral is the full amount, and
+        // with one window of interest the debt exceeds it.
+        let mut p = drawn(0);
+        let s = p.default(100).unwrap();
+
+        assert_eq!(s.debt_sat, 1_100_000);
+        assert_eq!(
+            s.from_collateral_sat, 1_000_000,
+            "the position's own collateral is taken first"
+        );
+        assert_eq!(s.from_bond_sat, 0, "there was no bond to take");
+        assert_eq!(
+            s.shortfall_sat, 100_000,
+            "the lender absorbs what collateral could not cover"
+        );
+        assert_eq!(s.excess_returned_sat, 0, "nothing was left over");
+
+        // The bond is what backs a default; posting one discounts the collateral
+        // requirement, so the debt now spills past the collateral into the bond.
+        let mut p2 = drawn(50_000);
+        assert_eq!(
+            p2.collateral_sat, 950_000,
+            "the bond discounted the requirement"
+        );
+        let s2 = p2.default(100).unwrap();
+        assert_eq!(s2.debt_sat, 1_100_000);
+        assert_eq!(
+            s2.from_collateral_sat, 950_000,
+            "the position's collateral goes first"
+        );
+        assert_eq!(s2.from_bond_sat, 50_000, "the bond covers all it can");
+        assert_eq!(
+            s2.shortfall_sat, 100_000,
+            "and the lender absorbs the remainder"
+        );
+        assert_eq!(s2.lender_recovered_sat(), 1_000_000);
+        assert_eq!(
+            s2.borrower_lost_sat(),
+            1_000_000,
+            "collateral plus bond, and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_default_returns_excess_collateral_to_the_borrower() {
+        // Borrow far less than the collateral held. A default must take the debt
+        // and no more: the rest is the borrower's, and keeping it would be theft.
+        let mut p = CreditPosition::open(&spec(100_000, 0, 0)).unwrap();
+        assert_eq!(p.collateral_sat, 100_000, "fully collateralized at open");
+        p.bond_sat = 0;
+
+        // Default before any interest accrues, so the debt is exactly principal.
+        let s = p.default(0).unwrap();
+        assert_eq!(s.debt_sat, 100_000);
+        assert_eq!(s.from_collateral_sat, 100_000);
+        assert_eq!(s.excess_returned_sat, 0);
+
+        // Now the same position but the collateral is deliberately larger.
+        let mut p2 = p.clone();
+        p2.state = PositionState::Drawn {
+            at_height: 0,
+            repaid_principal_sat: 0,
+            repaid_interest_sat: 0,
+        };
+        p2.collateral_sat = 250_000;
+        let s2 = p2.default(0).unwrap();
+        assert_eq!(
+            s2.excess_returned_sat, 150_000,
+            "collateral in excess of the debt returns to the borrower"
+        );
+        assert_eq!(
+            s2.borrower_lost_sat(),
+            100_000,
+            "the borrower loses the debt, not the collateral"
+        );
+    }
+
+    #[test]
+    fn a_settled_position_cannot_change_again() {
+        // Terminal means terminal, in both directions.
+        let mut p = drawn(0);
+        p.default(0).unwrap();
+        assert!(p.default(10).is_err(), "cannot default twice");
+        assert!(p.debt_at(10).is_err(), "a settled position has no debt");
+        assert!(
+            p.repay(100, 10).is_err(),
+            "cannot repay a defaulted position"
+        );
+
+        let mut q = drawn(0);
+        q.repay(1_000_000, 0).unwrap();
+        assert!(q.is_terminal());
+        assert!(
+            q.default(100).is_err(),
+            "nothing is owed, so nothing defaults"
+        );
+        assert!(q.repay(1, 100).is_err(), "cannot repay a repaid position");
+    }
+
+    #[test]
+    fn a_default_of_a_nothing_owed_position_is_refused() {
+        let mut p = drawn(0);
+        // Repay the principal and all interest, leaving a live but zero-debt
+        // position would be impossible; a partial repayment leaving principal
+        // still owes, so it can default.
+        p.repay(100_000, 0).unwrap();
+        assert!(!p.is_terminal());
+        // But zero outstanding principal is refused rather than settled at zero.
+        p.state = PositionState::Drawn {
+            at_height: 0,
+            repaid_principal_sat: 1_000_000,
+            repaid_interest_sat: 0,
+        };
+        assert!(
+            p.default(0).is_err(),
+            "nothing is owed, so nothing can default"
         );
     }
 

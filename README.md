@@ -243,9 +243,8 @@ itself, without a human in the loop to release funds.
 
 ### Undercollateralized agent credit — _in development_
 
-**Built:** the collateral arithmetic, with the invariants that make it safe.
-
-**Not built:** the position itself — open, repay, default, settlement.
+**Built:** the collateral arithmetic and the position lifecycle, with the
+invariants that make them safe.
 
 An agent with a demonstrated track record can borrow against future work rather
 than pre-funding every transaction. This is deliberately built on two
@@ -256,7 +255,15 @@ discounts the requirement, never replaces it.
 The design is explicit that reputation is not a consensus input. A credit limit
 computed on-chain from a mutable score would make every reputation update a
 consensus event and make fresh identities farmable, which is the cheapest attack
-against the gate.
+against the gate. So `credit.rs` has no signature that accepts a score at all —
+the guarantee is the type system refusing the call, not the code declining it.
+
+**If a position defaults**, settlement takes the position's own collateral first,
+then the bond, and **never reputation**. Collateral in excess of the debt returns
+to the borrower: a default takes what it is owed and no more, so an
+overcollateralized position that went bad still belongs to its borrower outside
+the debt. Any debt left after both is a reported shortfall, which the lender
+absorbs rather than the protocol inventing funds to cover.
 
 **What it supports:** an agent earning from work it has not yet performed, with
 the risk carried by a bond instead of by trust in a stranger.
@@ -673,7 +680,7 @@ applies.
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
 | **Escrowed service contracts** | **In development** | The general contract and its transitions; one non-compute deliverable shipping |
-| **Agent credit** | **In development** | The collateral arithmetic is built; the position lifecycle is not |
+| **Agent credit** | **In development** | Collateral, repayment and default settlement; not yet wired to a bond ledger |
 | **Delegation chains** | **Not built** | Needs a policy parent link and a SPEC amendment |
 | **Conditional payments** | **Not built** | Held pending arbitrator key custody |
 | **Compute-backed staking** | **Not built** | Held pending a live validator committee |
