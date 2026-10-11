@@ -14,11 +14,42 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
-### Fixed (2026-10-10, consensus verification only — no rule change)
+### Added (licensing)
+
+- **`TRADEMARK.md`.** The code licence and the brand policy are now separate
+  documents, which is the arrangement Bitcoin uses. The code stays `MIT OR
+  Apache-2.0` so anyone can run, audit, fork and commercialise it; the *Jounit*
+  name, the `JNT` ticker and the logos are trademarked so nobody can ship a
+  product under our identity that is not this software.
+
+  Written against a real tension rather than assumed away. A permissive code
+  licence cannot protect a brand, and a brand left unprotected eventually gets
+  used by someone who is not us, on a chain that is not this one, holding a
+  token that looks like ours — and the user has no way to tell. Forks remain
+  explicitly permitted; what the trademark refuses is the rebranding.
+
+### Fixed
+
+- `Cargo.toml` declared `repository = "https://github.com/jounit-network/jounit"`,
+  which is not the actual remote. Cosmetic, but it is the first thing
+  `cargo publish` would have used.
+
+### Changed (documentation)
+
+- **README rewritten** from 876 lines to ~240. The previous version carried a
+  giant status blockquote, 15 sections, deep protocol tables and a module map
+  inline, which made it hard to read and hard to keep accurate. What remains is
+  what someone needs in the first five minutes — what it is, how to run it, what
+  is built, what is not done, and how it is licensed. Protocol detail belongs to
+  `SPEC.md`, which is normative, and to `docs/`, which already carries the design
+  record. The rewritten version also fixes a broken `## License` heading that had
+  merged with its own body text.
+
+### Fixed (consensus verification only — no rule change)
 
 - **L1/L2 exit disagreements are no longer invisible.** `ChainL2::apply_block`
   recorded an L1-accepted exit claim that the replayed L2 state could not back
-  only behind a `debug_assertion`, which compiles out of the build a long-running
+  only behind a `debug_assert`, which compiles out of the build a long-running
   node actually ships. The disagreement is now recorded as an `UnbackedClaim`
   (height, owner, nonce, named reason) and exposed through
   `ChainL2::unbacked_claims()`. The watch is still dropped — L1 already
