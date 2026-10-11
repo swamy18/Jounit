@@ -14,6 +14,39 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed (documentation)
+
+- **README expanded to cover the areas a reviewer asks about first**, and every
+  claim re-derived from the code rather than carried over:
+  - **Supply** — the stock cap's removal, the exact ladder figure
+    (39 157 124 JNT, not the 39 157 200 a geometric shortcut gives, because
+    genesis occupies a rung-0 height without minting), the tail's decay to a
+    permanent 0.1 JNT floor, the two bounds that enforce it, and the measured
+    consequence that net supply *falls* below break-even at ≈5 % activity.
+  - **What the chain is for** — L1 as settlement, L2 as a task economy, with the
+    six transaction types and six contract states tabulated.
+  - **Machines, agents and robots** — identity derivation, the fail-closed
+    spend-policy rules, why there is no second currency, the fixed reputation
+    weight table with `DisputeLost` at −3, and streaming micro-payments.
+    Carries the scope limit plainly: the layer is a pure library and is **not**
+    wired into `submit_at`, so it cannot by itself move a coin.
+  - **Verified Work Certificates** — what one is, the two kinds, and the
+    unchallenged-result rule spelled out rather than footnoted.
+  - **How fraud is detected** — the canonical reference, the full lifecycle
+    diagram, the vote transport, and what a fraud verdict does to each party.
+  - **How withdrawals work** — the four steps, why the claim is proof-authorised
+    rather than signed, exact funding and its liveness cost, and that mainnet
+    exits are off.
+  - **A before/now table** recording what each mechanism was and is, so a reader
+    can tell the shipped state from the earlier one.
+  - **Component status** — every row is a code path that exists, with the
+    honest caveat where one applies, and the five items that are *not* done
+    marked as such rather than omitted.
+
+  Nothing planned is described as shipped. Where something is a library rather
+  than a consensus rule, or registered-but-inactive, or retained-as-evidence but
+  not yet slashable, the README says so.
+
 ### Added (licensing)
 
 - **`TRADEMARK.md`.** The code licence and the brand policy are now separate
