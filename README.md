@@ -8,6 +8,10 @@ without weakening the security a blockchain depends on.
 > [Not ready to launch](#not-ready-to-launch). What remains is configuration,
 > operators, and an external audit: not missing protocol.
 
+**Author and copyright:** Swamy Gadila. The code is © 2026 Swamy Gadila, and
+the *Jounit* name, `JNT` ticker and logos are his trademarks — see
+[License and trademark](#license-and-trademark).
+
 ---
 
 ## Contents
@@ -687,19 +691,24 @@ each item with its evidence.
 
 ## License and trademark
 
+**Copyright © 2026 Swamy Gadila.**
+
 **Code: `MIT OR Apache-2.0`** — the standard permissive Rust dual licence. Both
 texts ship at the repo root (`LICENSE-MIT`, `LICENSE-APACHE`). You may use,
 modify, run, audit and redistribute the software, including commercially.
 
-**Name and marks: trademarked.** The *Jounit* name, the `JNT` ticker and the
-project's logos are trademarks, not part of the code licence. See
-[TRADEMARK.md](TRADEMARK.md).
+**Name and marks: trademarked by the author.** The *Jounit* name, the `JNT`
+ticker and the project's logos are trademarks of Swamy Gadila, not part of the
+code licence. See [TRADEMARK.md](TRADEMARK.md).
 
 The distinction is the same one Bitcoin uses: **the code is open so anyone can
 run it, and the name is protected so nobody can pass themselves off as us.**
 Nothing in an open-source licence can stop someone forking the code — that is
 deliberate, and it is how the ecosystem works. What the trademark stops is
 someone shipping a product under our name that is not this software.
+
+Forks are explicitly permitted. The code belongs to everyone under the terms
+above; the name belongs to the author.
 
 If you want to use the name or marks commercially, or you want a licence other
 than the one above, get in touch first.

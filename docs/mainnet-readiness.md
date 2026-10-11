@@ -7,6 +7,12 @@ a `config.toml`, a `/metrics` endpoint, a `serve --sync` flag) and a
 pre-launch checklist that marked unrun items ✅. Those are corrected below.
 Mainnet is blocked by three things that are not operational at all — they are
 protocol decisions — and the blockers are named at the end.
+
+**Author and copyright holder:** Swamy Gadila (© 2026). The three blockers at
+the end are the launch gate: mainnet stays **NO-GO** until all three are closed,
+and none of the three can be satisfied by writing more code. The same gate is
+recorded in `memory.md`.
+
 ## What is actually implemented
 
 | Area | Implemented |

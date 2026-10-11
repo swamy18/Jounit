@@ -14,6 +14,22 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added (attribution)
+
+- **Authorship is now recorded throughout the project.** The code carried no
+  `authors` field, the licence files named a holder that was not a person, and
+  the Apache-2.0 boilerplate still had its unfilled `[yyyy] [name of copyright
+  owner]` placeholder. All three are fixed:
+  - `Cargo.toml` gains `authors = ["Swamy Gadila"]` and a workspace description,
+    so crates.io and `cargo metadata` attribute the work.
+  - `LICENSE-MIT` and `LICENSE-APACHE` now name **Swamy Gadila** as the
+    copyright holder. This is a legal attribution change — previously it read
+    "Copyright (c) 2026 Jounit".
+  - `README.md` credits the author and copyright holder, and `TRADEMARK.md`
+    states the marks belong to the same holder, with the reporting and contact
+    paths pointing at a named person rather than "the maintainers".
+  - `docs/mainnet-readiness.md` carries the attribution alongside the launch gate.
+
 ### Changed (documentation)
 
 - **README expanded to cover the areas a reviewer asks about first**, and every
