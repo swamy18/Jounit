@@ -162,7 +162,7 @@ pub fn dispute_plan(
         let mut a = ComputeAttestation {
             task_id,
             result_hash: counter_result,
-            backend: contract.compute_task.backend_hint,
+            backend: contract.deliverable.0.backend_hint,
             worker_address: addr,
             attest_height: height,
             signature: vec![],

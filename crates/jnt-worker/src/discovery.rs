@@ -59,7 +59,7 @@ pub fn discover_tasks<V: L2NodeView>(
         if !available(contract, height, &state, config) {
             continue;
         }
-        let t = &contract.compute_task;
+        let t = &contract.deliverable.0;
         out.push(TaskRef {
             task_id: contract.task_id,
             submitter: contract.submitter,
@@ -106,7 +106,7 @@ pub fn available(
     if contract.deadline_height.saturating_sub(height) > f.max_deadline_distance {
         return false;
     }
-    let t = &contract.compute_task;
+    let t = &contract.deliverable.0;
     if t.required_memory_bytes > f.max_memory_bytes {
         return false;
     }

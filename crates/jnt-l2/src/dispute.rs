@@ -198,13 +198,12 @@ impl DisputeEngine {
     /// interpreted.
     pub fn resolve(contract: &TaskContract) -> L2Result<DisputeVerdict> {
         let evidence = DisputeEvidence::from_contract(contract)?;
-        let t = &contract.compute_task;
-        let reference = jnt_core::compute_ir::reference_result_hash(
-            &contract.task_id,
-            &t.ir_hash,
-            &t.input_hash,
-            t.required_memory_bytes,
-        );
+        // Rule 3 of the predicate discipline: the reference is computed here,
+        // from the contract's own committed deliverable, and is never supplied
+        // by a caller. Reading it off the deliverable rather than from the
+        // compute-specific fields is what keeps this one path for every kind of
+        // deliverable - there is no second, compute-only arbitration.
+        let reference = contract.reference();
         Self::arbitrate(&evidence, reference)
     }
 }

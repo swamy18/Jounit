@@ -125,12 +125,16 @@ impl World {
     }
 
     fn reference(&self, id: Hash) -> Hash {
+        // Computed independently of the contract's own `reference()`, on
+        // purpose: this is the check that the deliverable abstraction still
+        // produces the canonical CPU result and has not quietly become a second
+        // implementation that could drift from it.
         let t = self.state.task(&id).unwrap();
         reference_result_hash(
             &t.task_id,
-            &t.compute_task.ir_hash,
-            &t.compute_task.input_hash,
-            t.compute_task.required_memory_bytes,
+            &t.deliverable.0.ir_hash,
+            &t.deliverable.0.input_hash,
+            t.deliverable.0.required_memory_bytes,
         )
     }
 

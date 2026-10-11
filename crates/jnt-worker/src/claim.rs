@@ -68,7 +68,7 @@ pub fn claim_plan(
     let payload = ClaimTaskPayload::build(
         wallet,
         task_id,
-        contract.compute_task.backend_hint,
+        contract.deliverable.0.backend_hint,
         config.worker_deposit_sat,
     )?;
     let tx = L2Transaction::new(L2Payload::Claim(payload));

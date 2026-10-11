@@ -33,7 +33,7 @@ pub struct ExecutionWork {
 impl ExecutionWork {
     /// Project from a live contract, or refuse when it is not claimable work.
     pub fn from_contract(contract: &TaskContract, current_height: u64) -> WorkerResult<Self> {
-        let t: &ComputeTask = &contract.compute_task;
+        let t: &ComputeTask = &contract.deliverable.0;
         Ok(ExecutionWork {
             task_id: contract.task_id,
             ir_hash: t.ir_hash,

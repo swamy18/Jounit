@@ -20,7 +20,8 @@
 //! an actor chooses. A submitter who could pick their own window could pick a
 //! zero-length one; a worker who could pick it could make challenges impossible.
 
-use jnt_core::compute_ir::{ComputeAttestation, ComputeTask};
+use jnt_core::compute_ir::ComputeAttestation;
+use jnt_core::deliverable::{Attestation, ComputeDeliverable, Deliverable};
 use jnt_core::fees::split_flat_fee;
 use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
@@ -86,7 +87,7 @@ impl L2Config {
 
 /// A task's lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContractState {
+pub enum ContractState<A = ComputeAttestation> {
     Open,
     InProgress {
         claimed_at: u64,
@@ -94,14 +95,14 @@ pub enum ContractState {
     ResultSubmitted {
         result_hash: Hash,
         submitted_at: u64,
-        attestation: ComputeAttestation,
+        attestation: A,
     },
-    Disputed(DisputeChallenge),
+    Disputed(DisputeChallenge<A>),
     Settled(SettlementOutcome),
     Expired(ExpiryOutcome),
 }
 
-impl ContractState {
+impl<A> ContractState<A> {
     pub fn name(&self) -> &'static str {
         match self {
             ContractState::Open => "Open",
@@ -127,12 +128,12 @@ impl ContractState {
 /// evidence from the contract alone rather than reaching back into a prior
 /// state the contract no longer carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisputeChallenge {
+pub struct DisputeChallenge<A = ComputeAttestation> {
     pub challenger: Address,
     pub against_result: Hash,
-    pub against_attestation: ComputeAttestation,
+    pub against_attestation: A,
     pub counter_result: Hash,
-    pub counter_attestation: ComputeAttestation,
+    pub counter_attestation: A,
     pub deposit_sat: u64,
     pub filed_at: u64,
 }
@@ -172,18 +173,48 @@ pub struct ExpiryOutcome {
     pub at_height: u64,
 }
 
+/// The general escrowed-service contract.
+///
+/// `D` is the deliverable being adjudicated and `A` the worker's signed claim
+/// about it. Everything above them - escrow, bonding, the dispute window, the
+/// settlement arithmetic - is identical for every `D`, which is the point: the
+/// trust primitive is general and only the *predicate* varies.
+///
+/// [`TaskContract`] is the compute instantiation, and it is a type alias rather
+/// than a wrapper, so there is exactly one settlement path in the tree
+/// (`docs/roadmap-agent-economy.md` D3). A second implementation sitting beside
+/// this one would make the abstraction cosmetic.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskContract {
+pub struct ServiceContract<D = ComputeDeliverable, A = ComputeAttestation> {
     pub task_id: Hash,
     pub submitter: Address,
     pub worker: Option<Address>,
-    pub compute_task: ComputeTask,
+    pub deliverable: D,
     pub payment_sat: u64,
     pub worker_deposit_sat: u64,
     pub deadline_height: u64,
     pub dispute_window: u64,
     pub nonce: u64,
-    pub state: ContractState,
+    pub state: ContractState<A>,
+}
+
+/// The compute instantiation of [`ServiceContract`]: escrow against a
+/// `ComputeTask`, adjudicated by the canonical CPU reference.
+pub type TaskContract = ServiceContract<ComputeDeliverable, ComputeAttestation>;
+
+impl<D, A> ServiceContract<D, A> {
+    /// The canonical result this contract's deliverable must produce.
+    ///
+    /// Rule 3 of the predicate discipline: computed from the contract's own
+    /// committed fields, never taken from a caller. The id passed is the
+    /// *contract's*, not the deliverable's own - see
+    /// `Deliverable::reference` for why that distinction is load-bearing.
+    pub fn reference(&self) -> Hash
+    where
+        D: Deliverable,
+    {
+        self.deliverable.reference(&self.task_id)
+    }
 }
 
 impl TaskContract {
@@ -213,7 +244,7 @@ impl TaskContract {
             task_id: post.task_id,
             submitter: post.submitter,
             worker: None,
-            compute_task: post.compute_task.clone(),
+            deliverable: ComputeDeliverable(post.compute_task.clone()),
             payment_sat: post.payment_sat,
             worker_deposit_sat: 0,
             deadline_height: post.deadline_height,
@@ -295,13 +326,13 @@ impl TaskContract {
         if submit.task_id != self.task_id {
             return Err(L2Error::BadAttestation("task_id"));
         }
-        if submit.attestation.task_id != self.task_id {
+        if submit.attestation.task_id() != self.task_id {
             return Err(L2Error::BadAttestation("attestation task_id"));
         }
-        if submit.attestation.worker_address != actor {
+        if submit.attestation.worker_address() != actor {
             return Err(L2Error::BadAttestation("attestation worker_address"));
         }
-        if submit.attestation.result_hash != submit.result_hash {
+        if submit.attestation.result_hash() != submit.result_hash {
             return Err(L2Error::BadAttestation("attestation result_hash"));
         }
         // An all-zero result hash is the expired placeholder, not a commitment.
@@ -313,7 +344,7 @@ impl TaskContract {
                 "result_hash is the expired placeholder; a result must commit to real output",
             ));
         }
-        if submit.attestation.signature.is_empty() {
+        if !submit.attestation.is_signed() {
             return Err(L2Error::BadAttestation("attestation is unsigned"));
         }
         self.state = ContractState::ResultSubmitted {
@@ -351,10 +382,10 @@ impl TaskContract {
         if dispute.challenge_deposit_sat == 0 {
             return Err(L2Error::ZeroAmount("challenge_deposit_sat"));
         }
-        if dispute.counter_attestation.task_id != self.task_id {
+        if dispute.counter_attestation.task_id() != self.task_id {
             return Err(L2Error::BadAttestation("counter attestation task_id"));
         }
-        if dispute.counter_attestation.result_hash != dispute.counter_result {
+        if dispute.counter_attestation.result_hash() != dispute.counter_result {
             return Err(L2Error::BadAttestation("counter attestation result_hash"));
         }
         self.state = ContractState::Disputed(DisputeChallenge {
@@ -627,9 +658,9 @@ impl DisputeChallenge {
     pub(crate) fn encode(&self, w: &mut Writer) {
         w.fixed(&self.challenger)
             .fixed(&self.against_result)
-            .raw(&self.against_attestation.serialize())
+            .raw(&self.against_attestation.encode())
             .fixed(&self.counter_result)
-            .raw(&self.counter_attestation.serialize())
+            .raw(&self.counter_attestation.encode())
             .u64le(self.deposit_sat)
             .u64le(self.filed_at);
     }
@@ -645,12 +676,12 @@ impl DisputeChallenge {
         // The protocol only ever writes a challenge whose evidence names this
         // task (both attestations are checked at filing), so a blob that
         // disagrees was not produced by a node.
-        if against_attestation.task_id != *task_id {
+        if against_attestation.task_id() != *task_id {
             return Err(L2Error::BadAttestation(
                 "wire: challenged attestation names another task",
             ));
         }
-        if counter_attestation.task_id != *task_id {
+        if counter_attestation.task_id() != *task_id {
             return Err(L2Error::BadAttestation(
                 "wire: counter attestation names another task",
             ));
@@ -736,7 +767,7 @@ impl TaskContract {
                 w.u8(0);
             }
         }
-        w.raw(&self.compute_task.serialize())
+        w.raw(&self.deliverable.encode())
             .u64le(self.payment_sat)
             .u64le(self.worker_deposit_sat)
             .u64le(self.deadline_height)
@@ -757,7 +788,7 @@ impl TaskContract {
                 w.u8(WIRE_RESULT_SUBMITTED)
                     .fixed(result_hash)
                     .u64le(*submitted_at)
-                    .raw(&attestation.serialize());
+                    .raw(&attestation.encode());
             }
             ContractState::Disputed(c) => {
                 w.u8(WIRE_DISPUTED);
@@ -788,7 +819,7 @@ impl TaskContract {
             1 => Some(r.fixed().map_err(L2Error::Codec)?),
             _ => return Err(L2Error::Codec(jnt_core::Error::Malformed("worker flag"))),
         };
-        let compute_task = ComputeTask::from_reader(r)?;
+        let deliverable = ComputeDeliverable::decode(r)?;
         let payment_sat = r.u64le().map_err(L2Error::Codec)?;
         let worker_deposit_sat = r.u64le().map_err(L2Error::Codec)?;
         let deadline_height = r.u64le().map_err(L2Error::Codec)?;
@@ -804,8 +835,8 @@ impl TaskContract {
             WIRE_RESULT_SUBMITTED => {
                 let result_hash: Hash = r.fixed().map_err(L2Error::Codec)?;
                 let submitted_at = r.u64le().map_err(L2Error::Codec)?;
-                let attestation = ComputeAttestation::from_reader(r).map_err(L2Error::Codec)?;
-                if attestation.task_id != task_id {
+                let attestation = ComputeAttestation::decode(r).map_err(L2Error::Codec)?;
+                if attestation.task_id() != task_id {
                     return Err(L2Error::BadAttestation(
                         "wire: submitted attestation names another task",
                     ));
@@ -855,12 +886,12 @@ impl TaskContract {
             let expected = worker.ok_or(L2Error::Codec(jnt_core::Error::Malformed(
                 "wire: unattested submission",
             )))?;
-            if attestation.worker_address != expected {
+            if attestation.worker_address() != expected {
                 return Err(L2Error::BadAttestation(
                     "wire: attestation is by someone other than the worker",
                 ));
             }
-            if attestation.result_hash != *result_hash {
+            if attestation.result_hash() != *result_hash {
                 return Err(L2Error::BadAttestation(
                     "wire: attestation disagrees with the submitted result",
                 ));
@@ -871,7 +902,7 @@ impl TaskContract {
             task_id,
             submitter,
             worker,
-            compute_task,
+            deliverable,
             payment_sat,
             worker_deposit_sat,
             deadline_height,
@@ -885,7 +916,7 @@ impl TaskContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jnt_core::compute_ir::ComputeBackend;
+    use jnt_core::compute_ir::{ComputeBackend, ComputeTask};
     use jnt_core::l2::{derive_task_id, Auth};
 
     fn addr(n: u8) -> Address {

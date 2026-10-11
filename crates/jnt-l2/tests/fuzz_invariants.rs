@@ -544,9 +544,9 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
                         match state.task(&id) {
                             Some(t) => jnt_core::compute_ir::reference_result_hash(
                                 &t.task_id,
-                                &t.compute_task.ir_hash,
-                                &t.compute_task.input_hash,
-                                t.compute_task.required_memory_bytes,
+                                &t.deliverable.0.ir_hash,
+                                &t.deliverable.0.input_hash,
+                                t.deliverable.0.required_memory_bytes,
                             ),
                             None => rng.hash(),
                         }

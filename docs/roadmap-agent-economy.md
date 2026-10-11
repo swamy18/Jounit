@@ -276,6 +276,105 @@ blocked on adoption, not on code.
 
 ---
 
+## Locked decisions
+
+Recorded 2026-10-11. These are settled; implementation follows them.
+
+### D1 — Credit is bond-backed. Reputation is a derived view, never a consensus input
+
+**Decided.** Consensus-computed reputation feeding credit limits is rejected.
+
+The reason is specific: it turns every reputation update into a consensus event,
+and it makes fresh IDs farmable. A credit line gated on a consensus-visible score
+is a subsidy to anyone willing to mint identities, which is the cheapest attack
+against the gate and the most expensive to defend.
+
+The clean split:
+
+| | |
+|---|---|
+| **Reputation** | Computed deterministically from on-chain events, published as a **view** any counterparty can read. Never a consensus input. |
+| **Credit** | Always **collateralized**. A posted bond *discounts* the collateral requirement, nothing more. |
+
+Consequences that follow, and are accepted deliberately:
+
+- **No subsidy.** A good record buys a lower requirement, never a free line.
+- **No Sybil surface.** Farming an id yields nothing, because nothing reads the
+  score. A bond is worth exactly its face value regardless of who posts it.
+- **No consensus dependency on a mutable score.** Reputation stays off the
+  critical path, so the score can be rebuilt, corrected or ignored without a
+  consensus change.
+
+The score still has value — it is the *lender's* underwriting input, and every
+agent choosing to lend against reputation can read the same deterministic view.
+That is a market, not a protocol rule, and it is the right place for a judgement
+call that the chain should not be making.
+
+### D2 — Conditional/oracle payments are blocked, off the critical path
+
+**Decided.** Item 4 is parked as **blocked on arbitrator key custody**.
+
+The blocker is real and already listed unresolved in the README: the transport is
+built, but who runs the arbitrators is an organisational decision. An oracle-gated
+payment needs the same answer before it can be specified honestly, because the
+oracle *is* the untrusted party the escrow exists to eliminate.
+
+So item 4 does not gate items 1, 2, 3 or 5, and the state machine is not
+designed around it. When custody is answered, item 4 is either a deterministic
+predicate (as recommended above) or a different design entirely.
+
+### D3 — Item 1c is an acceptance test, not a phase. Refactor, do not fork
+
+**Decided.** `TaskContract` *becomes* the `ServiceContract` with a pluggable
+`Deliverable`. One code path.
+
+> If after 1c there are two settlement paths in the tree, the abstraction failed
+> and we revert.
+
+A parallel `ServiceContract` sitting beside `TaskContract` would be strictly
+worse than no abstraction: it would look generalized while the real contract —
+the one holding escrows — stayed compute-specific.
+
+**The mechanical check**: `grep -rn "fn settle_inner" crates/` must return
+exactly one definition, and there must be exactly one `struct ServiceContract`
+with no `struct TaskContract` beside it. `TaskContract` is a type alias
+`pub type TaskContract = ServiceContract<ComputeDeliverable, ComputeAttestation>`,
+so every existing call site and the whole wire format are untouched.
+
+**Status: met.** Verified after 1b/1c — one `settle_inner`, one
+`ServiceContract`, `TaskContract` an alias, 1003 tests green, vectors and
+`fmt`/`clippy` clean.
+
+### One trap the refactor actually caught
+
+Worth recording, because it is the kind of bug a generalization invites and the
+kind only a full test suite catches.
+
+`ComputeTask` carries its own `task_id` field, and it is **not** guaranteed to
+equal the contract's `task_id`. The first cut of the abstraction read the
+deliverable's own id inside `Deliverable::reference()`, which looked obviously
+right — "the deliverable knows its own id".
+
+It was wrong. The contract's id is authoritative. Compute the reference under the
+wrong one and a dispute resolves against the wrong commitment: every honest
+settlement comes back `Inconclusive`, and no fact is settled. Five tests in
+`dispute_flow.rs` failed immediately, which is the suite doing its job rather
+than the refactor being cautious.
+
+The fix was to make the id an explicit parameter, so the authority is visible at
+the call site rather than implied by a field:
+
+```rust
+fn reference(&self, task_id: &Hash) -> Hash;   // contract's id, passed in
+```
+
+The lesson generalizes past this item: when generalizing a state machine that
+previously reached into a concrete type, the fields of that concrete type are not
+automatically authoritative. The state machine was, and the signature now says
+so. `crates/jnt-core/src/deliverable.rs` has a test for exactly this case.
+
+---
+
 ## Sequencing
 
 | # | Item | Depends on | Consensus change | Blocked by |
