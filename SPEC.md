@@ -2101,6 +2101,62 @@ protocol effect that the L2 state machine did not authorize.
   external identity reference (attestation `worker_address`, registry account)
   is reported as `WorkerError::IdentityMismatch` and aborts the operation.
 
+### 18.2.1 Delegated agent identities and policy chains (normative for `jnt_core::agent` and `jnt_core::delegation`)
+
+**This section changes no consensus rule.** It amends the derivation scheme for
+*agent policy identities* — an offline, non-consensus object (the owner-signed
+`SpendPolicy`) that no block validity rule reads. The amendment is recorded here
+because a new identity derivation is protocol-visible, not because blocks change.
+
+**Sub-agent derivation.** An agent that spends under a delegated policy derives
+its id from its **parent**, never from the funds it is trusted with:
+
+```text
+agent_id  = sha256_dom(DOM_AGENT_ID_SUB, network_id || parent_agent_id || role)[..20]
+```
+
+`DOM_AGENT_ID_SUB` is a new domain tag (`"jounit/agent-id/sub/v1"`), the treatment
+`DOM_ADDR/v2` received: two derivations over one tag are two meanings over one
+byte string, and a collision between them would be an identity confusion, not a
+bug. A root policy (no parent) derives as before, with `DOM_AGENT_ID` from
+`(network_id, role, owner)`.
+
+**The parent link lives in the signed bytes.** `SpendPolicy` carries
+`parent_agent_id: Option<[u8; 20]>`; the canonical encoding gained a final
+presence byte, and `POLICY_VERSION` moved from 1 to 2 so a version-1 policy is
+refused rather than reinterpreted as a root. A link held in a separate table
+could be attached to a policy that never had one — exactly the widening
+delegation must refuse — so a child policy is a child because the bytes say so.
+
+**The narrowing rule (the whole of item 3).** A child is refused unless it is
+**dominated by its parent on every field**:
+
+| Field | Rule |
+|---|---|
+| `version`, `network_id`, `owner`, `role` | equal — a delegate does not hop networks, does not add a co-spender, and does not change what kind of actor spends |
+| `agent_id` | derives from the parent via the sub-agent derivation |
+| `parent_agent_id` | names the policy above it |
+| `window_blocks`, `per_tx_max_sat`, `cumulative_max_sat` | child ≤ parent |
+| `not_before_height`, `expires_at_height` | child ≥ parent / child ≤ parent |
+| `allowed_recipients`, `allowed_services` | child ⊆ parent |
+
+Domination is checked field by field and each check is independent: "narrower on
+average" is not a property, and a child with a tighter per-transaction cap but a
+longer window can out-spend its parent. The safe configuration is the default, so
+widening is impossible to do by omission.
+
+**Chain rules.** A chain is a sequence of policies, root first. Every adjacent
+pair is checked with the domination rule, so the rule composes; a chain longer
+than `MAX_DELEGATION_DEPTH` is refused, because verification cost must not be the
+caller's choice. A revoked policy anywhere in the chain refuses the whole chain —
+an ancestor's kill switch must reach its leaves. A delegation registry
+(`DelegationBook`) answers the questions a chain cannot: one agent id has one
+lineage, and a link is not recorded twice.
+
+**What remains unwired, deliberately.** The policy layer is a constraint, not an
+enforced one, until something consults it (open finding, `docs/security-audit-2026-10-11.md`);
+delegation inherits that status unchanged. Delegation decides no block's validity.
+
 ### 18.3 Node connection
 
 - The SDK never decides what the chain is. It reads protocol state through an

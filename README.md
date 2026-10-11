@@ -1,15 +1,15 @@
-# Jounit (JNT)
+﻿# Jounit (JNT)
 
 An AI-native cryptocurrency. Mining that puts real work on GPUs and AI hardware
 without weakening the security a blockchain depends on.
 
 > **Status: code complete, not launched.** Every mechanism described here is
-> implemented and tested. Mainnet has **not** launched — see
+> implemented and tested. Mainnet has **not** launched â€” see
 > [Not ready to launch](#not-ready-to-launch). What remains is configuration,
 > operators, and an external audit: not missing protocol.
 
-**Author and copyright:** Swamy Gadila. The code is © 2026 Swamy Gadila, and
-the *Jounit* name, `JNT` ticker and logos are his trademarks — see
+**Author and copyright:** Swamy Gadila. The code is Â© 2026 Swamy Gadila, and
+the *Jounit* name, `JNT` ticker and logos are his trademarks â€” see
 [License and trademark](#license-and-trademark).
 
 ---
@@ -47,19 +47,19 @@ anything useful.
 
 Jounit keeps the principle and changes the work. Mining runs three stages:
 
-1. **A SHA-256 hash chain** — carries the security. This is what a quantum
+1. **A SHA-256 hash chain** â€” carries the security. This is what a quantum
    adversary has to break.
-2. **An integer-only neural network** — makes the work meaningful for AI hardware.
-3. **A final hash** — binds both into the value that must fall below the target.
+2. **An integer-only neural network** â€” makes the work meaningful for AI hardware.
+3. **A final hash** â€” binds both into the value that must fall below the target.
 
 Two properties keep the neural stage a cost model rather than a liability:
 
-- **Capped share.** The network must account for 30–50% of modelled work. A
+- **Capped share.** The network must account for 30â€“50% of modelled work. A
   registry entry outside that band is rejected outright, so it can never become
   the weak link.
 - **No floating point, anywhere.** Weights derive from the epoch id by SHA-256,
   the forward pass accumulates in `i64` and wraps to `i32`, and every integer is
-  explicit. Two implementations on two machines produce identical digests — which
+  explicit. Two implementations on two machines produce identical digests â€” which
   is tested against an independent Python reference, not assumed.
 
 Because weights come from the epoch id, no miner can precompute them before an
@@ -102,8 +102,8 @@ Run `jnt-node help` for the full command list; every command accepts `--help`.
 
 ## Supply
 
-There is **no stock cap**. That is a deliberate change — see
-[Decision 18](docs/decisions.md) — and the current bounds are different in kind.
+There is **no stock cap**. That is a deliberate change â€” see
+[Decision 18](docs/decisions.md) â€” and the current bounds are different in kind.
 
 **The ladder** halves in whole JNT every 262 800 blocks (~5 years at a 10-minute
 block):
@@ -112,20 +112,20 @@ block):
 76, 38, 19, 9, 4, 2, 1 JNT
 ```
 
-Whole JNT, not shifted satoshis: halving 9.5 → 4.75 would break the arithmetic.
+Whole JNT, not shifted satoshis: halving 9.5 â†’ 4.75 would break the arithmetic.
 
 **Premine is 0%**, enforced in code rather than in prose. Genesis mints nothing.
 
 **The ladder totals exactly 39 157 124 JNT.** Not the 39 157 200 a geometric
-shortcut suggests — genesis occupies a rung-0 height without minting, so the
-first rung is paid by `H − 1` blocks rather than `H`. That 76 JNT is the
+shortcut suggests â€” genesis occupies a rung-0 height without minting, so the
+first rung is paid by `H âˆ’ 1` blocks rather than `H`. That 76 JNT is the
 difference between the design document's approximation and what the chain can
 actually reach, and `supply::max_issuance_sat` reports the real figure.
 
 **The tail** takes over after the ladder (height 1 839 600) and never stops:
 
 ```
-0.50 → 0.25 → 0.125 JNT, then a permanent 0.1 JNT floor
+0.50 â†’ 0.25 â†’ 0.125 JNT, then a permanent 0.1 JNT floor
 ```
 
 So issuance continues forever, reaching the floor at height 2 628 000 (~50 years)
@@ -136,19 +136,19 @@ first tail period.
 validator and node cannot disagree about what is mintable at a height:
 
 1. **The issuance integral.** A block may not mint past
-   `cumulative_issuance_sat(height)`. Overflow is refused rather than wrapped — a
+   `cumulative_issuance_sat(height)`. Overflow is refused rather than wrapped â€” a
    wrapped sum would compare small and pass the bound.
 2. **The rate anchor.** After ladder exhaustion, gross issuance inside the current
    halving window may not exceed **1% of the supply issued at that window's
-   start**. The approved schedule sits ~3× under it, so the anchor never binds it
-   today — it exists to refuse a *future* schedule that would dilute far faster.
+   start**. The approved schedule sits ~3Ã— under it, so the anchor never binds it
+   today â€” it exists to refuse a *future* schedule that would dilute far faster.
    The ladder era is grandfathered.
 
 **Net supply can fall.** The base fee splits 50/50 into a burn and an on-chain
 reserve, so usage *removes* supply from the spendable set. Combined with a
 declining tail reward, the simulation measures net supply falling below
-break-even at ≈5% activity and being at 25% at the fee floor. This is a measured
-consequence, not a bug — the analysis and sensitivity tables are in
+break-even at â‰ˆ5% activity and being at 25% at the fee floor. This is a measured
+consequence, not a bug â€” the analysis and sensitivity tables are in
 [docs/monetary-policy.md](docs/monetary-policy.md).
 
 Gross issuance, removal and net supply are reported by `status`,
@@ -160,7 +160,7 @@ Gross issuance, removal and net supply are reported by `status`,
 
 Two distinct layers, with different jobs:
 
-**Layer 1** is a conventional UTXO chain — wallets, transfers, blocks, P2P. It
+**Layer 1** is a conventional UTXO chain â€” wallets, transfers, blocks, P2P. It
 exists to be a durable settlement layer, and nothing about it is AI-specific.
 
 **Layer 2** is the part that makes the compute work worth doing. It is a task
@@ -180,8 +180,8 @@ The six L2 transaction types are the whole vocabulary:
 | `0x14` Settle | Committee | Apply the decision: pay, refund, slash |
 | `0x15` ExitQueue | Owner | Start withdrawing back to Layer 1 |
 
-A task moves through six states: `Open → InProgress → ResultSubmitted →
-Disputed? → Settled`, with `Expired` as the timeout branch.
+A task moves through six states: `Open â†’ InProgress â†’ ResultSubmitted â†’
+Disputed? â†’ Settled`, with `Expired` as the timeout branch.
 
 ---
 
@@ -193,12 +193,12 @@ first exists.
 
 Each section says what the capability is and what it supports. **What is actually
 built differs per item, and the status is stated in each heading rather than
-implied by being on the same page** — the [Component status](#component-status)
+implied by being on the same page** â€” the [Component status](#component-status)
 table carries the same labels. Two of the five are held on decisions that are
 organisational rather than technical, and are marked as such instead of being
 started to look further along.
 
-### Escrowed service contracts — _in development_
+### Escrowed service contracts â€” _in development_
 
 **Built:** the general `ServiceContract`, its transitions, and a non-compute
 deliverable that drives them.
@@ -207,7 +207,7 @@ The task economy above is a *specific case* of a general primitive: party A
 commits to a deliverable and bonds against it, party B escrows payment,
 settlement fires when the deliverable is verified. Refactoring that into a
 standalone **ServiceContract** means the same escrow, bonding and dispute
-machinery serves any computation with an admissible verifier — not only a neural
+machinery serves any computation with an admissible verifier â€” not only a neural
 network task.
 
 The design constraint is what makes it work: the verifier must be a
@@ -218,18 +218,18 @@ of it rather than the only one.
 **What it supports:** any task where one party can produce a result that another
 can check without re-running it.
 
-### Attenuated delegation chains — _not built_
+### Attenuated delegation chains â€” _not built_
 
 Multi-agent systems need an owner to grant an agent a subset of their own
 spending authority, and that agent to do the same downward. Each level inherits a
-**strict subset** of its parent's spend policy — never a wider one — so authority
+**strict subset** of its parent's spend policy â€” never a wider one â€” so authority
 narrows as it travels.
 
 **What it supports:** machine fleets and agent hierarchies where the operator
 must bound what any single agent can spend, without re-authorizing each
 transaction by hand.
 
-### Conditional and oracle-gated payments — _blocked on arbitrator key custody_
+### Conditional and oracle-gated payments â€” _blocked on arbitrator key custody_
 
 Payment that releases against a stated condition rather than a manual approval:
 "release when the result matches," "release when latency stayed under a
@@ -241,7 +241,7 @@ until the protocol answers who operators the oracle.
 **What it supports:** pay-as-you-use and outcome-based pricing that settles
 itself, without a human in the loop to release funds.
 
-### Undercollateralized agent credit — _in development_
+### Undercollateralized agent credit â€” _in development_
 
 **Built:** the collateral arithmetic, the position lifecycle with a repayment
 deadline, and a credit book that holds bonds, balances and locked collateral
@@ -250,13 +250,13 @@ under a conservation invariant.
 An agent with a demonstrated track record can borrow against future work rather
 than pre-funding every transaction. This is deliberately built on two
 constraints: reputation is published as a deterministic **view** read off
-on-chain events, and credit is **always collateralized** — a posted bond
+on-chain events, and credit is **always collateralized** â€” a posted bond
 discounts the requirement, never replaces it.
 
 The design is explicit that reputation is not a consensus input. A credit limit
 computed on-chain from a mutable score would make every reputation update a
 consensus event and make fresh identities farmable, which is the cheapest attack
-against the gate. So `credit.rs` has no signature that accepts a score at all —
+against the gate. So `credit.rs` has no signature that accepts a score at all â€”
 the guarantee is the type system refusing the call, not the code declining it.
 
 **If a position defaults**, settlement takes the position's own collateral first,
@@ -266,8 +266,8 @@ overcollateralized position that went bad still belongs to its borrower outside
 the debt. Any debt left after both is a reported shortfall, which the lender
 absorbs rather than the protocol inventing funds to cover.
 
-**A position runs to a deadline.** Before it, a default is refused — a lender
-cannot settle a merely late position on a whim — and the bond a position is
+**A position runs to a deadline.** Before it, a default is refused â€” a lender
+cannot settle a merely late position on a whim â€” and the bond a position is
 priced with must be posted before it opens, so no discount is ever unbacked.
 The credit book holds free balances, posted bonds and collateral locked inside
 live positions, and asserts after every mutation that their sum equals
@@ -276,12 +276,12 @@ everything deposited: value is moved, never created.
 **What it supports:** an agent earning from work it has not yet performed, with
 the risk carried by a bond instead of by trust in a stranger.
 
-### Compute-backed validator staking — _blocked on validator adoption_
+### Compute-backed validator staking â€” _blocked on validator adoption_
 
 Validators that also serve verified work earn more, which ties the protocol's
 security budget and its utility budget into one budget. The condition is that
 what a validator is paid for is *verified* work, where verified means a quorum
-proved it — not work that was merely submitted and left unchallenged.
+proved it â€” not work that was merely submitted and left unchallenged.
 
 **What it supports:** making the neural stage of mining economically useful
 rather than merely elegant, and aligning the interests that secure the chain with
@@ -298,12 +298,12 @@ These are properties verifiable in this repository, not aspirations.
 The canonical reference that decides fraud is computed by the arbitration engine
 from the task's own committed fields. It is never accepted as an argument, so no
 caller can dictate the verdict. This is a structural property rather than a
-policy — see
+policy â€” see
 [How fraud is detected](#how-fraud-is-detected).
 
 ### A receipt that is not mistaken for verification
 
-When a result goes unchallenged, the protocol pays it and issues a certificate —
+When a result goes unchallenged, the protocol pays it and issues a certificate â€”
 and that certificate states plainly that it proves nothing. A `WindowElapsed`
 certificate is a record that nobody objected; `validate_verified()` refuses it by
 name, and `asserts_correctness()` returns `false`. Relying parties that need
@@ -318,7 +318,7 @@ weak basis is unmissable rather than a convention a caller can forget.
 The consensus core computes in integers end to end: weights derive from the epoch
 id by SHA-256, forward passes accumulate in `i64` and wrap to `i32`, difficulty
 and supply use explicit arithmetic with every overflow refused rather than
-wrapped. A wrapped sum would compare small and pass a bound — this is a security
+wrapped. A wrapped sum would compare small and pass a bound â€” this is a security
 property, not a style preference.
 
 Two separate implementations, in two languages, produce identical digests. The
@@ -330,7 +330,7 @@ evidence the specification is unambiguous rather than merely self-consistent.
 
 Mining weights derive from the epoch id, so no miner can compute them before an
 epoch starts. The neural stage is a cost model with a bounded contribution rather
-than the load-bearing part of the proof — the SHA-256 chain carries the security,
+than the load-bearing part of the proof â€” the SHA-256 chain carries the security,
 so the neural work can never become the weak link it is meant to make useful.
 
 ---
@@ -346,7 +346,7 @@ outcome, so the two sides need no prior relationship and no arbitrator they both
 trust.
 
 **Machines spending under a written policy.** An owner authorizes once, offline,
-and every later spend is checked against it with the owner offline — bounded per
+and every later spend is checked against it with the owner offline â€” bounded per
 transaction, bounded per window, to named recipients and named services, with a
 nonce that makes an authorization unreplayable and a kill switch.
 
@@ -372,8 +372,8 @@ delegation of computation, with the blockchain as the escrow and the arbiter.
 ## Machines, agents and robots
 
 There is a full policy layer for software acting on someone's behalf. It lives in
-`jnt-core/src/agent.rs` and is **pure and deterministic** — no clock, no
-randomness, no I/O — so a wallet and a service reaching the same inputs reach the
+`jnt-core/src/agent.rs` and is **pure and deterministic** â€” no clock, no
+randomness, no I/O â€” so a wallet and a service reaching the same inputs reach the
 same answer.
 
 **Agent identity.** `derive_agent_id(network_id, role, owner)` gives a stable
@@ -386,10 +386,10 @@ different chains.
 question: *may this agent, at this height, spend this much to this recipient?*
 Every refusal is a named error, and the ambiguous cases all fail closed:
 
-- an **empty recipient list** authorizes nothing — not "anything";
+- an **empty recipient list** authorizes nothing â€” not "anything";
 - an **empty service list** authorizes no service-tagged payment;
 - a **nonce must strictly increase**, so an authorization cannot be replayed;
-- a height below the policy's own window start refuses — time does not run
+- a height below the policy's own window start refuses â€” time does not run
   backwards inside a policy;
 - cumulative spend is bounded **per window**, and the window rolls over rather
   than accumulating forever.
@@ -412,9 +412,9 @@ table in code, not data**:
 | Payment completed | +1 |
 | Verified work | +2 |
 | Dispute won | +1 |
-| **Dispute lost** | **−3** |
+| **Dispute lost** | **âˆ’3** |
 
-An event carries no amount, no weight and no signature of its own — the weights
+An event carries no amount, no weight and no signature of its own â€” the weights
 are not forgeable by producing a differently-shaped event. Losing a dispute costs
 three times what winning one earns, so baseless challenges are expensive. It is
 **not mintable**: nothing here creates a token.
@@ -422,7 +422,7 @@ three times what winning one earns, so baseless challenges are expensive. It is
 **Streaming micro-payments.** `PaymentStream` is pay-as-you-use: a payer-signed
 rate per block, a window, a hard cap, a recipient, and the governing policy for
 non-human payers. Settlement receipts are payer-signed and the `StreamBook` is
-fail-closed — exact amounts, strictly ordered, non-future settlements, accrual
+fail-closed â€” exact amounts, strictly ordered, non-future settlements, accrual
 checked for wraparound. Settlement rides the ordinary payment path with the
 stream id as the reference, so there is no new transaction type.
 
@@ -431,7 +431,7 @@ receipts and reputation.
 
 > **Scope limit worth stating.** This layer changes no consensus rule. It is a
 > library the node, wallet and worker SDK all call. Until a decision wires it into
-> `submit_at`, it cannot by itself move a coin — a policy constrains spending, it
+> `submit_at`, it cannot by itself move a coin â€” a policy constrains spending, it
 > does not create spending authority.
 
 ---
@@ -440,7 +440,7 @@ receipts and reputation.
 
 A **VWC** is the protocol's receipt for work that settled as correct: task `T`
 settled `Correct` with result `R`, worker `W` paid `P` satoshi at height `H`. It
-is a *derived consequence* of a settlement, never a claim an actor makes — there
+is a *derived consequence* of a settlement, never a claim an actor makes â€” there
 is no issuance transaction and no issuer key, because the settlement path already
 did all the authorizing.
 
@@ -451,7 +451,7 @@ tampered certificate cannot carry a matching id, and its encoding is byte-unique
 
 | Kind | What backs it | Offline-verifiable? |
 |---|---|---|
-| `Quorum` | The settle payload's own BLS aggregate over the decision | **Yes** — against the validator set |
+| `Quorum` | The settle payload's own BLS aggregate over the decision | **Yes** â€” against the validator set |
 | `WindowElapsed` | Nothing but the on-chain record that nobody objected in time | **No** |
 
 ### The unchallenged-result rule
@@ -487,7 +487,7 @@ and acts in time.
 - **Earnings.** `jnt-worker` derives earnings from protocol state rather than
   from anything a server tells it.
 
-A `Fraudulent` or `Expired` settlement issues **no** certificate — those are a
+A `Fraudulent` or `Expired` settlement issues **no** certificate â€” those are a
 slash record and a refund respectively, not evidence of correct work.
 
 ---
@@ -506,7 +506,7 @@ the *task*, never to a caller's claim about it.
 Two properties make it authoritative:
 
 - **It is not interpreted.** The reference is a permutation over commitments, not
-  an interpreter for arbitrary IR. SPEC §16.4/§16.5 forbid an on-chain
+  an interpreter for arbitrary IR. SPEC Â§16.4/Â§16.5 forbid an on-chain
   interpreter, and this is the shape that respects that: a fixed function, not a
   runtime.
 - **It has no height, clock or RNG input.** Identical task fields produce
@@ -516,35 +516,35 @@ Two properties make it authoritative:
 
 ```
 worker submits R
-      │
-      ├─ nobody challenges inside the window
-      │     → auto-settle Correct → paid → WindowElapsed VWC
-      │                          (a receipt, NOT a verification)
-      │
-      └─ challenger files R' with a deposit
-            → DisputeEngine::resolve computes the reference itself
-                  reference == R   → WorkerCorrect     → Verdict::Correct
-                  reference == R'  → ChallengerCorrect → Verdict::Fraudulent
-                  reference == neither → Inconclusive  → settles nothing
+      â”‚
+      â”œâ”€ nobody challenges inside the window
+      â”‚     â†’ auto-settle Correct â†’ paid â†’ WindowElapsed VWC
+      â”‚                          (a receipt, NOT a verification)
+      â”‚
+      â””â”€ challenger files R' with a deposit
+            â†’ DisputeEngine::resolve computes the reference itself
+                  reference == R   â†’ WorkerCorrect     â†’ Verdict::Correct
+                  reference == R'  â†’ ChallengerCorrect â†’ Verdict::Fraudulent
+                  reference == neither â†’ Inconclusive  â†’ settles nothing
 ```
 
 `DisputeEngine::resolve` reads the evidence from the contract and computes the
 reference from the contract's own fields. It never accepts the reference as a
-parameter — taking it as an argument would let any caller dictate the verdict.
+parameter â€” taking it as an argument would let any caller dictate the verdict.
 
 **"No match is not guilt."** An inconclusive arbitration settles nothing. A
 malformed or unexecutable task cannot become a fraud conviction by accident.
 
 ### The vote transport
 
-A committee member signs one vote per held key — four keys is four committee
+A committee member signs one vote per held key â€” four keys is four committee
 members, not one member with four signatures, because a quorum counts *distinct*
 signers.
 
 A vote binds the task, the verdict, the reference result, the network, the height
 and the signer, under its own domain separation tag. It signs exactly
 `SettlePayload::signing_hash`, which is what lets a quorum of votes aggregate
-into the aggregate the settlement transaction carries — and lets the settlement
+into the aggregate the settlement transaction carries â€” and lets the settlement
 path re-verify it from scratch with real BLS pairings.
 
 Receiving nodes check a vote against **their own** committee and height, and relay
@@ -552,15 +552,15 @@ only what they accepted, so a bad vote travels at most one hop. One vote per
 signer means a replay, a duplicate, or a relay loop cannot inflate quorum.
 
 A **split committee** (two honest members disagreeing) is refused but *not*
-recorded as equivocation — blaming an honest signer for the committee's
+recorded as equivocation â€” blaming an honest signer for the committee's
 disagreement is exactly the kind of thing that gets turned into a slash. A genuine
 double-sign is recorded as `ArbitrationEquivocation`.
 
 > **One stated limitation.** A vote signs the settle *decision*, so its signature
 > verifies on any chain carrying that decision. Network and height are checked
 > against the node's own chain at tally time rather than bound into the signature.
-> Binding them into the hash would change `SettlePayload::signing_hash` — a
-> consensus change — so it is documented in
+> Binding them into the hash would change `SettlePayload::signing_hash` â€” a
+> consensus change â€” so it is documented in
 > [`arbitration.rs`](crates/jnt-core/src/arbitration.rs) rather than made
 > unilaterally.
 
@@ -571,7 +571,7 @@ double-sign is recorded as `ArbitrationEquivocation`.
 | Worker | Deposit slashed through the M2 vault: 50% burned immediately, 50% vests linearly over a year |
 | Submitter | Refunded whole |
 | Challenger | Paid a bounty from the PSCB reserve; their deposit returns |
-| Certificate | **None** — a fraud verdict is not evidence of correct work |
+| Certificate | **None** â€” a fraud verdict is not evidence of correct work |
 
 Settlement fees are proportional: 0.1% of task value, 1 000-sat minimum.
 
@@ -584,7 +584,7 @@ Deposits are not one-way. An owner on Layer 2 can bring value back to Layer 1.
 1. **Deposit.** An ordinary Layer 1 payment to the profile's derived sink
    address. No new transaction type. Credited 1:1 after finality depth.
 2. **Queue.** The owner signs an `ExitQueue` transaction, which debits
-   `amount + exit_fee + queue_fee` and records `(owner, nonce) → (amount,
+   `amount + exit_fee + queue_fee` and records `(owner, nonce) â†’ (amount,
    destination, height)`. Nonces are per-owner and strictly increasing.
 3. **Mature.** After finality depth *and* binding finality, the exit is
    settleable. Exits use the same or a stronger rule than deposits, never weaker.
@@ -593,8 +593,8 @@ Deposits are not one-way. An owner on Layer 2 can bring value back to Layer 1.
    queue block.
 
 The claim is authorised by an **inclusion proof, not a signature**, because the
-sink holds no key. Consensus pays only the destination the proven record names —
-a caller cannot redirect it — and the claimant collects a fee the owner prepaid
+sink holds no key. Consensus pays only the destination the proven record names â€”
+a caller cannot redirect it â€” and the claimant collects a fee the owner prepaid
 at queue time, which is what makes a crank nobody wants to run a non-issue rather
 than a griefing vector.
 
@@ -612,7 +612,7 @@ third party, so a non-miner can build a block with them.
 restores the sink outputs, clears the identity, and L2 replay regenerates the
 watch.
 
-**Conservation is unchanged.** The joint check needed no exit term at all — the
+**Conservation is unchanged.** The joint check needed no exit term at all â€” the
 L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 
 > **Not active on mainnet.** `mainnet.exit_activation_height` is `0`, which means
@@ -623,8 +623,8 @@ L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 
 ## Validators and finality
 
-**Bonded stake** (`bond.rs`, Decision 20). Three transaction types — `TX_BOND`,
-`TX_UNBOND`, `TX_SLASH` — feed a bond ledger with a bond-order index. Minimum
+**Bonded stake** (`bond.rs`, Decision 20). Three transaction types â€” `TX_BOND`,
+`TX_UNBOND`, `TX_SLASH` â€” feed a bond ledger with a bond-order index. Minimum
 stake is `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, an immutable consensus constant
 rather than a tunable. Unbonding locks for `UNBONDING_PERIOD_BLOCKS` = 1 008
 (seven days). Provable equivocation burns the full bond.
@@ -634,7 +634,7 @@ chain state and nothing else. Finality keys follow the ledger, so a bond changes
 the validator set and a reorg rewinds it.
 
 **Checkpoint signing** (`signing.rs`) is the other half of M5. Verification has
-existed since the gadget landed — six clauses with real BLS12-381 pairings,
+existed since the gadget landed â€” six clauses with real BLS12-381 pairings,
 bound to the canonical block at the certificate's height. What was missing was any
 code that *produced* a certificate: every one in the tree was a test helper, so
 binding finality could not activate anywhere because nothing ever signed.
@@ -646,7 +646,7 @@ jnt-node validator --network testnet --data-dir ./chain --add --label my-key
 ```
 
 Keys live in `<data-dir>/validators/`, mode 0600 on unix, deliberately separate
-from `wallets.json` — a wallet holds funds this node spends, a validator key
+from `wallets.json` â€” a wallet holds funds this node spends, a validator key
 signs consensus messages. `serve` loads them, signs a checkpoint at each epoch
 boundary for a block it holds as its own canonical tip, and broadcasts it. A node
 with no keys signs nothing and still verifies and relays.
@@ -657,7 +657,7 @@ bytes for a block nobody holds gets a certificate every peer rejects.
 
 **Why it is off on mainnet.** `finality_activation_height` is `0`, and
 `genesis_validators` is empty. With no committee and no bonded stake, checkpoint
-verification fails closed — the honest state, not a broken one. Testnet activates
+verification fails closed â€” the honest state, not a broken one. Testnet activates
 at height 20 with four deterministic keys and quorum 3 of 4.
 
 ---
@@ -675,10 +675,10 @@ applies.
 | P2P: blocks, transactions, checkpoints, votes | **Shipped** | Real sockets; 3-node tests over real transport |
 | L2 task lifecycle (6 states, 6 tx types) | **Shipped** | Full lifecycle suites |
 | L2 deposits | **Shipped** | Active on testnet/mini |
-| L2 → L1 exits | **Shipped** | **Off on mainnet** (activation height unset) |
+| L2 â†’ L1 exits | **Shipped** | **Off on mainnet** (activation height unset) |
 | Dispute engine + canonical reference | **Shipped** | Reference computed by the engine, never supplied |
 | Arbitration vote transport | **Shipped** | Signed, relayed, tallied, quorum-checked |
-| **Arbitrator key custody** | **Not decided** | Organisational — who runs the arbitrators |
+| **Arbitrator key custody** | **Not decided** | Organisational â€” who runs the arbitrators |
 | **Slash transaction for vote equivocation** | **Not built** | Evidence is recorded; the slash path is not wired |
 | Verified Work Certificates | **Shipped** | `Quorum` verifiable; `WindowElapsed` refused by `validate_verified` |
 | Bonded stake, unbonding, slashing | **Shipped** | 15 attack-first tests |
@@ -689,7 +689,7 @@ applies.
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
 | **Escrowed service contracts** | **In development** | The general contract and its transitions; one non-compute deliverable shipping |
 | **Agent credit** | **In development** | Terms, position lifecycle, deadlines and a conservation-checked credit book; not yet wired to a caller |
-| **Delegation chains** | **Not built** | Needs a policy parent link and a SPEC amendment |
+| **Delegation chains** | **In development** | Narrowing rule, sub-agent derivation and the link book; not wired into any consensus path |
 | **Conditional payments** | **Not built** | Held pending arbitrator key custody |
 | **Compute-backed staking** | **Not built** | Held pending a live validator committee |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
@@ -706,7 +706,7 @@ applies.
 `hbm_pow.rs` implements the memory-hard permutation, its parameter scaling and
 ten tests. It is **not** registered as a `puzzle_id`, so it validates nothing.
 Registering it would change the consensus puzzle without an independent security
-review of the memory parameters — that is not a mistake worth making before a
+review of the memory parameters â€” that is not a mistake worth making before a
 review. Base PoW (`puzzle_id = 1`) is the active mechanism.
 
 ---
@@ -722,13 +722,13 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **L2 withdrawals** | Undefined; deposits were one-way | **Implemented** (Decision 19): `ExitQueue`, a proof-authorised sink spend, a permissionless crank, reorg-safe |
 | **Exit accessibility** | Only a node's own miner could build a claim | **`GET /v1/exit/crankable`** hands claims to any third party |
 | **Stake and bonds** | No bond ledger, no stake transaction | **Implemented** (Decision 20): bond/unbond/slash, bond-order committee, ledger-derived finality keys |
-| **What counts as fraud** | Unspecified — the slash vault stayed inert | **The canonical CPU reference decides** (Decision 21). No caller can supply it |
+| **What counts as fraud** | Unspecified â€” the slash vault stayed inert | **The canonical CPU reference decides** (Decision 21). No caller can supply it |
 | **Arbitration transport** | No way to exchange verdicts; the quorum had to be assembled out of band | **Signed votes relay over P2P**; a quorum aggregates into the settlement |
 | **Checkpoint signing** | Verification existed; **nothing ever signed**, so binding finality could not activate anywhere | **Production signing** via `jnt-node validator` and the serve loop |
 | **Settle fee** | A flat fee a small escrow could not cover, failing closed | **Proportional** (Decision 23): 0.1% of task value, 1 000-sat minimum |
 | **L1/L2 disagreement** | An exit claim with no L2 record was caught only by `debug_assert`, which compiles out of release builds | **Recorded as `UnbackedClaim`** and exposed, so a release build reports the divergence |
 | **Unchallenged results** | A wrong unchallenged result produced a certificate that `validate()` accepted with no signal | **`asserts_correctness()` / `validate_verified`** make the weak basis unmissable |
-| **HBM** | Unregistered, unspecified | Unregistered **by decision**, with the reason recorded — an open item, not an omission |
+| **HBM** | Unregistered, unspecified | Unregistered **by decision**, with the reason recorded â€” an open item, not an omission |
 
 ---
 
@@ -751,7 +751,7 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 
 Seven crates in one workspace. **All consensus logic lives in `jnt-core`**, which
 has no I/O, no clock and no network. The `mini` profile is the same code with
-different parameters — never a second implementation — so anything tested on
+different parameters â€” never a second implementation â€” so anything tested on
 `mini` is the production code path.
 
 Key documents: [`docs/decisions.md`](docs/decisions.md) for design decisions,
@@ -811,7 +811,7 @@ figures are in JNT.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1034 tests, 0 failures
+cargo test --workspace                                   # 1048 tests, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -838,13 +838,13 @@ tagged tree before publishing artifacts with checksums.
 **Vectors.** `tests/vectors/` holds the consensus byte layouts, generated only
 from the implementation. `sim/jounit_reference.py` is a second PoW implementation
 written from `SPEC.md` rather than from the Rust, and it reproduces all 21 puzzle
-digests — that agreement is the evidence the spec is unambiguous rather than
+digests â€” that agreement is the evidence the spec is unambiguous rather than
 merely self-consistent.
 
 **Fuzzing.** 14 cargo-fuzz targets over L1 wire, mempool, storage and
 checkpoints; L2 codec, disputes, state and certificates; and the worker. They
-assert capability invariants — decode/encode inversion, bounded allocation, value
-conservation under adversarial transaction programs — not just panic-freedom.
+assert capability invariants â€” decode/encode inversion, bounded allocation, value
+conservation under adversarial transaction programs â€” not just panic-freedom.
 
 **Red team.** `crates/jnt-core/tests/redteam.rs` holds 12 adversarial integration
 tests, each confirmed to fail against the code it now guards. The full record of
@@ -860,14 +860,14 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1034 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1048 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration transport is built; who runs the arbitrators is an organisational decision. |
 | **Operations** | No bootnodes, no log shipping, no published PGP key. Artifacts are unsigned because no signing key is published. |
 
 What this means in practice: **a fresh `jnt-node init --network mainnet` runs
 today, and on it withdrawals and binding finality are both inactive.** That is
-fail-closed, not broken — no funds can be lost — but users should know before
+fail-closed, not broken â€” no funds can be lost â€” but users should know before
 they point real money at it.
 
 `testnet` is the appropriate next milestone and the right place to rehearse
@@ -878,9 +878,9 @@ each item with its evidence.
 
 ## License and trademark
 
-**Copyright © 2026 Swamy Gadila.**
+**Copyright Â© 2026 Swamy Gadila.**
 
-**Code: `MIT OR Apache-2.0`** — the standard permissive Rust dual licence. Both
+**Code: `MIT OR Apache-2.0`** â€” the standard permissive Rust dual licence. Both
 texts ship at the repo root (`LICENSE-MIT`, `LICENSE-APACHE`). You may use,
 modify, run, audit and redistribute the software, including commercially.
 
@@ -890,7 +890,7 @@ code licence. See [TRADEMARK.md](TRADEMARK.md).
 
 The distinction is the same one Bitcoin uses: **the code is open so anyone can
 run it, and the name is protected so nobody can pass themselves off as us.**
-Nothing in an open-source licence can stop someone forking the code — that is
+Nothing in an open-source licence can stop someone forking the code â€” that is
 deliberate, and it is how the ecosystem works. What the trademark stops is
 someone shipping a product under our name that is not this software.
 

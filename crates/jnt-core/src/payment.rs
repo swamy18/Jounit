@@ -632,6 +632,7 @@ mod tests {
             not_before_height: 0,
             expires_at_height: 10_000,
             revoked: false,
+            parent_agent_id: None,
         }
     }
 

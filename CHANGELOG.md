@@ -16,6 +16,36 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ### Added (library)
 
+- **Delegation chains: every level inherits a strict subset of its parent's
+  spending policy.** Roadmap item 3, recorded as decision D4 and specified in
+  SPEC §18.2.1. No consensus change; it narrows what an offline authorization
+  may grant and decides no block's validity.
+  - **The sub-agent derivation is new.** `derive_sub_agent_id(network_id,
+    parent_agent_id, role)` under a new domain tag (`DOM_AGENT_ID_SUB`). A
+    delegate derives from its **parent**, never from the funds it is trusted
+    with: a sub-agent holds no value, and deriving it from the root's owner
+    would let it re-derive the root's own id and inherit the root's power.
+  - **The parent link lives inside the signed policy bytes.** `SpendPolicy`
+    carries `parent_agent_id`, and `POLICY_VERSION` moved 1 → 2 so an old policy
+    is refused rather than reinterpreted as a root. A link held in a side table
+    could be attached to a policy that never had one — exactly the widening
+    delegation must refuse.
+  - **Domination, not inheritance.** `delegation::dominates(parent, child)`
+    refuses a child that is not inside its parent on *every* field — per-tx cap,
+    cumulative cap, window, expiry, recipient set, service set — plus network,
+    owner and role equality. "Narrower on average" is refused: a child with a
+    tighter per-tx cap but a longer window can out-spend its parent, so each
+    check is independent and widening by omission is impossible.
+  - **Chains, and the book that answers what a chain cannot.** `assert_chain`
+    composes the rule link by link, bound by `MAX_DELEGATION_DEPTH`, and refuses
+    the whole chain if any policy in it is revoked — an ancestor's kill switch
+    must reach its leaves. `DelegationBook` registers links so one agent id has
+    one lineage, and `authorize_with_chain` composes the chain proof with
+    `PolicyBook`'s budget rules in exactly one place, with no second
+    implementation of either.
+
+### Added (library)
+
 - **Agent credit gains the position deadline and the book that holds positions.**
   Roadmap item 2 (locked decision D1) is library-complete: no consensus change, no
   L2 transaction type. New in `credit.rs`:

@@ -47,6 +47,7 @@ fn policy(service: [u8; 32], provider: [u8; 20]) -> SpendPolicy {
         not_before_height: 0,
         expires_at_height: 10_000,
         revoked: false,
+        parent_agent_id: None,
     }
 }
 

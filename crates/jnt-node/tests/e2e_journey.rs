@@ -382,6 +382,7 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
         not_before_height: 0,
         expires_at_height: 10_000,
         revoked: false,
+        parent_agent_id: None,
     };
     policy.validate().expect("the grant is well-formed");
 

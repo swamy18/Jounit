@@ -468,6 +468,7 @@ fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -
         not_before_height: 0,
         expires_at_height: 10_000,
         revoked: false,
+        parent_agent_id: None,
     }
 }
 
@@ -673,6 +674,7 @@ fn a_payment_for_another_network_is_refused() {
         not_before_height: 0,
         expires_at_height: 10_000,
         revoked: false,
+        parent_agent_id: None,
     };
     let mut book = PolicyBook::default();
     let request = build_signed_request(

@@ -54,7 +54,13 @@ use std::fmt;
 pub type AgentId = [u8; 20];
 
 /// Policy encoding version. A future format MUST use a new value.
-pub const POLICY_VERSION: u8 = 1;
+///
+/// Version 2 adds the delegation link: `parent_agent_id`, the field that makes a
+/// policy a child of another. A version-1 policy has no such field, so its bytes
+/// decode into a policy with no parent — which is not what they are, and MUST be
+/// refused rather than reinterpreted. The version moved rather than the meaning.
+pub const POLICY_VERSION: u8 = 2;
+
 /// Longest accepted network id (bytes). Bounded so a policy cannot be a blob.
 pub const MAX_NETWORK_ID_LEN: usize = 64;
 /// Most recipients one policy may name.
@@ -66,6 +72,9 @@ pub const DEFAULT_MAX_POLICIES: usize = 1024;
 
 /// Domain tag for agent identity derivation.
 pub const DOM_AGENT_ID: &[u8] = b"jounit/agent-id/v1";
+/// Domain tag for sub-agent identity derivation: a delegate derives from its
+/// parent, never from the funds it is trusted with.
+pub const DOM_AGENT_ID_SUB: &[u8] = b"jounit/agent-id/sub/v1";
 /// Domain tag for the policy signing hash.
 pub const DOM_AGENT_POLICY: &[u8] = b"jounit/agent-policy/v1";
 /// Domain tag for the authorization signing hash.
@@ -118,6 +127,49 @@ pub fn derive_agent_id(network_id: &str, role: AgentRole, owner: &Address) -> Ag
     let h = sha256_dom(
         DOM_AGENT_ID,
         &[network_id.as_bytes(), &[role.as_u8()], owner],
+    );
+    let mut id = [0u8; 20];
+    id.copy_from_slice(&h[..20]);
+    id
+}
+
+/// The delegated agent identity: derived from the **parent**, never from the
+/// funds the delegate is trusted with.
+///
+/// This is the sharp edge the roadmap called out. A sub-agent holds no value and
+/// has no owner of its own, so deriving its id from an owner (as
+/// [`derive_agent_id`] does) would either fail or — worse — let a delegate
+/// re-derive the *root's* id by presenting the root's owner. Deriving from the
+/// parent agent id makes the chain structural instead of promissory: a delegate
+/// is named by its delegate chain, so it cannot be any agent it is not a child
+/// of.
+///
+/// The domain tag is new rather than shared, per the treatment `DOM_ADDR/v2`
+/// received: two derivations over one tag are two meanings over one byte string,
+/// and a collision between them would be an identity confusion, not a bug.
+///
+/// ```
+/// # use jnt_core::agent::{derive_agent_id, derive_sub_agent_id, AgentRole};
+/// let owner = [7u8; 20];
+/// let root = derive_agent_id("jounit/testnet", AgentRole::Machine, &owner);
+/// let sub = derive_sub_agent_id("jounit/testnet", &root, AgentRole::Machine);
+/// assert_ne!(root, sub, "a delegate is not its parent");
+/// // The same parent yields the same delegate, deterministically.
+/// assert_eq!(
+///     sub,
+///     derive_sub_agent_id("jounit/testnet", &root, AgentRole::Machine)
+/// );
+/// // A different parent yields a different delegate: the chain is the identity.
+/// let other_root = derive_agent_id("jounit/mini", AgentRole::Machine, &owner);
+/// assert_ne!(
+///     sub,
+///     derive_sub_agent_id("jounit/mini", &other_root, AgentRole::Machine)
+/// );
+/// ```
+pub fn derive_sub_agent_id(network_id: &str, parent: &AgentId, role: AgentRole) -> AgentId {
+    let h = sha256_dom(
+        DOM_AGENT_ID_SUB,
+        &[network_id.as_bytes(), parent, &[role.as_u8()]],
     );
     let mut id = [0u8; 20];
     id.copy_from_slice(&h[..20]);
@@ -289,6 +341,15 @@ pub struct SpendPolicy {
     pub expires_at_height: u64,
     /// Owner-initiated emergency kill switch.
     pub revoked: bool,
+    /// The parent this policy was delegated from, or `None` for a root policy
+    /// (one whose owner authorized it directly).
+    ///
+    /// This is the delegation link, and it lives **inside** the policy rather
+    /// than beside it: a link held in a separate table can be added to a policy
+    /// that never had one, which is precisely the widening delegation must
+    /// refuse. With the link in the signed bytes, a child policy is a child
+    /// because the bytes say so.
+    pub parent_agent_id: Option<AgentId>,
 }
 
 impl SpendPolicy {
@@ -326,6 +387,14 @@ impl SpendPolicy {
         w.u64le(self.not_before_height)
             .u64le(self.expires_at_height)
             .u8(u8::from(self.revoked));
+        match &self.parent_agent_id {
+            Some(parent) => {
+                w.u8(1).fixed(parent);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
         w.into_vec()
     }
 
@@ -426,6 +495,14 @@ impl SpendPolicy {
             1 => true,
             _ => return Err(PolicyError::Malformed("revoked flag not 0 or 1")),
         };
+        let parent_agent_id = match r.u8().map_err(|_| PolicyError::Malformed("parent link"))? {
+            0 => None,
+            1 => Some(
+                r.fixed::<20>()
+                    .map_err(|_| PolicyError::Malformed("parent agent id"))?,
+            ),
+            _ => return Err(PolicyError::Malformed("parent link tag not 0 or 1")),
+        };
         r.expect_end()
             .map_err(|_| PolicyError::Malformed("trailing bytes"))?;
 
@@ -443,6 +520,7 @@ impl SpendPolicy {
             not_before_height,
             expires_at_height,
             revoked,
+            parent_agent_id,
         };
         policy.validate()?;
         Ok(policy)
@@ -492,7 +570,16 @@ impl SpendPolicy {
         }
         // Identity binding: the id must actually be this owner's, for this
         // network, in this role. A policy cannot claim someone else's agent.
-        let expected = derive_agent_id(&self.network_id, self.role, &self.owner);
+        //
+        // A child policy proves itself differently: its id derives from the
+        // parent it names, not from the owner whose funds it spends. Without
+        // that split, a sub-agent with no funds of its own would either fail to
+        // derive or — if it derived from the root owner — could re-derive the
+        // root's id and inherit the root's power by presenting the root's owner.
+        let expected = match self.parent_agent_id {
+            Some(parent) => derive_sub_agent_id(&self.network_id, &parent, self.role),
+            None => derive_agent_id(&self.network_id, self.role, &self.owner),
+        };
         if expected != self.agent_id {
             return Err(PolicyError::IdentityMismatch);
         }
@@ -888,6 +975,7 @@ mod tests {
             not_before_height: 0,
             expires_at_height: 1_000,
             revoked: false,
+            parent_agent_id: None,
         }
     }
 

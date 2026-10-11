@@ -3,8 +3,8 @@
 A roadmap for the layers that compound what already ships. Every item here
 builds on primitives that exist today; nothing on this list asks for a rewrite.
 
-**Status:** item 1 shipped, item 2 library-complete, items 3–5 as designed
-below. Item 1 was the dependency root and is done.
+**Status:** item 1 shipped, item 2 and item 3 library-complete, items 4–5 as
+designed below. Item 1 was the dependency root and is done.
 
 ---
 
@@ -188,6 +188,18 @@ small, but it is not purely additive.
 
 **Risk:** medium. Pure policy library, no consensus change, but one SPEC
 amendment and an identity-derivation change.
+
+**Status: implemented.** Library-complete, as SPEC §18.2.1 now records. The
+sharp edge was resolved exactly as designed above: a sub-agent derives from its
+parent with a new domain tag (`DOM_AGENT_ID_SUB`), never from an owner address,
+because a delegate holds no funds and deriving it from the root's owner would
+let it re-derive the root's own id. The parent link lives inside the signed
+policy bytes, and `POLICY_VERSION` moved 1 → 2 so an old policy is refused rather
+than reinterpreted as a root. Delegation is dominated-on-every-field rather than
+inherit-what-is-not-overridden: the safe configuration is the default, and
+widening by omission is impossible. Nothing is wired into a consensus path,
+which is this item's stated scope — it narrows what an offline authorization may
+grant and decides no block's validity.
 
 ---
 
@@ -386,8 +398,39 @@ with no `struct TaskContract` beside it. `TaskContract` is a type alias
 so every existing call site and the whole wire format are untouched.
 
 **Status: met.** Verified after 1b/1c — one `settle_inner`, one
-`ServiceContract`, `TaskContract` an alias, 1034 tests green, vectors and
+`ServiceContract`, `TaskContract` an alias, 1048 tests green, vectors and
 `fmt`/`clippy` clean.
+
+### D4 — Delegation is attenuation, and the attenuation is structural
+
+**Decided.** A sub-agent's policy must be **dominated by its parent on every
+field**, or the chain is refused. The reason to prefer domination over
+inherit-what-is-not-overridden is that the second makes the safe configuration
+silence: a child that sets nothing inherits everything, so a mistake reads as a
+narrower policy. Domination makes the safe configuration the default.
+
+Details, all in `crates/jnt-core/src/delegation.rs` and SPEC §18.2.1:
+
+- **Identity derives from the parent.** A new domain tag, `DOM_AGENT_ID_SUB`,
+  and `derive_sub_agent_id(network_id, parent_agent_id, role)`. A sub-agent has
+  no funds and no owner, so deriving it from an owner address would either fail
+  or let it re-derive the *root's* id by presenting the root's owner.
+- **The parent link lives in the signed bytes.** A link in a side table can be
+  attached to a policy that never had one — the widening delegation must refuse.
+  `POLICY_VERSION` moved to 2 because the canonical encoding gained a field, so
+  a version-1 policy is refused rather than reinterpreted as a root.
+- **Equal is dominated, more is refused.** A child identical to its parent is a
+  valid (if pointless) delegate. What is refused is strictly more, on any single
+  field — the average-is-narrower case is the trap this rules out.
+- **Revocation propagates down the chain.** An ancestor's kill switch must reach
+  its leaves, or a chain is only as strong as its root at the moment it was
+  formed.
+- **One agent id, one lineage.** `DelegationBook` refuses a second registration
+  and an over-long chain, so the questions a chain cannot answer about itself
+  are answered somewhere.
+- **No consensus change, and nothing wired.** The policy layer is not consulted
+  by any consensus path (open finding below); delegation inherits that status
+  exactly.
 
 ### One trap the refactor actually caught
 

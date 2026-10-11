@@ -38,6 +38,7 @@ fn machine_policy() -> SpendPolicy {
         not_before_height: 5,
         expires_at_height: 1_000,
         revoked: false,
+        parent_agent_id: None,
     }
 }
 
@@ -257,7 +258,20 @@ fn the_signing_hash_covers_every_field() {
             Box::new(|p: &mut SpendPolicy| p.expires_at_height = 999),
         ),
         ("revoked", Box::new(|p: &mut SpendPolicy| p.revoked = true)),
-        ("version", Box::new(|p: &mut SpendPolicy| p.version = 2)),
+        (
+            "version",
+            Box::new(|p: &mut SpendPolicy| p.version = POLICY_VERSION - 1),
+        ),
+        (
+            "parent_agent_id",
+            Box::new(|p: &mut SpendPolicy| {
+                // A delegation link claims the policy has a parent, and the
+                // signing hash must cover that claim: a signed link is a signed
+                // chain, and a hash that ignored it would let a parent be
+                // attached after the fact.
+                p.parent_agent_id = Some(derive_agent_id(NET, AgentRole::Machine, &p.owner));
+            }),
+        ),
     ];
 
     for (name, mutate) in mutations {
