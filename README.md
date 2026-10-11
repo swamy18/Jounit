@@ -22,6 +22,7 @@ the *Jounit* name, `JNT` ticker and logos are his trademarks — see
 - [What the chain is for](#what-the-chain-is-for)
 - [Capabilities the project is building](#capabilities-the-project-is-building)
 - [What makes this different](#what-makes-this-different)
+- [Use cases](#use-cases)
 - [Machines, agents and robots](#machines-agents-and-robots)
 - [Verified Work Certificates](#verified-work-certificates)
 - [How fraud is detected](#how-fraud-is-detected)
@@ -186,12 +187,21 @@ Disputed? → Settled`, with `Expired` as the timeout branch.
 
 ## Capabilities the project is building
 
-The base layer above is complete and running. The following capabilities are in
-active development, each one generalizing machinery that already ships. They are
-listed in dependency order, because several of them are only meaningful once the
+The base layer above is complete and running. What follows is where it is going,
+listed in dependency order because several of these are only meaningful once the
 first exists.
 
-### Escrowed service contracts
+Each section says what the capability is and what it supports. **What is actually
+built differs per item, and the status is stated in each heading rather than
+implied by being on the same page** — the [Component status](#component-status)
+table carries the same labels. Two of the five are held on decisions that are
+organisational rather than technical, and are marked as such instead of being
+started to look further along.
+
+### Escrowed service contracts — _in development_
+
+**Built:** the general `ServiceContract`, its transitions, and a non-compute
+deliverable that drives them.
 
 The task economy above is a *specific case* of a general primitive: party A
 commits to a deliverable and bonds against it, party B escrows payment,
@@ -208,7 +218,7 @@ of it rather than the only one.
 **What it supports:** any task where one party can produce a result that another
 can check without re-running it.
 
-### Attenuated delegation chains
+### Attenuated delegation chains — _not built_
 
 Multi-agent systems need an owner to grant an agent a subset of their own
 spending authority, and that agent to do the same downward. Each level inherits a
@@ -219,7 +229,7 @@ narrows as it travels.
 must bound what any single agent can spend, without re-authorizing each
 transaction by hand.
 
-### Conditional and oracle-gated payments
+### Conditional and oracle-gated payments — _blocked on arbitrator key custody_
 
 Payment that releases against a stated condition rather than a manual approval:
 "release when the result matches," "release when latency stayed under a
@@ -231,7 +241,11 @@ until the protocol answers who operators the oracle.
 **What it supports:** pay-as-you-use and outcome-based pricing that settles
 itself, without a human in the loop to release funds.
 
-### Undercollateralized agent credit
+### Undercollateralized agent credit — _in development_
+
+**Built:** the collateral arithmetic, with the invariants that make it safe.
+
+**Not built:** the position itself — open, repay, default, settlement.
 
 An agent with a demonstrated track record can borrow against future work rather
 than pre-funding every transaction. This is deliberately built on two
@@ -247,7 +261,7 @@ against the gate.
 **What it supports:** an agent earning from work it has not yet performed, with
 the risk carried by a bond instead of by trust in a stranger.
 
-### Compute-backed validator staking
+### Compute-backed validator staking — _blocked on validator adoption_
 
 Validators that also serve verified work earn more, which ties the protocol's
 security budget and its utility budget into one budget. The condition is that
@@ -306,7 +320,7 @@ so the neural work can never become the weak link it is meant to make useful.
 
 ---
 
-## What the chain is for
+## Use cases
 
 These are the things a UTXO chain with a task economy on top of it can do that
 the two layers alone cannot.
@@ -658,9 +672,9 @@ applies.
 | Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
-| **Escrowed service contracts** | **In development** | Generalizing the task escrow; see [above](#capabilities-the-project-is-building) |
-| **Delegation chains** | **In development** | Needs a policy parent link and a SPEC amendment |
-| **Agent credit** | **Not built** | Collateralized by design; reputation stays a view |
+| **Escrowed service contracts** | **In development** | The general contract and its transitions; one non-compute deliverable shipping |
+| **Agent credit** | **In development** | The collateral arithmetic is built; the position lifecycle is not |
+| **Delegation chains** | **Not built** | Needs a policy parent link and a SPEC amendment |
 | **Conditional payments** | **Not built** | Held pending arbitrator key custody |
 | **Compute-backed staking** | **Not built** | Held pending a live validator committee |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
