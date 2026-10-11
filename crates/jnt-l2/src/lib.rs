@@ -56,6 +56,7 @@ pub use genesis::L2Genesis;
 pub use replay::{ChainL2, ExitWatch, SkippedL2, UnbackedClaim};
 pub use state::{ExitRecord, L2Effect, L2State};
 pub use task_contract::{
-    ContractState, DisputeChallenge, ExpiryOutcome, L2Config, SettlementOutcome, TaskContract,
+    ContractState, DisputeChallenge, ExpiryOutcome, L2Config, ServiceContract, SettlementOutcome,
+    TaskContract,
 };
 pub use vwc::{VerifiedWorkCertificate, VwcVerification, VWC_VERSION};

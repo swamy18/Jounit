@@ -217,6 +217,60 @@ impl<D, A> ServiceContract<D, A> {
     }
 }
 
+/// The compute wire entry points.
+///
+/// These forward to the generic transitions, so the L2 payload types stay
+/// concrete while the logic exists exactly once.
+impl TaskContract {
+    /// Record the worker's result from a `SubmitResult` payload.
+    ///
+    /// The attestation must bind to this task, to the signing worker, and to the
+    /// result hash in the same payload. Its own `signature` field is not
+    /// independently verifiable (an attestation carries an address, not a key);
+    /// the authoritative authentication is the enclosing `SubmitResult` payload's
+    /// signature, which covers the attestation bytes.
+    pub fn submit_result(
+        &mut self,
+        actor: Address,
+        submit: &SubmitResultPayload,
+        current_height: u64,
+    ) -> L2Result<()> {
+        if submit.task_id != self.task_id {
+            return Err(L2Error::BadAttestation("task_id"));
+        }
+        self.submit(
+            actor,
+            submit.result_hash,
+            submit.attestation.clone(),
+            current_height,
+        )
+    }
+
+    /// File a challenge against a submitted result from a `Dispute` payload.
+    pub fn file_dispute(
+        &mut self,
+        actor: Address,
+        dispute: &DisputePayload,
+        current_height: u64,
+    ) -> L2Result<()> {
+        if dispute.task_id != self.task_id || actor != dispute.challenger {
+            return Err(L2Error::BadAuthorization);
+        }
+        self.dispute(
+            actor,
+            dispute.counter_result,
+            dispute.counter_attestation.clone(),
+            dispute.challenge_deposit_sat,
+            current_height,
+        )
+    }
+}
+
+/// Construction from a compute post is the only compute-specific step.
+///
+/// Everything below is deliverable-agnostic: this is the one place a concrete
+/// type has to be named, and it is here rather than in the state machine so that
+/// the transitions themselves work for any `Deliverable`.
 impl TaskContract {
     /// Create an `Open` contract from a post.
     ///
@@ -253,7 +307,20 @@ impl TaskContract {
             state: ContractState::Open,
         })
     }
+}
 
+/// The state machine, deliverable-agnostic.
+///
+/// The transitions below are shared by every `Deliverable`. They were written
+/// against `ComputeAttestation` until this impl block was made generic, which is
+/// why the compute path is a type alias rather than a parallel implementation:
+/// there is one set of transitions, and a second deliverable drives the same ones
+/// (`docs/roadmap-agent-economy.md` D3).
+impl<D, A> ServiceContract<D, A>
+where
+    D: Deliverable,
+    A: Attestation,
+{
     /// Reserve the task for `actor`.
     pub fn claim(
         &mut self,
@@ -301,65 +368,64 @@ impl TaskContract {
         Ok(())
     }
 
-    /// Record the worker's result.
+    /// Record a result with an already-validated attestation of any kind.
     ///
-    /// The attestation must bind to this task, to the signing worker, and to the
-    /// result hash in the same payload. Its own `signature` field is not
-    /// independently verifiable (an attestation carries an address, not a key);
-    /// the authoritative authentication is the enclosing `SubmitResult` payload's
-    /// signature, which covers the attestation bytes.
-    pub fn submit_result(
+    /// The generic step of the transition. [`TaskContract::submit_result`] is
+    /// the compute wire form; this is what a second deliverable drives, so the
+    /// validation below exists once rather than twice.
+    pub fn submit(
         &mut self,
         actor: Address,
-        submit: &SubmitResultPayload,
+        result_hash: Hash,
+        attestation: A,
         current_height: u64,
     ) -> L2Result<()> {
         if !matches!(self.state, ContractState::InProgress { .. }) {
             return Err(self.illegal("submit a result"));
         }
-        if Some(actor) != self.worker || actor != submit.worker {
+        if Some(actor) != self.worker {
             return Err(L2Error::BadAuthorization);
+        }
+        if attestation.worker_address() != actor {
+            return Err(L2Error::BadAttestation("attestation worker_address"));
         }
         if current_height > self.deadline_height {
             return Err(L2Error::TaskExpired);
         }
-        if submit.task_id != self.task_id {
-            return Err(L2Error::BadAttestation("task_id"));
-        }
-        if submit.attestation.task_id() != self.task_id {
+        if attestation.task_id() != self.task_id {
             return Err(L2Error::BadAttestation("attestation task_id"));
         }
-        if submit.attestation.worker_address() != actor {
-            return Err(L2Error::BadAttestation("attestation worker_address"));
-        }
-        if submit.attestation.result_hash() != submit.result_hash {
+        if attestation.result_hash() != result_hash {
             return Err(L2Error::BadAttestation("attestation result_hash"));
         }
         // An all-zero result hash is the expired placeholder, not a commitment.
         // Allowing it would make a certified-correct settlement and an expired
         // one indistinguishable in the settle record, which is exactly the
         // collision Phase 4's certificates must not have (SPEC.md §17.6).
-        if submit.result_hash == VWC_HASH_EXPIRED {
+        if result_hash == VWC_HASH_EXPIRED {
             return Err(L2Error::BadAttestation(
                 "result_hash is the expired placeholder; a result must commit to real output",
             ));
         }
-        if !submit.attestation.is_signed() {
+        if !attestation.is_signed() {
             return Err(L2Error::BadAttestation("attestation is unsigned"));
         }
         self.state = ContractState::ResultSubmitted {
-            result_hash: submit.result_hash,
+            result_hash,
             submitted_at: current_height,
-            attestation: submit.attestation.clone(),
+            attestation,
         };
         Ok(())
     }
 
-    /// File a challenge against a submitted result.
-    pub fn file_dispute(
+    /// File a challenge with attestations of any kind - the generic step of the
+    /// transition. [`TaskContract::file_dispute`] is the compute wire form.
+    pub fn dispute(
         &mut self,
         actor: Address,
-        dispute: &DisputePayload,
+        counter_result: Hash,
+        counter_attestation: A,
+        challenge_deposit_sat: u64,
         current_height: u64,
     ) -> L2Result<()> {
         let (result_hash, submitted_at, against_attestation) = match &self.state {
@@ -370,31 +436,31 @@ impl TaskContract {
             } => (*result_hash, *submitted_at, attestation.clone()),
             _ => return Err(self.illegal("file a dispute")),
         };
-        if dispute.task_id != self.task_id || actor != dispute.challenger {
-            return Err(L2Error::BadAuthorization);
+        if counter_attestation.task_id() != self.task_id {
+            return Err(L2Error::BadAttestation("counter attestation task_id"));
+        }
+        if counter_attestation.result_hash() != counter_result {
+            return Err(L2Error::BadAttestation("counter attestation result_hash"));
         }
         if current_height > submitted_at.saturating_add(self.dispute_window) {
             return Err(L2Error::DisputeWindowClosed);
         }
-        if dispute.counter_result == result_hash {
+        if counter_result == result_hash {
             return Err(L2Error::DisputeAgreesWithResult);
         }
-        if dispute.challenge_deposit_sat == 0 {
+        if challenge_deposit_sat == 0 {
             return Err(L2Error::ZeroAmount("challenge_deposit_sat"));
         }
-        if dispute.counter_attestation.task_id() != self.task_id {
-            return Err(L2Error::BadAttestation("counter attestation task_id"));
-        }
-        if dispute.counter_attestation.result_hash() != dispute.counter_result {
-            return Err(L2Error::BadAttestation("counter attestation result_hash"));
+        if !counter_attestation.is_signed() {
+            return Err(L2Error::BadAttestation("counter attestation is unsigned"));
         }
         self.state = ContractState::Disputed(DisputeChallenge {
             challenger: actor,
             against_result: result_hash,
             against_attestation,
-            counter_result: dispute.counter_result,
-            counter_attestation: dispute.counter_attestation.clone(),
-            deposit_sat: dispute.challenge_deposit_sat,
+            counter_result,
+            counter_attestation,
+            deposit_sat: challenge_deposit_sat,
             filed_at: current_height,
         });
         Ok(())

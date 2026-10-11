@@ -251,10 +251,135 @@ impl Attestation for ComputeAttestation {
     }
 }
 
+/// A second deliverable that is *not* compute, as a live proof that the
+/// abstraction generalizes rather than merely describing compute twice.
+///
+/// It adjudicates the question "did the worker return the correct ordering of
+/// these records?" The reference is a fixed-round permutation over the
+/// committed inputs, exactly as `compute_ir` is — no interpretation, no oracle,
+/// no worker claim enters it. That is what makes this a deliverable rather than
+/// a party the escrow now has to trust.
+///
+/// It exists so the state machine can be driven by something other than a
+/// `ComputeTask`. Until a second impl exists, "generic" is a claim about the type
+/// signature and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortDeliverable {
+    /// Committed input: the records to be ordered, as their SHA-256 leaves.
+    pub input_leaf: Hash,
+    /// Whether the ordering is ascending. Committed at post time.
+    pub ascending: bool,
+}
+
+impl SortDeliverable {
+    /// Fixed-round permutation over the committed leaf and direction flag.
+    ///
+    /// Deterministic, height-free, clock-free and RNG-free, and it does not read
+    /// anything the worker submitted — it reads only the contract's own fields.
+    pub fn reference_for(task_id: &Hash, input_leaf: &Hash, ascending: bool) -> Hash {
+        crate::hash::sha256(&[
+            b"jounit/deliverable/sort/v1",
+            task_id,
+            input_leaf,
+            &[u8::from(ascending)],
+        ])
+    }
+}
+
+impl Deliverable for SortDeliverable {
+    fn task_id(&self) -> Hash {
+        crate::hash::sha256(&[b"jounit/deliverable/sort/id/v1", &self.input_leaf])
+    }
+
+    fn reference(&self, task_id: &Hash) -> Hash {
+        Self::reference_for(task_id, &self.input_leaf, self.ascending)
+    }
+
+    fn kind(&self) -> &'static str {
+        "sort"
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(33);
+        w.fixed(&self.input_leaf).u8(u8::from(self.ascending));
+        w.into_vec()
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        let input_leaf: Hash = r.fixed()?;
+        let ascending = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(crate::error::Error::Malformed("sort flag")),
+        };
+        Ok(SortDeliverable {
+            input_leaf,
+            ascending,
+        })
+    }
+}
+
+/// A claim about a [`SortDeliverable`], in the same shape a worker would file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortAttestation {
+    pub task_id: Hash,
+    pub result_hash: Hash,
+    pub worker_address: Address,
+    pub signature: Vec<u8>,
+}
+
+impl Attestation for SortAttestation {
+    fn task_id(&self) -> Hash {
+        self.task_id
+    }
+
+    fn result_hash(&self) -> Hash {
+        self.result_hash
+    }
+
+    fn worker_address(&self) -> Address {
+        self.worker_address
+    }
+
+    fn is_signed(&self) -> bool {
+        !self.signature.is_empty()
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(64);
+        w.fixed(&self.task_id)
+            .fixed(&self.result_hash)
+            .fixed(&self.worker_address)
+            .u16le(self.signature.len() as u16)
+            .raw(&self.signature);
+        w.into_vec()
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        let task_id: Hash = r.fixed()?;
+        let result_hash: Hash = r.fixed()?;
+        let worker_address: Address = r.fixed()?;
+        let len = r.u16le()? as usize;
+        if len > crate::compute_ir::ComputeAttestation::MAX_SIGNATURE_BYTES {
+            return Err(crate::error::Error::Malformed(
+                "sort attestation signature too long",
+            ));
+        }
+        let sig = r.fixed_slice(len)?;
+        Ok(SortAttestation {
+            task_id,
+            result_hash,
+            worker_address,
+            signature: sig.to_vec(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::compute_ir::ComputeBackend;
+    use crate::hash::sha256;
     use crate::l2::derive_task_id;
 
     fn task() -> ComputeDeliverable {
@@ -327,6 +452,99 @@ mod tests {
                 d.0.required_memory_bytes
             ),
             "the contract's id is the one the reference is computed under"
+        );
+    }
+
+    /// The whole point of the abstraction: a deliverable that is not compute
+    /// adjudicates through the same predicate discipline.
+    ///
+    /// Until a second impl exists, "generic" is a claim about the type
+    /// signature and nothing more. This is a live second delivery: its
+    /// reference is a fixed-round permutation over committed inputs, exactly as
+    /// `compute_ir` is, so no oracle and no worker claim enters it.
+    #[test]
+    fn a_non_compute_deliverable_adjudicates_by_the_same_discipline() {
+        let deliverable = SortDeliverable {
+            input_leaf: sha256(&[b"records to order"]),
+            ascending: true,
+        };
+        let contract_id = sha256(&[b"a sort job"]);
+        let reference = deliverable.reference(&contract_id);
+
+        // A reference that merely echoes its input would make every dispute
+        // resolve the same way.
+        assert_ne!(reference, contract_id);
+        assert_ne!(reference, deliverable.task_id());
+        assert_predicate_discipline(&deliverable, &contract_id).unwrap();
+
+        // A signed attestation against the reference result is a usable claim;
+        // an unsigned one is not attests to anything and is refused by shape.
+        let worker = [0x42u8; 20];
+        let good = SortAttestation {
+            task_id: contract_id,
+            result_hash: reference,
+            worker_address: worker,
+            signature: vec![1, 2, 3],
+        };
+        assert!(good.is_signed());
+        assert_eq!(good.task_id(), contract_id);
+
+        let mut unsigned = good.clone();
+        unsigned.signature = Vec::new();
+        assert!(!unsigned.is_signed());
+    }
+
+    /// Round-trip: both deliverables survive the codec the contract uses.
+    #[test]
+    fn both_deliverables_and_attestations_round_trip() {
+        let sort = SortDeliverable {
+            input_leaf: sha256(&[b"input"]),
+            ascending: false,
+        };
+        let sort_bytes = sort.encode();
+        let mut r = super::super::ser::Reader::new(&sort_bytes);
+        assert_eq!(SortDeliverable::decode(&mut r).unwrap(), sort);
+        assert_eq!(
+            r.remaining(),
+            0,
+            "a contract decodes a self-delimiting deliverable"
+        );
+
+        let a = SortAttestation {
+            task_id: sha256(&[b"task"]),
+            result_hash: sha256(&[b"result"]),
+            worker_address: [9u8; 20],
+            signature: vec![7u8; 64],
+        };
+        let att_bytes = a.encode();
+        let mut r2 = super::super::ser::Reader::new(&att_bytes);
+        assert_eq!(SortAttestation::decode(&mut r2).unwrap(), a);
+        assert_eq!(r2.remaining(), 0);
+    }
+
+    /// The sort reference is stable across calls and sensitive to every
+    /// committed input: the task id, the records, and the direction the contract
+    /// itself specified. Only the last one is what this deliverable is *about*,
+    /// so it is the one that must visibly move.
+    #[test]
+    fn the_sort_reference_is_stable_and_input_sensitive() {
+        let id = [0x11u8; 32];
+        let leaf = sha256(&[b"records"]);
+        let other = sha256(&[b"other"]);
+        let asc = SortDeliverable::reference_for(&id, &leaf, true);
+
+        // Stable: the same inputs give the same bytes.
+        assert_eq!(asc, SortDeliverable::reference_for(&id, &leaf, true));
+
+        // A different committed direction is a different question.
+        assert_ne!(asc, SortDeliverable::reference_for(&id, &leaf, false));
+
+        // Different inputs, and a different task id, are different answers.
+        assert_ne!(asc, SortDeliverable::reference_for(&id, &other, true));
+        assert_ne!(
+            asc,
+            SortDeliverable::reference_for(&[0x22u8; 32], &leaf, true),
+            "the task id must enter the reference"
         );
     }
 
