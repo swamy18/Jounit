@@ -1202,6 +1202,10 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let mut signed_epochs = std::collections::BTreeSet::new();
     let mut finality_keys_missing_warning =
         validator_committee.is_none() && store.params.finality_activation_height > 0;
+    // Fraud arbitration (Decision 21): inbound votes, tallied per dispute. Not
+    // persisted — see `jnt_node::mediation` for why losing it costs only the
+    // ability to *propose*, never the ability to verify or relay.
+    let mut votes = jnt_core::arbitration::VoteBook::new();
     // L2 follows the tip by replay; nothing L2 is persisted.
     let l2 = NodeL2::replay_from(&chain, &store.params);
     let mut l2_skipped_seen = l2.skipped().len();
@@ -1375,7 +1379,8 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             }
         }
 
-        // Drain inbound P2P events and apply to chain.
+        // Drain inbound P2P events and apply to chain. Inbound arbitration votes
+        // are tallied here, against this node's own committee and height.
         let before = sh.chain.height();
         node.poll_events(
             NodeState {
@@ -1383,6 +1388,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 pool: &mut sh.pool,
                 syncer: &mut syncer,
                 relay: &mut relay,
+                votes: &mut votes,
             },
             Some(now_ms()),
         );
@@ -1437,6 +1443,45 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 );
             }
             relay_seen = (accepted, refused);
+        }
+
+        // Fraud arbitration (Decision 21). Two halves, in this order:
+        //
+        // 1. Sign. If this node holds arbitrator keys, derive the canonical
+        //    reference for every live dispute and broadcast one signed vote per
+        //    key. Deterministic, so every honest arbitrator over the same chain
+        //    signs the same bytes.
+        // 2. Propose. Any dispute with a reaching quorum becomes a `Settle`
+        //    transaction in the L2 include queue, applied by the existing
+        //    settlement path - which re-verifies the aggregate from scratch.
+        //
+        // Signing first so a node's own vote is not waiting on its own relay.
+        if let Some(committee) = validator_committee.as_ref() {
+            let mine = jnt_node::mediation::votes_for(
+                &sh.chain,
+                sh.l2.state(),
+                committee,
+                sh.chain.height(),
+            );
+            for vote in mine {
+                let task = vote.task_id;
+                node.broadcast_vote(vote);
+                println!(
+                    "arbitration    vote signed for task {}",
+                    &hash_to_hex(&task)[..16]
+                );
+            }
+        }
+        {
+            let committee = sh.chain.committee_keys();
+            let proposals = jnt_node::mediation::live_proposals(&votes, &committee, sh.l2.state());
+            for p in proposals {
+                sh.l2_to_include.push(p.tx);
+                println!(
+                    "arbitration    quorum reached for task {}",
+                    &hash_to_hex(&p.task_id)[..16]
+                );
+            }
         }
 
         // Blocks from peers are persisted per batch, not per event.

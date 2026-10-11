@@ -165,6 +165,7 @@ fn pump(
                 pool,
                 syncer,
                 relay,
+                votes: &mut jnt_core::arbitration::VoteBook::new(),
             },
             None,
         );
@@ -256,6 +257,7 @@ fn a_node_syncs_a_peer_over_real_sockets() {
                 pool: &mut client_pool,
                 syncer: &mut client_syncer,
                 relay: &mut client_relay,
+                votes: &mut jnt_core::arbitration::VoteBook::new(),
             },
             None,
         );

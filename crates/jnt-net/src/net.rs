@@ -121,7 +121,7 @@ impl P2pConfig {
 /// what made `handle_message` an eight-parameter function whose signature had to
 /// be suppressed rather than fixed.
 ///
-/// Grouping them also states the invariant the node depends on: all four are
+/// Grouping them also states the invariant the node depends on: all five are
 /// mutated by a single thread, so the pool can never be validated against a chain
 /// that another thread is moving underneath it.
 pub struct NodeState<'a> {
@@ -129,6 +129,10 @@ pub struct NodeState<'a> {
     pub pool: &'a mut Mempool,
     pub syncer: &'a mut SyncManager,
     pub relay: &'a mut RelayManager,
+    /// Inbound arbitration votes, tallied per dispute (Decision 21). Owned by
+    /// the node rather than by this layer so it survives across polls; see
+    /// `jnt_node::mediation` for what the node does with a reaching quorum.
+    pub votes: &'a mut jnt_core::arbitration::VoteBook,
 }
 
 impl<'a> NodeState<'a> {
@@ -142,6 +146,7 @@ impl<'a> NodeState<'a> {
             pool: self.pool,
             syncer: self.syncer,
             relay: self.relay,
+            votes: self.votes,
         }
     }
 }
@@ -357,6 +362,25 @@ impl P2pNode {
         }
     }
 
+    /// Relay a signed arbitration vote to every peer (Decision 21, SPEC.md §16).
+    ///
+    /// Complete vote rather than an announcement, for the same reason
+    /// `broadcast_checkpoint` carries the whole certificate: there is no vote
+    /// store to serve a getdata from and the signature is the content.
+    ///
+    /// The caller must have verified the signature itself first — `VoteTally::
+    /// record` does, against this node's own committee — for the same reason
+    /// `broadcast_tx` takes only txids: relaying something the node does not
+    /// itself hold as valid would make it an amplifier. A peer receiving a vote
+    /// that fails its own checks drops it and does not re-relay, so a bad vote
+    /// travels at most one hop.
+    pub fn broadcast_vote(&self, vote: jnt_core::arbitration::ArbitrationVote) {
+        let peers = self.peers.lock().unwrap();
+        for peer in peers.values() {
+            let _ = peer.send(crate::msg::Message::ArbitrationVote(Box::new(vote.clone())));
+        }
+    }
+
     /// Announce transaction ids to all peers except `exclude_peer` (§13.14).
     ///
     /// The caller is expected to have admitted these to its own pool first.
@@ -541,6 +565,7 @@ impl P2pNode {
             pool,
             syncer,
             relay,
+            votes,
         } = state;
         match msg {
             Message::GetBlocks { locator, stop } => {
@@ -713,6 +738,35 @@ impl P2pNode {
                     for (id, peer) in peers.iter() {
                         if *id != peer_id {
                             let _ = peer.send(Message::Checkpoint(cp.clone()));
+                        }
+                    }
+                }
+            }
+            Message::ArbitrationVote(vote) => {
+                // Fraud arbitration (Decision 21). Record the vote against this
+                // node's own committee and height — never against the sender's
+                // say-so — then relay only what this node itself accepts, so a
+                // vote that fails verification here does not travel further.
+                //
+                // The tally is a transport accumulator: the quorum is this
+                // layer's judgement and nothing more, and `jnt_node::mediation`
+                // re-verifies the aggregate from the votes before anything is
+                // proposed.
+                let committee = chain.committee_keys();
+                let quorum = {
+                    let set = jnt_core::bls_checkpoint::ValidatorSet::new(committee.clone());
+                    set.quorum_size()
+                };
+                let height = chain.height();
+                let accepted = votes
+                    .entry(vote.task_id, quorum)
+                    .record(&vote, &chain.params().network_id, height, &committee)
+                    .is_ok();
+                if accepted {
+                    let peers = self.peers.lock().unwrap();
+                    for (id, peer) in peers.iter() {
+                        if *id != peer_id {
+                            let _ = peer.send(Message::ArbitrationVote(vote.clone()));
                         }
                     }
                 }

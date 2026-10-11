@@ -236,6 +236,17 @@ impl Committee {
         self.keys.len()
     }
 
+    /// The held keys, behind references so a caller cannot move one out and
+    /// lose the `Debug`-redacted wrapper's protection.
+    ///
+    /// Needed for the one thing an aggregate cannot express: a *single*
+    /// signature. Arbitration votes are one-per-arbitrator and are aggregated
+    /// later from many independent votes, so a node signing one needs its own
+    /// key's signature rather than a merged one.
+    pub fn keys(&self) -> &[ValidatorKey] {
+        &self.keys
+    }
+
     /// True when no keys are configured.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()

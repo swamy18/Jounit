@@ -44,7 +44,7 @@ use jnt_core::state_root::{
 
 use crate::error::{L2Error, L2Result};
 use crate::genesis::L2Genesis;
-use crate::task_contract::{L2Config, SettlementOutcome, TaskContract};
+use crate::task_contract::{ContractState, L2Config, SettlementOutcome, TaskContract};
 use crate::vwc::{VerifiedWorkCertificate, VwcVerification};
 
 /// What an applied transaction did, for logging, tests and (later) event streams.
@@ -644,6 +644,19 @@ impl L2State {
         let mut ids: Vec<Hash> = self.tasks.keys().copied().collect();
         ids.sort_unstable();
         ids.into_iter().map(|id| &self.tasks[&id]).collect()
+    }
+
+    /// Every task currently in the `Disputed` state, sorted by task id.
+    ///
+    /// The arbitrator worklist (§16): these are the tasks whose result is under
+    /// challenge and whose canonical reference an arbitrator will run. Sorted
+    /// for the same reason `tasks()` is — two nodes holding the same state must
+    /// enumerate disputes in the same order.
+    pub fn disputed_tasks(&self) -> Vec<&TaskContract> {
+        self.tasks()
+            .into_iter()
+            .filter(|t| matches!(t.state, ContractState::Disputed(_)))
+            .collect()
     }
 
     pub fn applied_count(&self) -> usize {

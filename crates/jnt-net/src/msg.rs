@@ -52,6 +52,13 @@ pub enum MessageType {
     /// Carry the complete certificate; the receiver verifies it against
     /// its local committee — consensus never consults it.
     Checkpoint = 11,
+    /// Fraud arbitration vote (Decision 21, SPEC.md §16). One arbitrator's
+    /// signed verdict for one dispute. Additive per the freeze rule: a node
+    /// built before this existed ignores it rather than disconnecting.
+    ///
+    /// Carry the complete vote rather than an id, because there is no vote
+    /// store to serve a getdata from and the signature *is* the content.
+    ArbitrationVote = 12,
 }
 
 impl MessageType {
@@ -68,6 +75,7 @@ impl MessageType {
             9 => MessageType::Addr,
             10 => MessageType::Tx,
             11 => MessageType::Checkpoint,
+            12 => MessageType::ArbitrationVote,
             _ => return None,
         })
     }
@@ -103,6 +111,10 @@ pub enum Message {
     /// protocol exists to give them meaning. Verified on receipt;
     /// consensus never consults it.
     Checkpoint(jnt_core::bls_checkpoint::Checkpoint),
+    /// A fraud-arbitration vote. Verified on receipt against the chain's own
+    /// committee and its own height; consensus never consults it. See
+    /// `jnt_node::mediation` for what the node does with one that checks out.
+    ArbitrationVote(Box<jnt_core::arbitration::ArbitrationVote>),
     /// An unknown type number — ignored, per the freeze rule. Retained so
     /// tests can assert that unknown types are dropped without disconnect.
     Unknown {
@@ -211,6 +223,9 @@ impl Message {
             Message::Checkpoint(cp) => {
                 w.raw(&cp.serialize());
             }
+            Message::ArbitrationVote(v) => {
+                w.raw(&v.serialize());
+            }
             Message::Unknown { raw, .. } => {
                 // `raw` is the payload verbatim as received — decode stores the
                 // whole payload, not a re-framed copy — so encoding is a
@@ -253,6 +268,10 @@ impl Message {
                 jnt_core::bls_checkpoint::Checkpoint::deserialize(payload)
                     .map_err(|e| NetError::Decode(format!("checkpoint deserialize: {e}")))?,
             ),
+            Some(MessageType::ArbitrationVote) => Message::ArbitrationVote(Box::new(
+                jnt_core::arbitration::ArbitrationVote::deserialize(payload)
+                    .map_err(|e| NetError::Decode(format!("arbitration vote deserialize: {e}")))?,
+            )),
             None => {
                 // Unknown: preserve the raw payload so callers can log it, but
                 // do not act on it. §13.5 freeze rule.

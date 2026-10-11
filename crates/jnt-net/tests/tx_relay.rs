@@ -59,6 +59,8 @@ struct Peer {
     pool: Mempool,
     syncer: SyncManager,
     relay: RelayManager,
+    /// Inbound arbitration votes, tallied per dispute.
+    votes: jnt_core::arbitration::VoteBook,
     /// Height the pool was last reconciled against.
     cursor: u64,
     /// Synthetic clock handed to `poll_events`.
@@ -98,6 +100,7 @@ impl Peer {
             pool: Mempool::default(),
             syncer: SyncManager::new(),
             relay: RelayManager::new(),
+            votes: jnt_core::arbitration::VoteBook::new(),
             cursor,
             clock: None,
         }
@@ -112,6 +115,7 @@ impl Peer {
                 pool: &mut self.pool,
                 syncer: &mut self.syncer,
                 relay: &mut self.relay,
+                votes: &mut self.votes,
             },
             self.clock,
         );

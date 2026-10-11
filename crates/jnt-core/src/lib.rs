@@ -24,6 +24,7 @@
 //! - streaming micro-payments for pay-as-you-use (`stream.rs`)
 
 pub mod agent;
+pub mod arbitration;
 pub mod block;
 pub mod bls;
 pub mod bls_checkpoint;

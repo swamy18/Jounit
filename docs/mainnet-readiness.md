@@ -226,15 +226,22 @@ reached.
    `UNBONDING_PERIOD_BLOCKS` = 1008) is enforced by code but has no operator.
    Building a signer is blocked on a key-custody decision recorded in
    `docs/decisions.md`, which is an organisational choice, not a code gap.
-3. **The arbitration transport does not exist.** Decision 21 defined what proves
-   a compute result fraudulent (`compute_ir::reference_result_hash`) and
-   `DisputeEngine::resolve` computes it itself from the disputed contract, so no
-   caller can dictate a verdict. Nothing signs or relays that verdict. The
-   consequence must be stated plainly: because SPEC §16.4/§16.5 forbid an
-   on-chain interpreter, L2 consensus does **not** re-execute compute — it accepts
-   any non-placeholder result hash, and a *wrong* result is only convicted if
-   somebody challenges it inside the dispute window. An unchallenged one
-   auto-settles `Correct` with a `WindowElapsed` certificate.
+3. **The arbitration transport is now built; the arbitration *decision* is not
+   centralized.** Decision 21's canonical reference decides what is fraudulent,
+   `DisputeEngine::resolve` computes it from the disputed contract so no caller
+   can dictate a verdict, and the whole vote path now exists: a committee member
+   signs one vote per held key (`jnt-core/src/arbitration.rs`), the node tallies
+   them against its own committee and height, relays only what it accepted
+   (`Message::ArbitrationVote`, `msg_type = 12`), and on quorum builds the
+   `Settle` transaction the existing path applies — which re-verifies the
+   aggregate with real pairings. The guarantee about *unchallenged* results is
+   structural and stated in the README: a `WindowElapsed` certificate is a
+   receipt for an uncontested settlement, `asserts_correctness()` is false for
+   it, and `validate_verified` refuses it. What remains is a **key-custody
+   decision** for who runs the arbitrators — an organisational choice, not a code
+   gap — and the slash transaction that would turn recorded arbitration
+   equivocation (`ArbitrationEquivocation`) into a bond burn. Neither is a
+   missing protocol rule.
 4. **Operational gaps** — these do **not** block a testnet, but they block a
    defensible mainnet: no log shipping, no published PGP key, and no signed
    release artifacts. The release workflow and checksums exist; the key does not.
