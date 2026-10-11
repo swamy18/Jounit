@@ -31,6 +31,7 @@ pub mod bls_checkpoint;
 pub mod bond;
 pub mod chain;
 pub mod compute_ir;
+pub mod deliverable;
 pub mod difficulty;
 pub mod error;
 pub mod exit;
