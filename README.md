@@ -678,7 +678,7 @@ applies.
 | L2 â†’ L1 exits | **Shipped** | **Off on mainnet** (activation height unset) |
 | Dispute engine + canonical reference | **Shipped** | Reference computed by the engine, never supplied |
 | Arbitration vote transport | **Shipped** | Signed, relayed, tallied, quorum-checked |
-| **Arbitrator key custody** | **Not decided** | Organisational â€” who runs the arbitrators |
+| **Arbitrator key custody** | **Decided (Decision 9)** | The arbitration quorum is organisational (run by Jounit operators). Separately, conditional *escrow* release names a contract-selected independent BLS arbitrator per escrow — no Jounit-held release key. |
 | **Slash transaction for vote equivocation** | **Not built** | Evidence is recorded; the slash path is not wired |
 | Verified Work Certificates | **Shipped** | `Quorum` verifiable; `WindowElapsed` refused by `validate_verified` |
 | Bonded stake, unbonding, slashing | **Shipped** | 15 attack-first tests |
@@ -690,7 +690,7 @@ applies.
 | **Escrowed service contracts** | **In development** | The general contract and its transitions; one non-compute deliverable shipping |
 | **Agent credit** | **In development** | Terms, position lifecycle, deadlines and a conservation-checked credit book; not yet wired to a caller |
 | **Delegation chains** | **In development** | Narrowing rule, sub-agent derivation and the link book; not wired into any consensus path |
-| **Conditional payments** | **Not built** | Held pending arbitrator key custody |
+| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. Coin settlement is Item 10. |
 | **Compute-backed staking** | **Not built** | Held pending a live validator committee |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |
@@ -862,7 +862,7 @@ replaces.
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
 | **No independent security review** | 1048 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
-| **Arbitrator key custody** | The arbitration transport is built; who runs the arbitrators is an organisational decision. |
+| **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnodes, no log shipping, no published PGP key. Artifacts are unsigned because no signing key is published. |
 
 What this means in practice: **a fresh `jnt-node init --network mainnet` runs

@@ -362,9 +362,15 @@ On top of the arithmetic sit the position lifecycle and the book that holds it:
   bonds: a validator bond secures consensus, a credit bond secures a debt, and
   mixing them would let a validator's stake back an agent's borrowing.
 
-Item 2 is **library-complete** — no consensus change, no L2 transaction type.
-`CreditBook` has no caller yet; wiring one is a separate decision, because the
-first caller sets who may hold agent funds.
+Item 2 is **library-complete** — no consensus change, no L2 transaction type. A
+caller is wired in this change: `SharedNode.credit` holds a `CreditBook` and
+`admit_payment` takes a `CreditGate`, so a payment is refused when the payer's
+free balance + live-position headroom cannot cover `amount_sat`. The gate is
+purely arithmetic and off consensus — it reserves capacity for admission, but
+does not move coin (that settlement path stays item 10). Item 2's open question
+— "who may hold agent funds" — is answered for now by the node itself, behind a
+test-only `/v1/credit/deposit` endpoint; swap in an L1-deposit proof handler
+later without touching `CreditTerms` or the domination rules above.
 
 ### D2 — Conditional/oracle payments are blocked, off the critical path
 
@@ -469,7 +475,7 @@ so. `crates/jnt-core/src/deliverable.rs` has a test for exactly this case.
 | 1 | ServiceContract | — | No | Nothing |
 | 3 | Delegation chains | — | No | SPEC amendment |
 | 4 | Conditional payments | 1 | Yes | Oracle question |
-| 2 | Agent credit | 1, 3 | Yes | Credit-limit decision |
+| 2 | Agent credit | 1, 3 | No | Credit-limit decision (wiring: gated admission, node-local book) |
 | 5 | Compute-backed staking | 1 | Yes | Validator adoption |
 
 **Start with 1.** It is the only item that is pure library work with no

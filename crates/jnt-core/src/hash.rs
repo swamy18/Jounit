@@ -5,6 +5,10 @@ use crate::error::{Error, Result};
 pub type Hash = [u8; 32];
 pub type Address = [u8; 20];
 
+/// All-zero hash: the placeholder identity used by `NoCreditGate` (no position
+/// id, no reserved debit). Not a valid position id, by construction.
+pub const ZERO_HASH: Hash = [0u8; 32];
+
 /// Domain-separation tags. Frozen; the `/v1` suffix must never be reused by a
 /// different construction. See SPEC.md §0.
 pub const DOM_BLOCK: &[u8] = b"jounit/blockhash/v1";

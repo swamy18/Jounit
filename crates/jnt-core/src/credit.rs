@@ -1013,6 +1013,115 @@ fn sat_mul_bps(sat: u64, bps: u32) -> u64 {
     }
 }
 
+/// The one thing `admit_payment` needs from a credit book, kept to a trait so
+/// the admission path stays consensus-free and testable without a real lender:
+/// given a payer and the amount it is trying to spend, either confirm credit is
+/// available or refuse. A default-implemented `NoCreditGate` opts out, so
+/// callers that have not wired credit yet behave exactly as before — credit
+/// gating is added only when a node plugs a book in.
+pub trait CreditGate {
+    /// Confirm payer `agent`/address has `amount_sat` available credit, and
+    /// reserve it against this payment. Returns the reserved id on success;
+    /// a reserved debit must be released if admission later fails, so this is
+    /// always called after every other check passes.
+    fn reserve(&mut self, payer: &Address, amount_sat: u64, height: u64) -> Result<Reservation>;
+}
+
+/// A debit reserved against a credit line. The holder of the `CreditGate` must
+/// release it if the payment never commits; otherwise it is a claim the
+/// settlement layer settles against the position named by `position_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    pub id: Hash,
+    /// The position this debit was charged against, if any (a free-balance draw
+    /// has none). Informational: lets a lender reconcile without storing it.
+    pub position_id: Option<Hash>,
+}
+
+/// The credit-gate is the only optional input to admission, so a node that has
+/// not wired credit plugs this in and gets the pre-credit behavior: every
+/// payment that is otherwise valid is admitted.
+pub struct NoCreditGate;
+impl CreditGate for NoCreditGate {
+    fn reserve(&mut self, _payer: &Address, _amount_sat: u64, _height: u64) -> Result<Reservation> {
+        Ok(Reservation {
+            id: crate::hash::ZERO_HASH,
+            position_id: None,
+        })
+    }
+}
+
+/// `CreditBook` is its own credit gate: a payment is admitted only if the payer's
+/// unencumbered capacity (free balance + the headroom in every live position that
+/// can absorb a debit) covers `amount_sat`. The reservation that admission returns
+/// is informational — the actual debit against an open position, if any, happens
+/// at settlement (§19.4); here we only *check* that capacity exists so a payment
+/// can never be committed to a payer with nothing to pay it.
+impl CreditGate for CreditBook {
+    fn reserve(&mut self, payer: &Address, amount_sat: u64, height: u64) -> Result<Reservation> {
+        if self.free(payer) >= amount_sat {
+            // The free balance alone covers it: no position is consumed. The
+            // reservation id is derived so a future settlement can look it up.
+            return Ok(Reservation {
+                id: position_id(payer, amount_sat, height),
+                position_id: None,
+            });
+        }
+
+        // Otherwise try an existing live position that still has principal
+        // outstanding; the debit is charged there at settlement time.
+        let mut remaining = amount_sat.saturating_sub(self.free(payer));
+        let mut chosen: Option<Hash> = None;
+        for (id, position) in self.live_positions() {
+            if position.borrower != *payer {
+                continue;
+            }
+            // A position can only absorb a debit up to its outstanding principal.
+            let headroom = match position.state {
+                PositionState::Drawn {
+                    repaid_principal_sat,
+                    ..
+                } => position.amount_sat.saturating_sub(repaid_principal_sat),
+                _ => 0,
+            };
+            if headroom == 0 {
+                continue;
+            }
+            if remaining <= headroom {
+                remaining = 0;
+                chosen = Some(*id);
+                break;
+            }
+            remaining -= headroom;
+        }
+
+        if remaining > 0 {
+            return Err(crate::error::Error::InsufficientFunds {
+                needed: amount_sat,
+                available: self.free(payer),
+            });
+        }
+        Ok(Reservation {
+            id: chosen.unwrap_or_else(|| position_id(payer, amount_sat, height)),
+            position_id: chosen,
+        })
+    }
+}
+
+/// Derive a reservation id that is unique per (payer, amount, height), so a
+/// settlement can correlate an admission with the debit it eventually posts
+/// without storing the reservation itself.
+fn position_id(payer: &Address, amount_sat: u64, height: u64) -> Hash {
+    crate::hash::sha256_dom(
+        DOM_CREDIT_POSITION,
+        &[
+            payer.as_ref(),
+            &amount_sat.to_le_bytes(),
+            &height.to_le_bytes(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

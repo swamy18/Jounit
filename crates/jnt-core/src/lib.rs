@@ -34,6 +34,7 @@ pub mod compute_ir;
 pub mod credit;
 pub mod delegation;
 pub mod deliverable;
+pub mod escrow;
 pub mod difficulty;
 pub mod error;
 pub mod exit;

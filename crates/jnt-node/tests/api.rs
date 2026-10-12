@@ -34,13 +34,14 @@ use jnt_core::block::GENESIS_TIMESTAMP_MS;
 use jnt_core::chain::Chain;
 use jnt_core::compute_ir::{ComputeBackend, ComputeTask};
 use jnt_core::hash::{address_to_hex, hash_to_hex};
-use jnt_core::l2::{L2Payload, L2Transaction, PostTaskPayload};
+use jnt_core::l2::{Auth, L2Payload, L2Transaction, PostTaskPayload};
 use jnt_core::params::NetworkParams;
 use jnt_core::payment::{build_signed_payment, MachinePayment};
 use jnt_core::receipt::{sign_receipt, ReceiptAnchor, ServiceReceipt, RECEIPT_VERSION};
 use jnt_core::service::{
     authorize_request, build_signed_request, derive_service_id, result_hash_of, RequestSpec,
 };
+use jnt_core::sig::Bundle;
 use jnt_core::tx::Transaction;
 use jnt_core::wallet::Wallet;
 use jnt_node::api::{spawn, SharedNode};
@@ -50,6 +51,9 @@ use serde_json::Value;
 
 const NET: &str = "jounit/mini";
 const EXPIRES: u64 = 9_000;
+/// The amount `run_bridge` opens a grant for — the credit gate must cover this
+/// for admission to succeed.
+const BRIDGE_AMOUNT_SAT: u64 = 400;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -146,6 +150,17 @@ fn get(node: &Node, path: &str) -> (u16, Value) {
 fn post(node: &Node, path: &str, body: &Value) -> (u16, Value) {
     let (status, text) = http(node.addr, "POST", path, Some(&body.to_string()));
     (status, json(&text))
+}
+
+/// Like `post`, but for a refusal body — the server may emit an error JSON or a
+/// bare string, so this keeps the raw text.
+fn post_text(node: &Node, path: &str, body: &Value) -> (u16, String) {
+    http(node.addr, "POST", path, Some(&body.to_string()))
+}
+
+/// The chain height the live node is at (used to re-verify a forked payment).
+fn node_height(node: &Node) -> u64 {
+    node.shared.lock().unwrap().chain.height()
 }
 
 // ---------------------------------------------------------------------------
@@ -472,11 +487,47 @@ fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -
     }
 }
 
+/// Submit a signed payment with the full authorization material the node now
+/// requires. Returns the raw status + body so a refusal can be asserted on.
+fn submit_payment(
+    node: &Node,
+    payment: &MachinePayment,
+    auth: &Authorization,
+    sigs: &Bundle,
+    keys: &Bundle,
+) -> (u16, Value) {
+    post(
+        node,
+        "/v1/payment/submit",
+        &serde_json::json!({
+            "payment_hex": hex::encode(payment.serialize()),
+            "authorization_hex": hex::encode(auth.serialize()),
+            "auth_sigs_hex": hex::encode(sigs.to_bytes()),
+            "auth_keys_hex": hex::encode(keys.to_bytes()),
+        }),
+    )
+}
+
 /// The full bridge, exercised through the API: policy + signed request are
 /// POSTed, the returned authorization is decoded and used to build a payment,
-/// the payment is submitted, and a receipt for it is recorded.
-fn run_bridge(node: &Node) -> (MachinePayment, ServiceReceipt, Vec<u8>) {
+/// the payment is submitted, and a receipt for it is recorded. Returns
+/// everything a caller needs to (re)submit the payment.
+///
+/// `credit_deposit` seeds the payer's credit line so admission has something to
+/// debit; pass 0 to leave it unfunded (for the credit-gate refusal test). The
+/// bridge is non-consensus: credit is a balance in the book, not L1 coin.
+fn run_bridge(
+    node: &Node,
+    credit_deposit: u64,
+) -> (
+    MachinePayment,
+    ServiceReceipt,
+    Authorization,
+    Bundle,
+    Bundle,
+) {
     let payer = wallet(61, "api-payer");
+    let payer_addr = payer.address().unwrap();
     let provider = wallet(62, "api-provider");
     let provider_addr = provider.address().unwrap();
     let service = derive_service_id(NET, &provider_addr, b"jounit-llm");
@@ -509,8 +560,6 @@ fn run_bridge(node: &Node) -> (MachinePayment, ServiceReceipt, Vec<u8>) {
     assert_eq!(granted["amount_sat"], 400);
     assert_eq!(granted["nonce"], 1);
 
-    // The authorization comes back as bytes the payment layer can consume —
-    // that round trip is the whole point of returning it.
     let auth_bytes = hex::decode(granted["authorization_hex"].as_str().unwrap()).unwrap();
     let auth = Authorization::deserialize(&auth_bytes).expect("authorization must decode");
     assert_eq!(hash_to_hex(&auth.signing_hash()), granted["signing_hash"]);
@@ -525,6 +574,21 @@ fn run_bridge(node: &Node) -> (MachinePayment, ServiceReceipt, Vec<u8>) {
         request.request_id(),
     )
     .unwrap();
+
+    let sigs = Auth::sigs_for(&payer, &auth.signing_hash()).unwrap();
+    let keys = Auth::keys_for(&payer).unwrap();
+
+    if credit_deposit > 0 {
+        let (s, b) = post(
+            node,
+            "/v1/credit/deposit",
+            &serde_json::json!({
+                "address_hex": address_to_hex(&payer_addr),
+                "amount_sat": credit_deposit,
+            }),
+        );
+        assert_eq!(s, 200, "seeding the credit line failed: {b}");
+    }
 
     let mut receipt = ServiceReceipt {
         version: RECEIPT_VERSION,
@@ -548,7 +612,7 @@ fn run_bridge(node: &Node) -> (MachinePayment, ServiceReceipt, Vec<u8>) {
     sign_receipt(&mut receipt, &provider).unwrap();
     receipt.verify_binding(&payment).unwrap();
 
-    (payment, receipt, auth_bytes)
+    (payment, receipt, auth, sigs, keys)
 }
 
 #[test]
@@ -620,25 +684,16 @@ fn a_malformed_policy_is_a_client_error() {
 #[test]
 fn a_verified_payment_is_recorded_once_and_readable() {
     let node = start();
-    let (payment, _receipt, _auth) = run_bridge(&node);
-    let payment_hex = hex::encode(payment.serialize());
+    let (payment, _receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
 
-    let (s, body) = post(
-        &node,
-        "/v1/payment/submit",
-        &serde_json::json!({ "payment_hex": payment_hex }),
-    );
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 200, "payment refused: {body}");
     assert_eq!(body["duplicate"], false);
     let id = body["payment_id"].as_str().unwrap().to_string();
     assert_eq!(id, hash_to_hex(&payment.signing_hash()));
 
     // The exact same payment is idempotent, not a second payment.
-    let (s, body) = post(
-        &node,
-        "/v1/payment/submit",
-        &serde_json::json!({ "payment_hex": payment_hex }),
-    );
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 200);
     assert_eq!(body["duplicate"], true);
 
@@ -651,8 +706,6 @@ fn a_verified_payment_is_recorded_once_and_readable() {
 #[test]
 fn a_payment_for_another_network_is_refused() {
     let node = start();
-    // A structurally valid payment naming a different network: verification
-    // must reject the binding rather than record it.
     let payer = wallet(81, "foreign");
     let provider = wallet(82, "provider").address().unwrap();
     let service = derive_service_id("jounit/testnet", &provider, b"svc");
@@ -701,26 +754,22 @@ fn a_payment_for_another_network_is_refused() {
         request.request_id(),
     )
     .unwrap();
+    let sigs = Auth::sigs_for(&payer, &auth.signing_hash()).unwrap();
+    let keys = Auth::keys_for(&payer).unwrap();
 
-    let (s, body) = post(
-        &node,
-        "/v1/payment/submit",
-        &serde_json::json!({ "payment_hex": hex::encode(payment.serialize()) }),
-    );
-    assert_eq!(s, 400);
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    // The policy was never issued under on this (mini) node, so admission
+    // refuses it as an unknown policy before the network binding is consulted.
+    assert_eq!(s, 409);
     assert_eq!(body["error"], "payment_refused");
 }
 
 #[test]
 fn a_receipt_records_once_and_a_contradicting_one_is_refused() {
     let node = start();
-    let (payment, receipt, _auth) = run_bridge(&node);
+    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
 
-    let (s, body) = post(
-        &node,
-        "/v1/payment/submit",
-        &serde_json::json!({ "payment_hex": hex::encode(payment.serialize()) }),
-    );
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 200, "{body}");
 
     let receipt_hex = hex::encode(receipt.serialize());
@@ -764,6 +813,117 @@ fn a_receipt_records_once_and_a_contradicting_one_is_refused() {
     let (s, body) = get(&node, &format!("/v1/receipt/{payment_id}"));
     assert_eq!(s, 200);
     assert_eq!(body["payment_id"], payment_id);
+}
+
+#[test]
+fn a_payment_without_its_authorization_is_refused() {
+    let node = start();
+    let (payment, _receipt, _auth, _sigs, _keys) = run_bridge(&node, 0);
+    // Omitting the authorization material makes the request body malformed to
+    // the new handler — a missing required field is 422, and crucially the
+    // payment is never recorded.
+    let (s, _body) = post_text(
+        &node,
+        "/v1/payment/submit",
+        &serde_json::json!({ "payment_hex": hex::encode(payment.serialize()) }),
+    );
+    assert_eq!(
+        s, 422,
+        "a payment without its authorization must be refused"
+    );
+    let (s, body) = get(
+        &node,
+        &format!("/v1/payment/{}", hash_to_hex(&payment.signing_hash())),
+    );
+    assert_eq!(s, 404, "the refused payment must not be recorded");
+    let _ = body;
+}
+
+#[test]
+fn a_payment_whose_policy_the_node_never_authorized_is_refused() {
+    // The gap this closes, end-to-end: a payment that names a policy hash the
+    // node has never issued under is refused, even though its payer signature
+    // is otherwise valid. The policy hash is no longer a decorative field.
+    let node = start();
+    let (mut payment, _receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+
+    // The payment was built under the bridge's policy, so it is otherwise valid;
+    // we only change the hash it names, and re-sign so verify still passes.
+    payment.policy_hash = [9u8; 32];
+    payment.sigs = Auth::sigs_for(&wallet(61, "api-payer"), &payment.signing_hash()).unwrap();
+    payment.keys = Auth::keys_for(&wallet(61, "api-payer")).unwrap();
+    payment.verify(NET, node_height(&node)).unwrap();
+
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(
+        s, 409,
+        "an unknown policy must be refused, not recorded: {body}"
+    );
+    assert_eq!(body["error"], "payment_refused");
+    assert!(body["detail"]
+        .as_str()
+        .unwrap()
+        .contains("never authorized under on this node"));
+}
+
+#[test]
+fn a_payment_whose_authorization_is_forged_is_refused() {
+    let node = start();
+    let (payment, _receipt, auth, _sigs, _keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+
+    // The authorization is authentic, but its signature material is supplied by
+    // someone else's key: the owner never granted this spend.
+    let forger = wallet(99, "forger");
+    let sigs = Auth::sigs_for(&forger, &auth.signing_hash()).unwrap();
+    let keys = Auth::keys_for(&forger).unwrap();
+
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 400, "a forged authorization must be refused");
+    assert_eq!(body["error"], "bad_request");
+}
+
+#[test]
+fn a_payment_is_admitted_only_when_the_payers_credit_covers_it() {
+    // Item 4 wiring: admission is gated on the payer's credit line. A payment
+    // that names a valid policy and authorization is refused when the payer has
+    // too little credit, and admitted once the line covers it. The coin itself
+    // does not move at admission — this is consensus-neutral bookkeeping.
+    let node = start();
+    let (payment, _receipt, auth, sigs, keys) = run_bridge(&node, 0);
+    let payer_addr = wallet(61, "api-payer").address().unwrap();
+    assert_eq!(payment.amount_sat, 400);
+
+    // Funding short: 300 < 400 -> refused before the tracker sees it.
+    let (s, b) = post(
+        &node,
+        "/v1/credit/deposit",
+        &serde_json::json!({
+            "address_hex": address_to_hex(&payer_addr),
+            "amount_sat": 300,
+        }),
+    );
+    assert_eq!(s, 200, "deposit refused: {b}");
+    assert_eq!(b["balance"], 300);
+
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 400, "underfunded credit must refuse, not record: {body}");
+    assert_eq!(body["error"], "bad_request");
+
+    // Top up so the line covers the payment, then the same payment is admitted.
+    let (s, b) = post(
+        &node,
+        "/v1/credit/deposit",
+        &serde_json::json!({
+            "address_hex": address_to_hex(&payer_addr),
+            "amount_sat": 400,
+        }),
+    );
+    assert_eq!(s, 200, "top-up refused: {b}");
+    assert_eq!(b["balance"], 700);
+
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 200, "funded credit must admit: {body}");
+    assert_eq!(body["duplicate"], false);
 }
 
 // ---------------------------------------------------------------------------
@@ -906,4 +1066,215 @@ fn an_undefined_l2_type_byte_is_refused_by_the_decoder() {
     // next byte does not.
     assert!(jnt_core::l2::L2TxType::from_wire(0x15).is_ok());
     assert!(jnt_core::l2::L2TxType::from_wire(0x16).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Item 4: conditional escrow with contract-selected arbitrators.
+// These exercise the HTTP API end-to-end: open, authorize via arbiter, refuse
+// a non-designated signer, and accept a mutual release. The node only records
+// the state machine here — no coins move through this path.
+// ---------------------------------------------------------------------------
+use jnt_core::bls::SecretKey as BlsSecretKey;
+use jnt_core::bls_checkpoint::BlsSignature;
+use jnt_core::escrow::{ConditionalEscrow, EscrowVerdict};
+
+#[test]
+fn escrow_open_records_then_refuses_an_unauthorized_arbiter_release_and_accepts_a_authorized_one(
+) {
+    let node = start();
+
+    // A contract-selected arbitrator: the escrow binds this key at open time.
+    let arb_sk = BlsSecretKey::derive(&[5u8; 32]).unwrap();
+    let arb_pk = arb_sk.public_key();
+    // Parties also carry BLS keys so mutual release is bound to them.
+    let payer_sk = BlsSecretKey::derive(&[7u8; 32]).unwrap();
+    let payer_pk = payer_sk.public_key();
+    let payee_sk = BlsSecretKey::derive(&[8u8; 32]).unwrap();
+    let payee_pk = payee_sk.public_key();
+
+    let payer_addr = wallet(61, "escrow-payer").address().unwrap();
+    let payee_addr = wallet(62, "escrow-payee").address().unwrap();
+
+    let body = serde_json::json!({
+        "network_id": "jounit/test",
+        "payer": address_to_hex(&payer_addr),
+        "payer_bls": hex::encode(payer_pk.0),
+        "payee": address_to_hex(&payee_addr),
+        "payee_bls": hex::encode(payee_pk.0),
+        "arbitrator": hex::encode(arb_pk.0),
+        "amount_sat": 1_000,
+        "nonce": 1,
+    });
+    let (s, b) = post(&node, "/v1/escrow/open", &body);
+    assert_eq!(s, 200, "open refused: {b}");
+    let id_hex = b["escrow_id"].as_str().unwrap();
+
+    // Reconstruct the escrow purely to compute the exact release-signing hash
+    // the node will check. The hash is a pure function of the open fields.
+    let e = ConditionalEscrow::open(
+        "jounit/test".to_string(),
+        payer_addr,
+        payer_pk,
+        payee_addr,
+        payee_pk,
+        arb_pk,
+        1_000,
+        1,
+    )
+    .unwrap();
+    let release_hash = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+
+    // A non-arbiter tries to release with a bogus signature -> refused 409,
+    // fail-closed (state stays open).
+    let rogue = BlsSecretKey::derive(&[9u8; 32]).unwrap();
+    let bogus_sig = rogue.sign(&release_hash);
+    let (s, b) = post(
+        &node,
+        &format!("/v1/escrow/{id_hex}/release"),
+        &serde_json::json!({
+            "mode": "arbiter",
+            "arbiter_sig_hex": hex::encode(bogus_sig.0),
+        }),
+    );
+    assert_eq!(s, 409, "a non-designated arbiter must be refused: {b}");
+    assert_eq!(b["error"], "escrow_refused");
+
+    // The designated arbitrator releases -> 200, state becomes released_arbiter.
+    let good_sig = arb_sk.sign(&release_hash);
+    let (s, b) = post(
+        &node,
+        &format!("/v1/escrow/{id_hex}/release"),
+        &serde_json::json!({
+            "mode": "arbiter",
+            "arbiter_sig_hex": hex::encode(good_sig.0),
+        }),
+    );
+    assert_eq!(s, 200, "the designated arbiter must be able to release: {b}");
+    assert_eq!(b["state"], "released_arbiter");
+
+    // A second release on the already-released escrow is refused (not open).
+    let (s, b) = post(
+        &node,
+        &format!("/v1/escrow/{id_hex}/release"),
+        &serde_json::json!({
+            "mode": "arbiter",
+            "arbiter_sig_hex": hex::encode(good_sig.0),
+        }),
+    );
+    assert_eq!(s, 409, "a decided escrow must not be releasable: {b}");
+
+    // GET reflects the new state.
+    let (s, b) = get(&node, &format!("/v1/escrow/{id_hex}"));
+    assert_eq!(s, 200);
+    assert_eq!(b["state"], "released_arbiter");
+    assert_eq!(b["amount_sat"], 1_000);
+}
+
+#[test]
+fn a_mutual_release_is_accepted_when_both_parties_sign_and_refused_when_one_is_missing(
+) {
+    let node = start();
+    let arb_sk = BlsSecretKey::derive(&[5u8; 32]).unwrap();
+    let arb_pk = arb_sk.public_key();
+    let payer_sk = BlsSecretKey::derive(&[7u8; 32]).unwrap();
+    let payer_pk = payer_sk.public_key();
+    let payee_sk = BlsSecretKey::derive(&[8u8; 32]).unwrap();
+    let payee_pk = payee_sk.public_key();
+    let payer_addr = wallet(63, "m-payer").address().unwrap();
+    let payee_addr = wallet(64, "m-payee").address().unwrap();
+
+    let body = serde_json::json!({
+        "network_id": "jounit/test",
+        "payer": address_to_hex(&payer_addr),
+        "payer_bls": hex::encode(payer_pk.0),
+        "payee": address_to_hex(&payee_addr),
+        "payee_bls": hex::encode(payee_pk.0),
+        "arbitrator": hex::encode(arb_pk.0),
+        "amount_sat": 1_000,
+        "nonce": 2,
+    });
+    let (s, b) = post(&node, "/v1/escrow/open", &body);
+    assert_eq!(s, 200, "open refused: {b}");
+    let id_hex = b["escrow_id"].as_str().unwrap();
+
+    let e = ConditionalEscrow::open(
+        "jounit/test".to_string(),
+        payer_addr,
+        payer_pk,
+        payee_addr,
+        payee_pk,
+        arb_pk,
+        1_000,
+        2,
+    )
+    .unwrap();
+    let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+
+    // Only the payer signed -> refused (arity is fine, but the payee sig fails
+    // the pairing).
+    let (s, b) = post(
+        &node,
+        &format!("/v1/escrow/{id_hex}/release"),
+        &serde_json::json!({
+            "mode": "mutual",
+            "mutual_sigs_hex": [
+                hex::encode(payer_sk.sign(&msg).0),
+                hex::encode(BlsSignature([0u8; 96]).0),
+            ],
+        }),
+    );
+    assert_eq!(s, 409, "a one-sided signature must be refused: {b}");
+
+    // Both parties sign -> accepted.
+    let (s, b) = post(
+        &node,
+        &format!("/v1/escrow/{id_hex}/release"),
+        &serde_json::json!({
+            "mode": "mutual",
+            "mutual_sigs_hex": [
+                hex::encode(payer_sk.sign(&msg).0),
+                hex::encode(payee_sk.sign(&msg).0),
+            ],
+        }),
+    );
+    assert_eq!(s, 200, "a genuine mutual release must verify: {b}");
+    assert_eq!(b["state"], "released_mutual");
+}
+
+#[test]
+fn escrow_open_rejects_a_zero_arbitrator_key_and_non_party_payer_key() {
+    let node = start();
+    let payer_sk = BlsSecretKey::derive(&[7u8; 32]).unwrap();
+    let payer_pk = payer_sk.public_key();
+    let payer_addr = wallet(65, "z-payer").address().unwrap();
+    let payee_addr = wallet(66, "z-payee").address().unwrap();
+
+    let (s, b) = post(
+        &node,
+        "/v1/escrow/open",
+        &serde_json::json!({
+            "network_id": "jounit/test",
+            "payer": address_to_hex(&payer_addr),
+            "payer_bls": hex::encode(payer_pk.0),
+            "payee": address_to_hex(&payee_addr),
+            // payee_bls intentionally zero -> must be refused.
+            "payee_bls": hex::encode([0u8; 48]),
+            "arbitrator": hex::encode([0u8; 48]),
+            "amount_sat": 1_000,
+            "nonce": 1,
+        }),
+    );
+    assert_eq!(s, 400, "a zero key must be refused: {b}");
+    assert_eq!(b["error"], "escrow_refused");
+}
+
+#[test]
+fn an_unknown_escrow_id_is_404_never_500() {
+    let node = start();
+    let (s, b) = post(
+        &node,
+        "/v1/escrow/0000000000000000000000000000000000000000000000000000000000000000/release",
+        &serde_json::json!({ "mode": "arbiter", "arbiter_sig_hex": hex::encode([0u8; 96]) }),
+    );
+    assert_eq!(s, 404, "a missing escrow must 404, not 500: {b}");
 }

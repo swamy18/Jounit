@@ -1,7 +1,7 @@
 # JOUNIT PROTOCOL SPECIFICATION
 
 **Version:** 0.1.0 (the workspace version in `Cargo.toml`)
-**Status:** Draft — §0–§12 normative for `jnt-core`; §13 normative for `jnt-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `jnt-l2`; §18 for `jnt-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested.
+**Status:** Draft — §0–§12 normative for `jnt-core`; §13 normative for `jnt-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `jnt-l2`; §18 for `jnt-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `jnt-core::escrow` and `jnt-node::api`; coin settlement is Item 10.
 **Scope:** Layer 1 (base layer, §0–§13), the M1–M5 protocol mechanisms (§14), Layer 2 and the worker SDK (§15–§18), and L1↔L2 integration including deposits and exits (§19). §13 covers block and transaction relay between nodes.
 
 This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
@@ -2782,3 +2782,91 @@ exit_proof, exit_is_mature, note_release, exited_total, exit_queue_is_active}`,
 `Chain::{exit_active_at, exit_released, mine_from_pool_with_exits}`,
 `NodeL2::{pending_exits, crank_claims, simulate_root}`, `jnt_worker::{queue_exit,
 queue_exit_plan, ExitPlan}`.
+
+---
+
+## 20. Conditional Escrow with Contract-Selected Arbitrators (Item 4)
+
+This section is non-consensus: the escrow is a *state machine recorded by the node*
+(`jnt-core::escrow::ConditionalEscrow`), and the actual coin move at release reuses the
+ordinary L1 exit path (§19.4). It lets a payer lock value subject to a condition that is
+resolved either by **both parties** signing (mutual release) or by a **single designated
+arbitrator** signing (arbiter release).
+
+### 20.1 Design
+
+- The payer opens an escrow with `ConditionalEscrow::open(...)` naming an arbitrator's
+  BLS public key **in the contract**. The arbitrator is *not* a Jounit key: the protocol
+  never holds an "arbitrator key," and there is no committee. The contract selects one
+  independently-operated BLS public key per escrow; a quorum of one is the point.
+- Both parties also record a BLS public key (`payer_key`, `payee_key`), so a mutual
+  release cannot be satisfied by an attacker naming their own key in the request.
+- The escrow `id = H(network_id ‖ payer ‖ payer_key ‖ payee ‖ payee_key ‖ arbitrator ‖
+  amount ‖ nonce)` (DOM_ESCROW). It is a pure function of the open fields, so the node can
+  recompute the release-signing hash without storing extra state, and two escrows between
+  the same parties differ by nonce.
+- Release signing hash: `h = H(id ‖ verdict)` (DOM_ESCROW). For the standard pay-to-payee
+  outcome `verdict = ReleasedToPayee (0)`.
+
+### 20.2 State machine
+
+```
+Open
+  --(arbiter sig over h)-->       ReleasedArbiter{at_height}
+  --(both sigs over h)-->         ReleasedMutual{at_height}
+Released{Arbiter,Mutual}
+  --(ledger settlement, §19.4)--> Finalized{at_height}
+```
+
+- `Open` is the only live state. A release from any other state is refused (fail closed);
+  a decided escrow cannot be re-released.
+- The node records `ReleasedArbiter`/`ReleasedMutual`. `Finalized` is written by the
+  settlement path when the coin actually leaves the escrow address on the base layer.
+
+### 20.3 Verification rules
+
+- **Arbiter release** (`verify_arbiter_release`): exactly one BLS signature, verified
+  under the `arbitrator` key recorded in the escrow. Any other signer's signature fails the
+  pairing — there is no fallback list.
+- **Mutual release** (`verify_mutual_release`): exactly two BLS signatures, verified under
+  `payer_key` then `payee_key` respectively, **and** the claimed keys must equal the
+  escrow's bound `payer_key`/`payee_key` (so a non-party cannot release by naming a key).
+- Signatures are raw BLS12-381 `min_pk` (48-byte public key, 96-byte signature,
+  §16 signature scheme), verified via `RealBls` (`blst`), the same primitive used for
+  validator signatures elsewhere — no bespoke signing logic is added to the contract.
+
+### 20.4 API
+
+- `POST /v1/escrow/open` — body `{network_id, payer, payer_bls, payee, payee_bls,
+  arbitrator, amount_sat, nonce}`; returns `{escrow_id}`. A zero party/arbiter key or a
+  zero amount is a `400 escrow_refused`.
+- `POST /v1/escrow/{id}/release` — body `{mode:"arbiter", arbiter_sig_hex}` or
+  `{mode:"mutual", mutual_sigs_hex:[sig0,sig1]}`; on success returns `{escrow_id, state}`.
+  A bad signature is `409 escrow_refused`; a decided escrow is `409`; a missing escrow is
+  `404`.
+- `GET /v1/escrow/{id}` — `{escrow_id, payer, payee, amount_sat, state}`.
+
+### 20.5 Rationale
+
+- *Why contract-selected arbitrators, not a Jounit committee?* So Jounit holds no power of
+  attorney over users' funds and cannot unilaterally release. The user picks the
+  arbitrator they trust; the protocol only enforces the signature against the key the
+  contract recorded. This corresponds to Decision 9 and ends the prior custody blocker.
+- *Why BLS for the parties?* It is the only signature primitive the protocol already
+  carries (§16), so mutual release reuses `blst` rather than introducing a secp256k1
+  aggregation path that would need its own consensus rules and test vectors.
+- *Why record `Finalized` here?* To keep the release signature check off consensus
+  (§14.1) while still surfacing the settlement outcome that the L1 exit path produces in
+  §19.4.
+
+### 20.6 Implemented surface
+
+`jnt-core::escrow` (`ConditionalEscrow`, `EscrowState`, `EscrowVerdict`,
+`release_signing_hash`, `verify_mutual_release`, `verify_arbiter_release`,
+`BlsVerifier` trait + `RealBls`, encode/decode) is unit-tested including: non-designated
+arbiter signature refused, non-party key refused for mutual, arity rule, round-trip
+codec, zero-key/self-party refusal. The HTTP surface in `jnt-node::api` is covered by
+`crates/jnt-node/tests/api.rs` (open, unauthorized arbiter refused, authorized arbiter
+accept, replay of a decided escrow refused, mutual accept, one-sided sig refused,
+unknown-id 404, zero-key open refused). Coin settlement for this state machine is
+Item 10.

@@ -52,6 +52,7 @@ use crate::agent::{
     derive_agent_id, verify_authorization, AgentId, AgentRole, Authorization, AuthorizationRequest,
     PolicyBook, PolicyError, SpendPolicy,
 };
+use crate::credit::CreditGate;
 use crate::hash::{sha256_dom, Address, Hash};
 use crate::payment::{MachinePayment, PaymentError};
 use crate::receipt::ServiceReceipt;
@@ -88,6 +89,11 @@ pub enum SessionError {
     Policy(PolicyError),
     /// Two stages of the session disagree.
     Binding(&'static str),
+    /// A payment was otherwise valid but the payer's credit line could not
+    /// cover it: `free + unencumbered position headroom` was less than
+    /// `amount_sat`. Distinct from a policy refusal so a caller can surface
+    /// "not enough credit" specifically.
+    InsufficientCredit(crate::error::Error),
     /// An amount string is not an exact decimal number of satoshis.
     BadAmount(&'static str),
 }
@@ -99,6 +105,9 @@ impl fmt::Display for SessionError {
             SessionError::Receipt(e) => write!(f, "receipt layer: {e}"),
             SessionError::Policy(e) => write!(f, "policy layer: {e}"),
             SessionError::Binding(w) => write!(f, "session binding failed: {w}"),
+            SessionError::InsufficientCredit(e) => {
+                write!(f, "payer credit line insufficient: {e}")
+            }
             SessionError::BadAmount(w) => write!(f, "bad amount: {w}"),
         }
     }
@@ -412,6 +421,115 @@ pub fn authorize_request(
         nonce,
     };
     Ok(book.authorize(policy, network_id, &areq)?)
+}
+
+/// The **only** admission for a machine payment into a node's record.
+///
+/// This closes the gap the seam had. `MachinePayment::verify` proves the payer
+/// signed *a* payment, and `PaymentTracker::accept` refuses a replay — but
+/// neither consults the policy engine, so a payment that *named* a policy hash
+/// nobody ever authorized under was accepted on the payer's own signature
+/// alone. A policy hash in a payment was, until now, a decorative field.
+///
+/// Four things must hold, and they are the four that make the hash mean what it
+/// says:
+///
+/// 1. the payment is structurally sound, network-bound, unexpired and signed by
+///    the payer it names (`MachinePayment::verify`);
+/// 2. the policy it names is the one it is being admitted under, that policy is
+///    for this network, and it is **known to the engine** — the engine has
+///    issued at least one authorization under it, which is what makes the hash a
+///    claim the engine can check rather than a string the payer chose;
+/// 3. that policy is still live at `height`;
+/// 4. the authorization is the **owner's** (`verify_authorization`), and the
+///    payment is exactly what it granted (`MachinePayment::linked_to`).
+///
+/// What this deliberately does **not** do: re-run the budget rules. They were
+/// checked, once, by the engine when the authorization was issued, and
+/// re-running them here with a state the authorization already advanced would
+/// refuse every legitimate payment. The budget rule has one home; this is the
+/// admission check, not a second engine.
+///
+/// Revocation is also not here, and for a structural reason: `revoked` is inside
+/// the canonical encoding, so a revoked policy is a **different hash** from the
+/// one the engine issued under. A gate handed a revoked variant sees a policy the
+/// engine has never issued under and refuses it on (2) — the right outcome for
+/// the wrong reason, and the original authorization is left standing. Killing
+/// that one is the record-keeper's job, because only the record-keeper knows
+/// which hash a revocation statement was aimed at; the node keeps a revocation
+/// set keyed by original hash, populated from an owner-signed revocation, and
+/// checks it before this gate runs.
+///
+/// Nothing is mutated — the engine is borrowed read-only. Committing the
+/// accounting for the *spend* is the caller's job, through the same
+/// `PolicyBook` that issued the grant.
+pub fn admit_payment(
+    book: &PolicyBook,
+    policy: &SpendPolicy,
+    payment: &MachinePayment,
+    presented: AuthPresentation<'_>,
+    network_id: &str,
+    height: u64,
+    gate: &mut dyn CreditGate,
+) -> Result<crate::credit::Reservation, SessionError> {
+    // 1. the payment proves itself.
+    payment.verify(network_id, height)?;
+
+    // 2. it names the policy it is admitted under, for this network, and that
+    //    policy is one the engine has actually issued under.
+    if payment.policy_hash != policy.hash() {
+        return Err(SessionError::Binding("payment names another policy"));
+    }
+    if policy.network_id != network_id {
+        return Err(SessionError::Binding("policy is for another network"));
+    }
+    if book.state(&policy.hash()).is_none() {
+        return Err(SessionError::Binding(
+            "policy is unknown to the engine: no authorization was issued under it",
+        ));
+    }
+
+    // 3. the policy is live at this height.
+    //
+    // Revocation is deliberately not checked here: `revoked` is inside the
+    // canonical encoding, so a revoked policy is a *different hash* from the one
+    // the engine issued under. A gate handed a revoked variant sees a policy the
+    // engine has never issued under, and refuses it on (2) — the right outcome
+    // for the wrong reason, and the original authorization is left standing.
+    // Killing that one is the record-keeper's job, because only the
+    // record-keeper knows which hash a revocation statement was aimed at.
+    if height < policy.not_before_height {
+        return Err(SessionError::Policy(PolicyError::NotYetValid {
+            not_before: policy.not_before_height,
+            height,
+        }));
+    }
+    if height >= policy.expires_at_height {
+        return Err(SessionError::Policy(PolicyError::PolicyExpired {
+            expires_at: policy.expires_at_height,
+            height,
+        }));
+    }
+
+    // 4. the grant is authentic and this payment is what it granted.
+    verify_authorization(presented.sigs, presented.keys, presented.auth)?;
+    if presented.auth.policy_hash != payment.policy_hash {
+        return Err(SessionError::Binding("authorization names another policy"));
+    }
+    payment.linked_to(presented.auth)?;
+
+    // 5. credit. Admission only goes as far as the policy layer; funding the
+    //    payment (consuming real coin) is a later step (roadmap item 10/§19.4).
+    //    But a policy that authorizes a spend must still be backed by *something*
+    //    that will pay it, and that is the credit book's job: confirm the payer's
+    //    free balance or live position can cover `amount_sat`, and reserve it so
+    //    the later settlement cannot overdraw. A book that has wired nothing in
+    //    gets `NoCreditGate` and this step is a no-op — pre-credit behavior.
+    let reservation = gate
+        .reserve(&payment.payer, payment.amount_sat, height)
+        .map_err(SessionError::InsufficientCredit)?;
+
+    Ok(reservation)
 }
 
 /// A granted authorization plus the signature material that proves the owner
@@ -908,6 +1026,215 @@ mod tests {
         assert_eq!(
             aggregate_payments(&mixed, NET, 100),
             Err(PaymentError::MixedPayers)
+        );
+    }
+
+    /// Everything an admission test needs: a live policy, an authorization
+    /// issued under it, and the payment built from that authorization.
+    fn granted(
+        w: &Wallet,
+        book: &mut PolicyBook,
+    ) -> (
+        SpendPolicy,
+        Authorization,
+        crate::payment::MachinePayment,
+        PaymentRequest,
+    ) {
+        let provider = service_wallet().address().unwrap();
+        let service = derive_service_id(NET, &provider, b"svc");
+        let policy = machine_policy(w.address().unwrap(), service);
+        let request = build_signed_request(
+            w,
+            RequestSpec {
+                network_id: NET.to_string(),
+                payer_type: AgentRole::Machine,
+                service_id: service,
+                recipient: provider,
+                max_amount_sat: 400,
+                expires_at_height: 9_000,
+                policy_hash: policy.hash(),
+            },
+        )
+        .unwrap();
+        let auth = authorize_request(book, &policy, NET, &request, 100, 1).unwrap();
+        let payment = crate::payment::build_signed_payment(
+            w,
+            &auth,
+            NET,
+            AgentRole::Machine,
+            0,
+            9_000,
+            request.request_id(),
+        )
+        .unwrap();
+        (policy, auth, payment, request)
+    }
+
+    /// The owner's signature over the authorization, and the key bundle it
+    /// verifies against.
+    fn grants(w: &Wallet, auth: &Authorization) -> (Bundle, Bundle) {
+        (
+            crate::l2::Auth::sigs_for(w, &auth.signing_hash()).unwrap(),
+            crate::l2::Auth::keys_for(w).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_payment_the_owner_authorized_is_admitted() {
+        let w = wallet();
+        let mut book = PolicyBook::default();
+        let (policy, auth, payment, _request) = granted(&w, &mut book);
+        let (sigs, keys) = grants(&w, &auth);
+        let presented = AuthPresentation {
+            auth: &auth,
+            sigs: &sigs,
+            keys: &keys,
+        };
+        let mut gate = crate::credit::NoCreditGate;
+        assert!(admit_payment(&book, &policy, &payment, presented, NET, 100, &mut gate).is_ok());
+    }
+
+    #[test]
+    fn a_payment_naming_a_policy_the_engine_never_issued_under_is_refused() {
+        // The leak this closes: the policy hash in a payment used to be a
+        // decorative field, because nothing consulted the engine. Now the
+        // engine must have issued under the policy the payment names.
+        let w = wallet();
+        let mut book = PolicyBook::default();
+        let (policy, auth, payment, _request) = granted(&w, &mut book);
+
+        // A second, perfectly valid policy the engine has never seen: the
+        // payment names it, so admission must refuse.
+        let mut other = policy.clone();
+        other.allowed_services = vec![[9u8; 32]];
+        other.per_tx_max_sat = 500;
+        assert_ne!(other.hash(), policy.hash());
+        assert!(book.state(&other.hash()).is_none());
+
+        let (sigs, keys) = grants(&w, &auth);
+        let presented = AuthPresentation {
+            auth: &auth,
+            sigs: &sigs,
+            keys: &keys,
+        };
+        let mut gate = crate::credit::NoCreditGate;
+        assert_eq!(
+            admit_payment(&book, &other, &payment, presented, NET, 100, &mut gate),
+            Err(SessionError::Binding("payment names another policy"))
+        );
+    }
+
+    #[test]
+    fn a_payment_whose_authorization_is_not_the_owners_is_refused() {
+        // The authorization is well-formed and binds correctly, but it was
+        // signed by someone else's key: the owner never granted this spend.
+        let w = wallet();
+        let mut book = PolicyBook::default();
+        let (policy, auth, payment, _request) = granted(&w, &mut book);
+
+        let forger = service_wallet();
+        let (sigs, keys) = grants(&forger, &auth);
+        let presented = AuthPresentation {
+            auth: &auth,
+            sigs: &sigs,
+            keys: &keys,
+        };
+        let mut gate = crate::credit::NoCreditGate;
+        assert!(admit_payment(&book, &policy, &payment, presented, NET, 100, &mut gate).is_err());
+    }
+
+    #[test]
+    fn a_payment_tampered_after_its_authorization_is_refused() {
+        // The payer re-signs a *bigger* payment: every budget rule passed when
+        // the authorization was issued, the payment is structurally valid, and
+        // it is still not what the owner authorized.
+        let w = wallet();
+        let mut book = PolicyBook::default();
+        let (policy, auth, payment, _request) = granted(&w, &mut book);
+        let mut forged = payment.clone();
+        forged.amount_sat = auth.amount_sat + 1;
+        forged.sigs = crate::l2::Auth::sigs_for(&w, &forged.signing_hash()).unwrap();
+        forged.verify(NET, 100).unwrap();
+
+        let (sigs, keys) = grants(&w, &auth);
+        let presented = AuthPresentation {
+            auth: &auth,
+            sigs: &sigs,
+            keys: &keys,
+        };
+        let mut gate = crate::credit::NoCreditGate;
+        assert_eq!(
+            admit_payment(&book, &policy, &forged, presented, NET, 100, &mut gate),
+            Err(SessionError::Payment(
+                PaymentError::NotLinkedToAuthorization("amount")
+            ))
+        );
+    }
+
+    #[test]
+    fn a_revoked_policy_variant_is_not_the_policy_the_engine_issued_under() {
+        // Revocation lives in the signed bytes, so a revoked variant is a
+        // *different hash*: the engine has no state under it, and a payment
+        // naming it is refused as an unknown policy rather than admitted.
+        let w = wallet();
+        let mut book = PolicyBook::default();
+        let (policy, auth, payment, _request) = granted(&w, &mut book);
+        let mut variant = policy.clone();
+        variant.revoked = true;
+        assert_ne!(variant.hash(), policy.hash());
+
+        let (sigs, keys) = grants(&w, &auth);
+        let presented = AuthPresentation {
+            auth: &auth,
+            sigs: &sigs,
+            keys: &keys,
+        };
+        let mut gate = crate::credit::NoCreditGate;
+        assert_eq!(
+            admit_payment(&book, &variant, &payment, presented, NET, 100, &mut gate),
+            Err(SessionError::Binding("payment names another policy"))
+        );
+    }
+
+    #[test]
+    fn a_policy_that_has_since_expired_refuses_a_later_payment() {
+        // The payment outlives its policy, and admitting it at a height past the
+        // policy's own expiry is refused: a grant does not extend the envelope
+        // it was issued inside.
+        let w = wallet();
+        let mut book = PolicyBook::default();
+        let (policy, auth, payment, _request) = granted(&w, &mut book);
+        assert_eq!(payment.expires_at_height, 9_000);
+        assert_eq!(policy.expires_at_height, 10_000);
+
+        let (sigs, keys) = grants(&w, &auth);
+        let presented = AuthPresentation {
+            auth: &auth,
+            sigs: &sigs,
+            keys: &keys,
+        };
+        let mut gate = crate::credit::NoCreditGate;
+        assert_eq!(
+            admit_payment(&book, &policy, &payment, presented, NET, 9_500, &mut gate),
+            Err(SessionError::Payment(PaymentError::Expired {
+                expires_at: 9_000,
+                height: 9_500
+            }))
+        );
+        // Rebuild the payment with a later expiry of its own, and now it is the
+        // *policy* that refuses it.
+        let mut later = crate::payment::MachinePayment {
+            expires_at_height: 11_000,
+            ..payment
+        };
+        later.sigs = crate::l2::Auth::sigs_for(&w, &later.signing_hash()).unwrap();
+        let mut gate = crate::credit::NoCreditGate;
+        assert_eq!(
+            admit_payment(&book, &policy, &later, presented, NET, 10_050, &mut gate),
+            Err(SessionError::Policy(PolicyError::PolicyExpired {
+                expires_at: 10_000,
+                height: 10_050
+            }))
         );
     }
 }

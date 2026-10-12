@@ -54,6 +54,9 @@
 //! POST /v1/receipt             verify + record a service receipt
 //! GET  /v1/receipt/{id}        receipt by id (or by payment id)
 //! GET  /v1/exit/crankable      the exit claims this node could settle now
+//! POST /v1/escrow/open         open a conditional escrow with a chosen arbitrator
+//! POST /v1/escrow/{id}/release arbiter- or mutual-release a live escrow (non-consensus)
+//! GET  /v1/escrow/{id}         escrow state
 //! ```
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
@@ -63,6 +66,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -108,6 +112,33 @@ pub struct SharedNode {
     pub payment_store: BTreeMap<Hash, MachinePayment>,
     /// Policy accounting for `POST /v1/authorize`.
     pub policies: jnt_core::agent::PolicyBook,
+    /// Credit book for `POST /v1/credit/*`: free balances, posted bonds and
+    /// positions. Item 2 wiring (roadmap item 2); kept here, off consensus, so
+    /// a payment can only be committed if the payer's line covers it, but the
+    /// coin itself still moves through the ordinary §1 UTXO path later.
+    pub credit: jnt_core::credit::CreditBook,
+    /// Conditional-escrow store for Item 4 (contract-selected arbitrators).
+    /// Non-consensus: the ledger tracks the state machine, and the actual coin
+    /// release reuses the §1 L1 exit / §19.4 path.
+    pub escrows: BTreeMap<jnt_core::hash::Hash, jnt_core::escrow::ConditionalEscrow>,
+    /// Policies this node has issued authorizations under, keyed by policy hash.
+    ///
+    /// The node keeps the policy object because admission (`POST
+    /// /v1/payment/submit`) must check the policy a payment *names* is the one
+    /// the engine issued under, and that it is still live at this height —
+    /// neither of which the accounting alone answers. A payment naming a policy
+    /// the node has never authorized under is refused, however well-formed.
+    pub policy_registry: BTreeMap<Hash, jnt_core::agent::SpendPolicy>,
+    /// Policy hashes the owner has revoked, by the hash the engine actually
+    /// issued under.
+    ///
+    /// Revocation needs this set because `revoked` is inside the canonical
+    /// encoding: a revoked policy is a *different hash* from the one the engine
+    /// authorized, so the revoked statement cannot find the original by itself.
+    /// The node maps it back — variant bytes with `revoked` cleared — and
+    /// records the original. Only the owner can produce that statement, because
+    /// it is the statement they sign.
+    pub revoked_policies: BTreeSet<Hash>,
     /// L1 txids the API accepted; drained by the serve loop, which owns the
     /// P2P node and announces them to peers.
     pub tx_to_relay: Vec<Hash>,
@@ -126,6 +157,10 @@ impl SharedNode {
             payment_tracker: PaymentTracker::default(),
             payment_store: BTreeMap::new(),
             policies: jnt_core::agent::PolicyBook::default(),
+            credit: jnt_core::credit::CreditBook::new(),
+            escrows: BTreeMap::new(),
+            policy_registry: BTreeMap::new(),
+            revoked_policies: BTreeSet::new(),
             tx_to_relay: Vec::new(),
             l2_to_include: Vec::new(),
         }
@@ -200,6 +235,17 @@ fn decode_hash(s: &str) -> Result<Hash, (StatusCode, Json<ErrorBody>)> {
 fn decode_hex_bytes(s: &str, what: &str) -> Result<Vec<u8>, (StatusCode, Json<ErrorBody>)> {
     let raw = s.trim().trim_start_matches("0x");
     hex::decode(raw).map_err(|e| bad(format!("{what} hex: {e}")))
+}
+
+/// Parse and length-check a 48-byte BLS public key hex string.
+fn decode_public_key(s: &str, what: &str) -> Result<jnt_core::bls_checkpoint::BlsPublicKey, (StatusCode, Json<ErrorBody>)> {
+    let raw = decode_hex_bytes(s, what)?;
+    let mut key = [0u8; 48];
+    if raw.len() != 48 {
+        return Err(bad(format!("{what} must be 48 hex bytes")));
+    }
+    key.copy_from_slice(&raw);
+    Ok(jnt_core::bls_checkpoint::BlsPublicKey(key))
 }
 
 fn task_json(t: &TaskContract) -> Value {
@@ -1137,6 +1183,10 @@ async fn authorize(State(state): State<ApiState>, Json(req): Json<AuthorizeReq>)
             req.nonce,
         )
         .map_err(session_err)?;
+        // Remember the policy under the hash the authorization carries, so
+        // admission later can check the payment names a policy this engine
+        // actually issued under. Idempotent: the same bytes hash the same.
+        sh.policy_registry.insert(auth.policy_hash, policy);
         // Unsigned: the *owner* signs `signing_hash` with their wallet. The
         // API never signs and never sees a key.
         Ok(Json(json!({
@@ -1165,6 +1215,76 @@ fn session_err(e: SessionError) -> (StatusCode, Json<ErrorBody>) {
 #[derive(Deserialize)]
 struct PaymentSubmitReq {
     payment_hex: String,
+    /// Canonical `Authorization` encoding the payment claims to be spending
+    /// under. Required: a machine payment without its grant is not admitted.
+    authorization_hex: String,
+    /// The owner's signature over the authorization's signing hash, and the
+    /// public key bundle it verifies against.
+    auth_sigs_hex: String,
+    auth_keys_hex: String,
+}
+
+/// Decode a signature/key bundle from its canonical bytes.
+fn decode_bundle(
+    hex_str: &str,
+    what: &str,
+) -> Result<jnt_core::sig::Bundle, (StatusCode, Json<ErrorBody>)> {
+    let bytes = decode_hex_bytes(hex_str, what)?;
+    let mut r = jnt_core::ser::Reader::new(&bytes);
+    jnt_core::sig::Bundle::from_reader(&mut r).map_err(|e| bad(format!("{what}: {e}")))
+}
+
+/// Revoke a policy this node has issued under.
+///
+/// The statement is the owner's: the same policy with `revoked` set, signed by
+/// the owner. The node maps it back to the hash it actually authorized by
+/// clearing the flag — only possible because the encoding is known — and records
+/// that hash as revoked. Nothing else may revoke: a revocation signed by anyone
+/// else is a griefing vector, not a kill switch.
+#[derive(Deserialize)]
+struct PolicyRevokeReq {
+    policy_hex: String,
+    sigs_hex: String,
+    keys_hex: String,
+}
+
+async fn policy_revoke(
+    State(state): State<ApiState>,
+    Json(req): Json<PolicyRevokeReq>,
+) -> ApiResult {
+    let bytes = decode_hex_bytes(&req.policy_hex, "policy")?;
+    let variant = jnt_core::agent::SpendPolicy::deserialize(&bytes)
+        .map_err(|e| bad(format!("policy: {e}")))?;
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
+    with_shared(&state, |sh| {
+        // The statement must be the owner's, over exactly these bytes.
+        let owner = keys.address().map_err(|e| bad(format!("keys: {e}")))?;
+        if owner != variant.owner {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "policy_revoked",
+                "the revocation is signed by someone other than the policy owner",
+            ));
+        }
+        jnt_core::sig::verify_bundle(&sigs, &keys, &variant.signing_hash())
+            .map_err(|e| bad(format!("revocation signature: {e}")))?;
+        // Map back to the hash the engine issued under.
+        let mut original = variant.clone();
+        original.revoked = false;
+        if !sh.policy_registry.contains_key(&original.hash()) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "policy_refused",
+                "this node never issued under the policy being revoked",
+            ));
+        }
+        let was_new = sh.revoked_policies.insert(original.hash());
+        Ok(Json(json!({
+            "policy_hash": hash_to_hex(&original.hash()),
+            "revoked": was_new,
+        })))
+    })?
 }
 
 async fn payment_submit(
@@ -1173,10 +1293,55 @@ async fn payment_submit(
 ) -> ApiResult {
     let bytes = decode_hex_bytes(&req.payment_hex, "payment")?;
     let payment = MachinePayment::deserialize(&bytes).map_err(|e| bad(format!("payment: {e}")))?;
+    let auth_bytes = decode_hex_bytes(&req.authorization_hex, "authorization")?;
+    let authorization = jnt_core::agent::Authorization::deserialize(&auth_bytes)
+        .map_err(|e| bad(format!("authorization: {e}")))?;
+    let auth_sigs = decode_bundle(&req.auth_sigs_hex, "auth_sigs")?;
+    let auth_keys = decode_bundle(&req.auth_keys_hex, "auth_keys")?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
         let id = payment.signing_hash();
+        // A revoked policy admits nothing further, whatever else is in order.
+        if sh.revoked_policies.contains(&payment.policy_hash) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "policy_revoked",
+                "the policy this payment names has been revoked by its owner",
+            ));
+        }
+        // Admission first: the payment must be what an authentic, live policy
+        // granted. A payment that names a policy this node never authorized
+        // under — or one that has since expired, or one whose authorization is
+        // not signed by the owner — is refused before it touches the replay
+        // tracker.
+        let policy = sh.policy_registry.get(&payment.policy_hash).cloned();
+        match policy {
+            Some(policy) => {
+                let presented = jnt_core::service::AuthPresentation {
+                    auth: &authorization,
+                    sigs: &auth_sigs,
+                    keys: &auth_keys,
+                };
+                jnt_core::service::admit_payment(
+                    &sh.policies,
+                    &policy,
+                    &payment,
+                    presented,
+                    &network,
+                    height,
+                    &mut sh.credit,
+                )
+                .map_err(session_err)?;
+            }
+            None => {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "payment_refused",
+                    "the policy this payment names was never authorized under on this node",
+                ));
+            }
+        }
         payment
             .verify(&network, height)
             .map_err(|e| fail(StatusCode::BAD_REQUEST, "payment_refused", e.to_string()))?;
@@ -1303,6 +1468,233 @@ async fn exit_crankable(
 }
 
 // ---------------------------------------------------------------------------
+// Credit (roadmap item 2 wiring; non-consensus)
+// ---------------------------------------------------------------------------
+/// `POST /v1/credit/deposit` — fund an address's credit line.
+///
+/// Item 2 wiring only: this mints a *credit* balance in `CreditBook`, not an L1
+/// coin. It exists so the credit gate can be exercised end-to-end (the book is
+/// otherwise empty and every admission would refuse). A production node would
+/// gate this behind an L1 deposit proof; in this crate the gate is pure
+/// arithmetic and consensus-neutral regardless.
+#[derive(Deserialize)]
+struct CreditDepositReq {
+    address_hex: String,
+    amount_sat: u64,
+}
+
+async fn credit_deposit(
+    State(state): State<ApiState>,
+    Json(req): Json<CreditDepositReq>,
+) -> ApiResult {
+    let addr = decode_address(&req.address_hex)?;
+    with_shared(&state, |sh| {
+        sh.credit
+            .deposit(addr, req.amount_sat)
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, "credit_refused", e.to_string()))?;
+        Ok(Json(json!({
+            "address": address_to_hex(&addr),
+            "balance": sh.credit.free(&addr),
+        })))
+    })?
+}
+
+/// `GET /v1/credit/balance/{address}` — free balance + bond + live positions.
+async fn credit_balance(State(state): State<ApiState>, Path(addr): Path<String>) -> ApiResult {
+    let addr = decode_address(&addr)?;
+    with_shared(&state, |sh| {
+        let free = sh.credit.free(&addr);
+        let bond = sh.credit.bond(&addr);
+        let positions: Vec<_> = sh
+            .credit
+            .live_positions()
+            .filter(|(_, p)| p.borrower == addr)
+            .map(|(id, p)| {
+                json!({
+                    "position_id": hash_to_hex(id),
+                    "amount_sat": p.amount_sat,
+                    "collateral_sat": p.collateral_sat,
+                    "state": match p.state {
+                        jnt_core::credit::PositionState::Drawn { .. } => "drawn",
+                        jnt_core::credit::PositionState::Repaid { .. } => "repaid",
+                        jnt_core::credit::PositionState::Defaulted { .. } => "defaulted",
+                    },
+                })
+            })
+            .collect();
+        Ok(Json(json!({
+            "address": address_to_hex(&addr),
+            "free_balance": free,
+            "bond": bond,
+            "positions": positions,
+        })))
+    })?
+}
+
+// ---------------------------------------------------------------------------
+// Item 4: conditional escrow with contract-selected arbitrators (non-consensus
+// state machine; coin release reuses the normal L1 exit path).
+// ---------------------------------------------------------------------------
+#[derive(Deserialize)]
+struct EscrowOpenReq {
+    network_id: String,
+    payer: String,
+    /// The payer's BLS public key — bound into the escrow so a mutual release
+    /// can only be signed by the actual party, not any key the releaser names.
+    payer_bls: String,
+    payee: String,
+    /// The payee's BLS public key.
+    payee_bls: String,
+    /// The arbitrator's 48-byte BLS public key, hex. Contract-selected.
+    arbitrator: String,
+    amount_sat: u64,
+    nonce: u64,
+}
+
+/// `POST /v1/escrow/open` — open an escrow naming a chosen arbitrator. The node
+/// records the state machine only; the locked value still comes from the payer's
+/// L1/L2 balance at settlement, not from this call.
+async fn escrow_open(State(state): State<ApiState>, Json(req): Json<EscrowOpenReq>) -> ApiResult {
+    let payer = decode_address(&req.payer)?;
+    let payee = decode_address(&req.payee)?;
+    let payer_key = decode_public_key(&req.payer_bls, "payer_bls")?;
+    let payee_key = decode_public_key(&req.payee_bls, "payee_bls")?;
+    let arbitrator = decode_public_key(&req.arbitrator, "arbitrator")?;
+    let escrow = jnt_core::escrow::ConditionalEscrow::open(
+        req.network_id.clone(),
+        payer,
+        payer_key,
+        payee,
+        payee_key,
+        arbitrator,
+        req.amount_sat,
+        req.nonce,
+    )
+    .map_err(|e| fail(StatusCode::BAD_REQUEST, "escrow_refused", e.to_string()))?;
+    let id = escrow.id();
+    with_shared(&state, |sh| {
+        if sh.escrows.contains_key(&id) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "escrow_exists",
+                "an escrow with this id already exists",
+            ));
+        }
+        sh.escrows.insert(id, escrow);
+        Ok(Json(json!({ "escrow_id": hash_to_hex(&id) })))
+    })?
+}
+
+/// `GET /v1/escrow/{id}` — escrow state, or 404.
+async fn escrow_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    let id = decode_hash(&id)?;
+    with_shared(&state, |sh| match sh.escrows.get(&id) {
+        Some(e) => Ok(Json(json!({
+            "escrow_id": hash_to_hex(&id),
+            "payer": address_to_hex(&e.payer),
+            "payee": address_to_hex(&e.payee),
+            "amount_sat": e.amount_sat,
+            "state": escrow_state_name(&e.state),
+        }))),
+        None => Err(fail(StatusCode::NOT_FOUND, "not_found", "no such escrow")),
+    })?
+}
+
+fn escrow_state_name(s: &jnt_core::escrow::EscrowState) -> &'static str {
+    match s {
+        jnt_core::escrow::EscrowState::Open => "open",
+        jnt_core::escrow::EscrowState::ReleasedMutual { .. } => "released_mutual",
+        jnt_core::escrow::EscrowState::ReleasedArbiter { .. } => "released_arbiter",
+        jnt_core::escrow::EscrowState::Finalized { .. } => "finalized",
+    }
+}
+
+#[derive(Deserialize)]
+struct EscrowReleaseReq {
+    /// One of "arbiter" or "mutual".
+    mode: String,
+    /// Arbiter release: a single 96-byte BLS signature.
+    arbiter_sig_hex: Option<String>,
+    /// Mutual release: two 96-byte BLS signatures, in payer-then-payee order.
+    mutual_sigs_hex: Option<Vec<String>>,
+}
+
+/// `POST /v1/escrow/{id}/release` — release a live escrow. `arbiter` mode
+/// requires a signature from the designated arbitrator; `mutual` requires both
+/// parties. The released state is recorded but the coin move is deferred to
+/// settlement (§19.4).
+async fn escrow_release(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<EscrowReleaseReq>,
+) -> ApiResult {
+    let id = decode_hash(&id)?;
+    let sig_to_bls = |h: Option<&String>| {
+        let h = h.ok_or_else(|| bad("signature hex required"))?;
+        let b = decode_hex_bytes(h, "signature")?;
+        let mut s = [0u8; 96];
+        if b.len() != 96 {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "escrow_refused",
+                "signature must be 96 hex bytes",
+            ));
+        }
+        s.copy_from_slice(&b);
+        Ok(jnt_core::bls_checkpoint::BlsSignature(s))
+    };
+    let keys = jnt_core::escrow::RealBls;
+    with_shared(&state, |sh| {
+        let escrow = sh
+            .escrows
+            .get_mut(&id)
+            .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such escrow"))?;
+        match req.mode.as_str() {
+            "arbiter" => {
+                let sig = sig_to_bls(req.arbiter_sig_hex.as_ref())?;
+                escrow
+                    .verify_arbiter_release(&sig, &keys)
+                    .map_err(|e| fail(StatusCode::CONFLICT, "escrow_refused", e.to_string()))?;
+                escrow.state = jnt_core::escrow::EscrowState::ReleasedArbiter {
+                    at_height: sh.chain.height(),
+                };
+                Ok(Json(json!({ "escrow_id": hash_to_hex(&id), "state": "released_arbiter" })))
+            }
+            "mutual" => {
+                let sigs_hex = req
+                    .mutual_sigs_hex
+                    .ok_or_else(|| bad("mutual_sigs_hex required"))?;
+                if sigs_hex.len() != 2 {
+                    return Err(fail(
+                        StatusCode::BAD_REQUEST,
+                        "escrow_refused",
+                        "a mutual release needs exactly two signatures",
+                    ));
+                }
+                let sig_objs: Vec<_> = sigs_hex
+                    .iter()
+                    .map(|h| sig_to_bls(Some(h)))
+                    .collect::<Result<_, _>>()?;
+                // Mutual release is verified against the keys the escrow bound
+                // at open time; the request only supplies the signatures.
+                escrow
+                    .verify_mutual_release(&sig_objs, &[escrow.payer_key, escrow.payee_key], &keys)
+                    .map_err(|e| fail(StatusCode::CONFLICT, "escrow_refused", e.to_string()))?;
+                escrow.state = jnt_core::escrow::EscrowState::ReleasedMutual {
+                    at_height: sh.chain.height(),
+                };
+                Ok(Json(json!({ "escrow_id": hash_to_hex(&id), "state": "released_mutual" })))
+            }
+            other => Err(fail(
+                StatusCode::BAD_REQUEST,
+                "escrow_refused",
+                format!("unknown release mode: {other}"),
+            )),
+        }
+    })?
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 pub fn router(state: ApiState) -> Router {
@@ -1328,10 +1720,16 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/vwc/{task_id}", get(vwc_by_task))
         .route("/v1/reputation/{id}", get(reputation_get))
         .route("/v1/authorize", post(authorize))
+        .route("/v1/policy/revoke", post(policy_revoke))
         .route("/v1/payment/submit", post(payment_submit))
         .route("/v1/payment/{payment_id}", get(payment_get))
         .route("/v1/receipt", post(receipt_submit))
         .route("/v1/receipt/{receipt_id}", get(receipt_get))
+        .route("/v1/credit/deposit", post(credit_deposit))
+        .route("/v1/credit/balance/{address}", get(credit_balance))
+        .route("/v1/escrow/open", post(escrow_open))
+        .route("/v1/escrow/{id}/release", post(escrow_release))
+        .route("/v1/escrow/{id}", get(escrow_get))
         .route("/v1/exit/crankable", get(exit_crankable))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
