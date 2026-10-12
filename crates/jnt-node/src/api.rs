@@ -75,6 +75,7 @@ use std::sync::{Arc, Mutex};
 
 use jnt_core::agent::{derive_agent_id, AgentRole};
 use jnt_core::chain::Chain;
+use jnt_core::credit::CreditGate;
 use jnt_core::fees;
 use jnt_core::hash::{address_from_hex, address_to_hex, hash_from_hex, hash_to_hex, Address, Hash};
 use jnt_core::l2::L2Transaction;
@@ -110,6 +111,13 @@ pub struct SharedNode {
     pub payment_tracker: PaymentTracker,
     /// Payment id -> payment, same cap as the tracker.
     pub payment_store: BTreeMap<Hash, MachinePayment>,
+    /// Admission-time credit reservation keyed by payment id. Consumed when the
+    /// matching `ServiceReceipt` is accepted (roadmap item 10 / §19.4): that is
+    /// the settlement event, so the credit debit is committed here rather than
+    // at admission. Pre-credit nodes wire `NoCreditGate`, which yields a zero-id
+    // reservation whose settle is a no-op, so this stays safe when credit is
+    // unconfigured.
+    pub reservations: BTreeMap<Hash, jnt_core::credit::Reservation>,
     /// Policy accounting for `POST /v1/authorize`.
     pub policies: jnt_core::agent::PolicyBook,
     /// Credit book for `POST /v1/credit/*`: free balances, posted bonds and
@@ -117,6 +125,13 @@ pub struct SharedNode {
     /// a payment can only be committed if the payer's line covers it, but the
     /// coin itself still moves through the ordinary §1 UTXO path later.
     pub credit: jnt_core::credit::CreditBook,
+    /// Delegation link book (roadmap item 3). Node-local authority for who
+    /// descends from whom: the policy layer is not a consensus rule (SPEC §18.2.1
+    /// / D4), but the engine that *issued* the policies must be the one that
+    /// registers their parent links, so a delegation is auditable against the
+    /// lineage that was actually permitted. `link` enforces domination on every
+    /// field and the depth cap in the same pass, reusing `delegation::dominates`.
+    pub delegations: jnt_core::delegation::DelegationBook,
     /// Conditional-escrow store for Item 4 (contract-selected arbitrators).
     /// Non-consensus: the ledger tracks the state machine, and the actual coin
     /// release reuses the §1 L1 exit / §19.4 path.
@@ -156,13 +171,28 @@ impl SharedNode {
             receipts: ReceiptBook::default(),
             payment_tracker: PaymentTracker::default(),
             payment_store: BTreeMap::new(),
+            reservations: BTreeMap::new(),
             policies: jnt_core::agent::PolicyBook::default(),
             credit: jnt_core::credit::CreditBook::new(),
+            delegations: jnt_core::delegation::DelegationBook::new(),
             escrows: BTreeMap::new(),
             policy_registry: BTreeMap::new(),
             revoked_policies: BTreeSet::new(),
             tx_to_relay: Vec::new(),
             l2_to_include: Vec::new(),
+        }
+    }
+
+    /// Advance escrows whose release has matured under finality to `Finalized`
+    /// (roadmap item 10, §19.4). Called each serve-loop tick so a released
+    /// escrow becomes settleable without an extra client round-trip; it is also
+    /// safe to call from read paths because it is idempotent and pure height
+    /// math (no coin moves — finality is a ledger height-stamp only).
+    pub fn advance_escrow_finality(&mut self) {
+        let now = self.chain.height();
+        let activation = self.chain.params().finality_activation_height;
+        for escrow in self.escrows.values_mut() {
+            let _ = escrow.finalize(now, activation);
         }
     }
 }
@@ -238,7 +268,10 @@ fn decode_hex_bytes(s: &str, what: &str) -> Result<Vec<u8>, (StatusCode, Json<Er
 }
 
 /// Parse and length-check a 48-byte BLS public key hex string.
-fn decode_public_key(s: &str, what: &str) -> Result<jnt_core::bls_checkpoint::BlsPublicKey, (StatusCode, Json<ErrorBody>)> {
+fn decode_public_key(
+    s: &str,
+    what: &str,
+) -> Result<jnt_core::bls_checkpoint::BlsPublicKey, (StatusCode, Json<ErrorBody>)> {
     let raw = decode_hex_bytes(s, what)?;
     let mut key = [0u8; 48];
     if raw.len() != 48 {
@@ -1201,6 +1234,63 @@ async fn authorize(State(state): State<ApiState>, Json(req): Json<AuthorizeReq>)
     })?
 }
 
+#[derive(Deserialize)]
+struct DelegationLinkReq {
+    /// The parent policy bytes: the delegator whose authority is being narrowed.
+    parent_policy_hex: String,
+    /// The child policy bytes: the delegate, already dominated by `parent`.
+    child_policy_hex: String,
+}
+
+/// `POST /v1/delegation/link` — register a parent→child delegation link through
+/// the node's lineage authority.
+///
+/// Delegation is a policy-layer narrowing (SPEC §18.2.1), not a consensus rule,
+/// but the engine that issued the policies is the only party that may attest to
+/// a lineage. Registering here is optional for admission — a chain is still
+/// validated by `delegation::assert_chain` wherever it is presented — and the
+/// link book is node-local so a refusal never changes a block's validity.
+async fn delegation_link(
+    State(state): State<ApiState>,
+    Json(req): Json<DelegationLinkReq>,
+) -> ApiResult {
+    let parent_bytes = decode_hex_bytes(&req.parent_policy_hex, "parent_policy")?;
+    let child_bytes = decode_hex_bytes(&req.child_policy_hex, "child_policy")?;
+    let parent = jnt_core::agent::SpendPolicy::deserialize(&parent_bytes)
+        .map_err(|e| bad(format!("parent_policy: {e}")))?;
+    let child = jnt_core::agent::SpendPolicy::deserialize(&child_bytes)
+        .map_err(|e| bad(format!("child_policy: {e}")))?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        // Lineage only makes sense within one network; a cross-network link is
+        // refused by `dominates` as `NetworkMismatch`, which is the right error.
+        if parent.network_id != network || child.network_id != network {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "delegation_refused",
+                "delegation must be scoped to this node's network",
+            ));
+        }
+        match sh.delegations.link(&parent, &child) {
+            Ok(()) => {
+                // Let admission resolve the child as a known policy, the same way
+                // `/v1/authorize` records a granted policy under its hash.
+                sh.policy_registry.insert(child.hash(), child.clone());
+                Ok(Json(json!({
+                    "linked": true,
+                    "child_policy_hash": hash_to_hex(&child.hash()),
+                    "depth": sh.delegations.depth_of(&child),
+                })))
+            }
+            Err(e) => Err(fail(
+                StatusCode::CONFLICT,
+                "delegation_refused",
+                format!("{:?}", e),
+            )),
+        }
+    })?
+}
+
 fn session_err(e: SessionError) -> (StatusCode, Json<ErrorBody>) {
     // Refusals by the policy engine are conflicts (the policy said no);
     // malformed material is a client error. Both are non-2xx; the detail
@@ -1323,7 +1413,7 @@ async fn payment_submit(
                     sigs: &auth_sigs,
                     keys: &auth_keys,
                 };
-                jnt_core::service::admit_payment(
+                let reservation = jnt_core::service::admit_payment(
                     &sh.policies,
                     &policy,
                     &payment,
@@ -1333,6 +1423,10 @@ async fn payment_submit(
                     &mut sh.credit,
                 )
                 .map_err(session_err)?;
+                // Hold the reservation until the receipt settles it (§19.4). A
+                // duplicate payment resubmit is idempotent, so this overwrites
+                // any identical id with the same reservation.
+                sh.reservations.insert(id, reservation);
             }
             None => {
                 return Err(fail(
@@ -1380,13 +1474,33 @@ async fn receipt_submit(
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         match sh.receipts.accept(&receipt, &network) {
-            Ok(outcome) => Ok(Json(json!({
-                "receipt_id": hash_to_hex(&receipt.receipt_id()),
-                "outcome": match outcome {
-                    ReceiptOutcome::Inserted => "inserted",
-                    ReceiptOutcome::Duplicate => "duplicate",
-                },
-            }))),
+            Ok(outcome) => {
+                // Settlement event (roadmap item 10 / §19.4): the receipt
+                // commits the admission-time credit reservation into a real
+                // debit against the payer's credit line. `NoCreditGate` yields a
+                // zero-id reservation whose settle is a no-op, so this is safe
+                // when credit is unconfigured. The matching reservation is
+                // consumed once so a re-submitted receipt cannot double-debit.
+                if let Some(reservation) = sh.reservations.remove(&receipt.payment_id) {
+                    if let Err(e) = sh.credit.settle(&reservation) {
+                        return Err(fail(
+                            StatusCode::CONFLICT,
+                            "credit_settle_failed",
+                            format!(
+                                "receipt {} accepted but credit settlement failed: {e}",
+                                hash_to_hex(&receipt.receipt_id())
+                            ),
+                        ));
+                    }
+                }
+                Ok(Json(json!({
+                    "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                    "outcome": match outcome {
+                        ReceiptOutcome::Inserted => "inserted",
+                        ReceiptOutcome::Duplicate => "duplicate",
+                    },
+                })))
+            }
             Err(jnt_core::receipt::ReceiptError::PaymentConflict { existing }) => Err(fail(
                 StatusCode::CONFLICT,
                 "receipt_conflict",
@@ -1588,15 +1702,21 @@ async fn escrow_open(State(state): State<ApiState>, Json(req): Json<EscrowOpenRe
 /// `GET /v1/escrow/{id}` — escrow state, or 404.
 async fn escrow_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     let id = decode_hash(&id)?;
-    with_shared(&state, |sh| match sh.escrows.get(&id) {
-        Some(e) => Ok(Json(json!({
-            "escrow_id": hash_to_hex(&id),
-            "payer": address_to_hex(&e.payer),
-            "payee": address_to_hex(&e.payee),
-            "amount_sat": e.amount_sat,
-            "state": escrow_state_name(&e.state),
-        }))),
-        None => Err(fail(StatusCode::NOT_FOUND, "not_found", "no such escrow")),
+    with_shared(&state, |sh| {
+        // Refresh finality first (borrows all escrows mutably), then read —
+        // done in this order so the GET reflects a matured release as Finalized
+        // without a second mutable borrow overlapping the lookup.
+        sh.advance_escrow_finality();
+        match sh.escrows.get(&id) {
+            Some(e) => Ok(Json(json!({
+                "escrow_id": hash_to_hex(&id),
+                "payer": address_to_hex(&e.payer),
+                "payee": address_to_hex(&e.payee),
+                "amount_sat": e.amount_sat,
+                "state": escrow_state_name(&e.state),
+            }))),
+            None => Err(fail(StatusCode::NOT_FOUND, "not_found", "no such escrow")),
+        }
     })?
 }
 
@@ -1658,7 +1778,9 @@ async fn escrow_release(
                 escrow.state = jnt_core::escrow::EscrowState::ReleasedArbiter {
                     at_height: sh.chain.height(),
                 };
-                Ok(Json(json!({ "escrow_id": hash_to_hex(&id), "state": "released_arbiter" })))
+                Ok(Json(
+                    json!({ "escrow_id": hash_to_hex(&id), "state": "released_arbiter" }),
+                ))
             }
             "mutual" => {
                 let sigs_hex = req
@@ -1683,7 +1805,9 @@ async fn escrow_release(
                 escrow.state = jnt_core::escrow::EscrowState::ReleasedMutual {
                     at_height: sh.chain.height(),
                 };
-                Ok(Json(json!({ "escrow_id": hash_to_hex(&id), "state": "released_mutual" })))
+                Ok(Json(
+                    json!({ "escrow_id": hash_to_hex(&id), "state": "released_mutual" }),
+                ))
             }
             other => Err(fail(
                 StatusCode::BAD_REQUEST,
@@ -1720,6 +1844,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/vwc/{task_id}", get(vwc_by_task))
         .route("/v1/reputation/{id}", get(reputation_get))
         .route("/v1/authorize", post(authorize))
+        .route("/v1/delegation/link", post(delegation_link))
         .route("/v1/policy/revoke", post(policy_revoke))
         .route("/v1/payment/submit", post(payment_submit))
         .route("/v1/payment/{payment_id}", get(payment_get))

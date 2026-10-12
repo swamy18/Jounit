@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -92,20 +94,39 @@ jobs:
           fi
           cat SHA256SUMS
 
+      # Keyless signing (cosign/OIDC). No long-lived private key is stored in
+      # the repo or its secrets: cosign mints an ephemeral key pair from the
+      # GitHub OIDC identity and uploads the attestation to the Sigstore
+      # transparency log. `mainnet-readiness.md` §7: operators verify against
+      # the SHA256SUMS + the Sigstore bundle, not a Jounit-held signing key.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-version: "latest"
+
+      - name: Sign binary
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          cosign sign-blob --bundle "${{ matrix.artifact }}.sig" \
+            --yes "${{ matrix.artifact }}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: jnt-node-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/${{ matrix.artifact }}
             target/${{ matrix.target }}/release/SHA256SUMS
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}.sig
           if-no-files-found: error
 
-  publish:
-    name: publish
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+publish:
+  name: publish
+  needs: build
+  runs-on: ubuntu-latest
+  permissions:
+    contents: write
+    id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -120,11 +141,18 @@ jobs:
         shell: bash
         run: |
           {
-            echo 'No release artifacts are signed. This is a deliberate gap,'
-            echo 'not an omission: signing needs a published key, and none is'
-            echo 'published yet (docs/mainnet-readiness.md §4). Verify each'
-            echo 'binary against the SHA256SUMS shipped beside it and build it'
-            echo 'yourself from source if the checksum is not enough.'
+            echo 'Release artifacts are signed keyless with cosign (OIDC identity)'
+            echo 'from this GitHub Actions run — no long-lived signing key is stored'
+            echo 'in the repository. See docs/mainnet-readiness.md §7.'
+            echo
+            echo 'Verification:'
+            echo
+            echo '  1. Fetch the binary and its .sig bundle for your platform from the'
+            echo '     GitHub Release assets.'
+            echo '  2. Verify the SHA-256 checksum:'
+            echo '       sha256sum -c SHA256SUMS'
+            echo '  3. Verify the sigstore bundle (cosign 2.x):'
+            echo '       cosign verify-blob --bundle <binary>.sig <binary>'
             echo
             echo 'Checksums:'
             cat dist/SHA256SUMS

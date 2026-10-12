@@ -683,7 +683,7 @@ applies.
 | Dispute engine + canonical reference | **Shipped** | Reference computed by the engine, never supplied |
 | Arbitration vote transport | **Shipped** | Signed, relayed, tallied, quorum-checked |
 | **Arbitrator key custody** | **Decided (Decision 9)** | The arbitration quorum is organisational (run by Jounit operators). Separately, conditional *escrow* release names a contract-selected independent BLS arbitrator per escrow — no Jounit-held release key. |
-| **Slash transaction for vote equivocation** | **Not built** | Evidence is recorded; the slash path is not wired |
+| **Slash transaction for vote equivocation** | **Wired** | `TX_SLASH` (two conflicting, same-height, shared-signer checkpoints) verifies via `check_slash_tx` (`bond.rs`), is admitted by the mempool (`admit_stake_tx`) and applied in `apply_state_tx`: the bond is removed and 50% of its value burns in the M2 vault immediately, 50% vests to the PSCB reserve (`slash.rs`). A node API to *build* a slash tx is not exposed (submit it like any stake tx) |
 | Verified Work Certificates | **Shipped** | `Quorum` verifiable; `WindowElapsed` refused by `validate_verified` |
 | Bonded stake, unbonding, slashing | **Shipped** | 15 attack-first tests |
 | Checkpoint signing | **Shipped** | 18 unit + 6 cross-node tests |
@@ -692,26 +692,36 @@ applies.
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
 | **Escrowed service contracts** | **In development** | The general contract and its transitions; one non-compute deliverable shipping |
-| **Agent credit** | **In development** | Terms, position lifecycle, deadlines and a conservation-checked credit book; not yet wired to a caller |
+| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; the capacity check is enforced. The *debit commit* is deferred to §19.4 coin settlement (Item 10), so admission over-reserves and the debit lands only when funding moves |
 | **Delegation chains** | **In development** | Narrowing rule, sub-agent derivation and the link book; not wired into any consensus path |
 | **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. Coin settlement is Item 10. |
 | **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |
 | M3 compute IR | Provides the reference | Envelopes carried, no interpreter |
-| M4 HBM puzzle | **Deliberately unregistered** | See below |
+| M4 HBM puzzle | **Registered (off on mainnet)** | `hbm_pow.rs` scratchpad PoW is registered as `puzzle_id = 2` (reviewed in `docs/security-review-hbm-2026-10-12.md`); `Chain::pow_satisfies` dispatches by puzzle id. `mini`/`testnet` keep mining `puzzle_id = 1` (hybrid); M4 is recognized but not activated as the mining puzzle |
 | M5 finality | **Off on mainnet** | Both sides built; activation unset |
 | REST API, `/metrics` | **Shipped** | Opt-in, loopback, unauthenticated |
 | Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, **unsigned** |
-| **Independent security review** | **Not done** | Cannot be self-certified |
+| **Independent security review** | **In progress** | A focused self-review of the HBM permutation gates M4 registration (`docs/security-review-hbm-2026-10-12.md`); a third-party audit is still required before mainnet |
 
-### Why M4 is off, deliberately
+### Why M4 is registered but not activated
 
-`hbm_pow.rs` implements the memory-hard permutation, its parameter scaling and
-ten tests. It is **not** registered as a `puzzle_id`, so it validates nothing.
-Registering it would change the consensus puzzle without an independent security
-review of the memory parameters â€” that is not a mistake worth making before a
-review. Base PoW (`puzzle_id = 1`) is the active mechanism.
+`hbm_pow.rs` implements the memory-bound scratchpad permutation, its parameter
+scaling, the `test()`/`production()` configs and the unit tests. It is now
+**registered as `puzzle_id = 2`** in `PuzzleRegistry::genesis()`, and
+`Chain::pow_satisfies` dispatches PoW verification: `puzzle_id = 1` uses the
+§5 hybrid `PuzzleSolver`; `puzzle_id = 2` verifies the HBM scratchpad proof
+against the network's `HbmConfig`. Registration was gated on the focused
+security review in `docs/security-review-hbm-2026-10-12.md`.
+
+M4 is **recognized but not the active mining puzzle**: `mini`/`testnet` mine
+`puzzle_id = 1`, and mainnet mining of HBM is not switched on. Switching a
+profile to `puzzle_id = 2` is a consensus choice that lives in the launch
+decision, not in this code change. An unregistered `puzzle_id` is rejected
+structurally (`Chain::submit` returns `UnknownPuzzle`) before any proof is
+read.
+
 
 ---
 
@@ -732,7 +742,7 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **Settle fee** | A flat fee a small escrow could not cover, failing closed | **Proportional** (Decision 23): 0.1% of task value, 1 000-sat minimum |
 | **L1/L2 disagreement** | An exit claim with no L2 record was caught only by `debug_assert`, which compiles out of release builds | **Recorded as `UnbackedClaim`** and exposed, so a release build reports the divergence |
 | **Unchallenged results** | A wrong unchallenged result produced a certificate that `validate()` accepted with no signal | **`asserts_correctness()` / `validate_verified`** make the weak basis unmissable |
-| **HBM** | Unregistered, unspecified | Unregistered **by decision**, with the reason recorded â€” an open item, not an omission |
+| **HBM** | Registered but not the active mining puzzle | Registered as `puzzle_id = 2` with a security review; `mini`/`testnet`/mainnet still mine `puzzle_id = 1` (hybrid), so registration is an open item made safe, not a mainnet-readiness change |
 
 ---
 

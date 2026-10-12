@@ -1286,6 +1286,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             None => {}
         }
 
+        // Item 10 / §19.4: advance released escrows whose release has matured
+        // under the finality window to Finalized. Pure height math — no coin
+        // moves — so it is safe to run on every tick alongside the mine step.
+        sh.advance_escrow_finality();
+
         // Mine one block if we have a miner wallet. `mine_from_pool` selects
         // from the pool and evicts what the *canonical* chain confirms; the
         // L2 queue only matters when the API has actually received L2

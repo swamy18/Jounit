@@ -871,10 +871,15 @@ fn committee_is_derived_by_stake_topn_not_bond_order() {
     // And it must be sorted by the ValidatorRecord total order (key-first).
     let mut canonical = set_keys.clone();
     canonical.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    assert_eq!(set_keys, canonical, "epoch set must be in canonical key order");
+    assert_eq!(
+        set_keys, canonical,
+        "epoch set must be in canonical key order"
+    );
     // stake_sat is the bonded value; stake_address is the identity, never zero.
     assert!(
-        set.validators.iter().all(|v| v.stake_address != Address::default()),
+        set.validators
+            .iter()
+            .all(|v| v.stake_address != Address::default()),
         "stake_address must bind to the bond identity, not zero"
     );
     assert!(

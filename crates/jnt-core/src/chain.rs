@@ -23,10 +23,11 @@ use crate::exit::ExitClaim;
 use crate::fees::{next_base_fee, required_fee, split_fees, FeeSplit};
 use crate::finality::{FinalityError, FinalityManager};
 use crate::hash::{Address, Hash, DOM_BLOCK};
+use crate::hbm_pow;
 use crate::ledger::{check_tx, Undo, Utxo, UtxoSet};
 use crate::mempool::{Mempool, ReconcileReport};
 use crate::params::NetworkParams;
-use crate::puzzle::{PuzzleRegistry, PuzzleSolver, PuzzleSpec};
+use crate::puzzle::{PuzzleKind, PuzzleRegistry, PuzzleSolver, PuzzleSpec};
 use crate::slash::SlashVault;
 use crate::supply::{
     block_reward_sat, check_mint_at_height, cumulative_issuance_sat, max_issuance_sat,
@@ -341,6 +342,35 @@ impl Chain {
         self.registry.get(id)
     }
 
+    /// Dispatch PoW verification by the header's `puzzle_id`.
+    ///
+    /// `puzzle_id == 1` uses the cached hybrid `PuzzleSolver` (§5); `puzzle_id == 2`
+    /// verifies the M4 HBM scratchpad proof against the network's `hbm` config.
+    /// Unknown ids are rejected structurally by `puzzle_for` first. This is the
+    /// single authority for PoW acceptance so `check_block` and `mine_block`
+    /// can never disagree on what a valid proof is.
+    fn pow_satisfies(&mut self, header: &crate::block::Header) -> Result<bool> {
+        let spec = self.puzzle_for(header.puzzle_id)?;
+        match spec.kind {
+            PuzzleKind::Hybrid => {
+                // The cached solver must be the hybrid spec; the hybrid puzzle
+                // is the only one that caches epoch-derived NN weights.
+                if spec.id != self.solver.spec().id {
+                    return Err(Error::BadPuzzleSpec(format!(
+                        "solver holds puzzle {} but the header names {}",
+                        self.solver.spec().id,
+                        header.puzzle_id
+                    )));
+                }
+                self.solver.satisfies(header)
+            }
+            PuzzleKind::Hbm => {
+                let res = hbm_pow::hbm_satisfies_cfg(header, header.difficulty, &self.params.hbm)?;
+                Ok(res)
+            }
+        }
+    }
+
     /// Cumulative PoW difficulty along the chain ending at `hash`.
     ///
     /// Recorded incrementally at insert time as `parent_work + difficulty`, so
@@ -411,7 +441,6 @@ impl Chain {
             return Err(Error::BadMerkleRoot);
         }
 
-        let spec = self.puzzle_for(block.header.puzzle_id)?;
         let expected_epoch = block.header.expected_epoch(self.params.nn_epoch_blocks);
         if block.header.epoch_id != expected_epoch {
             return Err(Error::BadEpoch {
@@ -467,14 +496,11 @@ impl Chain {
             ));
         }
 
-        // The cached solver must agree with the registry entry it stands in for.
-        if spec.id != self.solver.spec().id {
-            return Err(Error::BadPuzzleSpec(format!(
-                "solver holds puzzle {} but the header names {}",
-                spec.id, block.header.puzzle_id
-            )));
-        }
-        if !self.solver.satisfies(&block.header)? {
+        // Proof of work. `puzzle_for` (called inside `pow_satisfies`) rejects
+        // any puzzle_id the registry does not know; the hybrid solver is used
+        // for id 1, the HBM scratchpad path for id 2. Mining and validation
+        // share this single rule.
+        if !self.pow_satisfies(&block.header)? {
             return Err(Error::PowInvalid {
                 hash: crate::hash::hash_to_hex(&block.block_hash()),
                 difficulty: block.header.difficulty,
@@ -724,7 +750,7 @@ impl Chain {
         // the canonical ledger.
         self.finality.set_keys(self.committee_keys());
         self.finality.refresh_committee(
-            &            self.committee_records(),
+            &self.committee_records(),
             self.height(),
             self.params.checkpoint_interval_blocks,
             crate::validators::EPOCH_LOOKBACK_DEFAULT,
@@ -948,10 +974,7 @@ impl Chain {
 
     /// Current epoch on this branch, for committee derivation.
     pub fn epoch_of(&self) -> u64 {
-        crate::validators::epoch_of(
-            self.height(),
-            self.params.checkpoint_interval_blocks,
-        )
+        crate::validators::epoch_of(self.height(), self.params.checkpoint_interval_blocks)
     }
 
     /// Read-only access to the bond ledger (mempool admission, views).
@@ -1268,7 +1291,7 @@ impl Chain {
         // set moves with it before any checkpoint is validated.
         self.finality.set_keys(self.committee_keys());
         self.finality.refresh_committee(
-            &            self.committee_records(),
+            &self.committee_records(),
             self.height(),
             self.params.checkpoint_interval_blocks,
             crate::validators::EPOCH_LOOKBACK_DEFAULT,
@@ -1619,7 +1642,7 @@ impl Chain {
         // the node regardless of the cap its caller had asked for.
         for _ in 0..max_attempts {
             header.nonce = nonce;
-            if self.solver.satisfies(&header)? {
+            if self.pow_satisfies(&header)? {
                 return Ok(Block {
                     header,
                     signature: [0u8; 64],

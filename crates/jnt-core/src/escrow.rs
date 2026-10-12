@@ -40,7 +40,7 @@
 //! key, and no on-chain registry of "approved arbitrators" — the contract
 //! itself is the registry.
 
-use crate::bls::{self, SecretKey, BlsError};
+use crate::bls::{self, BlsError, SecretKey};
 use crate::bls_checkpoint::{BlsPublicKey, BlsSignature};
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Address, Hash};
@@ -120,26 +120,26 @@ impl ConditionalEscrow {
     /// arbitrator ‖ amount ‖ nonce)`. Deterministic, contract-unique, and
     /// independent of the state — the id is stable across a release.
     pub fn id(&self) -> Hash {
-        sha256_dom(DOM_ESCROW, &[
-            self.network_id.as_bytes(),
-            &self.payer,
-            self.payer_key.as_bytes(),
-            &self.payee,
-            self.payee_key.as_bytes(),
-            self.arbitrator.as_bytes(),
-            &self.amount_sat.to_le_bytes(),
-            &self.nonce.to_le_bytes(),
-        ])
+        sha256_dom(
+            DOM_ESCROW,
+            &[
+                self.network_id.as_bytes(),
+                &self.payer,
+                self.payer_key.as_bytes(),
+                &self.payee,
+                self.payee_key.as_bytes(),
+                self.arbitrator.as_bytes(),
+                &self.amount_sat.to_le_bytes(),
+                &self.nonce.to_le_bytes(),
+            ],
+        )
     }
 
     /// The hash an arbitrator signs to release this escrow, or that both parties
     /// sign for a mutual release. Binds the decision to this escrow id and a
     /// verdict, so a signature over one escrow cannot release another.
     pub fn release_signing_hash(&self, verdict: EscrowVerdict) -> Hash {
-        sha256_dom(DOM_ESCROW, &[
-            &self.id(),
-            &[verdict as u8],
-        ])
+        sha256_dom(DOM_ESCROW, &[&self.id(), &[verdict as u8]])
     }
 
     /// Open an escrow, validating its fields.
@@ -223,7 +223,9 @@ impl ConditionalEscrow {
     pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
         let version = r.u8()?;
         if version != ESCROW_VERSION {
-            return Err(Error::Malformed("escrow version is not one this build reads"));
+            return Err(Error::Malformed(
+                "escrow version is not one this build reads",
+            ));
         }
         let net_len = <u64>::from_le_bytes(r.fixed()?);
         if net_len as usize > MAX_ESCROW_NETWORK_ID {
@@ -291,7 +293,9 @@ impl ConditionalEscrow {
             return Err(Error::Malformed("escrow is not live"));
         }
         if sigs.len() != 2 || keys.len() != 2 {
-            return Err(Error::Malformed("a mutual release needs exactly two signatures"));
+            return Err(Error::Malformed(
+                "a mutual release needs exactly two signatures",
+            ));
         }
         if keys[0] != self.payer_key || keys[1] != self.payee_key {
             return Err(Error::Malformed("keys do not match this escrow's parties"));
@@ -323,6 +327,34 @@ impl ConditionalEscrow {
             return Err(Error::Malformed("arbiter signature did not verify"));
         }
         Ok(())
+    }
+
+    /// Commit a released escrow to ledger finality (roadmap item 10, §19.4). A
+    /// `ReleasedMutual`/`ReleasedArbiter` transition is irreversible: once the
+    /// release has aged out of the `activation_height` finality window it is
+    /// `Finalized` at the release height, which is the settlement landing height
+    /// the L1 payout is keyed to. `Open` and already-`Finalized` states are
+    /// no-ops here (the call site walks every escrow each tick); the structural
+    /// rule that only a live escrow can release is enforced by the verify steps.
+    ///
+    /// Returns `Ok(true)` if this call finalized the escrow, `Ok(false)` if it
+    /// did not (not yet mature, or already terminal). The release `at_height`
+    /// is frozen into `Finalized { at_height }` and never rewritten by a later
+    /// `finalize`, so a re-call after finality is idempotent.
+    pub fn finalize(&mut self, now: u64, activation_height: u64) -> Result<bool> {
+        let release_height = match &self.state {
+            EscrowState::ReleasedMutual { at_height }
+            | EscrowState::ReleasedArbiter { at_height } => *at_height,
+            // Not releasable yet, or already committed: nothing to do.
+            EscrowState::Open | EscrowState::Finalized { .. } => return Ok(false),
+        };
+        if now < release_height.saturating_add(activation_height) {
+            return Ok(false);
+        }
+        self.state = EscrowState::Finalized {
+            at_height: release_height,
+        };
+        Ok(true)
     }
 }
 
@@ -358,8 +390,8 @@ pub fn derive_arbitrator_key(seed: &[u8; 32]) -> std::result::Result<SecretKey, 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::RealBls;
+    use super::*;
 
     fn key(seed: u8) -> (SecretKey, BlsPublicKey) {
         let sk = SecretKey::derive(&[seed; 32]).unwrap();
@@ -485,11 +517,18 @@ mod tests {
 
         // Three signatures are rejected outright by the arity rule.
         let three = e.verify_mutual_release(
-            &[payer_sk.sign(&msg), other_sk.sign(&msg), payee_sk.sign(&msg)],
+            &[
+                payer_sk.sign(&msg),
+                other_sk.sign(&msg),
+                payee_sk.sign(&msg),
+            ],
             &[payer_pk, payee_pk, payee_pk],
             &RealBls,
         );
-        assert!(three.is_err(), "a release without exactly two sigs must refuse");
+        assert!(
+            three.is_err(),
+            "a release without exactly two sigs must refuse"
+        );
 
         // And naming a key that is not this escrow's party is refused before
         // any pairing runs.
@@ -522,12 +561,52 @@ mod tests {
 
         // A signature from the designated arbitrator verifies under real BLS.
         let good = e.verify_arbiter_release(&arb_sk.sign(&msg), &RealBls);
-        assert!(good.is_ok(), "the designated arbitrator must be able to release");
+        assert!(
+            good.is_ok(),
+            "the designated arbitrator must be able to release"
+        );
 
         // A signature from any other key fails the pairing: the escrow binds the
         // arbitrator's public key at open time, and the wrong key's signature
         // cannot satisfy it.
         let bad = e.verify_arbiter_release(&sig, &RealBls);
         assert!(bad.is_err(), "a non-designated signer must be refused");
+    }
+
+    #[test]
+    fn finalize_idempotently_lands_a_matured_release_at_the_release_height() {
+        // A release with no activation window commits at its own height.
+        let (mut e, _p, _payee) = escrow();
+        let h = 10;
+        e.state = EscrowState::ReleasedArbiter { at_height: h };
+
+        assert!(e.finalize(h, 0).unwrap(), "finalizes at the release height");
+        assert!(
+            matches!(e.state, EscrowState::Finalized { at_height } if at_height == h),
+            "finalized height stamps the release height, not now"
+        );
+        // Idempotent: a second call on a Finalized state is a no-op.
+        assert!(!e.finalize(h + 5, 0).unwrap(), "already final");
+
+        // A window defers finalization until maturity.
+        let mut e2 = e.clone();
+        e2.state = EscrowState::ReleasedMutual { at_height: 20 };
+        assert!(
+            !e2.finalize(20, 20).unwrap(),
+            "not mature at release height"
+        );
+        assert!(
+            !e2.finalize(20 + 20 - 1, 20).unwrap(),
+            "one block short of the window is not final"
+        );
+        assert!(e2.finalize(20 + 20, 20).unwrap(), "matured at window end");
+        assert!(matches!(e2.state, EscrowState::Finalized { at_height: 20 }));
+
+        // Open is never finalizable.
+        let (mut e3, ..) = escrow();
+        assert!(
+            !e3.finalize(1_000, 0).unwrap(),
+            "open escrow does not finalize"
+        );
     }
 }

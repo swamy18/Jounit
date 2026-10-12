@@ -28,7 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jnt_core::agent::{
-    derive_agent_id, AgentRole, Authorization, PolicyBook, SpendPolicy, POLICY_VERSION,
+    derive_agent_id, derive_sub_agent_id, AgentRole, Authorization, PolicyBook, SpendPolicy,
+    POLICY_VERSION,
 };
 use jnt_core::block::GENESIS_TIMESTAMP_MS;
 use jnt_core::chain::Chain;
@@ -926,6 +927,44 @@ fn a_payment_is_admitted_only_when_the_payers_credit_covers_it() {
     assert_eq!(body["duplicate"], false);
 }
 
+#[test]
+fn a_settled_receipt_commits_the_credit_debit() {
+    // Admission reserves against the payer's line but does not move coins.
+    // Receipt acceptance is the settlement event (§19.4): that is when the
+    // credit debit commits, so the free balance drops by the paid amount.
+    let node = start();
+    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+    let payer_addr = wallet(61, "api-payer").address().unwrap();
+    let balance_path = format!("/v1/credit/balance/{}", address_to_hex(&payer_addr));
+
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 200, "{body}");
+
+    // Reservation is a hold, not a debit.
+    let (s, b) = get(&node, &balance_path);
+    assert_eq!(s, 200);
+    assert_eq!(
+        b["free_balance"], BRIDGE_AMOUNT_SAT,
+        "reserve holds but does not debit"
+    );
+
+    // Accepting the receipt settles the reservation → debit commits.
+    let (s, body) = post(
+        &node,
+        "/v1/receipt",
+        &serde_json::json!({ "receipt_hex": hex::encode(receipt.serialize()) }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["outcome"], "inserted");
+
+    let (s, b) = get(&node, &balance_path);
+    assert_eq!(s, 200);
+    assert_eq!(
+        b["free_balance"], 0,
+        "settlement debited the reserved amount"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // L2 broadcast (dry-run only — state changes only via canonical replay)
 // ---------------------------------------------------------------------------
@@ -1079,8 +1118,7 @@ use jnt_core::bls_checkpoint::BlsSignature;
 use jnt_core::escrow::{ConditionalEscrow, EscrowVerdict};
 
 #[test]
-fn escrow_open_records_then_refuses_an_unauthorized_arbiter_release_and_accepts_a_authorized_one(
-) {
+fn escrow_open_records_then_refuses_an_unauthorized_arbiter_release_and_accepts_a_authorized_one() {
     let node = start();
 
     // A contract-selected arbitrator: the escrow binds this key at open time.
@@ -1149,7 +1187,10 @@ fn escrow_open_records_then_refuses_an_unauthorized_arbiter_release_and_accepts_
             "arbiter_sig_hex": hex::encode(good_sig.0),
         }),
     );
-    assert_eq!(s, 200, "the designated arbiter must be able to release: {b}");
+    assert_eq!(
+        s, 200,
+        "the designated arbiter must be able to release: {b}"
+    );
     assert_eq!(b["state"], "released_arbiter");
 
     // A second release on the already-released escrow is refused (not open).
@@ -1163,16 +1204,17 @@ fn escrow_open_records_then_refuses_an_unauthorized_arbiter_release_and_accepts_
     );
     assert_eq!(s, 409, "a decided escrow must not be releasable: {b}");
 
-    // GET reflects the new state.
+    // GET reflects the new state. Under mini's depth-only finality
+    // (`finality_activation_height = 0`) a released escrow is also mature, so the
+    // GET path's `advance_escrow_finality` commits it to Finalized.
     let (s, b) = get(&node, &format!("/v1/escrow/{id_hex}"));
     assert_eq!(s, 200);
-    assert_eq!(b["state"], "released_arbiter");
+    assert_eq!(b["state"], "finalized");
     assert_eq!(b["amount_sat"], 1_000);
 }
 
 #[test]
-fn a_mutual_release_is_accepted_when_both_parties_sign_and_refused_when_one_is_missing(
-) {
+fn a_mutual_release_is_accepted_when_both_parties_sign_and_refused_when_one_is_missing() {
     let node = start();
     let arb_sk = BlsSecretKey::derive(&[5u8; 32]).unwrap();
     let arb_pk = arb_sk.public_key();
@@ -1277,4 +1319,183 @@ fn an_unknown_escrow_id_is_404_never_500() {
         &serde_json::json!({ "mode": "arbiter", "arbiter_sig_hex": hex::encode([0u8; 96]) }),
     );
     assert_eq!(s, 404, "a missing escrow must 404, not 500: {b}");
+}
+
+#[test]
+fn a_released_escrow_advances_to_finalized_under_finality() {
+    // The GET path and each serve-loop tick call `advance_escrow_finality`, so a
+    // released escrow whose release has aged out of the finality window must read
+    // as `finalized` — the ledger-only Finalized commit (Item 10 / §19.4) —
+    // without any additional client call. We drive the node state directly to
+    // isolate that transition from the (BLS-heavy) release-verification path,
+    // which the prior test already covers end-to-end.
+    use jnt_core::escrow::EscrowState;
+
+    let node = start();
+    let payer_addr = wallet(61, "escrow-payer").address().unwrap();
+    let payee_addr = wallet(62, "escrow-payee").address().unwrap();
+    let arb_pk = BlsSecretKey::derive(&[5u8; 32]).unwrap().public_key();
+    let payer_pk = BlsSecretKey::derive(&[7u8; 32]).unwrap().public_key();
+    let payee_pk = BlsSecretKey::derive(&[8u8; 32]).unwrap().public_key();
+
+    let e = ConditionalEscrow::open(
+        NET.to_string(),
+        payer_addr,
+        payer_pk,
+        payee_addr,
+        payee_pk,
+        arb_pk,
+        1_000,
+        1,
+    )
+    .unwrap();
+    let id = e.id();
+    {
+        let mut sh = node.shared.lock().unwrap();
+        sh.escrows.insert(id, e);
+        assert!(matches!(
+            sh.escrows.get(&id).unwrap().state,
+            EscrowState::Open
+        ));
+    }
+
+    // Open reads as `open`.
+    let (s, b) = get(&node, &format!("/v1/escrow/{}", hash_to_hex(&id)));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["state"], "open");
+
+    // Release the escrow in ledger state, then advance finality. The mini
+    // network sets `finality_activation_height = 0` for mainnet-equivalent
+    // finality, so a release commits to Finalized at its own height.
+    {
+        let mut sh = node.shared.lock().unwrap();
+        let h = sh.chain.height();
+        let esc = sh.escrows.get_mut(&id).unwrap();
+        esc.state = EscrowState::ReleasedArbiter { at_height: h };
+        sh.advance_escrow_finality();
+        assert!(
+            matches!(
+                sh.escrows.get(&id).unwrap().state,
+                EscrowState::Finalized { .. }
+            ),
+            "matured release must finalize"
+        );
+    }
+
+    // The GET reflects Finalized without the caller driving it.
+    let (s, b) = get(&node, &format!("/v1/escrow/{}", hash_to_hex(&id)));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["state"], "finalized");
+    assert_eq!(b["amount_sat"], 1_000);
+}
+
+fn parent_policy() -> SpendPolicy {
+    // A wide-enough root that a narrowed child is meaningfully dominated.
+    let owner = wallet(50, "deleg-parent");
+    let owner_addr = owner.address().unwrap();
+    SpendPolicy {
+        version: POLICY_VERSION,
+        network_id: NET.to_string(),
+        agent_id: derive_agent_id(NET, AgentRole::Machine, &owner_addr),
+        owner: owner_addr,
+        role: AgentRole::Machine,
+        per_tx_max_sat: 1_000,
+        window_blocks: 100,
+        cumulative_max_sat: 5_000,
+        allowed_recipients: vec![[1u8; 20], [2u8; 20]],
+        allowed_services: vec![[4u8; 32], [5u8; 32]],
+        not_before_height: 0,
+        expires_at_height: 10_000,
+        revoked: false,
+        parent_agent_id: None,
+    }
+}
+
+fn child_of(parent: &SpendPolicy) -> SpendPolicy {
+    SpendPolicy {
+        version: POLICY_VERSION,
+        network_id: parent.network_id.clone(),
+        agent_id: derive_sub_agent_id(NET, &parent.agent_id, parent.role),
+        owner: parent.owner,
+        role: parent.role,
+        per_tx_max_sat: parent.per_tx_max_sat / 2,
+        window_blocks: parent.window_blocks / 2,
+        cumulative_max_sat: parent.cumulative_max_sat / 2,
+        allowed_recipients: parent.allowed_recipients[..1].to_vec(),
+        allowed_services: parent.allowed_services[..1].to_vec(),
+        not_before_height: parent.not_before_height,
+        expires_at_height: parent.expires_at_height,
+        revoked: false,
+        parent_agent_id: Some(parent.agent_id),
+    }
+}
+
+#[test]
+fn a_dominated_delegation_link_is_registered_and_a_widening_one_is_refused() {
+    let node = start();
+    let parent = parent_policy();
+    let child = child_of(&parent);
+
+    // A properly narrowed child links, records depth 1, and the child policy is
+    // reachable through the node's policy registry for later admission.
+    let (s, b) = post(
+        &node,
+        "/v1/delegation/link",
+        &serde_json::json!({
+            "parent_policy_hex": hex::encode(parent.serialize()),
+            "child_policy_hex": hex::encode(child.serialize()),
+        }),
+    );
+    assert_eq!(s, 200, "narrowed link refused: {b}");
+    assert_eq!(b["linked"], true);
+    assert_eq!(b["depth"], 1);
+
+    // Re-linking the identical (parent, child) pair is refused as AlreadyLinked:
+    // the book — not the client — is the authority on lineage, and a child may
+    // not acquire a second ancestry.
+    let (s, b) = post(
+        &node,
+        "/v1/delegation/link",
+        &serde_json::json!({
+            "parent_policy_hex": hex::encode(parent.serialize()),
+            "child_policy_hex": hex::encode(child.serialize()),
+        }),
+    );
+    assert_eq!(s, 409, "re-linking an existing child must be refused: {b}");
+    assert_eq!(b["error"], "delegation_refused");
+
+    // A widening child (cumulative cap larger than the parent's) is refused by
+    // the domination rule on the exact clause it breaks.
+    let mut widened = child_of(&parent);
+    widened.cumulative_max_sat = parent.cumulative_max_sat + 1;
+    let (s, b) = post(
+        &node,
+        "/v1/delegation/link",
+        &serde_json::json!({
+            "parent_policy_hex": hex::encode(parent.serialize()),
+            "child_policy_hex": hex::encode(widened.serialize()),
+        }),
+    );
+    assert_eq!(s, 409, "a widening delegation must be refused: {b}");
+    assert_eq!(b["error"], "delegation_refused");
+
+    // A cross-network child is refused as a client error (network scoping is
+    // checked before the domination rule), never as a conflict.
+    let foreign_net = "jounit/other".to_string();
+    let mut foreign = child_of(&parent);
+    foreign.network_id = foreign_net.clone();
+    // Re-derive on the foreign network so the policy still decodes (deserialize
+    // re-derives agent_id from network + parent + role); the cross-network check
+    // below is what rejects it, not an encoding error.
+    foreign.agent_id = derive_sub_agent_id(&foreign_net, &parent.agent_id, foreign.role);
+    let (s, b) = post(
+        &node,
+        "/v1/delegation/link",
+        &serde_json::json!({
+            "parent_policy_hex": hex::encode(parent.serialize()),
+            "child_policy_hex": hex::encode(foreign.serialize()),
+        }),
+    );
+    assert_eq!(s, 400, "cross-network delegation must be refused: {b}");
+    assert_eq!(b["error"], "delegation_refused");
 }

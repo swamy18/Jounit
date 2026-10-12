@@ -36,6 +36,7 @@
 //! SPEC.md §M4.
 
 use crate::block::Header;
+use crate::error::Error;
 use crate::hash::{sha256, Hash};
 use crate::u256::{target_for_difficulty, U256};
 
@@ -64,6 +65,11 @@ pub const LANES: usize = SCRATCHPAD_BYTES / 32;
 /// - `state` depends on the previous read, so you cannot compute access[N+1]
 ///   without finishing access[N].
 pub fn memory_hash(header: &Header, lanes: usize, accesses: usize) -> Hash {
+    // Defensive: `lanes == 0` would panic on the modular index in `mix_accesses`.
+    // Real callers go through `HbmConfig` (which validates), but `memory_hash` is
+    // public, so guard the invariant explicitly.
+    debug_assert!(lanes > 0, "HBM scratchpad must have at least one lane");
+    debug_assert!(accesses > 0, "HBM accesses must be > 0");
     let seed = build_seed(header);
     let scratchpad = build_scratchpad(&seed, lanes);
     mix_accesses(&scratchpad, &seed, lanes, accesses)
@@ -120,15 +126,27 @@ fn mix_accesses(pad: &[Hash], seed: &Hash, lanes: usize, accesses: usize) -> Has
 
 /// Check whether a block header satisfies the HBM scratchpad PoW target.
 ///
-/// Replaces `U256::from_be_bytes(block.block_hash()) <= target` for M4
-/// enabled blocks. The `lanes` and `accesses` parameters should come from
-/// `NetworkParams` in production (see `Cargo.toml` feature gates).
+/// Check whether a block header satisfies the HBM scratchpad PoW target.
+///
+/// Replaces `U256::from_be_bytes(block.block_hash()) <= target` for M4-enabled
+/// blocks. The `lanes` and `accesses` parameters should come from a validated
+/// `HbmConfig` (in production, carried by `NetworkParams`).
 pub fn hbm_satisfies(header: &Header, difficulty: u128, lanes: usize, accesses: usize) -> bool {
     let mh = memory_hash(header, lanes, accesses);
     let Ok(target) = target_for_difficulty(difficulty) else {
         return false;
     };
     U256::from_be_bytes(mh) <= target
+}
+
+/// `HbmConfig`-based checker used by the consensus dispatcher.
+pub fn hbm_satisfies_cfg(
+    header: &Header,
+    difficulty: u128,
+    cfg: &HbmConfig,
+) -> Result<bool, Error> {
+    cfg.validate()?;
+    Ok(hbm_satisfies(header, difficulty, cfg.lanes, cfg.accesses))
 }
 
 /// PoW configuration for the HBM puzzle (carried in network params or block header).
@@ -149,12 +167,36 @@ impl HbmConfig {
         }
     }
 
-    /// Production-grade config. 1 MiB scratchpad, 64 accesses.
+    /// Production-grade config. 8 MiB scratchpad (262,144 lanes), 256 accesses.
+    ///
+    /// This is the security-baseline size at which the bandwidth argument
+    /// (module docs §M4) becomes meaningful against ASIC on-die SRAM. Must not
+    /// be derived from `SCRATCHPAD_BYTES`, which is the 1 MiB test default.
     pub fn production() -> Self {
         HbmConfig {
-            lanes: LANES,
-            accesses: ACCESSES,
+            lanes: 8 * 1024 * 1024 / 32, // 8 MiB
+            accesses: 256,
         }
+    }
+
+    /// Reject degenerate configurations that would make the puzzle trivially
+    /// satisfiable or panic on indexing.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.lanes == 0 {
+            return Err(Error::BadPuzzleSpec("HBM lanes must be > 0".into()));
+        }
+        if self.accesses == 0 {
+            return Err(Error::BadPuzzleSpec("HBM accesses must be > 0".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Default for HbmConfig {
+    /// Defaults to the test config — never the production size, so no caller
+    /// accidentally mines against a 1 MiB pad on testnet/mainnet intent.
+    fn default() -> Self {
+        HbmConfig::test()
     }
 }
 
@@ -281,5 +323,48 @@ mod tests {
         let p = HbmConfig::production();
         assert!(t.lanes < p.lanes, "test lanes must be smaller");
         assert!(t.accesses < p.accesses, "test accesses must be fewer");
+    }
+
+    #[test]
+    fn production_scratchpad_is_at_least_8_mib() {
+        let p = HbmConfig::production();
+        assert!(
+            p.lanes * 32 >= 8 * 1024 * 1024,
+            "production scratchpad must match the documented 8 MiB baseline, got {} bytes",
+            p.lanes * 32
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_lanes() {
+        assert!(matches!(
+            HbmConfig {
+                lanes: 0,
+                accesses: 8
+            }
+            .validate(),
+            Err(Error::BadPuzzleSpec(_))
+        ));
+    }
+
+    #[test]
+    fn cfg_checker_rejects_degenerate_config() {
+        let h = genesis_header();
+        let bad = HbmConfig {
+            lanes: 0,
+            accesses: 0,
+        };
+        assert!(matches!(
+            hbm_satisfies_cfg(&h, 1, &bad),
+            Err(Error::BadPuzzleSpec(_))
+        ));
+    }
+
+    #[test]
+    fn cfg_checker_accepts_valid_config() {
+        let h = genesis_header();
+        let cfg = HbmConfig::test();
+        let res = hbm_satisfies_cfg(&h, 1, &cfg);
+        assert!(res.is_ok(), "valid config must not error");
     }
 }

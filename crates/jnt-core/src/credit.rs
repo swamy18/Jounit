@@ -294,6 +294,13 @@ pub struct CreditBook {
     recovered: BTreeMap<Address, u64>,
     /// Every satoshi ever put in. Append-only.
     deposited_total: u64,
+    /// Free-balance value committed to a settled payment (Item 10, §19.4).
+    /// Debited out of `free` at settlement; the matching on-chain payout still
+    /// happens only through the ordinary L1/L2 exit path, so this is a ledger
+    /// liability (a committed outbound) rather than a coin move. Tracked as its
+    /// own bucket so conservation (`free + bonds + collateral + recovered +
+    /// settled_payments == deposited`) survives a settlement debit.
+    settled_payments: u64,
 }
 
 impl CreditBook {
@@ -526,7 +533,8 @@ impl CreditBook {
                 self.recovered
                     .values()
                     .fold(0u64, |acc, v| acc.saturating_add(*v)),
-            );
+            )
+            .saturating_add(self.settled_payments);
         if accounted != self.deposited_total {
             return Err(Error::Malformed(
                 "credit conservation: accounted value does not equal deposited",
@@ -542,6 +550,11 @@ impl CreditBook {
 
     pub fn total_locked_collateral(&self) -> u64 {
         self.locked_collateral()
+    }
+
+    /// Value committed to settled (outbound) payments. See [`Self::settled_payments`].
+    pub fn total_settled(&self) -> u64 {
+        self.settled_payments
     }
 }
 
@@ -1025,6 +1038,18 @@ pub trait CreditGate {
     /// a reserved debit must be released if admission later fails, so this is
     /// always called after every other check passes.
     fn reserve(&mut self, payer: &Address, amount_sat: u64, height: u64) -> Result<Reservation>;
+
+    /// Commit the debit a reservation made against the ledger. Called by the
+    /// settlement layer (roadmap item 10 / §19.4) once a payment is
+    /// irrevocably settled: the receipt is accepted and the L1 payout is either
+    /// queued via the exit sink or already confirmed. This debits the payer's
+    /// credit line — it does **not** move on-chain coins, which still happen only
+    /// through the ordinary L1/L2 payout path. The reservation is consumed:
+    /// calling this twice on the same reservation is a logic error and is not
+    /// permitted.
+    fn settle(&mut self, _reservation: &Reservation) -> Result<()> {
+        Err(Error::Malformed("settle is not wired on this CreditGate"))
+    }
 }
 
 /// A debit reserved against a credit line. The holder of the `CreditGate` must
@@ -1033,6 +1058,12 @@ pub trait CreditGate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub id: Hash,
+    /// The payer whose credit line was charged. Carried so the settlement
+    /// layer can debit the right account without re-deriving the id.
+    pub debtor: Address,
+    /// Satoshis reserved. The settlement debit is exactly this amount — a
+    /// reservation must never settle for more or less than it reserved.
+    pub amount_sat: u64,
     /// The position this debit was charged against, if any (a free-balance draw
     /// has none). Informational: lets a lender reconcile without storing it.
     pub position_id: Option<Hash>,
@@ -1043,11 +1074,19 @@ pub struct Reservation {
 /// payment that is otherwise valid is admitted.
 pub struct NoCreditGate;
 impl CreditGate for NoCreditGate {
-    fn reserve(&mut self, _payer: &Address, _amount_sat: u64, _height: u64) -> Result<Reservation> {
+    fn reserve(&mut self, payer: &Address, amount_sat: u64, _height: u64) -> Result<Reservation> {
         Ok(Reservation {
             id: crate::hash::ZERO_HASH,
+            debtor: *payer,
+            amount_sat,
             position_id: None,
         })
+    }
+
+    // NoCreditGate debits nothing — it is the opt-out path for callers that have
+    // not wired a credit book. Settle is a no-op on an empty book by design.
+    fn settle(&mut self, _reservation: &Reservation) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1064,6 +1103,8 @@ impl CreditGate for CreditBook {
             // reservation id is derived so a future settlement can look it up.
             return Ok(Reservation {
                 id: position_id(payer, amount_sat, height),
+                debtor: *payer,
+                amount_sat,
                 position_id: None,
             });
         }
@@ -1103,8 +1144,37 @@ impl CreditGate for CreditBook {
         }
         Ok(Reservation {
             id: chosen.unwrap_or_else(|| position_id(payer, amount_sat, height)),
+            debtor: *payer,
+            amount_sat,
             position_id: chosen,
         })
+    }
+
+    /// Commit a reservation returned by [`CreditGate::reserve`], debiting the
+    /// payer's free balance. Ledger half of coin settlement (roadmap item 10,
+    /// §19.4): the credit line is reduced here; the on-chain coins still move
+    /// only through the ordinary L1/L2 payout path. Only the free-balance debit
+    /// path is wired — a position-backed reservation is refused with a named
+    /// error, as debiting a position is the settlement layer's lifecycle job.
+    fn settle(&mut self, reservation: &Reservation) -> Result<()> {
+        if reservation.position_id.is_some() {
+            return Err(crate::error::Error::Malformed(
+                "position-backed settlement debit is deferred to the position lifecycle",
+            ));
+        }
+        if reservation.amount_sat == 0 {
+            return Ok(());
+        }
+        let free = self.free(&reservation.debtor);
+        if free < reservation.amount_sat {
+            return Err(crate::error::Error::Malformed(
+                "credit reservation settled with no free balance to debit",
+            ));
+        }
+        let f = self.free.get_mut(&reservation.debtor).unwrap();
+        *f = f.saturating_sub(reservation.amount_sat);
+        self.settled_payments = self.settled_payments.saturating_add(reservation.amount_sat);
+        Ok(())
     }
 }
 
@@ -1609,5 +1679,71 @@ mod tests {
         let mut r = crate::ser::Reader::new(&bytes);
         assert_eq!(PositionSpec::decode(&mut r).unwrap(), s);
         assert_eq!(r.remaining(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Settlement debit commit (roadmap item 10, §19.4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_settled_free_balance_reservation_is_debited() {
+        // Reserve only checks capacity; the debit lands at settle.
+        let payer = [7u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(payer, 1_000_000).unwrap();
+        let res = book.reserve(&payer, 300_000, 1).unwrap();
+        assert!(res.position_id.is_none(), "free-balance reservation");
+        assert_eq!(book.free(&payer), 1_000_000, "reserve does not debit");
+        book.settle(&res).unwrap();
+        assert_eq!(book.free(&payer), 700_000, "settle debited the reservation");
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn settling_with_no_free_balance_fails_cleanly() {
+        let payer = [8u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(payer, 100_000).unwrap();
+        let res = book.reserve(&payer, 100_000, 1).unwrap();
+        assert!(res.position_id.is_none());
+        // The line is spent elsewhere before settlement lands.
+        *book.free.get_mut(&payer).unwrap() = 0;
+        let err = book.settle(&res).unwrap_err();
+        match err {
+            crate::error::Error::Malformed(m) => assert!(m.contains("no free balance")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_position_backed_reservation_is_not_settled_here() {
+        // Position-backed debits are deferred to the position lifecycle; settle
+        // refuses them with a named error rather than half-applying a debit.
+        // `spec` fixes borrower=[1u8;20].
+        let borrower = [1u8; 20];
+        let mut book = CreditBook::new();
+        let s = spec(1_000_000, 1_000_000, 1, 10_000);
+        let collateral = CreditPosition::open(&s).unwrap().collateral_sat;
+        book.deposit(borrower, collateral.saturating_add(1_000_000))
+            .unwrap();
+        book.post_bond(borrower, 1_000_000).unwrap();
+        let id = book.open(&s).unwrap();
+        let before = book.positions.get(&id).unwrap().clone();
+        // Free balance is exhausted (all collateral locked), so reserve draws
+        // the full amount against the position — a position-backed reservation.
+        let res = book
+            .reserve(&borrower, 1_000_000, 1)
+            .expect("line covers the amount via the position");
+        assert_eq!(res.position_id, Some(id));
+        let err = book.settle(&res).unwrap_err();
+        match err {
+            crate::error::Error::Malformed(m) => assert!(m.contains("deferred")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        assert_eq!(
+            book.positions.get(&id).unwrap(),
+            &before,
+            "no half-applied debit"
+        );
     }
 }

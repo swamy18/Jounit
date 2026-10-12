@@ -197,6 +197,12 @@ pub struct NetworkParams {
     /// Height interval after which the neural-net weights rotate.
     pub nn_epoch_blocks: u64,
     pub puzzle_id: u64,
+    /// M4 HBM scratchpad PoW parameters (SPEC.md §M4). Recognized only when
+    /// `puzzle_id == 2`; ignored for the hybrid puzzle. Carried as a network
+    /// parameter (rather than a compile-time constant) so the memory parameters
+    /// are governance-upgradeable and never silently wrong — see
+    /// `docs/security-review-hbm-2026-10-12.md` §5.
+    pub hbm: crate::hbm_pow::HbmConfig,
     pub max_tx_count: usize,
     pub max_block_bytes: usize,
     /// Reject inputs that carry a single-scheme signature bundle, requiring a
@@ -352,6 +358,9 @@ impl NetworkParams {
             base_fee_max_sat: 50_000_000,
             nn_epoch_blocks: 50_000,
             puzzle_id: 1,
+            // HBM recognized but inactive: mainnet mines the hybrid puzzle.
+            // Production memory parameters are the large config (see review §5).
+            hbm: crate::hbm_pow::HbmConfig::production(),
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
             require_hybrid_signatures: false,
@@ -409,6 +418,9 @@ impl NetworkParams {
             base_fee_max_sat: 1_000_000,
             nn_epoch_blocks: 2_000,
             puzzle_id: 1,
+            // HBM recognized but inactive: mini mines the hybrid puzzle. Test
+            // config keeps HBM verification cheap if ever exercised.
+            hbm: crate::hbm_pow::HbmConfig::test(),
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
             require_hybrid_signatures: false,
@@ -491,6 +503,9 @@ impl NetworkParams {
             base_fee_max_sat: 1_000_000,
             nn_epoch_blocks: 2_000,
             puzzle_id: 1,
+            // HBM recognized but inactive: testnet mines the hybrid puzzle. Test
+            // config keeps HBM verification cheap if exercised.
+            hbm: crate::hbm_pow::HbmConfig::test(),
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
             require_hybrid_signatures: false,
@@ -629,6 +644,11 @@ impl NetworkParams {
         if self.checkpoint_interval_blocks == 0 {
             return Err(Error::Malformed("checkpoint_interval_blocks must be > 0"));
         }
+        // M4 HBM parameters: validated structurally so a bad config can never
+        // land in a profile that opts into puzzle_id == 2 (which would otherwise
+        // panic on the modular index in `memory_hash`). See review §6. Unknown
+        // puzzle ids are rejected later by `Chain::puzzle_for` / `UnknownPuzzle`.
+        self.hbm.validate()?;
         // Binding finality (Decisions 12/13): an activation height must land on
         // an epoch boundary, or no epoch-aligned checkpoint could ever reach it
         // and finality would silently never activate.

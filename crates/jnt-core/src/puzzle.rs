@@ -27,10 +27,27 @@ const BIAS_INDEX_OFFSET: u32 = 1_000_000;
 /// Post-shift right amount applied before ReLU.
 const ACTIVATION_SHIFT: u32 = 2;
 
+/// Discriminates registered puzzle mechanisms (SPEC.md §5 / §M4).
+///
+/// A `PuzzleSpec` describes either the hybrid hash+NN puzzle (id 1) or the HBM
+/// memory-bound scratchpad puzzle (id 2). The NN fields below only apply to
+/// `Hybrid`; `Hbm` uses parameters carried by `NetworkParams::hbm`
+/// (`HbmConfig`), so its spec is a validation-time marker that lets the
+/// registry recognize the puzzle id without re-describing non-applicable
+/// dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PuzzleKind {
+    /// §5 hybrid: stage 1 hash chain → stage 2 integer NN → stage 3 final hash.
+    Hybrid,
+    /// §M4 HBM scratchpad PoW. Verification parameters live in `HbmConfig`.
+    Hbm,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PuzzleSpec {
     pub id: u64,
     pub name: String,
+    pub kind: PuzzleKind,
     pub hash_rounds: u32,
     pub nn_input_dim: usize,
     pub nn_hidden_dim: usize,
@@ -51,12 +68,30 @@ impl PuzzleSpec {
         PuzzleSpec {
             id: 1,
             name: "hybrid-v1".into(),
+            kind: PuzzleKind::Hybrid,
             hash_rounds: 16,
             nn_input_dim: 16,
             nn_hidden_dim: 16,
             nn_layers: 3,
             min_nn_share_bps: 3_000,
             max_nn_share_bps: 5_000,
+        }
+    }
+
+    /// `puzzle_id = 2`. M4 HBM scratchpad PoW (SPEC.md §M4). A registry marker:
+    /// verification parameters come from `NetworkParams::hbm`, so the NN/hash
+    /// fields are irrelevant and must not be audited here.
+    pub fn hbm_v1() -> Self {
+        PuzzleSpec {
+            id: 2,
+            name: "hbm-v1".into(),
+            kind: PuzzleKind::Hbm,
+            hash_rounds: 0,
+            nn_input_dim: 0,
+            nn_hidden_dim: 0,
+            nn_layers: 0,
+            min_nn_share_bps: 0,
+            max_nn_share_bps: 0,
         }
     }
 
@@ -109,6 +144,16 @@ impl PuzzleSpec {
 
     /// A registry entry must pass the Section 29.3 work-share audit.
     pub fn validate(&self) -> Result<()> {
+        match self.kind {
+            PuzzleKind::Hbm => {
+                // HBM verification parameters are carried by `NetworkParams::hbm`
+                // (`HbmConfig`), validated there. The spec itself is only a
+                // registry marker, so the NN / hash-round invariants below —
+                // which are meaningless for a non-hybrid puzzle — do not apply.
+                return Ok(());
+            }
+            PuzzleKind::Hybrid => {}
+        }
         if self.nn_input_dim == 0 || self.nn_hidden_dim == 0 || self.nn_layers == 0 {
             return Err(Error::BadPuzzleSpec(
                 "network dimensions must be non-zero".into(),
@@ -451,10 +496,11 @@ pub struct PuzzleRegistry {
 }
 
 impl PuzzleRegistry {
-    /// Registry containing only `hybrid-v1`.
+    /// Registry containing `hybrid-v1` (puzzle id 1) and `hbm-v1` (puzzle id 2).
     pub fn genesis() -> Self {
         let mut r = PuzzleRegistry::default();
         r.entries.insert(1, PuzzleSpec::hybrid_v1());
+        r.entries.insert(2, PuzzleSpec::hbm_v1());
         r
     }
 
