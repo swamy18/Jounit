@@ -276,12 +276,14 @@ everything deposited: value is moved, never created.
 **What it supports:** an agent earning from work it has not yet performed, with
 the risk carried by a bond instead of by trust in a stranger.
 
-### Compute-backed validator staking â€” _blocked on validator adoption_
+### Compute-backed validator staking â€” _implemented, empty on mainnet_
 
 Validators that also serve verified work earn more, which ties the protocol's
 security budget and its utility budget into one budget. The condition is that
 what a validator is paid for is *verified* work, where verified means a quorum
-proved it â€” not work that was merely submitted and left unchallenged.
+proved it â€” not work that was merely submitted and left unchallenged. The
+committee is derived **by bonded stake** (TopN), see [Validators and
+finality](#validators-and-finality).
 
 **What it supports:** making the neural stage of mining economically useful
 rather than merely elegant, and aligning the interests that secure the chain with
@@ -629,9 +631,11 @@ stake is `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, an immutable consensus constant
 rather than a tunable. Unbonding locks for `UNBONDING_PERIOD_BLOCKS` = 1 008
 (seven days). Provable equivocation burns the full bond.
 
-The committee is the **first 21 bonds by bond order**, derived from canonical
-chain state and nothing else. Finality keys follow the ledger, so a bond changes
-the validator set and a reorg rewinds it.
+The committee is the **top 21 bonded validators by stake** (`derive_set` /
+`SelectionRule::TopN`), each record carrying its bond-identity `stake_address`
+and `stake_sat`, derived from canonical chain state — a reorg unwinds the set.
+With no bonds the committee falls back to the profile's declared
+`genesis_validators`, so empty-stake is still well-defined on mainnet.
 
 **Checkpoint signing** (`signing.rs`) is the other half of M5. Verification has
 existed since the gadget landed â€” six clauses with real BLS12-381 pairings,
@@ -691,7 +695,7 @@ applies.
 | **Agent credit** | **In development** | Terms, position lifecycle, deadlines and a conservation-checked credit book; not yet wired to a caller |
 | **Delegation chains** | **In development** | Narrowing rule, sub-agent derivation and the link book; not wired into any consensus path |
 | **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. Coin settlement is Item 10. |
-| **Compute-backed staking** | **Not built** | Held pending a live validator committee |
+| **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |
 | M3 compute IR | Provides the reference | Envelopes carried, no interpreter |
@@ -721,7 +725,7 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **Stock supply cap** | A hard cap on total issuance | **Removed** (Decision 18). The ladder totals 39 157 124 JNT, then an approved tail pays 0.1 JNT/block forever, bounded by a 1%-per-period rate anchor |
 | **L2 withdrawals** | Undefined; deposits were one-way | **Implemented** (Decision 19): `ExitQueue`, a proof-authorised sink spend, a permissionless crank, reorg-safe |
 | **Exit accessibility** | Only a node's own miner could build a claim | **`GET /v1/exit/crankable`** hands claims to any third party |
-| **Stake and bonds** | No bond ledger, no stake transaction | **Implemented** (Decision 20): bond/unbond/slash, bond-order committee, ledger-derived finality keys |
+| **Stake and bonds** | No bond ledger, no stake transaction | **Implemented** (Decision 20): bond/unbond/slash, TopN stake-weighted committee, ledger-derived finality keys |
 | **What counts as fraud** | Unspecified â€” the slash vault stayed inert | **The canonical CPU reference decides** (Decision 21). No caller can supply it |
 | **Arbitration transport** | No way to exchange verdicts; the quorum had to be assembled out of band | **Signed votes relay over P2P**; a quorum aggregates into the settlement |
 | **Checkpoint signing** | Verification existed; **nothing ever signed**, so binding finality could not activate anywhere | **Production signing** via `jnt-node validator` and the serve loop |

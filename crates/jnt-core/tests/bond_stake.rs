@@ -1,11 +1,11 @@
-//! Bonded-stake suite (Decision 20 — P2).
+//! Bonded-stake suite (Decision 20 â€” P2).
 //!
 //! Written attack-first: each test builds the *hostile* stake transaction a
 //! compromised or careless validator would submit and asserts the exact clause
 //! that refuses it. The properties that matter are (1) no bond, unbond or
 //! slash commits unless every rule holds, (2) a refused block leaves the bond
 //! ledger and the vault exactly as found, and (3) the committee always follows
-//! the ledger — first 21 bonds by bond order, genesis fallback when empty.
+//! the ledger â€” first 21 bonds by bond order, genesis fallback when empty.
 //!
 //! Run with `cargo test -p jnt-core --test bond_stake`.
 
@@ -54,7 +54,7 @@ fn mine(chain: &mut Chain, to: Address, n: u64) {
 }
 
 /// A chain with one rich wallet: 80 coinbases mined, the matured ones
-/// returned. 70 × 76 JNT funds a 5,000-JNT bond with room for fees.
+/// returned. 70 Ã— 76 JNT funds a 5,000-JNT bond with room for fees.
 fn rich_chain() -> (Chain, Wallet, Vec<OutPoint>) {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     let w = wallet(1);
@@ -62,6 +62,23 @@ fn rich_chain() -> (Chain, Wallet, Vec<OutPoint>) {
     mine(&mut chain, addr, 80);
     let mut ops = Vec::new();
     for h in 1..=70u64 {
+        ops.push(OutPoint {
+            txid: chain.block_at(h).unwrap().txs[0].txid(),
+            index: 0,
+        });
+    }
+    (chain, w, ops)
+}
+
+/// Like [`rich_chain`] but with 250 matured outputs, enough to fund several
+/// large bonds (66 inputs each) while respecting `coinbase_maturity`.
+fn richer_chain() -> (Chain, Wallet, Vec<OutPoint>) {
+    let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+    let w = wallet(1);
+    let addr = w.address().unwrap();
+    mine(&mut chain, addr, 210);
+    let mut ops = Vec::new();
+    for h in 1..=200u64 {
         ops.push(OutPoint {
             txid: chain.block_at(h).unwrap().txs[0].txid(),
             index: 0,
@@ -84,7 +101,7 @@ fn utxo_total(chain: &Chain, ops: &[OutPoint]) -> u64 {
 }
 
 /// Bond transaction spending `ops`, locking exactly `BOND` to the derived
-/// identity, change back to the wallet. Re-signed after the payload is set —
+/// identity, change back to the wallet. Re-signed after the payload is set â€”
 /// the sighash covers the stake bytes, so a payload swap breaks every input.
 fn bond_tx(chain: &Chain, w: &Wallet, ops: &[OutPoint], pk: BlsPublicKey) -> Transaction {
     bond_tx_value(chain, w, ops, pk, BOND)
@@ -260,7 +277,7 @@ fn a_checkpoint_from_outside_the_bonded_committee_is_refused() {
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
     assert_eq!(chain.committee_keys(), vec![pk]);
 
-    // A stranger's key signs a well-formed checkpoint — but the committee is
+    // A stranger's key signs a well-formed checkpoint â€” but the committee is
     // the bonded key now, so the bitmap names nobody and quorum fails.
     let h = chain.height();
     let interval = chain.params().checkpoint_interval_blocks;
@@ -366,7 +383,7 @@ fn duplicate_bonds_and_duplicate_keys_are_refused() {
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
     assert_eq!(chain.bonds().len(), 1);
 
-    // Same bonder, same key again — well funded, refused as a duplicate.
+    // Same bonder, same key again â€” well funded, refused as a duplicate.
     let again = bond_tx(&chain, &w, &ops[66..132], pk);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![again]).unwrap_err(),
@@ -519,7 +536,7 @@ fn happy_path_unbond_releases_after_the_lock() {
         chain.params().genesis_validators.clone()
     );
 
-    // And the release spends like any other output — after its own 10-block
+    // And the release spends like any other output â€” after its own 10-block
     // maturity, which applies to every output, not just coinbases.
     let spend_at = chain.height() + 10;
     mine_to(&mut chain, bonder, spend_at);
@@ -603,7 +620,7 @@ fn happy_path_slash_burns_the_full_bond() {
 
     // Half vests to the PSCB reserve block by block: 125M per mini block.
     // Baslined after the slash block (whose own fee also fed the reserve),
-    // then only empty blocks — every sat of growth is vesting.
+    // then only empty blocks â€” every sat of growth is vesting.
     let pscb_after_slash = chain.pscb_reserve();
     mine(&mut chain, bonder, 5);
     assert_eq!(chain.pscb_reserve() - pscb_after_slash, 5 * 125_000_000);
@@ -636,8 +653,8 @@ fn slash_refusals_name_their_rule() {
     );
 
     // A foreign key signs, but the bitmap claims the bonded member signed:
-    // the aggregate does not match the claimed signers, so verification —
-    // not any bond lookup — refuses it. (The offender is drawn from verified
+    // the aggregate does not match the claimed signers, so verification â€”
+    // not any bond lookup â€” refuses it. (The offender is drawn from verified
     // bitmaps over the bonded set, so an "unbonded offender" cannot verify
     // in the first place: there is no such rule to pin.)
     let (osk, _) = bls_pair(9);
@@ -758,8 +775,8 @@ fn a_reorged_bond_leaves_no_undo_record_behind() {
 
     // Fork with the bond, then out-work it. The bond block is briefly
     // canonical, so it owns a `bond_undo` entry; once the reorg unwinds it that
-    // entry must go with it, or `verify_canonical_chain` — which replays only
-    // the canonical path — diverges forever after.
+    // entry must go with it, or `verify_canonical_chain` â€” which replays only
+    // the canonical path â€” diverges forever after.
     let fork_at = chain.height();
     let mut fork = Chain::new(NetworkParams::mini()).unwrap();
     for h in 1..=fork_at {
@@ -796,4 +813,79 @@ fn a_reorged_bond_leaves_no_undo_record_behind() {
     // The stake undo records are consensus state and are checked by replay:
     // this is the assertion that fails if the reorg path forgets to drop them.
     chain.verify_canonical_chain().unwrap();
+}
+
+/// Item 5: the checkpoint committee is stake-weighted (TopN), not bond-
+/// insertion-ordered. Three validators bond at the minimum with distinct BLS
+/// keys. The signing committee (`committee_keys`) follows bond insertion order,
+/// but the epoch set (`derive_set(TopN)`) must be in canonical key-first order
+/// with a real `stake_address` (the bond identity, not the zero placeholder).
+#[test]
+fn committee_is_derived_by_stake_topn_not_bond_order() {
+    let (mut chain, w, ops) = richer_chain();
+    let bonder = w.address().unwrap();
+    let net = chain.params().clone();
+
+    // Three validators, distinct BLS keys, each at the minimum stake.
+    let low = bls_pair(11);
+    let mid = bls_pair(12);
+    let high = bls_pair(13);
+    let bonds = [(low.1, BOND), (mid.1, BOND), (high.1, BOND)];
+    let mut cursor = 0usize;
+    for (pk, stake) in bonds {
+        let tx = bond_tx_value(&chain, &w, &ops[cursor..cursor + 66], pk, stake);
+        cursor += 66;
+        let h = chain.height() + 1;
+        let block = chain.mine_block(bonder, vec![tx], ts(h)).unwrap();
+        chain.submit(block).unwrap();
+    }
+    // All three bonded keys are listed for signing (genesis fallback is off):
+    let keys = chain.committee_keys();
+    assert_eq!(
+        keys.len(),
+        3,
+        "all bonded validators must be in the committee key set"
+    );
+
+    // The epoch set is the TopN derivation: canonical key-first order, each
+    // record carrying its bond identity and stake. Query it at the current epoch
+    // â€” `refresh_committee` ran at every canonical block, so the cache holds
+    // this epoch's set and the stake-backed path (not the genesis fallback)
+    // answers.
+    let epoch_blocks = net.checkpoint_interval_blocks;
+    let epoch = chain.height() / epoch_blocks.max(1);
+    let set = chain.finality().epoch_set(epoch).unwrap();
+    let set_keys: Vec<BlsPublicKey> = set.validators.iter().map(|v| v.bls_pk).collect();
+    assert_eq!(
+        set_keys.len(),
+        3,
+        "all three bonded validators must make the stake-derived committee"
+    );
+    // Canonical order (key first) differs from the bond insertion order the
+    // signing committee returns â€” that is what proves derive_set ran, not the
+    // order-preserving `committee()`.
+    assert_ne!(
+        set_keys, keys,
+        "the epoch set must be canonically ordered, not bond-insertion ordered"
+    );
+    // And it must be sorted by the ValidatorRecord total order (key-first).
+    let mut canonical = set_keys.clone();
+    canonical.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(set_keys, canonical, "epoch set must be in canonical key order");
+    // stake_sat is the bonded value; stake_address is the identity, never zero.
+    assert!(
+        set.validators.iter().all(|v| v.stake_address != Address::default()),
+        "stake_address must bind to the bond identity, not zero"
+    );
+    assert!(
+        set.validators.iter().all(|v| v.stake_sat == BOND),
+        "each validator's stake must equal its bond"
+    );
+    let low_identity = bond_identity(&net.network_id, &bonder, &low.1);
+    assert!(
+        set.validators
+            .iter()
+            .any(|v| v.bls_pk == low.1 && v.stake_address == low_identity),
+        "low validator's stake_address must be its bond identity"
+    );
 }

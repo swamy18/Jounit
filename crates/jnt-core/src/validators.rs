@@ -381,7 +381,7 @@ pub fn epoch_of(height: u64, epoch_blocks: u64) -> u64 {
 /// §14.6: a node tracks `set(e-1)` for one full epoch after handover, solely
 /// to validate late-arriving checkpoints from that epoch; after the grace
 /// period the old set is dropped.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EpochSetCache {
     current: Option<EpochSet>,
     previous: Option<EpochSet>,
@@ -466,6 +466,14 @@ impl EpochSetCache {
     /// Current epoch's set, if any.
     pub fn current(&self) -> Option<&EpochSet> {
         self.current.as_ref()
+    }
+
+    /// Drop all cached epoch sets, restoring the genesis-fallback behaviour
+    /// (used by `FinalityManager::refresh_committee` when no bonds are live).
+    pub fn clear(&mut self) {
+        self.current = None;
+        self.previous = None;
+        self.previous_expires_at_epoch = None;
     }
 
     /// Previous epoch's set, if still within grace.

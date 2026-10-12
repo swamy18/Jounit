@@ -19,8 +19,8 @@ use crate::bls_checkpoint::{BlsPublicKey, BlsVerifier, Checkpoint, ValidatorSet}
 use crate::hash::Hash;
 use crate::params::NetworkParams;
 use crate::validators::{
-    equivocation_evidence, genesis_epoch_set_at, validate_checkpoint_against_set, EpochSet,
-    EquivocationEvidence, ValidatorError,
+    derive_set, equivocation_evidence, genesis_epoch_set_at, validate_checkpoint_against_set,
+    EpochSet, EpochSetCache, EquivocationEvidence, SelectionRule, ValidatorError, ValidatorRecord,
 };
 
 /// Maximum retained equivocation evidence records. Evidence is diagnostic until
@@ -79,8 +79,14 @@ impl std::error::Error for FinalityError {}
 #[derive(Debug, Default, Clone)]
 pub struct FinalityManager {
     /// The fixed genesis committee (Decision 11). Empty means no committee, so
-    /// every certificate fails closed.
+    /// every certificate fails closed. Used as the fallback while no bonds exist;
+    /// once bonds are live the staked set (see `sets`) takes over.
     keys: Vec<BlsPublicKey>,
+    /// Stake-backed epoch sets (Item 5). The chain rebuilds this on every
+    /// canonical advance via `refresh_committee`; `accept` validates checkpoints
+    /// against it. When empty (no bonds yet) `accept` falls back to
+    /// `genesis_epoch_set_at`, preserving the Decision-11 behaviour.
+    sets: EpochSetCache,
     /// The network this manager observes; a certificate for another network is
     /// refused even if the keys happened to match.
     network_id: String,
@@ -114,6 +120,7 @@ impl FinalityManager {
     pub fn new(params: &NetworkParams) -> Self {
         Self {
             keys: params.genesis_validators.clone(),
+            sets: EpochSetCache::default(),
             network_id: params.network_id.clone(),
             epoch_blocks: params.checkpoint_interval_blocks,
             activation_height: params.finality_activation_height,
@@ -137,6 +144,45 @@ impl FinalityManager {
     /// the chain passes the profile's declared committee and nothing changes.
     pub fn set_keys(&mut self, keys: Vec<BlsPublicKey>) {
         self.keys = keys;
+    }
+
+    /// Install the stake-backed epoch sets (Item 5). The chain calls this on
+    /// every canonical advance, passing the active `ValidatorRecord`s derived
+    /// from `BondLedger` and the height at which the set takes effect. The cache
+    /// holds the current and previous epoch's sets (one-epoch grace for late
+    /// checkpoints per \u{b7}14.6); `accept` reads from it and only falls back
+    /// to the declared genesis committee when it is empty.
+    ///
+    /// With no bonds the candidate list is empty: rather than install an empty
+    /// set (which would shadow the genesis fallback needed on testnet/mini),
+    /// the cache is cleared so the declared committee stays in effect.
+    pub fn refresh_committee(
+        &mut self,
+        candidates: &[ValidatorRecord],
+        height: u64,
+        epoch_blocks: u64,
+        lookback: u64,
+    ) {
+        if candidates.is_empty() {
+            self.sets.clear();
+            return;
+        }
+        let epoch = crate::validators::epoch_of(height, epoch_blocks);
+        let seed = crate::validators::seed_height(epoch, epoch_blocks, lookback);
+        let seed_epoch = crate::validators::epoch_of(seed, epoch_blocks);
+        // Derive the set for the seed epoch and carry it forward for `epoch`;
+        // the seed height's state is what determines this epoch's committee.
+        if let Ok(set) = derive_set(
+            seed_epoch,
+            candidates,
+            SelectionRule::TopN,
+            crate::bond::MAX_COMMITTEE_SIZE,
+        ) {
+            let mut live = set;
+            live.epoch = epoch;
+            live.set_hash = crate::validators::set_hash(&live);
+            self.sets.insert(live, 1);
+        }
     }
 
     /// The configured activation height (0 = binding finality never activates).
@@ -211,9 +257,14 @@ impl FinalityManager {
         // same-height conflicting certificate is classified as a conflict
         // rather than a stale replay. A floor of 0 makes clause 6 inert.
         let keys = &self.keys;
+        let sets = &self.sets;
         validate_checkpoint_against_set(
             checkpoint,
-            |epoch| genesis_epoch_set_at(epoch, keys),
+            |epoch| {
+                sets.get(epoch)
+                    .cloned()
+                    .or_else(|_| genesis_epoch_set_at(epoch, keys))
+            },
             0,
             self.epoch_blocks,
             verify,
@@ -316,8 +367,13 @@ impl FinalityManager {
     }
 
     /// The epoch set for `epoch`, for callers that want to inspect it.
+    /// Reads the staked cache first (Item 5); falls back to the declared genesis
+    /// committee when no bonds are live yet.
     pub fn epoch_set(&self, epoch: u64) -> Result<EpochSet, ValidatorError> {
-        genesis_epoch_set_at(epoch, &self.keys)
+        self.sets
+            .get(epoch)
+            .cloned()
+            .or_else(|_| genesis_epoch_set_at(epoch, &self.keys))
     }
 }
 

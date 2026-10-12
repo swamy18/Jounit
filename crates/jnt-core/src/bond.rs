@@ -101,6 +101,15 @@ impl BondLedger {
         self.bonds.is_empty()
     }
 
+    /// All active bond records in ledger order (bond_height, bond_index, id).
+    /// Consensus iteration: never `by_key` (a HashMap).
+    pub fn records(&self) -> Vec<BondRecord> {
+        self.order
+            .iter()
+            .filter_map(|(_, _, id)| self.bonds.get(id).cloned())
+            .collect()
+    }
+
     pub fn get(&self, id: &BondId) -> Option<&BondRecord> {
         self.bonds.get(id)
     }

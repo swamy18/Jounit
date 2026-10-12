@@ -723,6 +723,12 @@ impl Chain {
         // canonical advancement applies blocks), so the keys always describe
         // the canonical ledger.
         self.finality.set_keys(self.committee_keys());
+        self.finality.refresh_committee(
+            &            self.committee_records(),
+            self.height(),
+            self.params.checkpoint_interval_blocks,
+            crate::validators::EPOCH_LOOKBACK_DEFAULT,
+        );
         Ok(())
     }
 
@@ -918,6 +924,34 @@ impl Chain {
         } else {
             bonded.into_iter().map(|r| r.bls_pk).collect()
         }
+    }
+
+    /// Stake-backed validator records for the current epoch's committee
+    /// derivation (Item 5). One `ValidatorRecord` per active bond: the bond's
+    /// identity address (network-bound, so a mainnet bond cannot masquerade as a
+    /// mini bond), its BLS key, and its locked value as `stake_sat`. `derive_set`
+    /// (TopN) consumes these to pick the top 21 by stake and bind the `stake_address`
+    /// into the epoch set hash — the bit that turns "a bonded key signs checkpoints"
+    /// into "the highest-staked 21 keys form the committee".
+    pub fn committee_records(&self) -> Vec<crate::validators::ValidatorRecord> {
+        use crate::bond::bond_identity;
+        self.bonds
+            .records()
+            .into_iter()
+            .map(|r| crate::validators::ValidatorRecord {
+                stake_address: bond_identity(&self.params.network_id, &r.bonder, &r.bls_pk),
+                bls_pk: r.bls_pk,
+                stake_sat: r.amount_sat,
+            })
+            .collect()
+    }
+
+    /// Current epoch on this branch, for committee derivation.
+    pub fn epoch_of(&self) -> u64 {
+        crate::validators::epoch_of(
+            self.height(),
+            self.params.checkpoint_interval_blocks,
+        )
     }
 
     /// Read-only access to the bond ledger (mempool admission, views).
@@ -1233,6 +1267,12 @@ impl Chain {
         // The committee follows the bonds: the ledger just moved, so the key
         // set moves with it before any checkpoint is validated.
         self.finality.set_keys(self.committee_keys());
+        self.finality.refresh_committee(
+            &            self.committee_records(),
+            self.height(),
+            self.params.checkpoint_interval_blocks,
+            crate::validators::EPOCH_LOOKBACK_DEFAULT,
+        );
     }
 
     fn snapshot(&self) -> Snapshot {
