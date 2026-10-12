@@ -229,7 +229,7 @@ narrows as it travels.
 must bound what any single agent can spend, without re-authorizing each
 transaction by hand.
 
-### Conditional and oracle-gated payments â€” _blocked on arbitrator key custody_
+### Conditional and oracle-gated payments â€” _in development_
 
 Payment that releases against a stated condition rather than a manual approval:
 "release when the result matches," "release when latency stayed under a
