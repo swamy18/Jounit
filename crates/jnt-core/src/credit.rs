@@ -1465,10 +1465,12 @@ impl CreditGate for CreditBook {
                 .free
                 .get_mut(payer)
                 .ok_or(Error::Malformed("no free balance to reserve against"))?;
-            *f = f.checked_sub(from_free_sat).ok_or(Error::InsufficientFunds {
-                needed: from_free_sat,
-                available: spendable,
-            })?;
+            *f = f
+                .checked_sub(from_free_sat)
+                .ok_or(Error::InsufficientFunds {
+                    needed: from_free_sat,
+                    available: spendable,
+                })?;
             let r = self.reserved.entry(*payer).or_insert(0);
             *r = r.checked_add(from_free_sat).ok_or(Error::ValueOverflow)?;
         }

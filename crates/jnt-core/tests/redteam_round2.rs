@@ -50,7 +50,11 @@ fn a_mixed_reservation_sweeps_free_so_it_cannot_back_two_payments() {
     // Reserve more than the free balance: the remainder draws on the position.
     let res = book.reserve(&borrower, free + 1_000, 1).unwrap();
     assert_eq!(res.from_free_sat, free, "the whole free balance is swept");
-    assert_eq!(book.available(&borrower), 0, "nothing spendable is left behind");
+    assert_eq!(
+        book.available(&borrower),
+        0,
+        "nothing spendable is left behind"
+    );
     assert_eq!(
         res.position_draws.iter().map(|(_, take)| take).sum::<u64>(),
         1_000,
@@ -66,7 +70,10 @@ fn a_mixed_reservation_sweeps_free_so_it_cannot_back_two_payments() {
     // A position-touching reservation is refused at settle before any debit,
     // so no half-debit lands.
     let settled_before = book.total_settled();
-    assert!(book.settle(&res).is_err(), "position-backed settle is refused");
+    assert!(
+        book.settle(&res).is_err(),
+        "position-backed settle is refused"
+    );
     assert_eq!(book.total_settled(), settled_before, "no half-debit");
 
     // Release returns everything exactly and leaves the position alone.
@@ -96,7 +103,9 @@ fn interest_overflow_is_refused_never_wrapped_or_silently_capped() {
         rate_bps_per_window: u32::MAX,
         window_blocks: 1,
     };
-    let err = hostile.accrued_interest(u64::MAX / 2, 0, u64::MAX / 2).unwrap_err();
+    let err = hostile
+        .accrued_interest(u64::MAX / 2, 0, u64::MAX / 2)
+        .unwrap_err();
     assert!(
         matches!(err, jnt_core::error::Error::ValueOverflow),
         "overflow is a refusal, not a number: {err:?}"
