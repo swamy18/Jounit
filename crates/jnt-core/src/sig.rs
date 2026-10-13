@@ -45,6 +45,17 @@ pub const SCHEME_SECP256K1_ECDSA: u8 = 1;
 /// scheme. Present to exercise the multi-scheme path end to end; it is not a
 /// post-quantum scheme and adds no quantum resistance on its own.
 pub const SCHEME_SECP256K1_SCHNORR: u8 = 2;
+/// ML-DSA-65 (FIPS 204, NIST security level 3). The post-quantum scheme: a
+/// Shor break of secp256k1 does not touch it. Public keys are 1952 bytes and
+/// signatures 3309, both under [`MAX_COMPONENT_BYTES`] by design — the cap was
+/// sized for exactly this. A bundle carrying schemes 1 and 3 is quantum-safe
+/// if *either* primitive holds classically and safe against a CRQC because of
+/// the lattice half; every component must still verify.
+pub const SCHEME_ML_DSA_65: u8 = 3;
+/// Encoded ML-DSA-65 verifying-key length, in bytes.
+pub const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1952;
+/// Encoded ML-DSA-65 signature length, in bytes.
+pub const ML_DSA_65_SIGNATURE_BYTES: usize = 3309;
 
 /// Largest number of components in one bundle. Four is generous: a
 /// post-quantum + classical pair is two, and the cap exists so a bundle cannot
@@ -63,13 +74,17 @@ pub fn scheme_name(scheme: u8) -> &'static str {
     match scheme {
         SCHEME_SECP256K1_ECDSA => "secp256k1-ecdsa",
         SCHEME_SECP256K1_SCHNORR => "secp256k1-schnorr",
+        SCHEME_ML_DSA_65 => "ml-dsa-65",
         _ => "unknown",
     }
 }
 
 /// True for a scheme this implementation can actually verify.
 pub fn scheme_supported(scheme: u8) -> bool {
-    matches!(scheme, SCHEME_SECP256K1_ECDSA | SCHEME_SECP256K1_SCHNORR)
+    matches!(
+        scheme,
+        SCHEME_SECP256K1_ECDSA | SCHEME_SECP256K1_SCHNORR | SCHEME_ML_DSA_65
+    )
 }
 
 /// One signature plus the scheme that produced it.
@@ -294,6 +309,25 @@ fn verify_one(scheme: u8, pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(
                 k256::schnorr::VerifyingKey::from_bytes(pubkey).map_err(|_| Error::BadPubkey)?;
             let parsed = k256::schnorr::Signature::try_from(sig).map_err(|_| bad.clone())?;
             key.verify_raw(msg, &parsed).map_err(|_| bad)
+        }
+        SCHEME_ML_DSA_65 => {
+            // FIPS 204 verification over the 32-byte digest as the message.
+            // The digest is already domain-separated upstream, so the ML-DSA
+            // context is empty: no second domain tag inside the primitive.
+            use ml_dsa::{EncodedVerifyingKey, MlDsa65, Signature, Verifier as _, VerifyingKey};
+            let bad = Error::BadSignature { scheme };
+            if sig.len() != ML_DSA_65_SIGNATURE_BYTES {
+                return Err(Error::BadComponentLength(sig.len()));
+            }
+            if pubkey.len() != ML_DSA_65_PUBLIC_KEY_BYTES {
+                return Err(Error::BadComponentLength(pubkey.len()));
+            }
+            let parsed =
+                Signature::<MlDsa65>::try_from(sig).map_err(|_| bad.clone())?;
+            let enc = EncodedVerifyingKey::<MlDsa65>::try_from(pubkey)
+                .map_err(|_| Error::BadPubkey)?;
+            let key = VerifyingKey::<MlDsa65>::decode(&enc);
+            key.verify(msg, &parsed).map_err(|_| bad)
         }
         other => Err(Error::UnsupportedSigScheme(other)),
     }
