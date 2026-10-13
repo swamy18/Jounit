@@ -301,7 +301,53 @@ pub struct CreditBook {
     /// own bucket so conservation (`free + bonds + collateral + recovered +
     /// settled_payments == deposited`) survives a settlement debit.
     settled_payments: u64,
+    /// Bond value already pledged as the discount backing of a live position.
+    ///
+    /// Sub-accounting of `bonds`, not a second value: the satoshis stay in
+    /// `bonds`, and only `bond - bond_pledged` may price the *next* position.
+    /// Without this, one posted bond could back any number of positions, each of
+    /// which would claim the same discount — the bond would be counted once per
+    /// obligation it secures, which is exactly what a bond must never be.
+    bond_pledged: BTreeMap<Address, u64>,
+    /// Free-balance value encumbered by an outstanding reservation.
+    ///
+    /// A reservation must *reduce* spendable capacity the moment it is granted,
+    /// or two payments can each reserve the same balance, both be admitted, and
+    /// only one of them can ever be debited. Moving the value into `reserved`
+    /// makes capacity exact: it is neither spendable nor settled, and it is the
+    /// bucket `settle` debits.
+    reserved: BTreeMap<Address, u64>,
+    /// Outstanding principal headroom encumbered by reservations drawn against a
+    /// live position (same rule as `reserved`, per position).
+    position_reserved: BTreeMap<Hash, u64>,
+    /// Reservation ids that have already been consumed, and how.
+    ///
+    /// A settlement must be idempotent and a released reservation must not be
+    /// settleable afterwards, so the book records the outcome per reservation
+    /// instead of trusting the caller to call once. Bounded: the log is a FIFO
+    /// cap-with-eviction, so a flood of reservations cannot grow it forever.
+    reservation_log: BTreeMap<Hash, ReservationOutcome>,
+    /// Insertion order for the reservation log, so eviction is deterministic.
+    reservation_order: std::collections::VecDeque<Hash>,
+    /// Monotonic reservation counter. Every reservation gets its own id, so two
+    /// payments from one payer at one height are never conflated.
+    reservation_seq: u64,
 }
+
+/// What a consumed reservation was used for. Replay of either is refused by
+/// name rather than silently applied twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationOutcome {
+    /// Settled: the debit landed.
+    Settled,
+    /// Released: the payment never committed and the encumbrance returned.
+    Released,
+}
+
+/// Longest reservation log. Old entries are evicted first, so a node that
+/// settles a bounded number of payments has an exact replay guard and a node
+/// that settles a million does not grow without bound.
+const MAX_RESERVATION_LOG: usize = 4_096;
 
 impl CreditBook {
     /// An empty book.
@@ -334,6 +380,28 @@ impl CreditBook {
         self.bonds.get(agent).copied().unwrap_or(0)
     }
 
+    /// Bond an agent may still pledge to a *new* position: the posted bond less
+    /// what live positions have already claimed.
+    ///
+    /// This is the number a position's discount must be priced against, not the
+    /// gross bond. A bond is real value at risk, and counting it once per
+    /// obligation it secures would let one bond discount any number of positions
+    /// — the arithmetic of an undercollateralized line wearing a discount's
+    /// clothes.
+    pub fn unpledged_bond(&self, agent: &Address) -> u64 {
+        self.bond(agent)
+            .saturating_sub(self.bond_pledged.get(agent).copied().unwrap_or(0))
+    }
+
+    /// Free balance an agent may still spend.
+    ///
+    /// An outstanding reservation has already had its value moved out of `free`,
+    /// so the unencumbered balance is simply what is left in `free`. This is the
+    /// number a new payment or a new position's collateral is checked against.
+    pub fn available(&self, agent: &Address) -> u64 {
+        self.free(agent)
+    }
+
     /// Post a bond from the agent's free balance.
     ///
     /// A bond cannot be posted from itself: it comes out of free money, or it is
@@ -353,10 +421,20 @@ impl CreditBook {
     }
 
     /// Release a bond back to the agent's free balance.
+    ///
+    /// Refuses to release bond that a live position is *priced with*: that
+    /// portion is at risk for the position it secures, and releasing it would
+    /// leave the position's discount unbacked — the exact defect the pledge
+    /// accounting exists to prevent.
     pub fn release_bond(&mut self, agent: Address, amount_sat: u64) -> Result<()> {
         if self.bond(&agent) < amount_sat {
             return Err(Error::Malformed(
                 "no posted bond covers the release requested",
+            ));
+        }
+        if amount_sat > self.unpledged_bond(&agent) {
+            return Err(Error::Malformed(
+                "bond pledged to a live position cannot be released",
             ));
         }
         let b = self.bonds.get_mut(&agent).unwrap();
@@ -368,38 +446,63 @@ impl CreditBook {
 
     /// Open a position, locking its collateral out of the borrower's free balance.
     ///
-    /// Two upstream requirements, both enforced here rather than assumed:
+    /// Three upstream requirements, all enforced here rather than assumed:
     ///
     /// - The bond the position is priced with must be **posted first**. A bond
     ///   that exists only in the spec buys a discount the borrower never backed,
     ///   which is undercollateralization wearing a discount's clothes.
+    /// - That bond must be **unpledged**. A bond already backing a live position
+    ///   has discounted that position; counting it again would let one bond
+    ///   secure any number of obligations.
     /// - The collateral must be in the borrower's free balance, because this is
     ///   where it leaves it.
     ///
     /// The bond itself is *credited* rather than moved: it stays posted, and the
     /// terms only count it toward the discount. A position therefore never
-    /// becomes able to spend the bond backing it.
+    /// becomes able to spend the bond backing it — and the pledge release on
+    /// settlement is what makes that safe over the whole book.
     pub fn open(&mut self, spec: &PositionSpec) -> Result<Hash> {
         let id = spec.id();
         if self.positions.contains_key(&id) {
             return Err(Error::Malformed("this position is already open"));
         }
         let position = CreditPosition::open(spec)?;
-        if self.bond(&spec.borrower) < spec.bond_sat {
+        if spec.bond_sat > self.unpledged_bond(&spec.borrower) {
             return Err(Error::Malformed(
-                "the bond a position is priced with must be posted before it opens",
+                "the bond a position is priced with must be posted, and unpledged, before it opens",
             ));
         }
-        if self.free(&spec.borrower) < position.collateral_sat {
+        if self.available(&spec.borrower) < position.collateral_sat {
             return Err(Error::Malformed(
                 "free balance cannot cover the collateral required",
             ));
         }
         let f = self.free.get_mut(&spec.borrower).unwrap();
         *f -= position.collateral_sat;
+        // Pledge the bond: it is at risk for this position until the position
+        // settles, and no second position may price against the same satoshis.
+        let pledged = self.bond_pledged.entry(spec.borrower).or_insert(0);
+        *pledged = pledged
+            .checked_add(spec.bond_sat)
+            .ok_or(Error::ValueOverflow)?;
         self.positions.insert(id, position);
         self.check_conservation()?;
         Ok(id)
+    }
+
+    /// Release the bond pledge a settled position held, returning it to the
+    /// pool a new position may price against. Value does not move: only the
+    /// sub-accounting of who has claimed the discount.
+    fn release_pledge(&mut self, borrower: Address, pledged_sat: u64) -> Result<()> {
+        if pledged_sat == 0 {
+            return Ok(());
+        }
+        let pledged = self.bond_pledged.entry(borrower).or_insert(0);
+        *pledged = pledged.saturating_sub(pledged_sat);
+        if *pledged == 0 {
+            self.bond_pledged.remove(&borrower);
+        }
+        self.check_conservation()
     }
 
     /// Look a position up.
@@ -429,7 +532,7 @@ impl CreditBook {
                 .ok_or(Error::Malformed("no such position"))?;
             (position.borrower, position.lender)
         };
-        if self.free(&borrower) < payment_sat {
+        if self.available(&borrower) < payment_sat {
             return Err(Error::Malformed("free balance cannot cover the repayment"));
         }
         let result = {
@@ -450,15 +553,20 @@ impl CreditBook {
         // A fully repaid position returns its collateral to the borrower. The
         // repayment says whether it settled; the position holds the collateral.
         if result.remaining_debt_sat == 0 {
-            let returned = self
-                .positions
-                .get(id)
-                .ok_or(Error::Malformed("no such position"))?
-                .collateral_sat;
+            let (returned, pledge) = {
+                let position = self
+                    .positions
+                    .get(id)
+                    .ok_or(Error::Malformed("no such position"))?;
+                (position.collateral_sat, position.bond_sat)
+            };
             if returned > 0 {
                 let f = self.free.entry(borrower).or_insert(0);
                 *f = f.checked_add(returned).ok_or(Error::ValueOverflow)?;
             }
+            // The debt is gone, so the bond that discounted it is no longer at
+            // risk and may price the next position.
+            self.release_pledge(borrower, pledge)?;
         }
         self.check_conservation()?;
         Ok(result)
@@ -470,14 +578,38 @@ impl CreditBook {
     /// then the bond, never reputation. The difference here is that the bond is
     /// *actually taken* — this is where a default's values leave the locked
     /// pools, and the conservation check confirms exactly where they land.
+    ///
+    /// Everything is computed and pre-checked *before* any bucket is written, so
+    /// a refusal (a posted bond smaller than the default requires) leaves the
+    /// book exactly as it was rather than half-settled.
     pub fn default(&mut self, id: &Hash, height: u64) -> Result<DefaultSettlement> {
-        let position = self
-            .positions
+        // Read everything, and refuse on every condition, before mutating. The
+        // pure arithmetic lives on the position so the book can price the
+        // settlement without committing it — an early return after a mutation is
+        // how a book ends up half-settled.
+        let (settlement, borrower, lender, pledge) = {
+            let position = self
+                .positions
+                .get(id)
+                .ok_or(Error::Malformed("no such position"))?;
+            (
+                position.simulate_default(height)?,
+                position.borrower,
+                position.lender,
+                position.bond_sat,
+            )
+        };
+        if settlement.from_bond_sat > self.bond(&borrower) {
+            return Err(Error::Malformed(
+                "posted bond is smaller than the default requires",
+            ));
+        }
+
+        // The position settles; from here on every write is unconditional.
+        self.positions
             .get_mut(id)
-            .ok_or(Error::Malformed("no such position"))?;
-        let borrower = position.borrower;
-        let lender = position.lender;
-        let settlement = position.default(height)?;
+            .ok_or(Error::Malformed("no such position"))?
+            .default(height)?;
 
         let f = self.free.entry(borrower).or_insert(0);
         *f = f
@@ -488,17 +620,16 @@ impl CreditBook {
                 .bonds
                 .get_mut(&borrower)
                 .ok_or(Error::Malformed("no posted bond to take the default from"))?;
-            if *b < settlement.from_bond_sat {
-                return Err(Error::Malformed(
-                    "posted bond is smaller than the default requires",
-                ));
-            }
             *b -= settlement.from_bond_sat;
         }
         let r = self.recovered.entry(lender).or_insert(0);
         *r = r
             .checked_add(settlement.lender_recovered_sat())
             .ok_or(Error::ValueOverflow)?;
+        // The whole pledge is retired with the position: the part the default
+        // consumed is already out of `bonds`, and the part it did not consume
+        // returns to the pool a new position may price against.
+        self.release_pledge(borrower, pledge)?;
         self.check_conservation()?;
         Ok(settlement)
     }
@@ -522,6 +653,11 @@ impl CreditBook {
     /// A failed check is a bug, not a policy disagreement, which is why it
     /// returns an error rather than a bool — a caller that cannot proceed on
     /// failure must not be able to ignore it.
+    ///
+    /// `reserved` is a bucket of its own because an outstanding reservation is
+    /// neither spendable nor settled: counting it inside `free` would let one
+    /// balance back two admitted payments, and dropping it would make the
+    /// invariant fail the moment a reservation is made.
     pub fn check_conservation(&self) -> Result<()> {
         let accounted = self
             .free
@@ -534,7 +670,12 @@ impl CreditBook {
                     .values()
                     .fold(0u64, |acc, v| acc.saturating_add(*v)),
             )
-            .saturating_add(self.settled_payments);
+            .saturating_add(self.settled_payments)
+            .saturating_add(
+                self.reserved
+                    .values()
+                    .fold(0u64, |acc, v| acc.saturating_add(*v)),
+            );
         if accounted != self.deposited_total {
             return Err(Error::Malformed(
                 "credit conservation: accounted value does not equal deposited",
@@ -562,8 +703,7 @@ impl CreditBook {
 impl CreditPosition {
     /// Canonical encoding. Self-delimiting: the attestation-free fields are
     /// fixed-size or written by their own encoders, so `decode` never guesses.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = crate::ser::Writer::with_capacity(256);
+    pub fn encode(&self) -> Vec<u8> {        let mut w = crate::ser::Writer::with_capacity(256);
         w.fixed(&self.borrower)
             .fixed(&self.agent_id)
             .fixed(&self.lender)
@@ -669,6 +809,142 @@ impl CreditPosition {
 const WIRE_DRAWN: u8 = 0;
 const WIRE_REPAID: u8 = 1;
 const WIRE_DEFAULTED: u8 = 2;
+
+/// Maximum entries the book codec will read back per map. The book is bounded by
+/// what a node's own depositors created, but a decoded count still has to be
+/// checked against the bytes actually present before anything is allocated.
+const MAX_BOOK_ENTRIES: usize = 1 << 20;
+
+/// Restart recovery for the whole book.
+///
+/// The book is node-local and non-consensus, but losing it loses every free
+/// balance, posted bond, locked position and outstanding reservation a node has
+/// accepted — so it is encodable and decodable, and a restart round-trips byte
+/// for byte with the conservation invariant intact.
+impl CreditBook {
+    /// Canonical encoding of the whole book.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(512);
+        Self::encode_u64_map(&mut w, &self.free);
+        Self::encode_u64_map(&mut w, &self.bonds);
+        Self::encode_u64_map(&mut w, &self.bond_pledged);
+        Self::encode_u64_map(&mut w, &self.reserved);
+        Self::encode_u64_map(&mut w, &self.recovered);
+        w.u64le(self.deposited_total).u64le(self.settled_payments);
+        w.u64le(self.reservation_seq);
+        // Positions, keyed by their derived id: an id is part of the record, so
+        // a book that round-trips keeps pointing at the same positions.
+        w.u32le(self.positions.len() as u32);
+        for (id, position) in &self.positions {
+            w.fixed(id);
+            let bytes = position.encode();
+            w.u32le(bytes.len() as u32).raw(&bytes);
+        }
+        w.u32le(self.position_reserved.len() as u32);
+        for (id, amount) in &self.position_reserved {
+            w.fixed(id).u64le(*amount);
+        }
+        w.u32le(self.reservation_log.len() as u32);
+        for (id, outcome) in &self.reservation_log {
+            w.fixed(id).u8(match outcome {
+                ReservationOutcome::Settled => 0,
+                ReservationOutcome::Released => 1,
+            });
+        }
+        w.into_vec()
+    }
+
+    fn encode_u64_map(w: &mut crate::ser::Writer, map: &BTreeMap<Address, u64>) {
+        w.u32le(map.len() as u32);
+        for (addr, amount) in map {
+            w.fixed(addr).u64le(*amount);
+        }
+    }
+
+    /// Decode what [`CreditBook::encode`] wrote. Bounded and fail-closed: a
+    /// declared count beyond the cap, a truncated field, or trailing bytes
+    /// produce an error rather than a half-built book.
+    pub fn decode(r: &mut crate::ser::Reader<'_>) -> Result<Self> {
+        let free = Self::decode_u64_map(r)?;
+        let bonds = Self::decode_u64_map(r)?;
+        let bond_pledged = Self::decode_u64_map(r)?;
+        let reserved = Self::decode_u64_map(r)?;
+        let recovered = Self::decode_u64_map(r)?;
+        let deposited_total = r.u64le()?;
+        let settled_payments = r.u64le()?;
+        let reservation_seq = r.u64le()?;
+        let mut book = CreditBook {
+            free,
+            bonds,
+            bond_pledged,
+            reserved,
+            recovered,
+            deposited_total,
+            settled_payments,
+            reservation_seq,
+            ..CreditBook::new()
+        };
+        let positions = r.u32le()? as usize;
+        if positions > MAX_BOOK_ENTRIES {
+            return Err(Error::Malformed("credit book position count over cap"));
+        }
+        for _ in 0..positions {
+            let id: Hash = r.fixed()?;
+            // Length-prefixed so a lying count cannot read past the buffer, and
+            // so the position's own decoder sees exactly its own bytes.
+            let len = r.u32le()? as usize;
+            if len > MAX_BOOK_ENTRIES * 256 {
+                return Err(Error::Malformed("credit book position over cap"));
+            }
+            let bytes = r.fixed_slice(len)?;
+            let mut sub = crate::ser::Reader::new(bytes);
+            let position = CreditPosition::decode(&mut sub)?;
+            if sub.remaining() != 0 {
+                return Err(Error::Malformed("credit book position has trailing bytes"));
+            }
+            book.positions.insert(id, position);
+        }
+        let position_reserved = r.u32le()? as usize;
+        if position_reserved > MAX_BOOK_ENTRIES {
+            return Err(Error::Malformed("credit book reservation count over cap"));
+        }
+        for _ in 0..position_reserved {
+            let id: Hash = r.fixed()?;
+            book.position_reserved.insert(id, r.u64le()?);
+        }
+        let log = r.u32le()? as usize;
+        if log > MAX_RESERVATION_LOG {
+            return Err(Error::Malformed("credit book reservation log over cap"));
+        }
+        for _ in 0..log {
+            let id: Hash = r.fixed()?;
+            let outcome = match r.u8()? {
+                0 => ReservationOutcome::Settled,
+                1 => ReservationOutcome::Released,
+                _ => return Err(Error::Malformed("unknown reservation outcome tag")),
+            };
+            book.reservation_order.push_back(id);
+            book.reservation_log.insert(id, outcome);
+        }
+        // A restored book must satisfy the invariant it was saved under, or the
+        // bytes were not a book at all.
+        book.check_conservation()?;
+        Ok(book)
+    }
+
+    fn decode_u64_map(r: &mut crate::ser::Reader<'_>) -> Result<BTreeMap<Address, u64>> {
+        let count = r.u32le()? as usize;
+        if count > MAX_BOOK_ENTRIES {
+            return Err(Error::Malformed("credit book entry count over cap"));
+        }
+        let mut map = BTreeMap::new();
+        for _ in 0..count {
+            let addr: Address = r.fixed()?;
+            map.insert(addr, r.u64le()?);
+        }
+        Ok(map)
+    }
+}
 
 /// What a repayment did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,23 +1239,20 @@ impl CreditPosition {
         })
     }
 
-    /// Settle an unpaid position at its deadline.
+    /// The settlement this default would produce, **without** committing it.
     ///
-    /// The order of payments is the whole point: **collateral first, then the
-    /// bond, and never reputation.** The position's own collateral is what was
-    /// pledged for it; the bond is what backs a default.
-    ///
-    /// The deadline is the lender's patience made checkable: before it, an
-    /// unpaid position is merely late, not defaulted — a lender that could
-    /// settle on a whim would make every term it offered meaningless.
-    ///
-    /// Collateral in excess of the debt returns to the borrower. A default takes
-    /// what it is owed and no more — an overcollateralized position that went
-    /// bad still belongs to its borrower outside the debt.
-    pub fn default(&mut self, height: u64) -> Result<DefaultSettlement> {
+    /// Pure arithmetic: `default` calls this and then commits, so the book (and
+    /// any caller) can price a default — and refuse one whose bond is short —
+    /// before a single bucket is written.
+    pub fn simulate_default(&self, height: u64) -> Result<DefaultSettlement> {
         if height < self.deadline_height {
             return Err(Error::Malformed(
                 "the position has not yet reached its deadline",
+            ));
+        }
+        if !matches!(self.state, PositionState::Drawn { .. }) {
+            return Err(Error::Malformed(
+                "a settled position cannot default twice",
             ));
         }
         let outstanding_principal = self.outstanding_principal();
@@ -996,14 +1269,30 @@ impl CreditPosition {
         let shortfall = still_owed - from_bond;
         let excess_returned = self.collateral_sat - from_collateral;
 
-        let settlement = DefaultSettlement {
+        Ok(DefaultSettlement {
             debt_sat: debt,
             from_collateral_sat: from_collateral,
             from_bond_sat: from_bond,
             shortfall_sat: shortfall,
             excess_returned_sat: excess_returned,
-        };
+        })
+    }
 
+    /// Settle an unpaid position at its deadline.
+    ///
+    /// The order of payments is the whole point: **collateral first, then the
+    /// bond, and never reputation.** The position's own collateral is what was
+    /// pledged for it; the bond is what backs a default.
+    ///
+    /// The deadline is the lender's patience made checkable: before it, an
+    /// unpaid position is merely late, not defaulted — a lender that could
+    /// settle on a whim would make every term it offered meaningless.
+    ///
+    /// Collateral in excess of the debt returns to the borrower. A default takes
+    /// what it is owed and no more — an overcollateralized position that went
+    /// bad still belongs to its borrower outside the debt.
+    pub fn default(&mut self, height: u64) -> Result<DefaultSettlement> {
+        let settlement = self.simulate_default(height)?;
         self.state = PositionState::Defaulted {
             at_height: height,
             settlement,
@@ -1045,10 +1334,17 @@ pub trait CreditGate {
     /// queued via the exit sink or already confirmed. This debits the payer's
     /// credit line — it does **not** move on-chain coins, which still happen only
     /// through the ordinary L1/L2 payout path. The reservation is consumed:
-    /// calling this twice on the same reservation is a logic error and is not
-    /// permitted.
+    /// calling this twice on the same reservation is idempotent (the second call
+    /// debits nothing) rather than a second debit.
     fn settle(&mut self, _reservation: &Reservation) -> Result<()> {
         Err(Error::Malformed("settle is not wired on this CreditGate"))
+    }
+
+    /// Give back a reservation that was never settled — the payment was refused
+    /// after admission, or the connection died. Without this the encumbrance
+    /// would last forever and the payer's line would shrink without any payment.
+    fn release(&mut self, _reservation: &Reservation) -> Result<()> {
+        Err(Error::Malformed("release is not wired on this CreditGate"))
     }
 }
 
@@ -1088,41 +1384,79 @@ impl CreditGate for NoCreditGate {
     fn settle(&mut self, _reservation: &Reservation) -> Result<()> {
         Ok(())
     }
+
+    fn release(&mut self, _reservation: &Reservation) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// `CreditBook` is its own credit gate: a payment is admitted only if the payer's
-/// unencumbered capacity (free balance + the headroom in every live position that
-/// can absorb a debit) covers `amount_sat`. The reservation that admission returns
-/// is informational — the actual debit against an open position, if any, happens
-/// at settlement (§19.4); here we only *check* that capacity exists so a payment
-/// can never be committed to a payer with nothing to pay it.
+/// unencumbered capacity (unencumbered free balance plus the headroom in every
+/// live position that can absorb a debit) covers `amount_sat`.
+///
+/// A reservation **encumbers** that capacity immediately — it moves out of
+/// `free` into `reserved`, or off a live position's principal headroom — so two
+/// payments cannot both be admitted against the same value. The debit still
+/// lands at settlement (§19.4); reserving is what makes that promise exact
+/// rather than advisory.
 impl CreditGate for CreditBook {
     fn reserve(&mut self, payer: &Address, amount_sat: u64, height: u64) -> Result<Reservation> {
-        if self.free(payer) >= amount_sat {
-            // The free balance alone covers it: no position is consumed. The
-            // reservation id is derived so a future settlement can look it up.
+        self.reservation_seq = self.reservation_seq.saturating_add(1);
+        // Every reservation gets its own id, so two payments from one payer at
+        // one height are never conflated into the same reservation.
+        let id = sha256_dom(
+            DOM_CREDIT_POSITION,
+            &[
+                payer.as_ref(),
+                &amount_sat.to_le_bytes(),
+                &height.to_le_bytes(),
+                &self.reservation_seq.to_le_bytes(),
+            ],
+        );
+
+        let spendable = self.available(payer);
+        if spendable >= amount_sat {
+            // The unencumbered balance alone covers it: no position is consumed,
+            // and the value moves to `reserved` so nothing else may spend it.
+            let f = self
+                .free
+                .get_mut(payer)
+                .ok_or(Error::Malformed("no free balance to reserve against"))?;
+            *f = f
+                .checked_sub(amount_sat)
+                .ok_or(Error::InsufficientFunds {
+                    needed: amount_sat,
+                    available: spendable,
+                })?;
+            let r = self.reserved.entry(*payer).or_insert(0);
+            *r = r.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
             return Ok(Reservation {
-                id: position_id(payer, amount_sat, height),
+                id,
                 debtor: *payer,
                 amount_sat,
                 position_id: None,
             });
         }
 
-        // Otherwise try an existing live position that still has principal
-        // outstanding; the debit is charged there at settlement time.
-        let mut remaining = amount_sat.saturating_sub(self.free(payer));
+        // Otherwise draw the remainder against live positions that still have
+        // unencumbered principal outstanding.
+        let mut remaining = amount_sat.saturating_sub(spendable);
         let mut chosen: Option<Hash> = None;
-        for (id, position) in self.live_positions() {
+        // The positions the draw is spread over, in line order, so the
+        // encumbrance below is computed from the same numbers the loop walked.
+        let mut spread: Vec<(Hash, u64)> = Vec::new();
+        for (pos_id, position) in self.live_positions() {
             if position.borrower != *payer {
                 continue;
             }
-            // A position can only absorb a debit up to its outstanding principal.
             let headroom = match position.state {
                 PositionState::Drawn {
                     repaid_principal_sat,
                     ..
-                } => position.amount_sat.saturating_sub(repaid_principal_sat),
+                } => position
+                    .amount_sat
+                    .saturating_sub(repaid_principal_sat)
+                    .saturating_sub(self.position_reserved.get(pos_id).copied().unwrap_or(0)),
                 _ => 0,
             };
             if headroom == 0 {
@@ -1130,66 +1464,160 @@ impl CreditGate for CreditBook {
             }
             if remaining <= headroom {
                 remaining = 0;
-                chosen = Some(*id);
+                chosen = Some(*pos_id);
+                spread.push((*pos_id, headroom));
                 break;
             }
             remaining -= headroom;
+            spread.push((*pos_id, headroom));
         }
 
         if remaining > 0 {
-            return Err(crate::error::Error::InsufficientFunds {
+            return Err(Error::InsufficientFunds {
                 needed: amount_sat,
-                available: self.free(payer),
+                available: spendable,
             });
         }
+        // Encumber the drawn part, position by position.
+        let mut to_encumber = amount_sat.saturating_sub(spendable);
+        for (pos_id, headroom) in spread {
+            let take = to_encumber.min(headroom);
+            let slot = self.position_reserved.entry(pos_id).or_insert(0);
+            *slot = slot.saturating_add(take);
+            to_encumber -= take;
+        }
         Ok(Reservation {
-            id: chosen.unwrap_or_else(|| position_id(payer, amount_sat, height)),
+            id,
             debtor: *payer,
             amount_sat,
             position_id: chosen,
         })
     }
 
-    /// Commit a reservation returned by [`CreditGate::reserve`], debiting the
-    /// payer's free balance. Ledger half of coin settlement (roadmap item 10,
-    /// §19.4): the credit line is reduced here; the on-chain coins still move
-    /// only through the ordinary L1/L2 payout path. Only the free-balance debit
-    /// path is wired — a position-backed reservation is refused with a named
-    /// error, as debiting a position is the settlement layer's lifecycle job.
+    /// Commit a reservation returned by [`CreditGate::reserve`], moving its
+    /// encumbrance into `settled_payments`. Ledger half of coin settlement
+    /// (roadmap item 10, §19.4): the credit line is reduced here; the on-chain
+    /// coins still move only through the ordinary L1/L2 payout path.
+    ///
+    /// Idempotent and replay-safe: the reservation id is recorded once it is
+    /// consumed, so a re-submitted receipt settling the same reservation again
+    /// debits nothing rather than debiting twice.
     fn settle(&mut self, reservation: &Reservation) -> Result<()> {
-        if reservation.position_id.is_some() {
-            return Err(crate::error::Error::Malformed(
-                "position-backed settlement debit is deferred to the position lifecycle",
-            ));
-        }
         if reservation.amount_sat == 0 {
             return Ok(());
         }
-        let free = self.free(&reservation.debtor);
-        if free < reservation.amount_sat {
-            return Err(crate::error::Error::Malformed(
-                "credit reservation settled with no free balance to debit",
+        match self.reservation_log.get(&reservation.id) {
+            Some(ReservationOutcome::Settled) => return Ok(()),
+            Some(ReservationOutcome::Released) => {
+                return Err(Error::Malformed(
+                    "this reservation was released and cannot be settled",
+                ))
+            }
+            None => {}
+        }
+        let debit = self
+            .reserved
+            .get_mut(&reservation.debtor)
+            .ok_or(Error::Malformed(
+                "no outstanding reservation for this payer to settle",
+            ))?;
+        if *debit < reservation.amount_sat {
+            return Err(Error::Malformed(
+                "reserved value does not cover the reservation being settled",
             ));
         }
-        let f = self.free.get_mut(&reservation.debtor).unwrap();
-        *f = f.saturating_sub(reservation.amount_sat);
-        self.settled_payments = self.settled_payments.saturating_add(reservation.amount_sat);
+        *debit -= reservation.amount_sat;
+        if *debit == 0 {
+            self.reserved.remove(&reservation.debtor);
+        }
+        self.settled_payments = self
+            .settled_payments
+            .checked_add(reservation.amount_sat)
+            .ok_or(Error::ValueOverflow)?;
+        self.record_reservation(reservation.id, ReservationOutcome::Settled);
         Ok(())
+    }
+
+    /// Return a reservation's encumbrance to the payer's spendable capacity.
+    ///
+    /// A reservation that was never settled must not keep shrinking the line it
+    /// came from: admission that fails afterwards, or a payment the payer
+    /// abandons, puts the value back where it was.
+    fn release(&mut self, reservation: &Reservation) -> Result<()> {
+        if reservation.amount_sat == 0 {
+            return Ok(());
+        }
+        match self.reservation_log.get(&reservation.id) {
+            Some(ReservationOutcome::Released) => return Ok(()),
+            Some(ReservationOutcome::Settled) => {
+                return Err(Error::Malformed(
+                    "this reservation was settled and cannot be released",
+                ))
+            }
+            None => {}
+        }
+        if let Some(debit) = self.reserved.get_mut(&reservation.debtor) {
+            let give = reservation.amount_sat.min(*debit);
+            *debit -= give;
+            if *debit == 0 {
+                self.reserved.remove(&reservation.debtor);
+            }
+            let free = self.free.entry(reservation.debtor).or_insert(0);
+            *free = free.checked_add(give).ok_or(Error::ValueOverflow)?;
+        }
+        // Any part drawn against a position's headroom is returned there.
+        if let Some(position_id) = reservation.position_id {
+            let slot = self.position_reserved.entry(position_id).or_insert(0);
+            *slot = slot.saturating_sub(reservation.amount_sat);
+            if *slot == 0 {
+                self.position_reserved.remove(&position_id);
+            }
+        }
+        self.record_reservation(reservation.id, ReservationOutcome::Released);
+        self.check_conservation()
     }
 }
 
-/// Derive a reservation id that is unique per (payer, amount, height), so a
-/// settlement can correlate an admission with the debit it eventually posts
-/// without storing the reservation itself.
-fn position_id(payer: &Address, amount_sat: u64, height: u64) -> Hash {
-    crate::hash::sha256_dom(
-        DOM_CREDIT_POSITION,
-        &[
-            payer.as_ref(),
-            &amount_sat.to_le_bytes(),
-            &height.to_le_bytes(),
-        ],
-    )
+impl CreditBook {
+    /// Record a consumed reservation, evicting the oldest entry past the cap so
+    /// the log stays bounded rather than growing with the settlement count.
+    fn record_reservation(&mut self, id: Hash, outcome: ReservationOutcome) {
+        if self.reservation_log.insert(id, outcome).is_none() {
+            self.reservation_order.push_back(id);
+        }
+        while self.reservation_order.len() > MAX_RESERVATION_LOG {
+            match self.reservation_order.pop_front() {
+                Some(oldest) => {
+                    self.reservation_log.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Value currently encumbered by outstanding reservations, free-balance and
+    /// position-backed together.
+    pub fn total_reserved(&self) -> u64 {
+        self.reserved
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
+            .saturating_add(
+                self.position_reserved
+                    .values()
+                    .fold(0u64, |acc, v| acc.saturating_add(*v)),
+            )
+    }
+
+    /// Free-balance value this payer has encumbered right now.
+    pub fn reserved_by(&self, agent: &Address) -> u64 {
+        self.reserved.get(agent).copied().unwrap_or(0)
+    }
+
+    /// Whether a reservation id has already been consumed, and how. Exposed so a
+    /// caller (and a test) can assert the replay guard directly.
+    pub fn reservation_outcome(&self, id: &Hash) -> Option<ReservationOutcome> {
+        self.reservation_log.get(id).copied()
+    }
 }
 
 #[cfg(test)]
@@ -1622,6 +2050,130 @@ mod tests {
     }
 
     #[test]
+    fn one_bond_cannot_price_two_positions_at_the_same_time() {
+        // The bond-reuse defect, pinned: a posted bond discounts the collateral
+        // of the position it is pledged to, and nothing else, for as long as
+        // that position is live. Without the pledge a 50 000 bond could back any
+        // number of positions, each claiming the same 50 000 discount, and the
+        // book's collateral would fall once per obligation secured.
+        let borrower = [1u8; 20];
+        let lender = [2u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 2_300_000).unwrap();
+        book.post_bond(borrower, 50_000).unwrap();
+        assert_eq!(book.unpledged_bond(&borrower), 50_000);
+
+        let first = book.open(&spec(1_000_000, 50_000, 0, 100)).unwrap();
+        assert_eq!(book.unpledged_bond(&borrower), 0, "the bond is pledged");
+        assert_eq!(book.total_locked_collateral(), 950_000);
+        book.check_conservation().unwrap();
+
+        // A second position priced with the same bond has no unpledged bond to
+        // claim, so it must be refused — not priced with a discount that is
+        // already at risk elsewhere.
+        let second = spec(1_000_000, 50_000, 0, 200);
+        assert!(
+            book.open(&second).is_err(),
+            "the same bond cannot secure two obligations"
+        );
+        assert_eq!(book.live_positions().count(), 1, "nothing was recorded");
+        assert_eq!(book.total_locked_collateral(), 950_000);
+        book.check_conservation().unwrap();
+
+        // A smaller bond posts and prices the second position against *its own*
+        // value, which is the honest way to get more than one line open.
+        book.deposit(borrower, 50_000).unwrap();
+        book.post_bond(borrower, 20_000).unwrap();
+        let second_id = book.open(&spec(1_000_000, 20_000, 0, 200)).unwrap();
+        assert_eq!(book.live_positions().count(), 2);
+        assert_eq!(book.unpledged_bond(&borrower), 0);
+        book.check_conservation().unwrap();
+
+        // Settling the first position frees its pledge: the bond is still posted
+        // (a default did not take it), but it may price a new position again.
+        book.deposit(borrower, 1_100_000).unwrap();
+        book.repay(&first, 1_100_000, 100).unwrap();
+        assert_eq!(book.unpledged_bond(&borrower), 50_000, "pledge released");
+        book.open(&spec(1_000_000, 50_000, 300, 400)).unwrap();
+        book.check_conservation().unwrap();
+        assert!(book.position(&second_id).is_some());
+        assert_eq!(book.recovered(&lender), 1_100_000);
+    }
+
+    #[test]
+    fn a_defaulted_positions_bond_pledge_is_released_after_the_bond_is_taken() {
+        // The pledge must track what the default actually consumed: the part the
+        // default took is already out of `bonds`, and only the unspent part
+        // returns to the pool a new position may price against.
+        let borrower = [1u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 1_100_000).unwrap();
+        book.post_bond(borrower, 50_000).unwrap();
+        let id = book.open(&spec(1_000_000, 50_000, 0, 100)).unwrap();
+        assert_eq!(book.unpledged_bond(&borrower), 0);
+
+        // One window of interest puts the debt at 1 100 000: 950 000 of
+        // collateral, then all 50 000 of the bond, and a shortfall.
+        let s = book.default(&id, 100).unwrap();
+        assert_eq!(s.from_bond_sat, 50_000);
+        assert_eq!(book.bond(&borrower), 0, "the bond was taken in full");
+        assert_eq!(book.unpledged_bond(&borrower), 0, "nothing left to pledge");
+        book.check_conservation().unwrap();
+
+        // Posting again is what creates capacity, exactly as at the start.
+        book.deposit(borrower, 1_000_000).unwrap();
+        book.post_bond(borrower, 50_000).unwrap();
+        assert_eq!(book.unpledged_bond(&borrower), 50_000);
+        book.open(&spec(1_000_000, 50_000, 0, 200)).unwrap();
+        assert_eq!(book.total_locked_collateral(), 950_000);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn the_book_round_trips_through_a_restart_with_the_invariant_intact() {
+        // Restart/recovery: a book that is saved and restored must come back
+        // byte-identical in every bucket, still satisfy conservation, and be
+        // able to continue its lifecycle. Anything less loses a balance, a bond
+        // or an outstanding reservation on restart.
+        let borrower = [1u8; 20];
+        let lender = [2u8; 20];
+        let payer = [7u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 2_400_000).unwrap();
+        book.deposit(payer, 900_000).unwrap();
+        book.post_bond(borrower, 50_000).unwrap();
+        let id = book.open(&spec(1_000_000, 50_000, 0, 100)).unwrap();
+        book.repay(&id, 100_000, 100).unwrap();
+        // A partial repayment leaves a live position, a partial debt, and an
+        // outstanding reservation all at once.
+        let res = book.reserve(&payer, 400_000, 5).unwrap();
+        book.check_conservation().unwrap();
+
+        let bytes = book.encode();
+        let mut r = crate::ser::Reader::new(&bytes);
+        let mut restored = CreditBook::decode(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0, "the codec is self-delimiting");
+        assert_eq!(restored, book, "every bucket round-trips");
+        restored.check_conservation().unwrap();
+
+        // And the restored book can finish the job: the reservation still
+        // settles exactly once, and the position still repays to zero.
+        restored.settle(&res).unwrap();
+        restored.settle(&res).unwrap();
+        assert_eq!(restored.total_settled(), 400_000);
+        restored.deposit(borrower, 1_100_000).unwrap();
+        restored.repay(&id, 1_000_000, 100).unwrap();
+        assert_eq!(restored.recovered(&lender), 1_100_000);
+        assert_eq!(restored.live_positions().count(), 0);
+        assert_eq!(restored.unpledged_bond(&borrower), 50_000);
+        restored.check_conservation().unwrap();
+
+        // A decoded blob that is not a book is refused rather than half-built.
+        let mut truncated = crate::ser::Reader::new(&bytes[..bytes.len() - 20]);
+        assert!(CreditBook::decode(&mut truncated).is_err());
+    }
+
+    #[test]
     fn a_default_takes_the_bond_from_the_book() {
         let borrower = [1u8; 20];
         let lender = [2u8; 20];
@@ -1687,39 +2239,90 @@ mod tests {
 
     #[test]
     fn a_settled_free_balance_reservation_is_debited() {
-        // Reserve only checks capacity; the debit lands at settle.
+        // A reservation must *encumber* the value it names, or two payments can
+        // each reserve the same balance, both be admitted, and only one of them
+        // ever be debited. Encumbrance is what makes the debit a promise the
+        // settlement can keep.
         let payer = [7u8; 20];
         let mut book = CreditBook::new();
         book.deposit(payer, 1_000_000).unwrap();
         let res = book.reserve(&payer, 300_000, 1).unwrap();
         assert!(res.position_id.is_none(), "free-balance reservation");
-        assert_eq!(book.free(&payer), 1_000_000, "reserve does not debit");
+        assert_eq!(book.reserved_by(&payer), 300_000, "but it is encumbered");
+        assert_eq!(book.available(&payer), 700_000, "spendable capacity fell");
+        book.check_conservation().unwrap();
+
         book.settle(&res).unwrap();
-        assert_eq!(book.free(&payer), 700_000, "settle debited the reservation");
+        assert_eq!(book.available(&payer), 700_000, "spendable capacity holds");
+        assert_eq!(book.reserved_by(&payer), 0, "the encumbrance was consumed");
+        assert_eq!(book.total_settled(), 300_000);
         book.check_conservation().unwrap();
     }
 
     #[test]
-    fn settling_with_no_free_balance_fails_cleanly() {
-        let payer = [8u8; 20];
+    fn a_reservation_encumbers_capacity_the_moment_it_is_made() {
+        // The over-reservation defect, pinned: two payments each naming the full
+        // free balance must not both be admitted.
+        let payer = [9u8; 20];
         let mut book = CreditBook::new();
         book.deposit(payer, 100_000).unwrap();
-        let res = book.reserve(&payer, 100_000, 1).unwrap();
-        assert!(res.position_id.is_none());
-        // The line is spent elsewhere before settlement lands.
-        *book.free.get_mut(&payer).unwrap() = 0;
-        let err = book.settle(&res).unwrap_err();
-        match err {
-            crate::error::Error::Malformed(m) => assert!(m.contains("no free balance")),
-            other => panic!("expected Malformed, got {other:?}"),
-        }
+        let first = book.reserve(&payer, 100_000, 5).unwrap();
+        assert_eq!(book.available(&payer), 0, "the whole line is encumbered");
+        let second = book.reserve(&payer, 100_000, 5);
+        assert!(
+            second.is_err(),
+            "the same balance cannot back two admitted payments"
+        );
+        book.settle(&first).unwrap();
+        book.check_conservation().unwrap();
     }
 
     #[test]
-    fn a_position_backed_reservation_is_not_settled_here() {
-        // Position-backed debits are deferred to the position lifecycle; settle
-        // refuses them with a named error rather than half-applying a debit.
-        // `spec` fixes borrower=[1u8;20].
+    fn settlement_is_idempotent_and_a_released_reservation_cannot_settle() {
+        let payer = [11u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(payer, 500_000).unwrap();
+        let res = book.reserve(&payer, 200_000, 3).unwrap();
+
+        // A replayed receipt settles the same reservation twice: the second call
+        // debits nothing rather than debiting twice.
+        book.settle(&res).unwrap();
+        book.settle(&res).unwrap();
+        assert_eq!(book.total_settled(), 200_000, "one debit, not two");
+        book.check_conservation().unwrap();
+
+        // And a released reservation is dead: admission failed afterwards, so the
+        // value went back and there is nothing left to settle.
+        let other = book.reserve(&payer, 100_000, 4).unwrap();
+        book.release(&other).unwrap();
+        assert_eq!(book.available(&payer), 300_000, "the line is restored");
+        assert!(book.settle(&other).is_err(), "released cannot settle");
+        assert_eq!(book.total_settled(), 200_000, "no second debit");
+        book.check_conservation().unwrap();
+
+        // A settled reservation cannot be released either: the value has moved.
+        assert!(book.release(&res).is_err());
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn a_reservation_is_refused_when_the_line_cannot_cover_it() {
+        // Admission fails closed before anything is encumbered, so a refused
+        // payment leaves the line exactly as it was.
+        let payer = [12u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(payer, 10_000).unwrap();
+        let err = book.reserve(&payer, 10_001, 1).unwrap_err();
+        assert!(matches!(err, Error::InsufficientFunds { .. }), "{err:?}");
+        assert_eq!(book.available(&payer), 10_000);
+        assert_eq!(book.total_reserved(), 0);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn a_position_backed_reservation_is_encumbered_not_double_spent() {
+        // Position headroom is encumbered just like a free balance, so a second
+        // payment cannot draw the same principal twice.
         let borrower = [1u8; 20];
         let mut book = CreditBook::new();
         let s = spec(1_000_000, 1_000_000, 1, 10_000);
@@ -1729,21 +2332,118 @@ mod tests {
         book.post_bond(borrower, 1_000_000).unwrap();
         let id = book.open(&s).unwrap();
         let before = book.positions.get(&id).unwrap().clone();
-        // Free balance is exhausted (all collateral locked), so reserve draws
-        // the full amount against the position — a position-backed reservation.
+        // Free balance is exhausted (all collateral locked), so the draw is
+        // charged against the position's outstanding principal.
         let res = book
             .reserve(&borrower, 1_000_000, 1)
             .expect("line covers the amount via the position");
         assert_eq!(res.position_id, Some(id));
+        assert_eq!(book.total_reserved(), 1_000_000);
+        // A second draw of the same principal has nothing left to encumber.
+        assert!(book.reserve(&borrower, 1, 1).is_err(), "headroom is spent");
+        // And nothing has been debited yet: the position is untouched.
+        assert_eq!(book.positions.get(&id).unwrap(), &before);
+
+        // Releasing gives the headroom back and leaves the position alone.
+        book.release(&res).unwrap();
+        assert_eq!(book.total_reserved(), 0);
+        assert_eq!(book.positions.get(&id).unwrap(), &before);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn a_default_whose_bond_is_short_leaves_the_book_untouched() {
+        // The interrupted-operation defect, pinned: a default is priced before a
+        // single bucket is written, so a refusal cannot strand a position in a
+        // settled state with the value never recovered.
+        let borrower = [1u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(borrower, 1_100_000).unwrap();
+        book.post_bond(borrower, 50_000).unwrap();
+        let id = book.open(&spec(1_000_000, 50_000, 0, 100)).unwrap();
+        let snapshot = book.clone();
+
+        // Half the bond is taken elsewhere — the position still carries its
+        // 50 000 price tag, but only 10 000 of bond is left to be taken. The
+        // move keeps the book's own invariant intact, so the refusal below has
+        // to be the *name* of the failure and not a conservation panic.
+        let b = book.bonds.get_mut(&borrower).unwrap();
+        *b -= 40_000;
+        drop(b);
+        let f = book.free.entry(borrower).or_insert(0);
+        *f += 40_000;
+        let p = book.bond_pledged.get_mut(&borrower).unwrap();
+        *p -= 40_000;
+        book.check_conservation().unwrap();
+
+        let err = book.default(&id, 100).unwrap_err();
+        assert!(err.to_string().contains("bond"), "{err}");
+
+        // Nothing was applied: the position is still live, so it can still be
+        // repaid, and the book still balances.
+        assert!(book.live_positions().any(|(pid, _)| pid == &id));
+        assert_eq!(
+            book.positions.get(&id).unwrap(),
+            snapshot.positions.get(&id).unwrap()
+        );
+        assert_eq!(book.total_locked_collateral(), 950_000);
+        assert_eq!(book.total_settled(), 0);
+        assert_eq!(book.recovered(&[2u8; 20]), 0);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn settling_a_reservation_that_was_never_made_fails_cleanly() {
+        // The failure mode a settlement must actually defend against now that
+        // capacity is encumbered at admission: a caller handing over a
+        // reservation the book never granted. There is nothing to debit, so the
+        // settle refuses rather than inventing a debit.
+        let payer = [8u8; 20];
+        let mut book = CreditBook::new();
+        book.deposit(payer, 100_000).unwrap();
+        let res = book.reserve(&payer, 100_000, 1).unwrap();
+        assert!(res.position_id.is_none());
+        book.release(&res).unwrap();
         let err = book.settle(&res).unwrap_err();
         match err {
-            crate::error::Error::Malformed(m) => assert!(m.contains("deferred")),
+            crate::error::Error::Malformed(m) => assert!(m.contains("released")),
             other => panic!("expected Malformed, got {other:?}"),
         }
+        assert_eq!(book.total_settled(), 0);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn a_position_backed_reservation_is_encumbered_until_settled_or_released() {
+        // Position headroom is encumbered at admission just like a free
+        // balance, so the same principal cannot back two admitted payments, and
+        // the position itself is only ever touched by the lifecycle.
+        let borrower = [1u8; 20];
+        let mut book = CreditBook::new();
+        let s = spec(1_000_000, 1_000_000, 1, 10_000);
+        let collateral = CreditPosition::open(&s).unwrap().collateral_sat;
+        book.deposit(borrower, collateral.saturating_add(1_000_000))
+            .unwrap();
+        book.post_bond(borrower, 1_000_000).unwrap();
+        let id = book.open(&s).unwrap();
+        let before = book.positions.get(&id).unwrap().clone();
+        let res = book
+            .reserve(&borrower, 1_000_000, 1)
+            .expect("line covers the amount via the position");
+        assert_eq!(res.position_id, Some(id));
+        assert_eq!(book.total_reserved(), 1_000_000);
+
+        // The charge against the position is a lifecycle event: `repay` is how a
+        // position's principal moves, and the settlement layer calls that. The
+        // reservation only ever holds the capacity.
         assert_eq!(
             book.positions.get(&id).unwrap(),
             &before,
             "no half-applied debit"
         );
+        book.release(&res).unwrap();
+        assert_eq!(book.total_reserved(), 0);
+        assert_eq!(book.positions.get(&id).unwrap(), &before);
+        book.check_conservation().unwrap();
     }
 }

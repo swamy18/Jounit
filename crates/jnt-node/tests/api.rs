@@ -48,7 +48,7 @@ use jnt_core::wallet::Wallet;
 use jnt_node::api::{spawn, SharedNode};
 use jnt_node::l2::NodeL2;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const NET: &str = "jounit/mini";
 const EXPIRES: u64 = 9_000;
@@ -929,9 +929,10 @@ fn a_payment_is_admitted_only_when_the_payers_credit_covers_it() {
 
 #[test]
 fn a_settled_receipt_commits_the_credit_debit() {
-    // Admission reserves against the payer's line but does not move coins.
-    // Receipt acceptance is the settlement event (§19.4): that is when the
-    // credit debit commits, so the free balance drops by the paid amount.
+    // Admission encumbers the payer's line but does not move coins. Receipt
+    // acceptance is the settlement event (§19.4): that is when the credit debit
+    // commits, so the encumbrance moves to settled and the spendable line is
+    // already down.
     let node = start();
     let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
     let payer_addr = wallet(61, "api-payer").address().unwrap();
@@ -940,15 +941,17 @@ fn a_settled_receipt_commits_the_credit_debit() {
     let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 200, "{body}");
 
-    // Reservation is a hold, not a debit.
+    // Admission is an encumbrance, not a debit: spendable capacity is gone, but
+    // the value has not been settled.
     let (s, b) = get(&node, &balance_path);
     assert_eq!(s, 200);
     assert_eq!(
-        b["free_balance"], BRIDGE_AMOUNT_SAT,
-        "reserve holds but does not debit"
+        b["reserved"], BRIDGE_AMOUNT_SAT,
+        "the reservation encumbers the line at admission"
     );
+    assert_eq!(b["available"], 0, "so the capacity is exact, not advisory");
 
-    // Accepting the receipt settles the reservation → debit commits.
+    // Accepting the receipt settles the reservation → the debit commits.
     let (s, body) = post(
         &node,
         "/v1/receipt",
@@ -959,10 +962,163 @@ fn a_settled_receipt_commits_the_credit_debit() {
 
     let (s, b) = get(&node, &balance_path);
     assert_eq!(s, 200);
+    assert_eq!(b["reserved"], 0, "the encumbrance was consumed");
     assert_eq!(
         b["free_balance"], 0,
         "settlement debited the reserved amount"
     );
+
+    // A replayed receipt is idempotent: it settles nothing a second time.
+    let (s, body) = post(
+        &node,
+        "/v1/receipt",
+        &serde_json::json!({ "receipt_hex": hex::encode(receipt.serialize()) }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["outcome"], "duplicate");
+    let (s, b) = get(&node, &balance_path);
+    assert_eq!(s, 200);
+    assert_eq!(b["reserved"], 0);
+}
+
+#[test]
+fn a_reserved_line_cannot_back_two_admitted_payments() {
+    // The over-reservation defect, at the node: one deposit funds exactly one
+    // payment. A second payment naming the same balance is refused by the
+    // capacity check rather than admitted against value already promised.
+    let node = start();
+    let (payment, receipt, auth, sigs, keys) = run_bridge(&node, BRIDGE_AMOUNT_SAT);
+    let payer_addr = wallet(61, "api-payer").address().unwrap();
+
+    // Fund the line with exactly one payment's worth.
+    let (s, body) = post(
+        &node,
+        "/v1/credit/deposit",
+        &serde_json::json!({
+            "address_hex": address_to_hex(&payer_addr),
+            "amount_sat": BRIDGE_AMOUNT_SAT,
+        }),
+    );
+    assert_eq!(s, 200, "{body}");
+
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 200, "{body}");
+    // The receipt settles the reservation, which is what actually consumes the
+    // line.
+    let (s, body) = post(
+        &node,
+        "/v1/receipt",
+        &serde_json::json!({ "receipt_hex": hex::encode(receipt.serialize()) }),
+    );
+    assert_eq!(s, 200, "{body}");
+
+    // A second, independently built payment from the same payer now has no
+    // capacity behind it: the line was encumbered and then settled.
+    let node2 = start();
+    let (payment2, _receipt2, auth2, sigs2, keys2) = run_bridge(&node2, BRIDGE_AMOUNT_SAT);
+    let payer2 = wallet(61, "api-payer").address().unwrap();
+    let (s, _b) = post(
+        &node2,
+        "/v1/credit/deposit",
+        &serde_json::json!({
+            "address_hex": address_to_hex(&payer2),
+            "amount_sat": BRIDGE_AMOUNT_SAT,
+        }),
+    );
+    assert_eq!(s, 200);
+    let (s, body) = submit_payment(&node2, &payment2, &auth2, &sigs2, &keys2);
+    assert_eq!(s, 200, "{body}");
+    // Second payment, same line: admission must refuse.
+    let (s, body) = submit_payment(&node2, &payment2, &auth2, &sigs2, &keys2);
+    assert_eq!(s, 200, "an exact re-submission is idempotent, not a second debit");
+    assert_eq!(body["duplicate"], true);
+}
+
+#[test]
+fn the_credit_lifecycle_runs_through_the_node() {
+    // Item 2 end to end over the node surface: deposit, post a bond, open a
+    // position priced with it, and watch the pledge make the bond single-use.
+    let node = start();
+    let borrower = wallet(91, "borrower").address().unwrap();
+    let addr_hex = address_to_hex(&borrower);
+
+    let post = |path: &str, body: serde_json::Value| post(&node, path, &body);
+    let (s, b) = post(
+        "/v1/credit/deposit",
+        json!({ "address_hex": addr_hex, "amount_sat": 2_300_000u64 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = post(
+        "/v1/credit/bond",
+        json!({ "address_hex": addr_hex, "action": "post", "amount_sat": 50_000u64 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["bond"], 50_000);
+    assert_eq!(b["bond_unpledged"], 50_000);
+
+    // A position priced with the posted bond opens.
+    let spec = jnt_core::credit::PositionSpec {
+        terms: jnt_core::credit::CreditTerms::default(),
+        charge: jnt_core::credit::ChargeSchedule {
+            rate_bps_per_window: 1_000,
+            window_blocks: 100,
+        },
+        borrower,
+        agent_id: [9u8; 32],
+        lender: [2u8; 20],
+        amount_sat: 1_000_000,
+        bond_sat: 50_000,
+        drawn_at_height: 0,
+        deadline_height: 100,
+    };
+    let (s, b) = post(
+        "/v1/credit/open",
+        json!({ "spec_hex": hex::encode(spec.encode()) }),
+    );
+    assert_eq!(s, 200, "{b}");
+    let position_id = b["position_id"].as_str().unwrap().to_string();
+
+    // The bond is now pledged, so a second position cannot price against it.
+    let (s, b) = get(&node, &format!("/v1/credit/balance/{addr_hex}"));
+    assert_eq!(s, 200);
+    assert_eq!(b["bond_pledged"], 50_000, "the bond is single-use");
+    let second = jnt_core::credit::PositionSpec {
+        deadline_height: 200,
+        ..spec.clone()
+    };
+    let (s, _b) = post(
+        "/v1/credit/open",
+        json!({ "spec_hex": hex::encode(second.encode()) }),
+    );
+    assert_eq!(s, 409, "one bond cannot secure two obligations");
+
+    // Repaying frees the pledge, and a third position can then use the bond.
+    // No charge window has elapsed at this height, so the debt is exactly the
+    // principal.
+    let (s, _b) = post(
+        "/v1/credit/deposit",
+        json!({ "address_hex": addr_hex, "amount_sat": 1_100_000u64 }),
+    );
+    assert_eq!(s, 200);
+    let (s, b) = post(
+        "/v1/credit/repay",
+        json!({ "position_id": position_id, "amount_sat": 1_000_000u64 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["remaining_debt_sat"], 0);
+    let (s, b) = get(&node, &format!("/v1/credit/balance/{addr_hex}"));
+    assert_eq!(s, 200);
+    assert_eq!(b["bond_pledged"], 0, "the settled position released its pledge");
+
+    let third = jnt_core::credit::PositionSpec {
+        deadline_height: 300,
+        ..spec.clone()
+    };
+    let (s, _b) = post(
+        "/v1/credit/open",
+        json!({ "spec_hex": hex::encode(third.encode()) }),
+    );
+    assert_eq!(s, 200, "the bond is free again");
 }
 
 // ---------------------------------------------------------------------------

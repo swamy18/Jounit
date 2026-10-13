@@ -1400,34 +1400,23 @@ async fn payment_submit(
                 "the policy this payment names has been revoked by its owner",
             ));
         }
+        // An exact re-submission is idempotent, and it is answered *before*
+        // admission: a second admission would reserve the same value twice, and
+        // the second reservation would be refused for a payment that is already
+        // recorded. Replay is not a refusal; it is a repeat of the first answer.
+        if sh.payment_tracker.contains(&id) {
+            return Ok(Json(json!({
+                "payment_id": hash_to_hex(&id),
+                "duplicate": true,
+            })));
+        }
         // Admission first: the payment must be what an authentic, live policy
         // granted. A payment that names a policy this node never authorized
         // under — or one that has since expired, or one whose authorization is
         // not signed by the owner — is refused before it touches the replay
-        // tracker.
-        let policy = sh.policy_registry.get(&payment.policy_hash).cloned();
-        match policy {
-            Some(policy) => {
-                let presented = jnt_core::service::AuthPresentation {
-                    auth: &authorization,
-                    sigs: &auth_sigs,
-                    keys: &auth_keys,
-                };
-                let reservation = jnt_core::service::admit_payment(
-                    &sh.policies,
-                    &policy,
-                    &payment,
-                    presented,
-                    &network,
-                    height,
-                    &mut sh.credit,
-                )
-                .map_err(session_err)?;
-                // Hold the reservation until the receipt settles it (§19.4). A
-                // duplicate payment resubmit is idempotent, so this overwrites
-                // any identical id with the same reservation.
-                sh.reservations.insert(id, reservation);
-            }
+        // tracker and before any credit is encumbered.
+        let policy = match sh.policy_registry.get(&payment.policy_hash).cloned() {
+            Some(policy) => policy,
             None => {
                 return Err(fail(
                     StatusCode::CONFLICT,
@@ -1435,26 +1424,54 @@ async fn payment_submit(
                     "the policy this payment names was never authorized under on this node",
                 ));
             }
-        }
+        };
         payment
             .verify(&network, height)
             .map_err(|e| fail(StatusCode::BAD_REQUEST, "payment_refused", e.to_string()))?;
+        let presented = jnt_core::service::AuthPresentation {
+            auth: &authorization,
+            sigs: &auth_sigs,
+            keys: &auth_keys,
+        };
+        let reservation = jnt_core::service::admit_payment(
+            &sh.policies,
+            &policy,
+            &payment,
+            presented,
+            &network,
+            height,
+            &mut sh.credit,
+        )
+        .map_err(session_err)?;
         match sh.payment_tracker.accept(&payment, &network, height) {
             Ok(id) => {
+                // The payment is recorded, so the reservation it holds is real:
+                // it stays until the receipt settles it (§19.4), or until it is
+                // released because the payment never committed.
                 sh.payment_store.insert(id, payment);
+                sh.reservations.insert(id, reservation);
                 Ok(Json(
                     json!({ "payment_id": hash_to_hex(&id), "duplicate": false }),
                 ))
             }
             // Same bytes, same id: an idempotent re-submission, not an error.
-            Err(jnt_core::payment::PaymentError::AlreadySeen) => Ok(Json(
-                json!({ "payment_id": hash_to_hex(&id), "duplicate": true }),
-            )),
-            Err(e) => Err(fail(
-                StatusCode::BAD_REQUEST,
-                "payment_refused",
-                e.to_string(),
-            )),
+            Err(jnt_core::payment::PaymentError::AlreadySeen) => {
+                let _ = sh.credit.release(&reservation);
+                Ok(Json(
+                    json!({ "payment_id": hash_to_hex(&id), "duplicate": true }),
+                ))
+            }
+            Err(e) => {
+                // The payment was not recorded, so the value it encumbered goes
+                // straight back: a reservation for a payment nobody accepted is
+                // a hold on the payer's line for nothing.
+                let _ = sh.credit.release(&reservation);
+                Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "payment_refused",
+                    e.to_string(),
+                ))
+            }
         }
     })?
 }
@@ -1473,34 +1490,64 @@ async fn receipt_submit(
         .map_err(|e| bad(format!("receipt: {e}")))?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
-        match sh.receipts.accept(&receipt, &network) {
-            Ok(outcome) => {
-                // Settlement event (roadmap item 10 / §19.4): the receipt
-                // commits the admission-time credit reservation into a real
-                // debit against the payer's credit line. `NoCreditGate` yields a
-                // zero-id reservation whose settle is a no-op, so this is safe
-                // when credit is unconfigured. The matching reservation is
-                // consumed once so a re-submitted receipt cannot double-debit.
-                if let Some(reservation) = sh.reservations.remove(&receipt.payment_id) {
-                    if let Err(e) = sh.credit.settle(&reservation) {
-                        return Err(fail(
-                            StatusCode::CONFLICT,
-                            "credit_settle_failed",
-                            format!(
-                                "receipt {} accepted but credit settlement failed: {e}",
-                                hash_to_hex(&receipt.receipt_id())
-                            ),
-                        ));
-                    }
-                }
-                Ok(Json(json!({
-                    "receipt_id": hash_to_hex(&receipt.receipt_id()),
-                    "outcome": match outcome {
-                        ReceiptOutcome::Inserted => "inserted",
-                        ReceiptOutcome::Duplicate => "duplicate",
-                    },
-                })))
+        // Validate and bind before anything is recorded or debited. A receipt
+        // that cannot be bound to a recorded payment must not reach the book,
+        // because the book is what makes a conflicting receipt impossible.
+        receipt
+            .verify(&network)
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, "receipt_refused", e.to_string()))?;
+        if let Some(payment) = sh.payment_store.get(&receipt.payment_id) {
+            receipt
+                .verify_binding(payment)
+                .map_err(|e| fail(StatusCode::BAD_REQUEST, "receipt_refused", e.to_string()))?;
+        }
+        // A re-submitted receipt is idempotent, and it is answered before any
+        // debit: the second call must not debit again. A *contradicting* receipt
+        // for the same payment is not a replay, it is a second claim, and the
+        // book refuses it — so the two are distinguished by id, not by order.
+        if sh.receipts.by_receipt_id(&receipt.receipt_id()).is_some() {
+            return Ok(Json(json!({
+                "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                "outcome": "duplicate",
+            })));
+        }
+        if let Some(existing) = sh.receipts.by_payment_id(&receipt.payment_id) {
+            let existing = existing.receipt_id();
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "receipt_conflict",
+                format!(
+                    "another receipt {} already claims this payment",
+                    hash_to_hex(&existing)
+                ),
+            ));
+        }
+        // Settlement event (roadmap item 10 / §19.4): the admission-time
+        // reservation commits as a real debit against the payer's credit line.
+        // The reservation is taken out of the map *before* the receipt is
+        // accepted, so a debit that fails leaves nothing half-applied and the
+        // reservation is still available for the retry.
+        if let Some(reservation) = sh.reservations.remove(&receipt.payment_id) {
+            if let Err(e) = sh.credit.settle(&reservation) {
+                sh.reservations.insert(receipt.payment_id, reservation);
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "credit_settle_failed",
+                    format!(
+                        "receipt {} refused: credit settlement failed: {e}",
+                        hash_to_hex(&receipt.receipt_id())
+                    ),
+                ));
             }
+        }
+        match sh.receipts.accept(&receipt, &network) {
+            Ok(outcome) => Ok(Json(json!({
+                "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                "outcome": match outcome {
+                    ReceiptOutcome::Inserted => "inserted",
+                    ReceiptOutcome::Duplicate => "duplicate",
+                },
+            }))),
             Err(jnt_core::receipt::ReceiptError::PaymentConflict { existing }) => Err(fail(
                 StatusCode::CONFLICT,
                 "receipt_conflict",
@@ -1619,6 +1666,7 @@ async fn credit_balance(State(state): State<ApiState>, Path(addr): Path<String>)
     with_shared(&state, |sh| {
         let free = sh.credit.free(&addr);
         let bond = sh.credit.bond(&addr);
+        let reserved = sh.credit.reserved_by(&addr);
         let positions: Vec<_> = sh
             .credit
             .live_positions()
@@ -1627,7 +1675,9 @@ async fn credit_balance(State(state): State<ApiState>, Path(addr): Path<String>)
                 json!({
                     "position_id": hash_to_hex(id),
                     "amount_sat": p.amount_sat,
+                    "bond_sat": p.bond_sat,
                     "collateral_sat": p.collateral_sat,
+                    "deadline_height": p.deadline_height,
                     "state": match p.state {
                         jnt_core::credit::PositionState::Drawn { .. } => "drawn",
                         jnt_core::credit::PositionState::Repaid { .. } => "repaid",
@@ -1639,8 +1689,141 @@ async fn credit_balance(State(state): State<ApiState>, Path(addr): Path<String>)
         Ok(Json(json!({
             "address": address_to_hex(&addr),
             "free_balance": free,
+            "reserved": reserved,
+            "available": sh.credit.available(&addr),
             "bond": bond,
+            "bond_pledged": bond.saturating_sub(sh.credit.unpledged_bond(&addr)),
             "positions": positions,
+        })))
+    })?
+}
+
+// ---------------------------------------------------------------------------
+// Credit position lifecycle (roadmap item 2; non-consensus).
+//
+// These routes are the operations the payment path only *reads*: posting and
+// releasing bonds, opening a position, repaying it, and settling one that
+// reached its deadline unpaid. Without them the position machinery has no
+// caller outside the core unit tests, and "the full credit lifecycle" is a
+// claim about arithmetic nobody can exercise.
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/credit/bond` — move free balance into a posted bond.
+///
+/// A bond is the discount a position is priced with, so it has to be real value
+/// the agent already holds. It is not coins: nothing here touches the ledger.
+#[derive(Deserialize)]
+struct CreditBondReq {
+    address_hex: String,
+    /// `post` or `release`.
+    action: String,
+    amount_sat: u64,
+}
+
+async fn credit_bond(State(state): State<ApiState>, Json(req): Json<CreditBondReq>) -> ApiResult {
+    let addr = decode_address(&req.address_hex)?;
+    with_shared(&state, |sh| {
+        match req.action.as_str() {
+            "post" => {
+                sh.credit
+                    .post_bond(addr, req.amount_sat)
+                    .map_err(|e| fail(StatusCode::CONFLICT, "credit_refused", e.to_string()))?;
+            }
+            "release" => {
+                sh.credit
+                    .release_bond(addr, req.amount_sat)
+                    .map_err(|e| fail(StatusCode::CONFLICT, "credit_refused", e.to_string()))?;
+            }
+            other => {
+                return Err(bad(format!("unknown bond action: {other}")));
+            }
+        }
+        Ok(Json(json!({
+            "address": address_to_hex(&addr),
+            "bond": sh.credit.bond(&addr),
+            "bond_unpledged": sh.credit.unpledged_bond(&addr),
+        })))
+    })?
+}
+/// `POST /v1/credit/open` — open a credit position under a lender's terms.
+///
+/// The spec is the canonical `PositionSpec` encoding, so the terms a position is
+/// priced with are exactly the bytes the caller submitted and cannot drift.
+#[derive(Deserialize)]
+struct CreditOpenReq {
+    spec_hex: String,
+}
+
+async fn credit_open(State(state): State<ApiState>, Json(req): Json<CreditOpenReq>) -> ApiResult {
+    let bytes = decode_hex_bytes(&req.spec_hex, "spec")?;
+    let mut r = jnt_core::ser::Reader::new(&bytes);
+    let spec = jnt_core::credit::PositionSpec::decode(&mut r)
+        .map_err(|e| bad(format!("spec: {e}")))?;
+    if r.remaining() != 0 {
+        return Err(bad("spec has trailing bytes"));
+    }
+    with_shared(&state, |sh| {
+        let id = sh
+            .credit
+            .open(&spec)
+            .map_err(|e| fail(StatusCode::CONFLICT, "credit_refused", e.to_string()))?;
+        let position = sh.credit.position(&id);
+        Ok(Json(json!({
+            "position_id": hash_to_hex(&id),
+            "collateral_sat": position.map(|p| p.collateral_sat).unwrap_or(0),
+        })))
+    })?
+}
+
+/// `POST /v1/credit/repay` — repay against a position, interest first.
+#[derive(Deserialize)]
+struct CreditRepayReq {
+    position_id: String,
+    amount_sat: u64,
+}
+
+async fn credit_repay(State(state): State<ApiState>, Json(req): Json<CreditRepayReq>) -> ApiResult {
+    let id = decode_hash(&req.position_id)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let repayment = sh
+            .credit
+            .repay(&id, req.amount_sat, height)
+            .map_err(|e| fail(StatusCode::CONFLICT, "credit_refused", e.to_string()))?;
+        Ok(Json(json!({
+            "position_id": hash_to_hex(&id),
+            "interest_paid_sat": repayment.interest_paid_sat,
+            "principal_paid_sat": repayment.principal_paid_sat,
+            "remaining_debt_sat": repayment.remaining_debt_sat,
+        })))
+    })?
+}
+
+/// `POST /v1/credit/default` — settle an unpaid position at or after its
+/// deadline. Collateral first, then the bond, never reputation.
+#[derive(Deserialize)]
+struct CreditDefaultReq {
+    position_id: String,
+}
+
+async fn credit_default(
+    State(state): State<ApiState>,
+    Json(req): Json<CreditDefaultReq>,
+) -> ApiResult {
+    let id = decode_hash(&req.position_id)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let settlement = sh
+            .credit
+            .default(&id, height)
+            .map_err(|e| fail(StatusCode::CONFLICT, "credit_refused", e.to_string()))?;
+        Ok(Json(json!({
+            "position_id": hash_to_hex(&id),
+            "debt_sat": settlement.debt_sat,
+            "from_collateral_sat": settlement.from_collateral_sat,
+            "from_bond_sat": settlement.from_bond_sat,
+            "shortfall_sat": settlement.shortfall_sat,
+            "excess_returned_sat": settlement.excess_returned_sat,
         })))
     })?
 }
@@ -1851,6 +2034,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/receipt", post(receipt_submit))
         .route("/v1/receipt/{receipt_id}", get(receipt_get))
         .route("/v1/credit/deposit", post(credit_deposit))
+        .route("/v1/credit/bond", post(credit_bond))
+        .route("/v1/credit/open", post(credit_open))
+        .route("/v1/credit/repay", post(credit_repay))
+        .route("/v1/credit/default", post(credit_default))
         .route("/v1/credit/balance/{address}", get(credit_balance))
         .route("/v1/escrow/open", post(escrow_open))
         .route("/v1/escrow/{id}/release", post(escrow_release))
