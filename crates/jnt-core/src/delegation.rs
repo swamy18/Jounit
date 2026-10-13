@@ -138,10 +138,9 @@ impl std::fmt::Display for DelegationError {
                 f,
                 "per-transaction cap {child} exceeds the parent's {parent}"
             ),
-            DelegationError::CumulativeWidened { parent, child } => write!(
-                f,
-                "cumulative cap {child} exceeds the parent's {parent}"
-            ),
+            DelegationError::CumulativeWidened { parent, child } => {
+                write!(f, "cumulative cap {child} exceeds the parent's {parent}")
+            }
             DelegationError::StartsEarlier { parent, child } => {
                 write!(f, "child starts at {child}, before the parent's {parent}")
             }

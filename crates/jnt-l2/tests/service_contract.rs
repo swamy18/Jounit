@@ -12,7 +12,7 @@
 
 use jnt_core::deliverable::{Deliverable, SortAttestation, SortDeliverable};
 use jnt_core::hash::{sha256, Address, Hash};
-use jnt_l2::task_contract::{ContractState, ServiceContract};
+use jnt_l2::task_contract::{ContractState, ServiceContract, ServiceContractSpec};
 use jnt_l2::L2Error;
 
 fn addr(n: u8) -> Address {
@@ -292,4 +292,112 @@ fn a_dust_deposit_makes_fraud_slapping_unreachable() {
         .expect("a properly bonded contract is slashable");
     assert_eq!(outcome.submitter_refunded, 5_000_000);
     assert_eq!(outcome.worker_deposit_slashed, 5_000);
+}
+
+#[test]
+fn a_non_compute_contract_opens_through_the_validated_constructor() {
+    // The general constructor: a service contract with a deliverable that is
+    // not compute, opened through the same validated path rather than by
+    // struct-literal assembly. The three conditions it refuses are the same
+    // three the compute path refuses.
+    let deliverable = SortDeliverable {
+        input_leaf: sha256(&[b"a translation, not a sort"]),
+        ascending: true,
+    };
+    let spec = ServiceContractSpec {
+        task_id: sha256(&[b"a service contract"]),
+        submitter: addr(1),
+        deliverable,
+        payment_sat: 5_000_000,
+        worker_deposit_sat: 10_000,
+        deadline_height: 100,
+        dispute_window: 5,
+        nonce: 1,
+    };
+    let mut contract = ServiceContract::open(spec);
+    assert_eq!(contract.state, ContractState::Open);
+    assert_eq!(contract.worker, None, "unclaimed on open");
+
+    // And it runs the same lifecycle: claim, submit, and settle when the
+    // window closes.
+    let worker = addr(2);
+    // The claim step is compute-only (`ClaimTaskPayload` is private to the
+    // compute path), so the test drives the claimed state directly, exactly as
+    // the other tests in this file do.
+    contract.worker = Some(worker);
+    contract.state = ContractState::InProgress { claimed_at: 2 };
+    let reference = contract.reference();
+    let attestation = SortAttestation {
+        task_id: contract.task_id,
+        result_hash: reference,
+        worker_address: worker,
+        signature: vec![1, 2, 3],
+    };
+    contract
+        .submit(worker, reference, attestation, 10)
+        .expect("delivery works");
+    assert!(
+        matches!(contract.state, ContractState::ResultSubmitted { .. }),
+        "a correct result is accepted by the generic path"
+    );
+    assert!(
+        contract.due_for_auto_settle(16),
+        "window is 5 blocks from 10"
+    );
+    let outcome = contract.auto_settle_correct(16).unwrap();
+    assert_eq!(outcome.verdict, jnt_core::l2::Verdict::Correct);
+    assert_eq!(outcome.worker_paid, 5_000_000);
+}
+
+#[test]
+fn the_open_constructor_refuses_a_contract_that_cannot_settle() {
+    // Every refusal is a condition the lifecycle cannot work around: an escrow
+    // for nothing, a contract with no deadline to time out at, and a dispute
+    // window that reaches past the deadline it is supposed to close inside.
+    let base = ServiceContractSpec {
+        task_id: sha256(&[b"an unsettleable contract"]),
+        submitter: addr(1),
+        deliverable: SortDeliverable {
+            input_leaf: sha256(&[b"records"]),
+            ascending: true,
+        },
+        payment_sat: 5_000_000,
+        worker_deposit_sat: 10_000,
+        deadline_height: 100,
+        dispute_window: 5,
+        nonce: 1,
+    };
+
+    let no_escrow = ServiceContractSpec {
+        payment_sat: 0,
+        ..base.clone()
+    };
+    let panicked = std::panic::catch_unwind(|| {
+        ServiceContract::<SortDeliverable, SortAttestation>::open(no_escrow)
+    })
+    .is_err();
+    assert!(panicked, "an escrow for nothing is not a contract");
+
+    let no_deadline = ServiceContractSpec {
+        deadline_height: 0,
+        ..base.clone()
+    };
+    let panicked = std::panic::catch_unwind(|| {
+        ServiceContract::<SortDeliverable, SortAttestation>::open(no_deadline)
+    })
+    .is_err();
+    assert!(panicked, "a contract with no deadline cannot time out");
+
+    let window_past_deadline = ServiceContractSpec {
+        dispute_window: 100,
+        ..base.clone()
+    };
+    let panicked = std::panic::catch_unwind(|| {
+        ServiceContract::<SortDeliverable, SortAttestation>::open(window_past_deadline)
+    })
+    .is_err();
+    assert!(
+        panicked,
+        "a dispute window that reaches the deadline cannot close before it"
+    );
 }

@@ -273,6 +273,27 @@ impl Committee {
     /// every peer, and shipping one would make the operator think they had
     /// signed.
     pub fn sign(&self, payload: &CheckpointPayload) -> Option<Result<Checkpoint, Error>> {
+        self.sign_in_set(payload, &self.public_keys())
+    }
+
+    /// Sign a checkpoint payload against a *specific* validator set.
+    ///
+    /// The set is what the bitmap indexes into, and it must be the set a peer
+    /// will verify against — the committee for the payload's epoch, sorted.
+    /// Signing against a shorter list produces a bitmap whose indices do not
+    /// mean what a peer will read them as: a node holding one key out of a
+    /// ten-member committee would mark index 0 of a one-element bitmap, and the
+    /// peer would read that as *validator zero of ten* signing, which is a
+    /// certificate that verifies against nothing — or, worse, one that
+    /// accidentally matches a different validator.
+    ///
+    /// A key that is not in `set_keys` is refused rather than placed by guess:
+    /// there is no honest index for it.
+    pub fn sign_in_set(
+        &self,
+        payload: &CheckpointPayload,
+        set_keys: &[BlsPublicKey],
+    ) -> Option<Result<Checkpoint, Error>> {
         if self.keys.is_empty() {
             return None;
         }
@@ -283,19 +304,27 @@ impl Committee {
             Err(e) => return Some(Err(e.into())),
         };
 
-        // The bitmap is an index into the sorted set of signer keys, so build it
-        // against that order rather than insertion order.
-        let mut sorted: Vec<BlsPublicKey> = self.keys.iter().map(|k| k.public_key()).collect();
+        // The set's own sorted order, exactly as a verifier computes it.
+        let mut sorted: Vec<BlsPublicKey> = set_keys.to_vec();
         sorted.sort_by_key(|k| k.0);
         let mut bitmap = vec![0u8; sorted.len().div_ceil(8)];
-        for (i, _) in sorted.iter().enumerate() {
-            bitmap[i / 8] |= 1 << (i % 8);
+        let mut signed = 0usize;
+        for (i, key) in sorted.iter().enumerate() {
+            if self.keys.iter().any(|k| &k.public_key() == key) {
+                bitmap[i / 8] |= 1 << (i % 8);
+                signed += 1;
+            }
+        }
+        if signed != self.keys.len() {
+            return Some(Err(Error::Malformed(
+                "a committee key is not a member of the validator set it signs against",
+            )));
         }
         Some(Ok(Checkpoint {
             payload: payload.clone(),
             aggregate_sig: aggregate,
             signer_bitmap: bitmap,
-            signer_count: sorted.len() as u32,
+            signer_count: signed as u32,
         }))
     }
 }
@@ -352,6 +381,19 @@ impl CheckpointSigner {
     ) -> Option<Result<Checkpoint, Error>> {
         let payload = self.payload(height, block_hash);
         committee.sign(&payload)
+    }
+
+    /// Sign against a specific validator set — the committee a peer will verify
+    /// against, sorted, and therefore the only thing a bitmap may index into.
+    pub fn sign_for_set(
+        &self,
+        height: u64,
+        block_hash: Hash,
+        committee: &Committee,
+        set_keys: &[crate::bls_checkpoint::BlsPublicKey],
+    ) -> Option<Result<Checkpoint, Error>> {
+        let payload = self.payload(height, block_hash);
+        committee.sign_in_set(&payload, set_keys)
     }
 }
 

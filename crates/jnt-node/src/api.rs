@@ -1524,9 +1524,7 @@ async fn payment_submit(
         // links are the ones this node accepted, so an unrecorded ancestor is
         // not authority the node can vouch for.
         if !payment.chain.is_empty() {
-            let recorded = sh
-                .delegations
-                .chain_of(payment.chain.last().unwrap());
+            let recorded = sh.delegations.chain_of(payment.chain.last().unwrap());
             let provable = recorded.as_ref().map(|chain| {
                 chain.len() == payment.chain.len()
                     && chain
@@ -1899,8 +1897,8 @@ struct CreditOpenReq {
 async fn credit_open(State(state): State<ApiState>, Json(req): Json<CreditOpenReq>) -> ApiResult {
     let bytes = decode_hex_bytes(&req.spec_hex, "spec")?;
     let mut r = jnt_core::ser::Reader::new(&bytes);
-    let spec = jnt_core::credit::PositionSpec::decode(&mut r)
-        .map_err(|e| bad(format!("spec: {e}")))?;
+    let spec =
+        jnt_core::credit::PositionSpec::decode(&mut r).map_err(|e| bad(format!("spec: {e}")))?;
     if r.remaining() != 0 {
         return Err(bad("spec has trailing bytes"));
     }
@@ -2038,6 +2036,18 @@ async fn escrow_get(State(state): State<ApiState>, Path(id): Path<String>) -> Ap
                 "payer": address_to_hex(&e.payer),
                 "payee": address_to_hex(&e.payee),
                 "amount_sat": e.amount_sat,
+                "condition": match e.condition() {
+                    jnt_core::escrow::EscrowCondition::ReleaseToPayee => "release_to_payee",
+                    jnt_core::escrow::EscrowCondition::Oracle { .. } => "oracle",
+                },
+                "releasable": e.releasable(),
+                // What an arbiter signs, and what both parties sign for a
+                // mutual release. Published so a relayer can prepare a release
+                // without recomputing it, and so the test can check the node is
+                // asking for a signature over exactly this escrow.
+                "release_hash": hash_to_hex(
+                    &e.release_signing_hash(jnt_core::escrow::EscrowVerdict::ReleasedToPayee)
+                ),
                 "state": escrow_state_name(&e.state),
             }))),
             None => Err(fail(StatusCode::NOT_FOUND, "not_found", "no such escrow")),
@@ -2095,14 +2105,21 @@ async fn escrow_release(
             .get_mut(&id)
             .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such escrow"))?;
         match req.mode.as_str() {
+            // The transition belongs to the escrow: this handler checks the shape
+            // of what was presented, and the escrow is the only thing that
+            // changes its own state.
             "arbiter" => {
                 let sig = sig_to_bls(req.arbiter_sig_hex.as_ref())?;
+                if !escrow.releasable() {
+                    return Err(fail(
+                        StatusCode::CONFLICT,
+                        "escrow_refused",
+                        "this escrow is gated on an oracle condition, which has no implemented verifier, so it cannot release",
+                    ));
+                }
                 escrow
-                    .verify_arbiter_release(&sig, &keys)
+                    .release_arbiter(&sig, sh.chain.height(), &keys)
                     .map_err(|e| fail(StatusCode::CONFLICT, "escrow_refused", e.to_string()))?;
-                escrow.state = jnt_core::escrow::EscrowState::ReleasedArbiter {
-                    at_height: sh.chain.height(),
-                };
                 Ok(Json(
                     json!({ "escrow_id": hash_to_hex(&id), "state": "released_arbiter" }),
                 ))
@@ -2124,16 +2141,28 @@ async fn escrow_release(
                     .collect::<Result<_, _>>()?;
                 // Mutual release is verified against the keys the escrow bound
                 // at open time; the request only supplies the signatures.
+                if !escrow.releasable() {
+                    return Err(fail(
+                        StatusCode::CONFLICT,
+                        "escrow_refused",
+                        "this escrow is gated on an oracle condition, which has no implemented verifier, so it cannot release",
+                    ));
+                }
                 escrow
-                    .verify_mutual_release(&sig_objs, &[escrow.payer_key, escrow.payee_key], &keys)
+                    .release_mutual(
+                        &sig_objs,
+                        &[escrow.payer_key, escrow.payee_key],
+                        sh.chain.height(),
+                        &keys,
+                    )
                     .map_err(|e| fail(StatusCode::CONFLICT, "escrow_refused", e.to_string()))?;
-                escrow.state = jnt_core::escrow::EscrowState::ReleasedMutual {
-                    at_height: sh.chain.height(),
-                };
                 Ok(Json(
                     json!({ "escrow_id": hash_to_hex(&id), "state": "released_mutual" }),
                 ))
             }
+            // Fail closed: an unknown release mode is a refusal, never a default.
+            // A handler that guesses which rule to apply releases on the wrong
+            // one.
             other => Err(fail(
                 StatusCode::BAD_REQUEST,
                 "escrow_refused",

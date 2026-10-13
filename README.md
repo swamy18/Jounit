@@ -1,4 +1,4 @@
-﻿# Jounit (JNT)
+# Jounit (JNT)
 
 An AI-native cryptocurrency. Mining that puts real work on GPUs and AI hardware
 without weakening the security a blockchain depends on.
@@ -200,8 +200,9 @@ started to look further along.
 
 ### Escrowed service contracts â€” _in development_
 
-**Built:** the general `ServiceContract`, its transitions, and a non-compute
-deliverable that drives them.
+**Built:** the general `ServiceContract`, its transitions, a validated
+`ServiceContract::open` constructor for non-compute deliverables, and a
+non-compute deliverable that drives them.
 
 The task economy above is a *specific case* of a general primitive: party A
 commits to a deliverable and bonds against it, party B escrows payment,
@@ -218,12 +219,19 @@ of it rather than the only one.
 **What it supports:** any task where one party can produce a result that another
 can check without re-running it.
 
-### Attenuated delegation chains â€” _not built_
+### Attenuated delegation chains â€” _in development_
 
 Multi-agent systems need an owner to grant an agent a subset of their own
 spending authority, and that agent to do the same downward. Each level inherits a
-**strict subset** of its parent's spend policy â€” never a wider one â€” so authority
+**strict subset** of its parent's spend policy — never a wider one — so authority
 narrows as it travels.
+
+A spend under a chain carries the chain, signed: a payment names its own
+agent id, which is derived from the ancestry it presents rather than from the
+payer's address. The node records the links (so it can prove the lineage later),
+verifies the owner's signature on every policy it grants under, and propagates a
+revocation down to every recorded descendant. Consent, key custody and the
+existence of a committee are organisational choices this document does not make.
 
 **What it supports:** machine fleets and agent hierarchies where the operator
 must bound what any single agent can spend, without re-authorizing each
@@ -691,10 +699,10 @@ applies.
 | Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
-| **Escrowed service contracts** | **In development** | The general contract and its transitions; one non-compute deliverable shipping |
-| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; the capacity check is enforced. The *debit commit* is deferred to §19.4 coin settlement (Item 10), so admission over-reserves and the debit lands only when funding moves |
-| **Delegation chains** | **In development** | Narrowing rule, sub-agent derivation and the link book; not wired into any consensus path |
-| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. Coin settlement is Item 10. |
+| **Escrowed service contracts** | **In development** | The general contract and its transitions, a validated `ServiceContract::open` for non-compute deliverables, one non-compute deliverable shipping. Coin settlement is Item 10 |
+| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; a reservation *encumbers* capacity (free to `reserved`, or a position's principal headroom) so one balance cannot back two admitted payments, and settlement is idempotent per reservation. The position lifecycle (bond post/release, open, repay, default) is reachable over HTTP; the *debit commit* lands at receipt acceptance, and the matching coin move is §19.4 coin settlement (Item 10) |
+| **Delegation chains** | **Wired into the payment path** | A payment and a request carry a signed, root-first delegation chain; identity is proved from the chain rather than from the payer address, so a spend cannot claim more than its whole ancestry permits. The node records links, verifies owner signatures on every policy, propagates revocation to descendants, and refuses a chain it did not record. Still non-consensus (no `TXVALIDATOR` policy byte) |
+| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. The transition lives on the escrow (`release_arbiter`/`release_mutual`), the release hash binds network and condition, and an **oracle condition is fail-closed**: it is recorded and can never release, because this codebase implements no oracle verifier. Coin settlement is Item 10 |
 | **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |

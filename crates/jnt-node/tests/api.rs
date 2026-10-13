@@ -470,7 +470,7 @@ fn garbage_bytes_are_a_client_error_not_a_panic() {
 
 fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -> SpendPolicy {
     let owner_addr = owner.address().unwrap();
-    let policy = SpendPolicy {
+    SpendPolicy {
         version: POLICY_VERSION,
         network_id: NET.to_string(),
         agent_id: derive_agent_id(NET, AgentRole::Machine, &owner_addr),
@@ -485,8 +485,7 @@ fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -
         expires_at_height: 10_000,
         revoked: false,
         parent_agent_id: None,
-    };
-    policy
+    }
 }
 
 /// Submit a signed payment with the full authorization material the node now
@@ -643,7 +642,7 @@ fn authorize_grants_then_refuses_a_replayed_nonce() {
     )
     .unwrap();
 
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
         "policy_hex": hex::encode(policy.serialize()),
         "policy_sigs_hex": policy_sigs_hex(&payer, &policy),
         "policy_keys_hex": policy_keys_hex(&payer),
@@ -1039,7 +1038,10 @@ fn a_reserved_line_cannot_back_two_admitted_payments() {
     assert_eq!(s, 200, "{body}");
     // Second payment, same line: admission must refuse.
     let (s, body) = submit_payment(&node2, &payment2, &auth2, &sigs2, &keys2);
-    assert_eq!(s, 200, "an exact re-submission is idempotent, not a second debit");
+    assert_eq!(
+        s, 200,
+        "an exact re-submission is idempotent, not a second debit"
+    );
     assert_eq!(body["duplicate"], true);
 }
 
@@ -1117,7 +1119,10 @@ fn the_credit_lifecycle_runs_through_the_node() {
     assert_eq!(b["remaining_debt_sat"], 0);
     let (s, b) = get(&node, &format!("/v1/credit/balance/{addr_hex}"));
     assert_eq!(s, 200);
-    assert_eq!(b["bond_pledged"], 0, "the settled position released its pledge");
+    assert_eq!(
+        b["bond_pledged"], 0,
+        "the settled position released its pledge"
+    );
 
     let third = jnt_core::credit::PositionSpec {
         deadline_height: 300,
@@ -1787,7 +1792,7 @@ fn a_delegated_spend_exercises_only_what_its_whole_chain_permits() {
             network_id: NET.to_string(),
             payer_type: AgentRole::Machine,
             service_id: parent.allowed_services[0],
-            recipient: parent.allowed_recipients[0].into(),
+            recipient: parent.allowed_recipients[0],
             max_amount_sat: 100,
             expires_at_height: 10_000,
             policy_hash: child.hash(),
@@ -1811,7 +1816,10 @@ fn a_delegated_spend_exercises_only_what_its_whole_chain_permits() {
             ],
         }),
     );
-    assert_eq!(s, 200, "a narrowed chained delegation must be granted: {granted}");
+    assert_eq!(
+        s, 200,
+        "a narrowed chained delegation must be granted: {granted}"
+    );
     assert_eq!(granted["delegation_depth"], 1);
 
     // With no chain at all, a delegated policy has no provable ancestry, and
@@ -1875,7 +1883,7 @@ fn revoking_an_ancestor_disables_its_descendants_at_payment_submission() {
             network_id: NET.to_string(),
             payer_type: AgentRole::Machine,
             service_id: parent.allowed_services[0],
-            recipient: parent.allowed_recipients[0].into(),
+            recipient: parent.allowed_recipients[0],
             max_amount_sat: 100,
             expires_at_height: 10_000,
             policy_hash: parent.hash(),
@@ -1917,14 +1925,24 @@ fn revoking_an_ancestor_disables_its_descendants_at_payment_submission() {
 
     // A payment under the grandchild now carries two revoked ancestors, and the
     // node refuses it rather than admitting it on the payer's signature alone.
-    let auth_bytes = hex::decode(
-        post_authorization(&node, &owner, &grandchild, &[parent.clone(), child.clone(), grandchild.clone()], 2),
-    )
+    let auth_bytes = hex::decode(post_authorization(
+        &node,
+        &owner,
+        &grandchild,
+        &[parent.clone(), child.clone(), grandchild.clone()],
+        2,
+    ))
     .unwrap();
     let _ = auth_bytes;
     let payment = build_signed_payment(
         &owner,
-        &authorization_from(&node, &owner, &grandchild, &[parent.clone(), child.clone(), grandchild.clone()], 3),
+        &authorization_from(
+            &node,
+            &owner,
+            &grandchild,
+            &[parent.clone(), child.clone(), grandchild.clone()],
+            3,
+        ),
         NET,
         AgentRole::Machine,
         0,
@@ -1989,8 +2007,7 @@ fn authorization_from_bytes(
                 .allowed_recipients
                 .first()
                 .copied()
-                .unwrap_or([8u8; 20])
-                .into(),
+                .unwrap_or([8u8; 20]),
             max_amount_sat: 100,
             expires_at_height: 10_000,
             policy_hash: policy.hash(),
@@ -2023,4 +2040,151 @@ fn post_authorization(
     nonce: u64,
 ) -> String {
     hex::encode(authorization_from(node, owner, policy, chain, nonce).serialize())
+}
+/// Open an escrow through the node with real BLS keys. Returns the escrow id,
+/// the arbitrator's secret key, and the party keys � everything a release needs.
+fn open_escrow(
+    node: &Node,
+    nonce: u64,
+) -> (
+    String,
+    jnt_core::bls::SecretKey,
+    jnt_core::bls::SecretKey,
+    jnt_core::bls::SecretKey,
+) {
+    let payer = jnt_core::bls::SecretKey::from_scalar(&[4u8; 32]).unwrap();
+    let payee = jnt_core::bls::SecretKey::from_scalar(&[5u8; 32]).unwrap();
+    let arb = jnt_core::bls::SecretKey::from_scalar(&[6u8; 32]).unwrap();
+    let (s, body) = post(
+        node,
+        "/v1/escrow/open",
+        &serde_json::json!({
+            "network_id": NET,
+            "payer": hex::encode([1u8; 20]),
+            "payer_bls": hex::encode(payer.public_key().0),
+            "payee": hex::encode([2u8; 20]),
+            "payee_bls": hex::encode(payee.public_key().0),
+            "arbitrator": hex::encode(arb.public_key().0),
+            "amount_sat": 1_000,
+            "nonce": nonce,
+        }),
+    );
+    assert_eq!(s, 200, "{body}");
+    (
+        body["escrow_id"].as_str().unwrap().to_string(),
+        payer,
+        payee,
+        arb,
+    )
+}
+
+#[test]
+fn an_escrow_release_refuses_forged_and_replayed_authorizations() {
+    // The adversarial set on the node path: a signature from a key that is not
+    // the contract's arbitrator, a replayed release of an already-released
+    // escrow, an unknown release mode, and a malformed signature length.
+    let node = start();
+    let (id, payer, payee, arb) = open_escrow(&node, 3);
+    let path = format!("/v1/escrow/{id}/release");
+
+    let (s, body) = get(&node, &format!("/v1/escrow/{id}"));
+    assert_eq!(s, 200, "{body}");
+    let release_hash: [u8; 32] = hex::decode(body["release_hash"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        body["releasable"], true,
+        "the default condition is releasable"
+    );
+
+    let good = arb.sign(&release_hash);
+    let wrong_key = jnt_core::bls::SecretKey::from_scalar(&[9u8; 32])
+        .unwrap()
+        .sign(&release_hash);
+
+    // Forged: signed by a key that is not the arbitrator this escrow selected.
+    let (s, body) = post(
+        &node,
+        &path,
+        &serde_json::json!({ "mode": "arbiter", "arbiter_sig_hex": hex::encode(wrong_key.0) }),
+    );
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "escrow_refused");
+
+    // The correct arbitrator releases, and the state reflects it exactly once.
+    let (s, body) = post(
+        &node,
+        &path,
+        &serde_json::json!({ "mode": "arbiter", "arbiter_sig_hex": hex::encode(good.0) }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["state"], "released_arbiter");
+
+    // Replayed: a release of an already-released escrow is refused.
+    let (s, body) = post(
+        &node,
+        &path,
+        &serde_json::json!({ "mode": "arbiter", "arbiter_sig_hex": hex::encode(good.0) }),
+    );
+    assert_eq!(s, 409, "{body}");
+
+    // Unknown mode: a refusal, never a guess at which rule to apply.
+    let (s, body) = post(
+        &node,
+        &path,
+        &serde_json::json!({ "mode": "whoever", "arbiter_sig_hex": hex::encode(good.0) }),
+    );
+    assert_eq!(s, 400, "{body}");
+
+    // Malformed signature length is refused before any crypto happens.
+    let (s, body) = post(
+        &node,
+        &path,
+        &serde_json::json!({ "mode": "arbiter", "arbiter_sig_hex": "00" }),
+    );
+    assert_eq!(s, 400, "{body}");
+
+    // One-sided mutual release is refused by the shape of the request.
+    let (s, body) = post(
+        &node,
+        &path,
+        &serde_json::json!({
+            "mode": "mutual",
+            "mutual_sigs_hex": [hex::encode(payer.sign(&release_hash).0)],
+        }),
+    );
+    assert_eq!(s, 400, "{body}");
+
+    // The escrow is released exactly once. The GET also advances finality, so a
+    // matured release reads as Finalized rather than ReleasedArbiter — the same
+    // single release, and a second release was refused above.
+    let (s, body) = get(&node, &format!("/v1/escrow/{id}"));
+    assert_eq!(s, 200, "{body}");
+    assert!(
+        body["state"] == "released_arbiter" || body["state"] == "finalized",
+        "{body}"
+    );
+
+    let _ = payee;
+}
+
+#[test]
+fn two_escrows_between_the_same_parties_are_distinct_contracts() {
+    // The nonce is what makes two escrows between the same parties distinct:
+    // without it they would share an id, and a release of one would release the
+    // other.
+    let node = start();
+    let (first, ..) = open_escrow(&node, 21);
+    let (second, ..) = open_escrow(&node, 22);
+    assert_ne!(first, second, "distinct nonces must not collide");
+
+    let (s, first_body) = get(&node, &format!("/v1/escrow/{first}"));
+    assert_eq!(s, 200);
+    let (s, second_body) = get(&node, &format!("/v1/escrow/{second}"));
+    assert_eq!(s, 200);
+    assert_ne!(
+        first_body["release_hash"], second_body["release_hash"],
+        "a release hash must name its own escrow"
+    );
 }

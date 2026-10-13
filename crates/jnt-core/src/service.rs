@@ -483,8 +483,12 @@ impl PaymentRequestV1 {
         let recipient = r
             .fixed::<20>()
             .map_err(|_| PaymentError::Malformed("recipient"))?;
-        let max_amount_sat = r.u64le().map_err(|_| PaymentError::Malformed("max amount"))?;
-        let expires_at_height = r.u64le().map_err(|_| PaymentError::Malformed("expires_at"))?;
+        let max_amount_sat = r
+            .u64le()
+            .map_err(|_| PaymentError::Malformed("max amount"))?;
+        let expires_at_height = r
+            .u64le()
+            .map_err(|_| PaymentError::Malformed("expires_at"))?;
         let policy_hash = r
             .fixed::<32>()
             .map_err(|_| PaymentError::Malformed("policy hash"))?;
@@ -600,6 +604,7 @@ pub fn authorize_request(
 /// `assert_chain` proves the bytes narrow all the way to a root, and
 /// `DelegationBook` proves the links are the ones this node recorded — so a
 /// caller cannot manufacture a lineage by presenting policies nobody linked.
+#[allow(clippy::too_many_arguments)]
 pub fn authorize_request_with_chain(
     book: &mut PolicyBook,
     delegations: &mut crate::delegation::DelegationBook,
@@ -661,9 +666,8 @@ pub fn authorize_request_with_chain(
             nonce,
         };
         let refs: Vec<&SpendPolicy> = chain.iter().collect();
-        crate::delegation::authorize_with_chain(book, &refs, network_id, &areq).map_err(|e| {
-            SessionError::Payment(PaymentError::ChainRefused(e.to_string()))
-        })
+        crate::delegation::authorize_with_chain(book, &refs, network_id, &areq)
+            .map_err(|e| SessionError::Payment(PaymentError::ChainRefused(e.to_string())))
     } else {
         if !chain.is_empty() {
             return Err(SessionError::Binding(
@@ -1183,7 +1187,7 @@ mod tests {
                     expires_at_height: 9_000,
                     policy_hash: p.hash(),
                 },
-    &[],
+                &[],
             )
             .unwrap();
             let auth = authorize_request(&mut book, &p, NET, &req, 100, (i + 1) as u64).unwrap();
@@ -1196,7 +1200,7 @@ mod tests {
                     0,
                     9_000,
                     req.request_id(),
-    &[],
+                    &[],
                 )
                 .unwrap(),
             );
@@ -1217,7 +1221,7 @@ mod tests {
                     expires_at_height: 9_000,
                     policy_hash: p.hash(),
                 },
-    &[],
+                &[],
             )
             .unwrap();
             let auth = authorize_request(&mut book, &p, NET, &req, 100, 100).unwrap();
@@ -1230,7 +1234,7 @@ mod tests {
                     0,
                     9_000,
                     req.request_id(),
-    &[],
+                    &[],
                 )
                 .unwrap(),
             );
@@ -1264,7 +1268,7 @@ mod tests {
                 expires_at_height: 9_000,
                 policy_hash: p2.hash(),
             },
-    &[],
+            &[],
         )
         .unwrap();
         let auth2 = authorize_request(&mut book, &p2, NET, &req2, 100, 1).unwrap();
@@ -1276,7 +1280,7 @@ mod tests {
             0,
             9_000,
             req2.request_id(),
-    &[],
+            &[],
         )
         .unwrap();
         let mut mixed = payments.clone();
@@ -1312,7 +1316,7 @@ mod tests {
                 expires_at_height: 9_000,
                 policy_hash: policy.hash(),
             },
-    &[],
+            &[],
         )
         .unwrap();
         let auth = authorize_request(book, &policy, NET, &request, 100, 1).unwrap();
@@ -1324,7 +1328,7 @@ mod tests {
             0,
             9_000,
             request.request_id(),
-    &[],
+            &[],
         )
         .unwrap();
         (policy, auth, payment, request)

@@ -26,6 +26,11 @@ recorded in `memory.md`.
 | Opt-in REST API | `--api-listen`, `/v1/*` routes (see §2) |
 | Fuzz harness | `fuzz/` (14 targets, cargo-fuzz nightly + ASan) |
 | Benchmarks | inline `#[ignore]`d probes, **not** a `benches/` harness |
+| Escrowed service contracts | `jnt-l2::ServiceContract` (generic over deliverable and attestation) with `ServiceContract::open` for non-compute services; `crates/jnt-l2/tests/service_contract.rs` drives a sort deliverable through claim → submit → settle. **No wire payload for a non-compute contract** — that is a new L2 transaction type and a consensus change |
+| Agent credit | `jnt-core::credit::CreditBook` + the `CreditGate` trait, consulted by `POST /v1/payment/submit`; reservation encumbers capacity, settlement is idempotent per reservation, bonds are pledged to the position they price; bond/open/repay/default reachable over HTTP. **Non-consensus and node-local**: there is no `TXCREDIT` and no credit persistence across a restart of `SharedNode` (the book has `encode`/`decode`, the store does not wire it) |
+| Delegation chains | `jnt-core::delegation` narrowing rule, sub-agent derivation, `DelegationBook` lineage, and a signed root-first chain carried by `MachinePayment`/`PaymentRequest`; node records links, verifies owner policy signatures, propagates revocation to descendants. **Non-consensus**: delegation is not a consensus input and is not part of any transaction byte |
+| Conditional escrow | `jnt-core::escrow::ConditionalEscrow` with `release_arbiter`/`release_mutual` on the type, a release hash binding network and condition, and fail-closed oracle conditions. **Non-integrated with L1 escrow settlement** — no `TXESCROW` and no coin movement |
+| Checkpoint certificates | `Committee::sign_in_set` builds the bitmap against the committee a verifier derives; the node signs against `chain.committee_keys()` for the epoch; `jnt_core::signing` covers the pure signing step |
 
 Not implemented, and named as such: an OpenTelemetry/OTLP exporter (the
 Prometheus text endpoint `/metrics` exists — §2), a node config file, a
@@ -225,13 +230,20 @@ reached.
    not missing protocol.
 2. **No committee exists to sign checkpoints.** The ledger that would hold
    bonded stake is built and tested (`bond.rs`); what does not exist is a
-   validator. `mainnet` carries an empty `genesis_validators`, no production code
-   signs a `Checkpoint`, and no transport carries one, so `finality_activation_height
-   = 0` keeps the chain on depth-based finality. Real bonded stake
-   (`MIN_VALIDATOR_STAKE_SAT` = 5,000 JNT, unbonding after
+   validator. `mainnet` carries an empty `genesis_validators`, and
+   `finality_activation_height = 0` keeps the chain on depth-based finality.
+   Real bonded stake (`MIN_VALIDATOR_STAKE_SAT` = 5,000 JNT, unbonding after
    `UNBONDING_PERIOD_BLOCKS` = 1008) is enforced by code but has no operator.
-   Building a signer is blocked on a key-custody decision recorded in
-   `docs/decisions.md`, which is an organisational choice, not a code gap.
+   The signing side that a key-custody decision can unlock is built and
+   correct: `Committee::sign_in_set` builds the bitmap against the committee a
+   verifier derives (`jnt-core/src/signing.rs`), the node signs at every epoch
+   boundary it crosses and applies the result (`jnt-node/src/main.rs`), and
+   `Committee::sign` (local keys only) is the audit unit test. The remaining
+   blocker is **key custody**: who holds the validator keys, whether they are
+   held by a node that also mines, and how they are replaced on loss. That is
+   an organisational decision recorded in `docs/decisions.md`, not a code gap.
+   Binding finality must stay `finality_activation_height = 0` on `mainnet`
+   until that decision is made and a committee is actually bonded.
 3. **The arbitration transport is now built; the arbitration *decision* is not
    centralized.** Decision 21's canonical reference decides what is fraudulent,
    `DisputeEngine::resolve` computes it from the disputed contract so no caller

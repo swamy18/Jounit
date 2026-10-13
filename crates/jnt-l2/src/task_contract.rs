@@ -202,6 +202,69 @@ pub struct ServiceContract<D = ComputeDeliverable, A = ComputeAttestation> {
 /// `ComputeTask`, adjudicated by the canonical CPU reference.
 pub type TaskContract = ServiceContract<ComputeDeliverable, ComputeAttestation>;
 
+/// Everything a *general* service contract is opened with.
+///
+/// The same fields `TaskContract::new` takes from a compute `PostTaskPayload`,
+/// but without the compute payload, so a non-compute service (a translation, a
+/// review, a delivery) is opened through the same validated path rather than by
+/// struct-literal assembly in a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceContractSpec<D> {
+    /// The service's identity: derived from submitter, service and nonce.
+    pub task_id: Hash,
+    /// Who funds the escrow.
+    pub submitter: Address,
+    /// The deliverable the contract is judged against.
+    pub deliverable: D,
+    /// Escrow amount. Zero is refused: an escrow for nothing is not a contract.
+    pub payment_sat: u64,
+    /// Bond the worker posts when claiming.
+    pub worker_deposit_sat: u64,
+    /// Last height at which the work may be delivered.
+    pub deadline_height: u64,
+    /// Heights after delivery in which a challenge may be raised.
+    pub dispute_window: u64,
+    /// Per-contract nonce, so two contracts with otherwise identical fields
+    /// are distinct.
+    pub nonce: u64,
+}
+
+impl<D, A> ServiceContract<D, A> {
+    /// Open a **general** service contract under any deliverable type.
+    ///
+    /// This is the constructor a non-compute deliverable goes through, and it
+    /// validates exactly what the compute path validates: a positive escrow, a
+    /// real deadline, a dispute window that fits before the deadline, and a
+    /// distinct id. A caller that cannot be bothered with those is not opening a
+    /// contract, it is assembling a struct.
+    pub fn open(spec: ServiceContractSpec<D>) -> Self {
+        assert!(
+            spec.payment_sat > 0,
+            "an escrow for nothing is not a contract"
+        );
+        assert!(
+            spec.deadline_height > 0,
+            "a contract with no deadline cannot time out"
+        );
+        assert!(
+            spec.dispute_window < spec.deadline_height,
+            "a dispute window that reaches the deadline cannot close before it"
+        );
+        ServiceContract {
+            task_id: spec.task_id,
+            submitter: spec.submitter,
+            worker: None,
+            deliverable: spec.deliverable,
+            payment_sat: spec.payment_sat,
+            worker_deposit_sat: spec.worker_deposit_sat,
+            deadline_height: spec.deadline_height,
+            dispute_window: spec.dispute_window,
+            nonce: spec.nonce,
+            state: ContractState::Open,
+        }
+    }
+}
+
 impl<D, A> ServiceContract<D, A> {
     /// The canonical result this contract's deliverable must produce.
     ///

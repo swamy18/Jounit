@@ -303,7 +303,7 @@ fn a_forged_service_response_cannot_authorize_a_payment() {
             expires_at_height: EXPIRES,
             policy_hash: revoked.hash(),
         },
-    &[],
+        &[],
     )
     .unwrap();
     let err = authorize_request(&mut book, &revoked, NET, &revoked_request, HEIGHT, 1)
@@ -615,7 +615,7 @@ fn wrong_network_is_refused_at_the_door() {
             expires_at_height: EXPIRES,
             policy_hash: mini_policy.hash(),
         },
-    &[],
+        &[],
     )
     .unwrap();
     let err = authorize_request(&mut book, &mini_policy, NET, &foreign_request, HEIGHT, 5)

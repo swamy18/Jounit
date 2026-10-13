@@ -290,7 +290,7 @@ impl MachinePayment {
         // verifies against its existing signature.
         match version {
             PAYMENT_VERSION => {}
-            1 => return MachinePaymentV1::decode(&bytes).map(MachinePayment::from_v1),
+            1 => return MachinePaymentV1::decode(bytes).map(MachinePayment::from_v1),
             other => return Err(PaymentError::UnsupportedVersion(other)),
         }
         let net_len = r
@@ -408,10 +408,7 @@ impl MachinePayment {
             }
         } else {
             Self::validate_chain(&self.chain)?;
-            let leaf = self
-                .chain
-                .last()
-                .ok_or(PaymentError::IdentityMismatch)?;
+            let leaf = self.chain.last().ok_or(PaymentError::IdentityMismatch)?;
             if leaf.network_id != self.network_id {
                 return Err(PaymentError::WrongNetwork {
                     expected: leaf.network_id.clone(),
@@ -591,7 +588,10 @@ impl MachinePaymentV1 {
         let recipient = r
             .fixed::<20>()
             .map_err(|_| PaymentError::Malformed("recipient"))?;
-        let service = match r.u8().map_err(|_| PaymentError::Malformed("service flag"))? {
+        let service = match r
+            .u8()
+            .map_err(|_| PaymentError::Malformed("service flag"))?
+        {
             0 => None,
             1 => Some(
                 r.fixed::<32>()
@@ -943,8 +943,17 @@ mod tests {
     fn a_signed_payment_round_trips_exactly() {
         let w = wallet();
         let auth = grant(&w, 250, 1);
-        let pay = build_signed_payment(&w, &auth, NET, AgentRole::Machine, 2_000, 9_000, [3u8; 32], &[])
-            .expect("payment must build");
+        let pay = build_signed_payment(
+            &w,
+            &auth,
+            NET,
+            AgentRole::Machine,
+            2_000,
+            9_000,
+            [3u8; 32],
+            &[],
+        )
+        .expect("payment must build");
         let bytes = pay.serialize();
         let back = MachinePayment::deserialize(&bytes).expect("decode");
         assert_eq!(back, pay, "encode → decode must be the exact inverse");
@@ -956,9 +965,17 @@ mod tests {
     fn verification_is_offline_and_rejects_every_mutation() {
         let w = wallet();
         let auth = grant(&w, 250, 1);
-        let pay = build_signed_payment(&w, &auth, NET, AgentRole::Machine, 2_000, 9_000, [3u8; 32],
-    &[],)
-            .unwrap();
+        let pay = build_signed_payment(
+            &w,
+            &auth,
+            NET,
+            AgentRole::Machine,
+            2_000,
+            9_000,
+            [3u8; 32],
+            &[],
+        )
+        .unwrap();
         pay.verify(NET, 100).expect("valid payment verifies");
 
         let mut wrong_net = pay.clone();
@@ -1050,9 +1067,8 @@ mod tests {
     fn the_tracker_refuses_exact_replays_and_prunes_only_expired_ids() {
         let w = wallet();
         let auth = grant(&w, 250, 1);
-        let pay =
-            build_signed_payment(&w, &auth, NET, AgentRole::Machine, 0, 500, [0u8; 32],
-    &[],).unwrap();
+        let pay = build_signed_payment(&w, &auth, NET, AgentRole::Machine, 0, 500, [0u8; 32], &[])
+            .unwrap();
         let mut t = PaymentTracker::default();
         t.accept(&pay, NET, 10).expect("first acceptance");
         assert_eq!(t.accept(&pay, NET, 11), Err(PaymentError::AlreadySeen));
@@ -1073,8 +1089,17 @@ mod tests {
         let auth = grant(&w, 250, 1);
         let w2 = Wallet::new_random("attacker");
         // Attacker cannot build a linked payment: owner check fires first.
-        let err = build_signed_payment(&w2, &auth, NET, AgentRole::Machine, 0, 9_000, [0u8; 32], &[])
-            .unwrap_err();
+        let err = build_signed_payment(
+            &w2,
+            &auth,
+            NET,
+            AgentRole::Machine,
+            0,
+            9_000,
+            [0u8; 32],
+            &[],
+        )
+        .unwrap_err();
         assert_eq!(err, PaymentError::NotLinkedToAuthorization("payer/owner"));
     }
 }

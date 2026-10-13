@@ -1345,32 +1345,51 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
 
             // Sign and broadcast a checkpoint at an epoch boundary (M5,
             // Decisions 12/14). This is the "a quorum produced this" side of the
-            // protocol: the node only signs a block it just settled as its own
-            // canonical tip, so a certificate can never name a hash this node
-            // does not hold. With no validator keys configured it signs nothing
-            // and says so once, rather than looking like a broken validator.
+            // protocol: the node only signs a block it holds canonically as its
+            // own tip, so a certificate can never name a hash this node does not
+            // have. With no validator keys configured it signs nothing and says
+            // so once, rather than looking like a broken validator.
+            //
+            // Signed against the committee this chain derives for the
+            // certificate's epoch — the set a peer verifies against — so the
+            // bitmap's indices mean the same thing on both sides. Signing
+            // against a locally assembled key list would place this node's key at
+            // index 0 of a short bitmap and a peer would read that as a different
+            // validator having signed.
             if let Some(committee) = validator_committee.as_ref() {
                 let height = sh.chain.height();
-                let epoch_blocks = sh.chain.params().checkpoint_interval_blocks;
-                let boundary_height = (height / epoch_blocks.max(1)) * epoch_blocks.max(1);
+                let epoch_blocks = sh.chain.params().checkpoint_interval_blocks.max(1);
+                let boundary_height = (height / epoch_blocks) * epoch_blocks;
                 if boundary_height > 0
-                    && boundary_height >= height
+                    && boundary_height <= height
                     && !signed_epochs.contains(&boundary_height)
                 {
-                    let signer = jnt_core::signing::CheckpointSigner::new(
-                        &sh.chain.params().network_id,
-                        epoch_blocks,
-                    );
-                    if let Some(Ok(cp)) =
-                        signer.sign(boundary_height, sh.chain.tip_hash(), committee)
-                    {
-                        if let Ok(()) = sh.chain.apply_checkpoint(&cp, &jnt_core::bls::RealBls) {
-                            signed_epochs.insert(boundary_height);
-                            node.broadcast_checkpoint(cp.clone());
-                            println!(
-                                "checkpoint   height {boundary_height} signed by {} validators",
-                                cp.signer_count
-                            );
+                    // The set a verifier will use for this epoch: the chain's own
+                    // committee keys for that height, in the sorted order
+                    // `EpochSet` uses.
+                    let epoch = boundary_height / epoch_blocks;
+                    let committee_keys = sh.chain.committee_keys();
+                    if !committee_keys.is_empty() {
+                        let signer = jnt_core::signing::CheckpointSigner::new(
+                            &sh.chain.params().network_id,
+                            epoch_blocks,
+                        );
+                        if let Some(Ok(cp)) = signer.sign_for_set(
+                            boundary_height,
+                            sh.chain.tip_hash(),
+                            committee,
+                            &committee_keys,
+                        ) {
+                            debug_assert_eq!(cp.payload.epoch, epoch);
+                            if let Ok(()) = sh.chain.apply_checkpoint(&cp, &jnt_core::bls::RealBls)
+                            {
+                                signed_epochs.insert(boundary_height);
+                                node.broadcast_checkpoint(cp.clone());
+                                println!(
+                                    "checkpoint   height {boundary_height} signed by {} validators",
+                                    cp.signer_count
+                                );
+                            }
                         }
                     }
                 }

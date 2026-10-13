@@ -86,6 +86,9 @@ pub struct ConditionalEscrow {
     /// Per-contract nonce, picked by the payer, so two escrows between the same
     /// parties do not collide.
     pub nonce: u64,
+    /// What must be true before the value can move. Signed into the id and the
+    /// release hash, so the parties agreed on exactly this condition.
+    pub condition: EscrowCondition,
     /// Where the escrow is. Open is the only live state.
     pub state: EscrowState,
 }
@@ -136,10 +139,21 @@ impl ConditionalEscrow {
     }
 
     /// The hash an arbitrator signs to release this escrow, or that both parties
-    /// sign for a mutual release. Binds the decision to this escrow id and a
-    /// verdict, so a signature over one escrow cannot release another.
+    /// sign for a mutual release.
+    ///
+    /// Binds the decision to this escrow id, this network and this *condition*,
+    /// so a signature over one escrow, one network or one condition cannot
+    /// release another.
     pub fn release_signing_hash(&self, verdict: EscrowVerdict) -> Hash {
-        sha256_dom(DOM_ESCROW, &[&self.id(), &[verdict as u8]])
+        sha256_dom(
+            DOM_ESCROW,
+            &[
+                self.network_id.as_bytes(),
+                &self.id(),
+                &[verdict as u8],
+                &self.condition.encode(),
+            ],
+        )
     }
 
     /// Open an escrow, validating its fields.
@@ -153,6 +167,38 @@ impl ConditionalEscrow {
         arbitrator: BlsPublicKey,
         amount_sat: u64,
         nonce: u64,
+    ) -> Result<Self> {
+        Self::open_with_condition(
+            network_id,
+            payer,
+            payer_key,
+            payee,
+            payee_key,
+            arbitrator,
+            amount_sat,
+            nonce,
+            EscrowCondition::ReleaseToPayee,
+        )
+    }
+
+    /// Open an escrow under a specific condition.
+    ///
+    /// The condition is part of the escrow's signed identity, because what a
+    /// payer is agreeing to *is* the condition: the same parties and the same
+    /// amount under different conditions are different contracts, and a release
+    /// hash that ignored that would let a signature for one condition release
+    /// the other.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_condition(
+        network_id: String,
+        payer: Address,
+        payer_key: BlsPublicKey,
+        payee: Address,
+        payee_key: BlsPublicKey,
+        arbitrator: BlsPublicKey,
+        amount_sat: u64,
+        nonce: u64,
+        condition: EscrowCondition,
     ) -> Result<Self> {
         if amount_sat == 0 {
             return Err(Error::Malformed("an escrow locks a positive amount"));
@@ -182,6 +228,7 @@ impl ConditionalEscrow {
             arbitrator,
             amount_sat,
             nonce,
+            condition,
             state: EscrowState::default(),
         })
     }
@@ -199,6 +246,7 @@ impl ConditionalEscrow {
             .fixed(self.arbitrator.as_bytes())
             .u64le(self.amount_sat)
             .u64le(self.nonce);
+        w.raw(&self.condition.encode());
         self.encode_state(&mut w);
         w.into_vec()
     }
@@ -248,6 +296,7 @@ impl ConditionalEscrow {
         let arbitrator = BlsPublicKey(arb_bytes);
         let amount_sat = r.u64le()?;
         let nonce = r.u64le()?;
+        let condition = EscrowCondition::decode(r)?;
         let state = Self::decode_state(r)?;
         Ok(ConditionalEscrow {
             version,
@@ -259,6 +308,7 @@ impl ConditionalEscrow {
             arbitrator,
             amount_sat,
             nonce,
+            condition,
             state,
         })
     }
@@ -331,15 +381,12 @@ impl ConditionalEscrow {
 
     /// Commit a released escrow to ledger finality (roadmap item 10, §19.4). A
     /// `ReleasedMutual`/`ReleasedArbiter` transition is irreversible: once the
-    /// release has aged out of the `activation_height` finality window it is
-    /// `Finalized` at the release height, which is the settlement landing height
-    /// the L1 payout is keyed to. `Open` and already-`Finalized` states are
-    /// no-ops here (the call site walks every escrow each tick); the structural
-    /// rule that only a live escrow can release is enforced by the verify steps.
+    /// release has aged past `activation_height` heights of chain it is
+    /// `Finalized` at the release height.
     ///
     /// Returns `Ok(true)` if this call finalized the escrow, `Ok(false)` if it
     /// did not (not yet mature, or already terminal). The release `at_height`
-    /// is frozen into `Finalized { at_height }` and never rewritten by a later
+    /// is frozen into `Finalized { at_height } and never rewritten by a later
     /// `finalize`, so a re-call after finality is idempotent.
     pub fn finalize(&mut self, now: u64, activation_height: u64) -> Result<bool> {
         let release_height = match &self.state {
@@ -355,6 +402,118 @@ impl ConditionalEscrow {
             at_height: release_height,
         };
         Ok(true)
+    }
+
+    /// Release to the payee on the arbitrator's single signature.
+    ///
+    /// The transition lives on the type, not in a handler: a release is a state
+    /// change this escrow makes about itself, and the only way to reach it is
+    /// through the verify step above it. `at_height` is the height the chain
+    /// stamps on the release, which is what finality is later measured against.
+    pub fn release_arbiter(
+        &mut self,
+        sig: &BlsSignature,
+        at_height: u64,
+        verifier: &dyn BlsVerifier,
+    ) -> Result<()> {
+        self.verify_arbiter_release(sig, verifier)?;
+        if matches!(self.condition, EscrowCondition::Oracle { .. }) {
+            return Err(Error::Malformed(
+                "an oracle-gated escrow has no implemented oracle verifier and cannot release",
+            ));
+        }
+        self.state = EscrowState::ReleasedArbiter { at_height };
+        Ok(())
+    }
+
+    /// Release to the payee on both parties' signatures.
+    pub fn release_mutual(
+        &mut self,
+        sigs: &[BlsSignature],
+        keys: &[BlsPublicKey],
+        at_height: u64,
+        verifier: &dyn BlsVerifier,
+    ) -> Result<()> {
+        self.verify_mutual_release(sigs, keys, verifier)?;
+        if matches!(self.condition, EscrowCondition::Oracle { .. }) {
+            return Err(Error::Malformed(
+                "an oracle-gated escrow has no implemented oracle verifier and cannot release",
+            ));
+        }
+        self.state = EscrowState::ReleasedMutual { at_height };
+        Ok(())
+    }
+
+    /// The condition this escrow is held under.
+    pub fn condition(&self) -> &EscrowCondition {
+        &self.condition
+    }
+
+    /// Whether a release is possible at all.
+    ///
+    /// An oracle condition is *not* releasable: nothing in this codebase verifies
+    /// an oracle claim, so there is no signature that could honestly satisfy it.
+    /// Reporting that up front is what "fail closed" means — the escrow refuses
+    /// to open a release path that no code can complete, rather than accepting
+    /// signatures and holding value forever.
+    pub fn releasable(&self) -> bool {
+        !matches!(self.condition, EscrowCondition::Oracle { .. })
+    }
+}
+
+/// What has to be true before an escrow's value can move.
+///
+/// The two kinds are deliberately separate, because they are verified by
+/// different mechanisms and only one of them exists:
+///
+/// - [`EscrowCondition::ReleaseToPayee`] is a *deterministic* condition. The
+///   release is authorized by the parties the contract selected (mutual
+///   signatures, or the contract's arbitrator) and nothing else is consulted.
+/// - [`EscrowCondition::Oracle`] names an external fact. Verifying an oracle
+///   claim needs an operator, a data source and a dispute path — none of which
+///   this codebase implements, and none of which a coding agent may invent. So
+///   an oracle-gated escrow is *accepted as a record* and *refused at every
+///   release*, which is the fail-closed shape: a condition nobody can verify
+///   releases nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EscrowCondition {
+    /// Release to the payee on valid authorization.
+    ReleaseToPayee,
+    /// Release contingent on an external oracle, which has no implemented
+    /// verifier here. Carries the oracle's identity and the question it was
+    /// asked, so a future operator surface can name what was supposed to be
+    /// answered instead of guessing.
+    Oracle {
+        /// Domain-separated identity of the question being asked.
+        question_hash: Hash,
+    },
+}
+
+impl EscrowCondition {
+    /// Canonical, tagged encoding, bound into the escrow id and the release
+    /// hash so the condition cannot be swapped after opening.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(40);
+        match self {
+            EscrowCondition::ReleaseToPayee => {
+                w.u8(0);
+            }
+            EscrowCondition::Oracle { question_hash } => {
+                w.u8(1).fixed(question_hash);
+            }
+        }
+        w.into_vec()
+    }
+
+    /// Decode, refusing an unknown tag rather than guessing.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        match r.u8()? {
+            0 => Ok(EscrowCondition::ReleaseToPayee),
+            1 => Ok(EscrowCondition::Oracle {
+                question_hash: r.fixed()?,
+            }),
+            _ => Err(Error::Malformed("unknown escrow condition tag")),
+        }
     }
 }
 
@@ -608,5 +767,218 @@ mod tests {
             !e3.finalize(1_000, 0).unwrap(),
             "open escrow does not finalize"
         );
+    }
+}
+
+#[cfg(test)]
+mod escrow_condition_tests {
+    use super::*;
+    use crate::bls::SecretKey;
+
+    /// A real key, and the escrow opened with its public keys, so a release
+    /// signature is verifiable rather than decorative.
+    fn escrow_with_keys(
+        condition: EscrowCondition,
+    ) -> (ConditionalEscrow, SecretKey, SecretKey, SecretKey) {
+        let payer_sk = SecretKey::from_scalar(&[11u8; 32]).unwrap();
+        let payee_sk = SecretKey::from_scalar(&[22u8; 32]).unwrap();
+        let arb_sk = SecretKey::from_scalar(&[33u8; 32]).unwrap();
+        let e = ConditionalEscrow::open_with_condition(
+            "jounit/mini".into(),
+            [1u8; 20],
+            payer_sk.public_key(),
+            [2u8; 20],
+            payee_sk.public_key(),
+            arb_sk.public_key(),
+            1_000,
+            7,
+            condition,
+        )
+        .unwrap();
+        (e, payer_sk, payee_sk, arb_sk)
+    }
+
+    fn sign(key: &SecretKey, msg: &Hash) -> BlsSignature {
+        key.sign(msg)
+    }
+
+    fn plain() -> EscrowCondition {
+        EscrowCondition::ReleaseToPayee
+    }
+
+    #[test]
+    fn the_condition_round_trips_through_the_codec() {
+        let (e, ..) = escrow_with_keys(plain());
+        assert!(e.releasable(), "the default condition is releasable");
+        let bytes = e.encode();
+        let mut r = Reader::new(&bytes);
+        let back = ConditionalEscrow::decode(&mut r).unwrap();
+        assert_eq!(back, e, "the condition is part of the escrow's identity");
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn an_oracle_gated_escrow_fails_closed_no_signature_releases_it() {
+        // There is no implemented oracle verifier in this codebase, so there is
+        // no honest signature for an oracle condition. The refusal is by name
+        // and in advance, rather than an escrow that accepts signatures and
+        // then holds the value forever.
+        let (e, _, _, arb) = escrow_with_keys(EscrowCondition::Oracle {
+            question_hash: [9u8; 32],
+        });
+        assert!(!e.releasable(), "no verifier exists");
+        let mut released = e.clone();
+        let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+        let err = released
+            .release_arbiter(&sign(&arb, &msg), 10, &RealBls)
+            .unwrap_err();
+        assert!(err.to_string().contains("oracle"), "{err}");
+        assert!(
+            matches!(released.state, EscrowState::Open),
+            "the escrow must still be live, not released"
+        );
+    }
+
+    #[test]
+    fn the_release_hash_binds_the_condition_and_the_network() {
+        // A signature is a decision about *something*. If the condition or the
+        // network were not in the hash, one signature would release an escrow
+        // with the same parties and amount under a different condition.
+        let (plain_escrow, ..) = escrow_with_keys(plain());
+        let (oracle, ..) = escrow_with_keys(EscrowCondition::Oracle {
+            question_hash: [4u8; 32],
+        });
+        assert_ne!(
+            plain_escrow.release_signing_hash(EscrowVerdict::ReleasedToPayee),
+            oracle.release_signing_hash(EscrowVerdict::ReleasedToPayee),
+            "the same parties under different conditions must not be releasable by one signature"
+        );
+        let other_net = ConditionalEscrow::open_with_condition(
+            "jounit/other".into(),
+            [1u8; 20],
+            plain_escrow.payer_key,
+            [2u8; 20],
+            plain_escrow.payee_key,
+            plain_escrow.arbitrator,
+            1_000,
+            7,
+            plain(),
+        )
+        .unwrap();
+        assert_ne!(
+            plain_escrow.release_signing_hash(EscrowVerdict::ReleasedToPayee),
+            other_net.release_signing_hash(EscrowVerdict::ReleasedToPayee),
+            "a release must be scoped to its network"
+        );
+    }
+
+    #[test]
+    fn a_release_signature_is_not_valid_for_another_escrow() {
+        // Cross-escrow replay: the arbitrator's signature over one escrow must
+        // not release a different one.
+        let (a, _, _, arb) = escrow_with_keys(plain());
+        let (b, _, _, _) = escrow_with_keys_other_nonce();
+        let mut target = b.clone();
+        let msg = a.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+        let err = target
+            .release_arbiter(&sign(&arb, &msg), 10, &RealBls)
+            .unwrap_err();
+        assert!(err.to_string().contains("arbiter"), "{err}");
+        assert!(matches!(target.state, EscrowState::Open));
+    }
+
+    fn escrow_with_keys_other_nonce() -> (ConditionalEscrow, SecretKey, SecretKey, SecretKey) {
+        let payer_sk = SecretKey::from_scalar(&[11u8; 32]).unwrap();
+        let payee_sk = SecretKey::from_scalar(&[22u8; 32]).unwrap();
+        let arb_sk = SecretKey::from_scalar(&[33u8; 32]).unwrap();
+        let e = ConditionalEscrow::open(
+            "jounit/mini".into(),
+            [1u8; 20],
+            payer_sk.public_key(),
+            [2u8; 20],
+            payee_sk.public_key(),
+            arb_sk.public_key(),
+            1_000,
+            8,
+        )
+        .unwrap();
+        (e, payer_sk, payee_sk, arb_sk)
+    }
+
+    #[test]
+    fn a_second_release_is_refused() {
+        let (e, _, _, arb) = escrow_with_keys(plain());
+        let mut once = e.clone();
+        let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+        once.release_arbiter(&sign(&arb, &msg), 10, &RealBls)
+            .unwrap();
+        assert!(matches!(
+            once.state,
+            EscrowState::ReleasedArbiter { at_height: 10 }
+        ));
+        // A second release of a released escrow is refused, not re-applied.
+        let err = once
+            .release_arbiter(&sign(&arb, &msg), 10, &RealBls)
+            .unwrap_err();
+        assert!(err.to_string().contains("not live"), "{err}");
+    }
+
+    #[test]
+    fn a_released_escrow_cannot_be_mutually_released() {
+        let (e, payer, payee, arb) = escrow_with_keys(plain());
+        let mut once = e.clone();
+        let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+        once.release_arbiter(&sign(&arb, &msg), 5, &RealBls)
+            .unwrap();
+        let err = once
+            .release_mutual(
+                &[sign(&payer, &msg), sign(&payee, &msg)],
+                &[e.payer_key, e.payee_key],
+                6,
+                &RealBls,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not live"), "{err}");
+    }
+
+    #[test]
+    fn a_mutual_release_with_one_signature_is_refused() {
+        // One-sided mutual release: the payee cannot unilaterally release by
+        // signing alone, and the payer must sign too.
+        let (e, payer, _, _) = escrow_with_keys(plain());
+        let mut escrow = e.clone();
+        let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+        let err = escrow
+            .release_mutual(&[sign(&payer, &msg)], &[e.payer_key], 1, &RealBls)
+            .unwrap_err();
+        assert!(err.to_string().contains("two signatures"), "{err}");
+        assert!(matches!(escrow.state, EscrowState::Open));
+    }
+
+    #[test]
+    fn finality_gates_finalization_and_is_idempotent() {
+        let (e, _, _, arb) = escrow_with_keys(plain());
+        let mut escrow = e.clone();
+        let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+        escrow
+            .release_arbiter(&sign(&arb, &msg), 100, &RealBls)
+            .unwrap();
+
+        // Inside the finality window the release is not yet final.
+        assert!(!escrow.finalize(149, 50).unwrap(), "not mature yet");
+        assert!(matches!(escrow.state, EscrowState::ReleasedArbiter { .. }));
+
+        // At the boundary it finalizes, frozen at the release height.
+        assert!(escrow.finalize(150, 50).unwrap());
+        assert!(matches!(
+            escrow.state,
+            EscrowState::Finalized { at_height: 100 }
+        ));
+        // And again: idempotent, no rewrite of the landing height.
+        assert!(!escrow.finalize(500, 50).unwrap());
+        assert!(matches!(
+            escrow.state,
+            EscrowState::Finalized { at_height: 100 }
+        ));
     }
 }

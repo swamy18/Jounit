@@ -703,7 +703,8 @@ impl CreditBook {
 impl CreditPosition {
     /// Canonical encoding. Self-delimiting: the attestation-free fields are
     /// fixed-size or written by their own encoders, so `decode` never guesses.
-    pub fn encode(&self) -> Vec<u8> {        let mut w = crate::ser::Writer::with_capacity(256);
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(256);
         w.fixed(&self.borrower)
             .fixed(&self.agent_id)
             .fixed(&self.lender)
@@ -1251,9 +1252,7 @@ impl CreditPosition {
             ));
         }
         if !matches!(self.state, PositionState::Drawn { .. }) {
-            return Err(Error::Malformed(
-                "a settled position cannot default twice",
-            ));
+            return Err(Error::Malformed("a settled position cannot default twice"));
         }
         let outstanding_principal = self.outstanding_principal();
         if outstanding_principal == 0 {
@@ -1422,12 +1421,10 @@ impl CreditGate for CreditBook {
                 .free
                 .get_mut(payer)
                 .ok_or(Error::Malformed("no free balance to reserve against"))?;
-            *f = f
-                .checked_sub(amount_sat)
-                .ok_or(Error::InsufficientFunds {
-                    needed: amount_sat,
-                    available: spendable,
-                })?;
+            *f = f.checked_sub(amount_sat).ok_or(Error::InsufficientFunds {
+                needed: amount_sat,
+                available: spendable,
+            })?;
             let r = self.reserved.entry(*payer).or_insert(0);
             *r = r.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
             return Ok(Reservation {
@@ -2369,7 +2366,6 @@ mod tests {
         // to be the *name* of the failure and not a conservation panic.
         let b = book.bonds.get_mut(&borrower).unwrap();
         *b -= 40_000;
-        drop(b);
         let f = book.free.entry(borrower).or_insert(0);
         *f += 40_000;
         let p = book.bond_pledged.get_mut(&borrower).unwrap();

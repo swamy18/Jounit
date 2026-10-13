@@ -53,7 +53,7 @@ fn committee(seeds: impl IntoIterator<Item = u8>, net: &str) -> Committee {
     c
 }
 
-/// A verifier for a node whose committee is `keys` — the equivalent of a peer
+/// A verifier for a node whose committee is `keys` - the equivalent of a peer
 /// that derived the same set from the same canonical bonds.
 fn verifier(keys: &[BlsPublicKey]) -> FinalityManager {
     let mut m = FinalityManager::new(&params());
@@ -95,7 +95,7 @@ fn a_quorum_certificate_finalizes_on_an_independent_verifier() {
     let cp = signer.sign(MINE_TO, tip, &committee).unwrap().unwrap();
 
     // The verifier is a separate instance, with keys set from the same committee
-    // — exactly a peer that derived its set from the same canonical bonds.
+    // - exactly a peer that derived its set from the same canonical bonds.
     let mut peer = verifier(&committee.public_keys());
     peer.accept(&cp, Some(tip), &jnt_core::bls::RealBls)
         .expect("an independent verifier must accept a quorum certificate");
@@ -316,4 +316,86 @@ fn a_committee_that_lost_a_member_signs_without_it() {
     peer.accept(&whole, Some(tip), &jnt_core::bls::RealBls)
         .unwrap();
     assert!(peer.is_finalized(20));
+}
+
+#[test]
+fn a_one_key_signature_places_the_right_index_in_a_larger_set() {
+    // The bitmap is an index into the committee a *verifier* derives. A node
+    // holding a single validator key inside a four-member committee used to build
+    // its bitmap against its own one-key list, which marks index zero of a
+    // one-bit map: a peer reads that as validator zero of four having signed,
+    // which is a certificate that verifies against nothing, or one that
+    // accidentally matches a different validator.
+    let net = params().network_id.clone();
+    let keys: Vec<SecretKey> = (1u8..=4)
+        .map(|s| SecretKey::derive(&[s; 32]).unwrap())
+        .collect();
+    let mut pks: Vec<BlsPublicKey> = keys.iter().map(|k| k.public_key()).collect();
+    pks.sort_by_key(|k| k.0);
+
+    // A committee holding only the *last* key in sorted order.
+    let member = committee([4], &net);
+    let chain_pks: Vec<BlsPublicKey> = committee([1, 2, 3, 4], &net).public_keys();
+    assert_eq!(chain_pks.len(), 4);
+
+    let payload = jnt_core::bls_checkpoint::CheckpointPayload {
+        height: MINE_TO,
+        block_hash: [9u8; 32],
+        network_id: net.clone(),
+        epoch: MINE_TO / params().checkpoint_interval_blocks,
+    };
+    let cp = member
+        .sign_in_set(&payload, &pks)
+        .expect("a member signs")
+        .expect("and aggregates");
+
+    let expected_index = pks.iter().position(|k| *k == keys[3].public_key()).unwrap();
+    let mut expected = vec![0u8; pks.len().div_ceil(8)];
+    expected[expected_index / 8] |= 1 << (expected_index % 8);
+    assert_eq!(
+        cp.signer_bitmap, expected,
+        "the bitmap must index the committee, not the local key list"
+    );
+    assert_eq!(cp.signer_count, 1);
+
+    // And a peer that derived the same committee accepts the bytes.
+    // A peer that derived the same committee reads the bitmap as exactly one
+    // signer out of four and then refuses it for quorum � which is the point:
+    // the refusal is a *quorum* refusal, counted correctly, not a mismatch over
+    // which validator signed. Under the old indexing the same bytes would have
+    // named validator zero and been refused as a non-member or an index error.
+    let mut mgr = verifier(&pks);
+    let acc = mgr.accept(&cp, Some([9u8; 32]), &jnt_core::bls::RealBls);
+    match acc {
+        Err(jnt_core::finality::FinalityError::InvalidCertificate(
+            jnt_core::validators::ValidatorError::CheckpointQuorumShort { have, need },
+        )) => {
+            assert_eq!(have, 1, "the peer counted exactly one signer");
+            assert_eq!(need, 3, "and then correctly wanted a quorum of three");
+        }
+        other => panic!("expected a quorum refusal counted from the bitmap, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_key_outside_the_set_cannot_sign_against_it() {
+    // An honest index is the whole point of the bitmap: a key the committee does
+    // not hold is refused rather than placed by guess.
+    let net = params().network_id.clone();
+    let pks: Vec<BlsPublicKey> = committee([1, 2, 3], &net).public_keys();
+    let member = committee([99], &net);
+    let payload = jnt_core::bls_checkpoint::CheckpointPayload {
+        height: MINE_TO,
+        block_hash: [9u8; 32],
+        network_id: net,
+        epoch: MINE_TO / params().checkpoint_interval_blocks,
+    };
+    let err = member
+        .sign_in_set(&payload, &pks)
+        .expect("signing attempted")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not a member"),
+        "a non-member key must be refused by name: {err}"
+    );
 }
