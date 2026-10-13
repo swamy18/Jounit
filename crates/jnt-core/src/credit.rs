@@ -989,12 +989,16 @@ impl ChargeSchedule {
         if windows == 0 || principal_sat == 0 {
             return Ok(0);
         }
-        let units =
-            (principal_sat as u128) * (self.rate_bps_per_window as u128) * (windows as u128);
-        match u64::try_from(units) {
-            Ok(v) => Ok(v / 10_000),
-            Err(_) => Ok(u64::MAX / 10_000),
-        }
+        // Checked in u128: the triple product overflows u128 for adversarial
+        // (principal, rate, windows) — a wrapped or silently capped value would
+        // undercharge interest and diverge between debug (panic) and release
+        // (wrap) builds, so overflow is a refusal, not a number.
+        let units = (principal_sat as u128)
+            .checked_mul(self.rate_bps_per_window as u128)
+            .and_then(|v| v.checked_mul(windows as u128))
+            .ok_or(Error::ValueOverflow)?;
+        let scaled = units / 10_000;
+        u64::try_from(scaled).map_err(|_| Error::ValueOverflow)
     }
 }
 
@@ -1306,12 +1310,10 @@ impl CreditPosition {
 /// step for large `sat`, and a wrapped product compares small and passes a
 /// bound. Compute in u128 and clamp once.
 fn sat_mul_bps(sat: u64, bps: u32) -> u64 {
-    let product = (sat as u128) * (bps as u128);
-    if product > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        product as u64 / 10_000
-    }
+    // Divide before clamping: clamping the raw product would overstate the
+    // result up to 10 000x whenever sat * bps exceeds u64::MAX but the divided
+    // value does not. The caps downstream assume this names the true quotient.
+    ((sat as u128) * (bps as u128) / 10_000).min(u64::MAX as u128) as u64
 }
 
 /// The one thing `admit_payment` needs from a credit book, kept to a trait so
@@ -1359,6 +1361,17 @@ pub struct Reservation {
     /// Satoshis reserved. The settlement debit is exactly this amount — a
     /// reservation must never settle for more or less than it reserved.
     pub amount_sat: u64,
+    /// Free-balance satoshis swept into `reserved` at admission. Zero for a
+    /// pure position-backed draw; equal to `amount_sat` for a pure free draw.
+    /// A mixed reservation sweeps the whole free balance and draws the rest
+    /// against position headroom, so no spendable value is left behind for a
+    /// second payment to re-admit.
+    pub from_free_sat: u64,
+    /// Per-position headroom encumbered, in the order drawn. Empty for a pure
+    /// free-balance draw. Every entry is released (or refused at settle) by
+    /// name, so a draw spread over several positions cannot leak on the ones
+    /// the reservation forgot to record.
+    pub position_draws: Vec<(Hash, u64)>,
     /// The position this debit was charged against, if any (a free-balance draw
     /// has none). Informational: lets a lender reconcile without storing it.
     pub position_id: Option<Hash>,
@@ -1374,6 +1387,8 @@ impl CreditGate for NoCreditGate {
             id: crate::hash::ZERO_HASH,
             debtor: *payer,
             amount_sat,
+            from_free_sat: amount_sat,
+            position_draws: Vec::new(),
             position_id: None,
         })
     }
@@ -1400,7 +1415,9 @@ impl CreditGate for NoCreditGate {
 /// rather than advisory.
 impl CreditGate for CreditBook {
     fn reserve(&mut self, payer: &Address, amount_sat: u64, height: u64) -> Result<Reservation> {
-        self.reservation_seq = self.reservation_seq.saturating_add(1);
+        // The sequence is committed only on success: a refused admission must
+        // leave the book exactly as it was, with no observable side effect.
+        let seq = self.reservation_seq.saturating_add(1);
         // Every reservation gets its own id, so two payments from one payer at
         // one height are never conflated into the same reservation.
         let id = sha256_dom(
@@ -1409,7 +1426,7 @@ impl CreditGate for CreditBook {
                 payer.as_ref(),
                 &amount_sat.to_le_bytes(),
                 &height.to_le_bytes(),
-                &self.reservation_seq.to_le_bytes(),
+                &seq.to_le_bytes(),
             ],
         );
 
@@ -1427,17 +1444,35 @@ impl CreditGate for CreditBook {
             })?;
             let r = self.reserved.entry(*payer).or_insert(0);
             *r = r.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
+            self.reservation_seq = seq;
             return Ok(Reservation {
                 id,
                 debtor: *payer,
                 amount_sat,
+                from_free_sat: amount_sat,
+                position_draws: Vec::new(),
                 position_id: None,
             });
         }
 
-        // Otherwise draw the remainder against live positions that still have
-        // unencumbered principal outstanding.
-        let mut remaining = amount_sat.saturating_sub(spendable);
+        // Otherwise sweep the whole free balance into `reserved` first, then
+        // draw the remainder against live positions. Leaving the free balance
+        // in place would let a second payment re-admit the same value while
+        // this reservation also claims it.
+        let from_free_sat = spendable;
+        if from_free_sat > 0 {
+            let f = self
+                .free
+                .get_mut(payer)
+                .ok_or(Error::Malformed("no free balance to reserve against"))?;
+            *f = f.checked_sub(from_free_sat).ok_or(Error::InsufficientFunds {
+                needed: from_free_sat,
+                available: spendable,
+            })?;
+            let r = self.reserved.entry(*payer).or_insert(0);
+            *r = r.checked_add(from_free_sat).ok_or(Error::ValueOverflow)?;
+        }
+        let mut remaining = amount_sat.saturating_sub(from_free_sat);
         let mut chosen: Option<Hash> = None;
         // The positions the draw is spread over, in line order, so the
         // encumbrance below is computed from the same numbers the loop walked.
@@ -1470,23 +1505,45 @@ impl CreditGate for CreditBook {
         }
 
         if remaining > 0 {
+            // The line cannot cover it: give the swept free balance straight
+            // back, so a refused admission leaves the book exactly as it was.
+            if from_free_sat > 0 {
+                if let Some(debit) = self.reserved.get_mut(payer) {
+                    *debit = debit.saturating_sub(from_free_sat);
+                    if *debit == 0 {
+                        self.reserved.remove(payer);
+                    }
+                }
+                let f = self.free.entry(*payer).or_insert(0);
+                *f = f.saturating_add(from_free_sat);
+            }
             return Err(Error::InsufficientFunds {
                 needed: amount_sat,
                 available: spendable,
             });
         }
-        // Encumber the drawn part, position by position.
-        let mut to_encumber = amount_sat.saturating_sub(spendable);
+        // Encumber the drawn part, position by position, recording the exact
+        // take per position so the release returns each one by name.
+        let mut to_encumber = amount_sat.saturating_sub(from_free_sat);
+        let mut draws: Vec<(Hash, u64)> = Vec::with_capacity(spread.len());
         for (pos_id, headroom) in spread {
             let take = to_encumber.min(headroom);
+            if take == 0 {
+                continue;
+            }
             let slot = self.position_reserved.entry(pos_id).or_insert(0);
             *slot = slot.saturating_add(take);
             to_encumber -= take;
+            draws.push((pos_id, take));
         }
+        debug_assert_eq!(to_encumber, 0);
+        self.reservation_seq = seq;
         Ok(Reservation {
             id,
             debtor: *payer,
             amount_sat,
+            from_free_sat,
+            position_draws: draws,
             position_id: chosen,
         })
     }
@@ -1511,6 +1568,16 @@ impl CreditGate for CreditBook {
                 ))
             }
             None => {}
+        }
+        // A draw against position headroom is capacity, not value: the debit is
+        // a position-lifecycle event (repay), so there is no outstanding free
+        // reservation for the drawn part to settle into. Refuse by name before
+        // touching any bucket, rather than settling the free part and silently
+        // dropping the rest.
+        if !reservation.position_draws.is_empty() {
+            return Err(Error::Malformed(
+                "no outstanding free reservation for this payer to settle: the reservation draws on position headroom, which settles through the position lifecycle, not the ledger",
+            ));
         }
         let debit = self
             .reserved
@@ -1553,21 +1620,31 @@ impl CreditGate for CreditBook {
             }
             None => {}
         }
-        if let Some(debit) = self.reserved.get_mut(&reservation.debtor) {
-            let give = reservation.amount_sat.min(*debit);
-            *debit -= give;
-            if *debit == 0 {
-                self.reserved.remove(&reservation.debtor);
+        // Return the swept free balance, exactly what admission moved.
+        if reservation.from_free_sat > 0 {
+            if let Some(debit) = self.reserved.get_mut(&reservation.debtor) {
+                let give = reservation.from_free_sat.min(*debit);
+                *debit -= give;
+                if *debit == 0 {
+                    self.reserved.remove(&reservation.debtor);
+                }
+                let free = self.free.entry(reservation.debtor).or_insert(0);
+                *free = free.checked_add(give).ok_or(Error::ValueOverflow)?;
             }
-            let free = self.free.entry(reservation.debtor).or_insert(0);
-            *free = free.checked_add(give).ok_or(Error::ValueOverflow)?;
         }
-        // Any part drawn against a position's headroom is returned there.
-        if let Some(position_id) = reservation.position_id {
-            let slot = self.position_reserved.entry(position_id).or_insert(0);
-            *slot = slot.saturating_sub(reservation.amount_sat);
-            if *slot == 0 {
-                self.position_reserved.remove(&position_id);
+        // Return every position draw by name, exactly what admission took. A
+        // draw spread over several positions releases each one; releasing the
+        // whole amount from a single recorded position would over-release it
+        // and leak the rest.
+        for (position_id, take) in &reservation.position_draws {
+            if *take == 0 {
+                continue;
+            }
+            if let Some(slot) = self.position_reserved.get_mut(position_id) {
+                *slot = slot.saturating_sub(*take);
+                if *slot == 0 {
+                    self.position_reserved.remove(position_id);
+                }
             }
         }
         self.record_reservation(reservation.id, ReservationOutcome::Released);
