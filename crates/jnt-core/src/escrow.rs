@@ -120,8 +120,16 @@ pub enum EscrowState {
 
 impl ConditionalEscrow {
     /// The escrow's identity: `SHA256(DOM_ESCROW ‖ network ‖ payer ‖ payee ‖
-    /// arbitrator ‖ amount ‖ nonce)`. Deterministic, contract-unique, and
-    /// independent of the state — the id is stable across a release.
+    /// arbitrator ‖ amount ‖ nonce ‖ condition)`. Deterministic,
+    /// contract-unique, and independent of the state — the id is stable across a
+    /// release.
+    ///
+    /// The condition is in the hash because it is part of the contract the
+    /// parties agreed to: the same parties and the same amount under a
+    /// deterministic release and under an oracle are two different agreements,
+    /// and an id that ignored the condition would make them one. A node keyed by
+    /// this id would keep one and silently drop the other, so whichever survived
+    /// would be indistinguishable from the one it replaced.
     pub fn id(&self) -> Hash {
         sha256_dom(
             DOM_ESCROW,
@@ -134,6 +142,7 @@ impl ConditionalEscrow {
                 self.arbitrator.as_bytes(),
                 &self.amount_sat.to_le_bytes(),
                 &self.nonce.to_le_bytes(),
+                &self.condition.encode(),
             ],
         )
     }

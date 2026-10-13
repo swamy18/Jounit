@@ -285,13 +285,8 @@ impl MachinePayment {
     pub fn deserialize(bytes: &[u8]) -> Result<Self, PaymentError> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
-        // v1 predates the delegation chain: a v1 payment carries no chain bytes
-        // and is decoded by the old layout, so an existing payment still
-        // verifies against its existing signature.
-        match version {
-            PAYMENT_VERSION => {}
-            1 => return MachinePaymentV1::decode(bytes).map(MachinePayment::from_v1),
-            other => return Err(PaymentError::UnsupportedVersion(other)),
+        if version != PAYMENT_VERSION {
+            return Err(PaymentError::UnsupportedVersion(version));
         }
         let net_len = r
             .u16le()
@@ -547,102 +542,7 @@ fn decode_chain(r: &mut Reader<'_>) -> Result<Vec<crate::agent::SpendPolicy>, Pa
     Ok(out)
 }
 
-/// A version-1 payment, decoded for compatibility only.
-///
-/// Version 1 has no delegation chain in its body, so the encoding stops at
-/// `reference`. Such a payment is still valid *as what it is* — a root spend —
-/// and is lifted into the current type with an empty chain rather than being
-/// refused. A chain-carrying payment, in turn, is version 2 and cannot be
-/// shortened to fit the old bytes.
-struct MachinePaymentV1;
-
-impl MachinePaymentV1 {
-    fn decode(bytes: &[u8]) -> Result<MachinePayment, PaymentError> {
-        let mut r = Reader::new(bytes);
-        let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
-        debug_assert_eq!(version, 1);
-        let net_len = r
-            .u16le()
-            .map_err(|_| PaymentError::Malformed("network len"))? as usize;
-        if net_len == 0 {
-            return Err(PaymentError::EmptyNetworkId);
-        }
-        if net_len > MAX_PAYMENT_NETWORK_ID_LEN {
-            return Err(PaymentError::NetworkIdTooLong(net_len));
-        }
-        let network_id = std::str::from_utf8(
-            r.fixed_slice(net_len)
-                .map_err(|_| PaymentError::Malformed("network id"))?,
-        )
-        .map_err(|_| PaymentError::Malformed("network id is not utf-8"))?
-        .to_string();
-        let payer_type_raw = r.u8().map_err(|_| PaymentError::Malformed("payer type"))?;
-        let payer_type = AgentRole::from_u8(payer_type_raw)
-            .ok_or(PaymentError::Malformed("payer type out of range"))?;
-        let payer = r
-            .fixed::<20>()
-            .map_err(|_| PaymentError::Malformed("payer"))?;
-        let agent_id = r
-            .fixed::<20>()
-            .map_err(|_| PaymentError::Malformed("agent id"))?;
-        let recipient = r
-            .fixed::<20>()
-            .map_err(|_| PaymentError::Malformed("recipient"))?;
-        let service = match r
-            .u8()
-            .map_err(|_| PaymentError::Malformed("service flag"))?
-        {
-            0 => None,
-            1 => Some(
-                r.fixed::<32>()
-                    .map_err(|_| PaymentError::Malformed("service tag"))?,
-            ),
-            _ => return Err(PaymentError::Malformed("service flag not 0 or 1")),
-        };
-        let amount_sat = r.u64le().map_err(|_| PaymentError::Malformed("amount"))?;
-        let fee_sat = r.u64le().map_err(|_| PaymentError::Malformed("fee"))?;
-        let nonce = r.u64le().map_err(|_| PaymentError::Malformed("nonce"))?;
-        let policy_hash = r
-            .fixed::<32>()
-            .map_err(|_| PaymentError::Malformed("policy hash"))?;
-        let expires_at_height = r
-            .u64le()
-            .map_err(|_| PaymentError::Malformed("expires_at"))?;
-        let reference = r
-            .fixed::<32>()
-            .map_err(|_| PaymentError::Malformed("reference"))?;
-        let keys = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
-        let sigs = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
-        r.expect_end()
-            .map_err(|_| PaymentError::Malformed("trailing bytes"))?;
-        Ok(MachinePayment {
-            version,
-            network_id,
-            payer_type,
-            payer,
-            agent_id,
-            recipient,
-            service,
-            amount_sat,
-            fee_sat,
-            nonce,
-            policy_hash,
-            expires_at_height,
-            reference,
-            chain: Vec::new(),
-            keys,
-            sigs,
-        })
-    }
-}
-
 impl MachinePayment {
-    /// Lift a decoded version-1 payment into the current type.
-    #[allow(clippy::wrong_self_convention)]
-    fn from_v1(v1: MachinePayment) -> MachinePayment {
-        v1
-    }
-
     /// Build a delegated payment under a chain, signed by the owner's wallet.
     ///
     /// The chain is the whole ancestry, oldest first, ending at the governing

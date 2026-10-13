@@ -238,11 +238,6 @@ impl PaymentRequest {
     pub fn deserialize(bytes: &[u8]) -> Result<Self, PaymentError> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
-        // v1 predates the delegation chain: it decodes by the old layout and
-        // lifts into an empty chain, so an existing request still verifies.
-        if version == 1 {
-            return PaymentRequestV1::decode(bytes);
-        }
         if version != REQUEST_VERSION {
             return Err(PaymentError::UnsupportedVersion(version));
         }
@@ -442,78 +437,6 @@ fn decode_request_chain(r: &mut Reader<'_>) -> Result<Vec<SpendPolicy>, PaymentE
         );
     }
     Ok(out)
-}
-
-/// The version-1 request, decoded for compatibility only: it has no chain in
-/// its body, so it decodes by the old layout and lifts into an empty chain.
-struct PaymentRequestV1;
-
-impl PaymentRequestV1 {
-    fn decode(bytes: &[u8]) -> Result<PaymentRequest, PaymentError> {
-        let mut r = Reader::new(bytes);
-        let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
-        debug_assert_eq!(version, 1);
-        let net_len = r
-            .u16le()
-            .map_err(|_| PaymentError::Malformed("network len"))? as usize;
-        if net_len == 0 {
-            return Err(PaymentError::EmptyNetworkId);
-        }
-        if net_len > crate::agent::MAX_NETWORK_ID_LEN {
-            return Err(PaymentError::NetworkIdTooLong(net_len));
-        }
-        let network_id = std::str::from_utf8(
-            r.fixed_slice(net_len)
-                .map_err(|_| PaymentError::Malformed("network id"))?,
-        )
-        .map_err(|_| PaymentError::Malformed("network id is not utf-8"))?
-        .to_string();
-        let payer = r
-            .fixed::<20>()
-            .map_err(|_| PaymentError::Malformed("payer"))?;
-        let payer_type_raw = r.u8().map_err(|_| PaymentError::Malformed("payer type"))?;
-        let payer_type = AgentRole::from_u8(payer_type_raw)
-            .ok_or(PaymentError::Malformed("payer type out of range"))?;
-        let agent_id = r
-            .fixed::<20>()
-            .map_err(|_| PaymentError::Malformed("agent id"))?;
-        let service_id = r
-            .fixed::<32>()
-            .map_err(|_| PaymentError::Malformed("service id"))?;
-        let recipient = r
-            .fixed::<20>()
-            .map_err(|_| PaymentError::Malformed("recipient"))?;
-        let max_amount_sat = r
-            .u64le()
-            .map_err(|_| PaymentError::Malformed("max amount"))?;
-        let expires_at_height = r
-            .u64le()
-            .map_err(|_| PaymentError::Malformed("expires_at"))?;
-        let policy_hash = r
-            .fixed::<32>()
-            .map_err(|_| PaymentError::Malformed("policy hash"))?;
-        let keys = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
-        let sigs = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
-        r.expect_end()
-            .map_err(|_| PaymentError::Malformed("trailing bytes"))?;
-        let request = PaymentRequest {
-            version,
-            network_id,
-            payer,
-            payer_type,
-            agent_id,
-            service_id,
-            recipient,
-            max_amount_sat,
-            expires_at_height,
-            policy_hash,
-            chain: Vec::new(),
-            keys,
-            sigs,
-        };
-        request.validate()?;
-        Ok(request)
-    }
 }
 
 /// Build and sign a payment request with the payer's wallet. The wallet is
