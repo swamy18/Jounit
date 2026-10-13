@@ -60,7 +60,6 @@ Signatures are versioned by the header field `sig_scheme` (**signature agility**
 | `sig_scheme` | Scheme |
 |---|---|
 | `1` | secp256k1 ECDSA over SHA-256 (v0.1 only) |
-
 A future hybrid post-quantum scheme MUST use a new `sig_scheme` value and MUST NOT reuse `1`. Nodes MUST reject unknown `sig_scheme` values.
 
 ### 1.1 Signature message
@@ -178,6 +177,35 @@ address, and a hybrid key set cannot be quietly reduced.
 BIP-340 Schnorr. Scheme 2 exercises the multi-scheme path end to end; it is not
 post-quantum and adds no quantum resistance on its own. A lattice scheme (3)
 would slot in without changing any encoding, since the bundle is generic.
+
+**Scheme `3` = ML-DSA-65 (FIPS 204), security level 3. Implemented.** A Shor
+break of secp256k1 does not reach the lattice component, so a bundle carrying
+`1 + 2 + 3` keeps a spend authorizable when the classical primitives fail and
+vice versa: every component must verify, so breaking any single one does not
+let an attacker through. Verifying keys are 1952 bytes and signatures 3309,
+both inside the 4096-byte component cap that was sized for exactly this.
+Verification is over the 32-byte digest with an empty ML-DSA context, since the
+digest is already domain-separated upstream.
+
+The three scheme sets a wallet can sign, and the address each one commits to:
+
+| Mode | Schemes | Address |
+|---|---|---|
+| `Classical` | `1` | `ecdsa_address` |
+| `Hybrid` (default) | `1 + 2` | `hybrid_address` |
+| `PostQuantum` | `1 + 2 + 3` | `pq_address` |
+
+All three addresses are distinct by construction — the address hashes the whole
+serialized key bundle — so funds credited to one are not spendable under
+another, and a hybrid output cannot be quietly reduced to its classical half.
+`Transaction::verify_input` derives the address from the input's own key bundle
+and compares it to the address that owns the spent output, so a bundle a
+caller invents for an output it does not own is refused before any
+cryptographic check.
+
+Scheme `3` is accepted by consensus but **not required yet**: there is no
+activation height at which a bundle lacking it becomes invalid. Turning that on
+is the PQ-activation decision recorded in `docs/decisions.md`.
 
 ```
 txid = SHA256( DOM_TX ‖ serialize(tx) )

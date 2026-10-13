@@ -15,6 +15,17 @@ pub struct Wallet {
     pub private_key: [u8; 32],
 }
 
+/// The scheme set an input is signed under. See [`Wallet::sign_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignMode {
+    /// ECDSA only. The pre-hybrid format.
+    Classical,
+    /// ECDSA + BIP-340 Schnorr. Default before a lattice component is added.
+    Hybrid,
+    /// ECDSA + Schnorr + ML-DSA-65. The post-quantum-ready bundle.
+    PostQuantum,
+}
+
 impl Wallet {
     pub fn new_random(label: impl Into<String>) -> Self {
         use rand::RngCore;
@@ -127,63 +138,83 @@ impl Wallet {
     /// Sign every input of `tx`. Re-signing after an output change invalidates
     /// all previous signatures, which is exactly the intended behaviour.
     ///
-    /// Produces a **hybrid** bundle by default: an ECDSA signature and a BIP-340
-    /// Schnorr signature over the same message, from the same key, under both
-    /// scheme ids. That is what a post-quantum-ready input looks like once a
-    /// lattice scheme is added -- the bundle, the address commitment and the
-    /// verification path already exist and take another component unchanged.
-    /// Pass `hybrid = false` for a single-scheme ECDSA bundle.
+    /// Three modes, and the mode decides which address the output must have
+    /// been credited to, because the address commits to the whole key set:
+    ///
+    /// - `SignMode::Classical` — ECDSA only (`ecdsa_address`).
+    /// - `SignMode::Hybrid` — ECDSA + Schnorr (`hybrid_address`, the default).
+    /// - `SignMode::PostQuantum` — ECDSA + Schnorr + ML-DSA-65 (`pq_address`).
+    ///
+    /// The post-quantum bundle is the one to use once a CRQC is plausible: a
+    /// Shor break of secp256k1 forges the classical components but cannot
+    /// produce the lattice one, and every component must verify.
     pub fn sign(&self, tx: &mut Transaction) -> Result<()> {
         self.sign_with(tx, true)
     }
 
     pub fn sign_with(&self, tx: &mut Transaction, hybrid: bool) -> Result<()> {
+        self.sign_mode(
+            tx,
+            if hybrid {
+                SignMode::Hybrid
+            } else {
+                SignMode::Classical
+            },
+        )
+    }
+
+    /// Sign every input under an explicit scheme set. See [`Wallet::sign`] for
+    /// what each mode commits to.
+    pub fn sign_mode(&self, tx: &mut Transaction, mode: SignMode) -> Result<()> {
         if tx.is_coinbase() {
             return Err(Error::BadKey("coinbase transactions are not signed"));
         }
         let ecdsa_pub = self.pubkey()?;
         let schnorr_pub = self.schnorr_pubkey()?;
+        let ml_dsa_pub = if mode == SignMode::PostQuantum {
+            Some(self.ml_dsa_pubkey()?)
+        } else {
+            None
+        };
+        let mut key_components = vec![crate::sig::Component::new(
+            crate::sig::SCHEME_SECP256K1_ECDSA,
+            ecdsa_pub.to_vec(),
+        )];
+        if mode != SignMode::Classical {
+            key_components.push(crate::sig::Component::new(
+                crate::sig::SCHEME_SECP256K1_SCHNORR,
+                schnorr_pub.to_vec(),
+            ));
+        }
+        if let Some(pq) = ml_dsa_pub {
+            key_components.push(crate::sig::Component::new(crate::sig::SCHEME_ML_DSA_65, pq));
+        }
+
         for k in 0..tx.inputs.len() {
             let msg = tx.message_for_input(k);
-            let ecdsa_sig = self.sign_digest(&msg)?;
-            let schnorr_sig = self.sign_schnorr(&msg)?;
-
-            let input = &mut tx.inputs[k];
-            if hybrid {
-                input.keys = crate::sig::Bundle {
-                    components: vec![
-                        crate::sig::Component::new(
-                            crate::sig::SCHEME_SECP256K1_ECDSA,
-                            ecdsa_pub.to_vec(),
-                        ),
-                        crate::sig::Component::new(
-                            crate::sig::SCHEME_SECP256K1_SCHNORR,
-                            schnorr_pub.to_vec(),
-                        ),
-                    ],
-                };
-                input.sigs = crate::sig::Bundle {
-                    components: vec![
-                        crate::sig::Component::new(
-                            crate::sig::SCHEME_SECP256K1_ECDSA,
-                            ecdsa_sig.to_vec(),
-                        ),
-                        crate::sig::Component::new(
-                            crate::sig::SCHEME_SECP256K1_SCHNORR,
-                            schnorr_sig.to_vec(),
-                        ),
-                    ],
-                };
-            } else {
-                input.keys = crate::sig::Bundle::single(
-                    crate::sig::SCHEME_SECP256K1_ECDSA,
-                    ecdsa_pub.to_vec(),
-                );
-                input.sigs = crate::sig::Bundle::single(
-                    crate::sig::SCHEME_SECP256K1_ECDSA,
-                    ecdsa_sig.to_vec(),
-                );
+            let mut sig_components = vec![crate::sig::Component::new(
+                crate::sig::SCHEME_SECP256K1_ECDSA,
+                self.sign_digest(&msg)?.to_vec(),
+            )];
+            if mode != SignMode::Classical {
+                sig_components.push(crate::sig::Component::new(
+                    crate::sig::SCHEME_SECP256K1_SCHNORR,
+                    self.sign_schnorr(&msg)?.to_vec(),
+                ));
             }
+            if mode == SignMode::PostQuantum {
+                sig_components.push(crate::sig::Component::new(
+                    crate::sig::SCHEME_ML_DSA_65,
+                    self.sign_ml_dsa(&msg)?,
+                ));
+            }
+            let input = &mut tx.inputs[k];
+            input.keys = crate::sig::Bundle {
+                components: key_components.clone(),
+            };
+            input.sigs = crate::sig::Bundle {
+                components: sig_components,
+            };
         }
         Ok(())
     }
@@ -231,6 +262,65 @@ impl Wallet {
         let mut out = [0u8; 64];
         out.copy_from_slice(&sig.to_bytes());
         Ok(out)
+    }
+
+    /// The ML-DSA-65 signing seed, derived from this wallet's key material.
+    ///
+    /// Derived rather than stored, so a wallet's serialization and its
+    /// post-quantum half stay in lockstep: a `Wallet` with no extra field still
+    /// recovers the same ML-DSA key after a restart. The seed is a fresh
+    /// domain-separated hash of the private key, not the scalar itself — the
+    /// ML-DSA key generation must not depend on the secp256k1 scalar being a
+    /// particular value.
+    fn ml_dsa_seed(&self) -> [u8; 32] {
+        use crate::hash::{sha256_dom, DOM_ADDR};
+        sha256_dom(DOM_ADDR, &[b"jounit/ml-dsa-65-seed/v1", &self.private_key])
+    }
+
+    /// The ML-DSA-65 public key for this wallet, encoded (1952 bytes).
+    pub fn ml_dsa_pubkey(&self) -> Result<Vec<u8>> {
+        use ml_dsa::{Keypair as _, MlDsa65, SigningKey};
+        let sk = SigningKey::<MlDsa65>::from_seed(&self.ml_dsa_seed().into());
+        Ok(sk.verifying_key().encode().to_vec())
+    }
+
+    /// ML-DSA-65 signature over a 32-byte digest (FIPS 204, deterministic).
+    pub fn sign_ml_dsa(&self, digest: &[u8; 32]) -> Result<Vec<u8>> {
+        use ml_dsa::{MlDsa65, SigningKey};
+        let sk = SigningKey::<MlDsa65>::from_seed(&self.ml_dsa_seed().into());
+        // `Signer` (the `SigningKey` wrapper) signs over a pre-hashed digest;
+        // the expanded key is what offers the deterministic primitive, and it
+        // is what `sign_deterministic` exists on.
+        let sig = sk
+            .expanded_key()
+            .sign_deterministic(digest, &[])
+            .map_err(|_| Error::BadKey("ml-dsa signing failed"))?;
+        Ok(sig.encode().to_vec())
+    }
+
+    /// The address a **post-quantum** bundle from this wallet produces:
+    /// ECDSA + Schnorr + ML-DSA-65 key components.
+    ///
+    /// This is the address mainnet funds should be credited at once wallets
+    /// sign PQ bundles. A hybrid (1+2) address and a PQ (1+2+3) address are
+    /// different addresses by construction — the address commits to the whole
+    /// key set — so the two never alias and an output sent to one is not
+    /// spendable under the other.
+    pub fn pq_address(&self) -> Result<Address> {
+        crate::sig::Bundle {
+            components: vec![
+                crate::sig::Component::new(
+                    crate::sig::SCHEME_SECP256K1_ECDSA,
+                    self.pubkey()?.to_vec(),
+                ),
+                crate::sig::Component::new(
+                    crate::sig::SCHEME_SECP256K1_SCHNORR,
+                    self.schnorr_pubkey()?.to_vec(),
+                ),
+                crate::sig::Component::new(crate::sig::SCHEME_ML_DSA_65, self.ml_dsa_pubkey()?),
+            ],
+        }
+        .address()
     }
 }
 

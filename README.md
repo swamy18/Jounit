@@ -698,6 +698,7 @@ applies.
 | **A live validator committee** | **Does not exist** | No operator is bonding 5 000 JNT |
 | Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
+| **Post-quantum signatures** | **Accepted, not required** | Scheme `3` = ML-DSA-65 (FIPS 204) verifies inside the hybrid bundle: a spend can be signed `ECDSA + Schnorr + ML-DSA`, every component must verify, and the address commits to the whole key set so a bundle cannot be reduced to its classical half. No activation height requires it yet |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
 | **Escrowed service contracts** | **In development** | The general contract and its transitions, a validated `ServiceContract::open` for non-compute deliverables, one non-compute deliverable shipping. Coin settlement is Item 10 |
 | **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; a reservation *encumbers* capacity (free to `reserved`, or a position's principal headroom) so one balance cannot back two admitted payments, and settlement is idempotent per reservation. Round-2 hardening: a mixed free+position reservation sweeps the whole free balance, per-position draws are tracked and released by name, a refused admission leaves the book untouched, and interest overflow is refused rather than wrapped. The position lifecycle (bond post/release, open, repay, default) is reachable over HTTP; the *debit commit* lands at receipt acceptance, and the matching coin move is §19.4 coin settlement (Item 10) |
@@ -853,6 +854,7 @@ cargo test -p jnt-net  --test arbitration_votes # 3 nodes, real TCP
 cargo test -p jnt-node --test exit_crank_api   # withdrawal flow over HTTP
 cargo test -p jnt-core --test redteam          # adversarial regressions
 cargo test -p jnt-core --test redteam_round2   # round-2 credit regressions
+cargo test -p jnt-core --test pq_signature     # post-quantum bundle attacks
 ```
 
 CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release
