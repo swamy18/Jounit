@@ -59,7 +59,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Payment encoding version. A future format MUST use a new value.
-pub const PAYMENT_VERSION: u8 = 1;
+pub const PAYMENT_VERSION: u8 = 2;
 /// Domain tag for the payment signing hash.
 pub const DOM_MACHINE_PAYMENT: &[u8] = b"jounit/machine-payment/v1";
 /// Longest accepted network id (bytes), same bound the policy layer uses.
@@ -106,6 +106,9 @@ pub enum PaymentError {
     /// A batch contains payments from different payers (one signer, one
     /// settlement).
     MixedPayers,
+    /// The delegation chain a payment carries is not a valid, narrowing,
+    /// in-cap ancestry for the spend it is paying for.
+    ChainRefused(String),
 }
 
 impl fmt::Display for PaymentError {
@@ -158,6 +161,9 @@ impl fmt::Display for PaymentError {
             PaymentError::MixedPayers => {
                 write!(f, "batch contains payments from different payers")
             }
+            PaymentError::ChainRefused(w) => {
+                write!(f, "delegation chain refused: {w}")
+            }
         }
     }
 }
@@ -205,6 +211,15 @@ pub struct MachinePayment {
     /// a chain txid when one is known at signing time. Zero means "unbound
     /// intent" and is permitted: binding is the settlement layer's job.
     pub reference: Hash,
+    /// The delegation chain this payment is spent under, oldest first, ending
+    /// at the governing policy named by `policy_hash`.
+    ///
+    /// Empty for a root policy. A delegated spend must carry the *whole* chain
+    /// because the authority it exercises is the intersection of every link in
+    /// it: a payment that shows only the leaf claims its own budget while an
+    /// ancestor's cap has never been consulted. The chain is part of the signed
+    /// body, so it cannot be swapped for a wider one after signing.
+    pub chain: Vec<crate::agent::SpendPolicy>,
     /// Public keys of the payer (hybrid bundle, same shape as an L1 input).
     pub keys: Bundle,
     /// Signatures of the payer over [`MachinePayment::signing_hash`].
@@ -238,6 +253,14 @@ impl MachinePayment {
             .fixed(&self.policy_hash)
             .u64le(self.expires_at_height)
             .fixed(&self.reference);
+        // The delegation chain is inside the signed body: a delegated spend
+        // necessarily exercises the intersection of every link above it, so the
+        // links have to be signed together with the payment that uses them.
+        w.u16le(self.chain.len() as u16);
+        for policy in &self.chain {
+            let bytes = policy.serialize();
+            w.u32le(bytes.len() as u32).raw(&bytes);
+        }
         w.into_vec()
     }
 
@@ -262,8 +285,13 @@ impl MachinePayment {
     pub fn deserialize(bytes: &[u8]) -> Result<Self, PaymentError> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
-        if version != PAYMENT_VERSION {
-            return Err(PaymentError::UnsupportedVersion(version));
+        // v1 predates the delegation chain: a v1 payment carries no chain bytes
+        // and is decoded by the old layout, so an existing payment still
+        // verifies against its existing signature.
+        match version {
+            PAYMENT_VERSION => {}
+            1 => return MachinePaymentV1::decode(&bytes).map(MachinePayment::from_v1),
+            other => return Err(PaymentError::UnsupportedVersion(other)),
         }
         let net_len = r
             .u16le()
@@ -316,6 +344,8 @@ impl MachinePayment {
             .fixed::<32>()
             .map_err(|_| PaymentError::Malformed("reference"))?;
 
+        let chain = decode_chain(&mut r)?;
+
         let keys = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
         let sigs = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
         r.expect_end()
@@ -335,6 +365,7 @@ impl MachinePayment {
             policy_hash,
             expires_at_height,
             reference,
+            chain,
             keys,
             sigs,
         };
@@ -361,13 +392,64 @@ impl MachinePayment {
             return Err(PaymentError::NoExpiry);
         }
         // Identity binding: the payment cannot name another identity.
-        let expected = derive_agent_id(&self.network_id, self.payer_type, &self.payer);
-        if expected != self.agent_id {
-            return Err(PaymentError::IdentityMismatch);
+        //
+        // A root payer's agent id is derived from the payer address, exactly as
+        // before. A *delegated* spend is not derived from an address at all — a
+        // sub-agent has no address of its own and spends its owner's — so its
+        // identity is proven by the chain it carries instead. The two paths are
+        // checked by different rules, and neither can be walked with the
+        // other's numbers: an attacker cannot claim a sub-agent id without the
+        // ancestry that derives it, and cannot claim an owner-derived id while
+        // carrying a chain.
+        if self.chain.is_empty() {
+            let expected = derive_agent_id(&self.network_id, self.payer_type, &self.payer);
+            if expected != self.agent_id {
+                return Err(PaymentError::IdentityMismatch);
+            }
+        } else {
+            Self::validate_chain(&self.chain)?;
+            let leaf = self
+                .chain
+                .last()
+                .ok_or(PaymentError::IdentityMismatch)?;
+            if leaf.network_id != self.network_id {
+                return Err(PaymentError::WrongNetwork {
+                    expected: leaf.network_id.clone(),
+                    got: self.network_id.clone(),
+                });
+            }
+            if leaf.agent_id != self.agent_id || leaf.owner != self.payer {
+                return Err(PaymentError::IdentityMismatch);
+            }
+            if leaf.hash() != self.policy_hash {
+                return Err(PaymentError::NotLinkedToAuthorization("policy hash"));
+            }
         }
         // Autonomous actors must be policy-governed; humans may pay directly.
         if self.payer_type != AgentRole::Human && self.policy_hash == [0u8; 32] {
             return Err(PaymentError::PolicyRequired);
+        }
+        Ok(())
+    }
+
+    /// The narrowing rule, applied to whatever chain a payment claims.
+    ///
+    /// A chain must start at a root and be a real delegation for every link, so
+    /// the top of the chain is the authority every actor below it actually
+    /// inherited. An empty or over-deep chain is refused by the same rule.
+    fn validate_chain(chain: &[crate::agent::SpendPolicy]) -> Result<(), PaymentError> {
+        use crate::delegation::assert_chain;
+        let refs: Vec<&crate::agent::SpendPolicy> = chain.iter().collect();
+        assert_chain(&refs).map_err(|e| PaymentError::ChainRefused(e.to_string()))?;
+        if chain.len() > crate::delegation::MAX_DELEGATION_DEPTH {
+            return Err(PaymentError::ChainRefused(
+                "delegation chain is deeper than the cap".to_string(),
+            ));
+        }
+        if chain[0].parent_agent_id.is_some() {
+            return Err(PaymentError::ChainRefused(
+                "delegation chain must start at a root policy".to_string(),
+            ));
         }
         Ok(())
     }
@@ -436,9 +518,201 @@ impl MachinePayment {
     }
 }
 
-/// Build the unsigned payment body for an authorization, then sign it with
-/// the payer's wallet. The wallet is passed in, never stored: nothing in this
-/// module reads, persists or emits a private key.
+/// Decode the `u16` count of delegation policies and then the policies
+/// themselves. A declared count is checked against the cap *and* the bytes
+/// actually remaining, so a four-byte lie cannot reserve a megabyte.
+fn decode_chain(r: &mut Reader<'_>) -> Result<Vec<crate::agent::SpendPolicy>, PaymentError> {
+    let count = r
+        .u16le()
+        .map_err(|_| PaymentError::Malformed("delegation chain count"))? as usize;
+    if count > crate::delegation::MAX_DELEGATION_DEPTH {
+        return Err(PaymentError::ChainRefused(
+            "delegation chain is deeper than the cap".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        let len = r
+            .u32le()
+            .map_err(|_| PaymentError::Malformed("delegation policy length"))?
+            as usize;
+        if len > crate::agent::MAX_NETWORK_ID_LEN * 2 + 1_024 {
+            return Err(PaymentError::Malformed("delegation policy too large"));
+        }
+        let bytes = r
+            .fixed_slice(len)
+            .map_err(|_| PaymentError::Malformed("delegation policy bytes"))?;
+        out.push(
+            crate::agent::SpendPolicy::deserialize(bytes)
+                .map_err(|e| PaymentError::ChainRefused(e.to_string()))?,
+        );
+    }
+    Ok(out)
+}
+
+/// A version-1 payment, decoded for compatibility only.
+///
+/// Version 1 has no delegation chain in its body, so the encoding stops at
+/// `reference`. Such a payment is still valid *as what it is* — a root spend —
+/// and is lifted into the current type with an empty chain rather than being
+/// refused. A chain-carrying payment, in turn, is version 2 and cannot be
+/// shortened to fit the old bytes.
+struct MachinePaymentV1;
+
+impl MachinePaymentV1 {
+    fn decode(bytes: &[u8]) -> Result<MachinePayment, PaymentError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
+        debug_assert_eq!(version, 1);
+        let net_len = r
+            .u16le()
+            .map_err(|_| PaymentError::Malformed("network len"))? as usize;
+        if net_len == 0 {
+            return Err(PaymentError::EmptyNetworkId);
+        }
+        if net_len > MAX_PAYMENT_NETWORK_ID_LEN {
+            return Err(PaymentError::NetworkIdTooLong(net_len));
+        }
+        let network_id = std::str::from_utf8(
+            r.fixed_slice(net_len)
+                .map_err(|_| PaymentError::Malformed("network id"))?,
+        )
+        .map_err(|_| PaymentError::Malformed("network id is not utf-8"))?
+        .to_string();
+        let payer_type_raw = r.u8().map_err(|_| PaymentError::Malformed("payer type"))?;
+        let payer_type = AgentRole::from_u8(payer_type_raw)
+            .ok_or(PaymentError::Malformed("payer type out of range"))?;
+        let payer = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("payer"))?;
+        let agent_id = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("agent id"))?;
+        let recipient = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("recipient"))?;
+        let service = match r.u8().map_err(|_| PaymentError::Malformed("service flag"))? {
+            0 => None,
+            1 => Some(
+                r.fixed::<32>()
+                    .map_err(|_| PaymentError::Malformed("service tag"))?,
+            ),
+            _ => return Err(PaymentError::Malformed("service flag not 0 or 1")),
+        };
+        let amount_sat = r.u64le().map_err(|_| PaymentError::Malformed("amount"))?;
+        let fee_sat = r.u64le().map_err(|_| PaymentError::Malformed("fee"))?;
+        let nonce = r.u64le().map_err(|_| PaymentError::Malformed("nonce"))?;
+        let policy_hash = r
+            .fixed::<32>()
+            .map_err(|_| PaymentError::Malformed("policy hash"))?;
+        let expires_at_height = r
+            .u64le()
+            .map_err(|_| PaymentError::Malformed("expires_at"))?;
+        let reference = r
+            .fixed::<32>()
+            .map_err(|_| PaymentError::Malformed("reference"))?;
+        let keys = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
+        let sigs = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
+        r.expect_end()
+            .map_err(|_| PaymentError::Malformed("trailing bytes"))?;
+        Ok(MachinePayment {
+            version,
+            network_id,
+            payer_type,
+            payer,
+            agent_id,
+            recipient,
+            service,
+            amount_sat,
+            fee_sat,
+            nonce,
+            policy_hash,
+            expires_at_height,
+            reference,
+            chain: Vec::new(),
+            keys,
+            sigs,
+        })
+    }
+}
+
+impl MachinePayment {
+    /// Lift a decoded version-1 payment into the current type.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_v1(v1: MachinePayment) -> MachinePayment {
+        v1
+    }
+
+    /// Build a delegated payment under a chain, signed by the owner's wallet.
+    ///
+    /// The chain is the whole ancestry, oldest first, ending at the governing
+    /// policy. It is signed with the payment, so a chain cannot be widened after
+    /// the fact and cannot be swapped for a different leaf.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_signed_under_chain(
+        wallet: &Wallet,
+        auth: &Authorization,
+        chain: &[crate::agent::SpendPolicy],
+        network_id: &str,
+        payer_type: AgentRole,
+        fee_sat: u64,
+        expires_at_height: u64,
+        reference: Hash,
+    ) -> Result<MachinePayment, PaymentError> {
+        Self::validate_chain(chain)?;
+        let leaf = chain
+            .last()
+            .ok_or(PaymentError::ChainRefused("empty delegation chain".into()))?;
+        // The authorization must be under the leaf policy of the chain offered,
+        // and the leaf must be owned by the wallet that signs.
+        if auth.policy_hash != leaf.hash() {
+            return Err(PaymentError::NotLinkedToAuthorization("policy hash"));
+        }
+        if auth.agent_id != leaf.agent_id {
+            return Err(PaymentError::NotLinkedToAuthorization("agent id"));
+        }
+        let payer = wallet.address()?;
+        if payer != auth.owner {
+            return Err(PaymentError::NotLinkedToAuthorization("payer/owner"));
+        }
+        if leaf.owner != payer {
+            return Err(PaymentError::IdentityMismatch);
+        }
+        let mut payment = MachinePayment {
+            version: PAYMENT_VERSION,
+            network_id: network_id.to_string(),
+            payer_type,
+            payer,
+            agent_id: leaf.agent_id,
+            recipient: auth.recipient,
+            service: auth.service,
+            amount_sat: auth.amount_sat,
+            fee_sat,
+            nonce: auth.nonce,
+            policy_hash: auth.policy_hash,
+            expires_at_height,
+            reference,
+            chain: chain.to_vec(),
+            keys: Auth::keys_for(wallet)?,
+            sigs: Bundle::default(),
+        };
+        payment.validate()?;
+        let msg = payment.signing_hash();
+        payment.sigs = Auth::sigs_for(wallet, &msg)?;
+        payment.verify(network_id, expires_at_height.saturating_sub(1))?;
+        payment.linked_to(auth)?;
+        Ok(payment)
+    }
+}
+
+/// Build a payment for an authorization, then sign it with the payer's wallet.
+/// The wallet is passed in, never stored: nothing in this module reads,
+/// persists or emits a private key.
+///
+/// `chain` is the delegation ancestry the payment is spent under, oldest first,
+/// ending at the policy the authorization was issued under. Empty for a root
+/// payment, which is the ordinary case.
+#[allow(clippy::too_many_arguments)]
 pub fn build_signed_payment(
     wallet: &Wallet,
     auth: &Authorization,
@@ -447,7 +721,20 @@ pub fn build_signed_payment(
     fee_sat: u64,
     expires_at_height: u64,
     reference: Hash,
+    chain: &[crate::agent::SpendPolicy],
 ) -> Result<MachinePayment, PaymentError> {
+    if !chain.is_empty() {
+        return MachinePayment::build_signed_under_chain(
+            wallet,
+            auth,
+            chain,
+            network_id,
+            payer_type,
+            fee_sat,
+            expires_at_height,
+            reference,
+        );
+    }
     let payer = wallet.address()?;
     let mut payment = MachinePayment {
         version: PAYMENT_VERSION,
@@ -463,6 +750,7 @@ pub fn build_signed_payment(
         policy_hash: auth.policy_hash,
         expires_at_height,
         reference,
+        chain: Vec::new(),
         keys: Auth::keys_for(wallet)?,
         sigs: Bundle::default(),
     };
@@ -479,7 +767,6 @@ pub fn build_signed_payment(
     payment.linked_to(auth)?;
     Ok(payment)
 }
-
 /// Everything but the key that builds a direct (policy-less) payment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectPaymentSpec {
@@ -518,6 +805,7 @@ pub fn build_direct_payment(
         policy_hash: [0u8; 32],
         expires_at_height: spec.expires_at_height,
         reference: spec.reference,
+        chain: Vec::new(),
         keys: Auth::keys_for(wallet)?,
         sigs: Bundle::default(),
     };
@@ -655,7 +943,7 @@ mod tests {
     fn a_signed_payment_round_trips_exactly() {
         let w = wallet();
         let auth = grant(&w, 250, 1);
-        let pay = build_signed_payment(&w, &auth, NET, AgentRole::Machine, 2_000, 9_000, [3u8; 32])
+        let pay = build_signed_payment(&w, &auth, NET, AgentRole::Machine, 2_000, 9_000, [3u8; 32], &[])
             .expect("payment must build");
         let bytes = pay.serialize();
         let back = MachinePayment::deserialize(&bytes).expect("decode");
@@ -668,7 +956,8 @@ mod tests {
     fn verification_is_offline_and_rejects_every_mutation() {
         let w = wallet();
         let auth = grant(&w, 250, 1);
-        let pay = build_signed_payment(&w, &auth, NET, AgentRole::Machine, 2_000, 9_000, [3u8; 32])
+        let pay = build_signed_payment(&w, &auth, NET, AgentRole::Machine, 2_000, 9_000, [3u8; 32],
+    &[],)
             .unwrap();
         pay.verify(NET, 100).expect("valid payment verifies");
 
@@ -722,6 +1011,7 @@ mod tests {
             policy_hash: [0u8; 32],
             expires_at_height: 500,
             reference: [0u8; 32],
+            chain: Vec::new(),
             keys: Auth::keys_for(&w).unwrap(),
             sigs: Bundle::default(),
         };
@@ -746,6 +1036,7 @@ mod tests {
             policy_hash: [0u8; 32],
             expires_at_height: 500,
             reference: [0u8; 32],
+            chain: Vec::new(),
             keys: Auth::keys_for(&w).unwrap(),
             sigs: Bundle::default(),
         };
@@ -760,7 +1051,8 @@ mod tests {
         let w = wallet();
         let auth = grant(&w, 250, 1);
         let pay =
-            build_signed_payment(&w, &auth, NET, AgentRole::Machine, 0, 500, [0u8; 32]).unwrap();
+            build_signed_payment(&w, &auth, NET, AgentRole::Machine, 0, 500, [0u8; 32],
+    &[],).unwrap();
         let mut t = PaymentTracker::default();
         t.accept(&pay, NET, 10).expect("first acceptance");
         assert_eq!(t.accept(&pay, NET, 11), Err(PaymentError::AlreadySeen));
@@ -781,7 +1073,7 @@ mod tests {
         let auth = grant(&w, 250, 1);
         let w2 = Wallet::new_random("attacker");
         // Attacker cannot build a linked payment: owner check fires first.
-        let err = build_signed_payment(&w2, &auth, NET, AgentRole::Machine, 0, 9_000, [0u8; 32])
+        let err = build_signed_payment(&w2, &auth, NET, AgentRole::Machine, 0, 9_000, [0u8; 32], &[])
             .unwrap_err();
         assert_eq!(err, PaymentError::NotLinkedToAuthorization("payer/owner"));
     }

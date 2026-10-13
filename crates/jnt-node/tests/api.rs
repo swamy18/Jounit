@@ -470,7 +470,7 @@ fn garbage_bytes_are_a_client_error_not_a_panic() {
 
 fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -> SpendPolicy {
     let owner_addr = owner.address().unwrap();
-    SpendPolicy {
+    let policy = SpendPolicy {
         version: POLICY_VERSION,
         network_id: NET.to_string(),
         agent_id: derive_agent_id(NET, AgentRole::Machine, &owner_addr),
@@ -485,7 +485,8 @@ fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -
         expires_at_height: 10_000,
         revoked: false,
         parent_agent_id: None,
-    }
+    };
+    policy
 }
 
 /// Submit a signed payment with the full authorization material the node now
@@ -545,6 +546,7 @@ fn run_bridge(
             expires_at_height: EXPIRES,
             policy_hash: policy.hash(),
         },
+        &[],
     )
     .unwrap();
 
@@ -553,6 +555,8 @@ fn run_bridge(
         "/v1/authorize",
         &serde_json::json!({
             "policy_hex": hex::encode(policy.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&payer, &policy),
+            "policy_keys_hex": policy_keys_hex(&payer),
             "request_hex": hex::encode(request.serialize()),
             "nonce": 1,
         }),
@@ -573,6 +577,7 @@ fn run_bridge(
         2_000,
         EXPIRES,
         request.request_id(),
+        &[],
     )
     .unwrap();
 
@@ -634,11 +639,14 @@ fn authorize_grants_then_refuses_a_replayed_nonce() {
             expires_at_height: EXPIRES,
             policy_hash: policy.hash(),
         },
+        &[],
     )
     .unwrap();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "policy_hex": hex::encode(policy.serialize()),
+        "policy_sigs_hex": policy_sigs_hex(&payer, &policy),
+        "policy_keys_hex": policy_keys_hex(&payer),
         "request_hex": hex::encode(request.serialize()),
         "nonce": 7,
     });
@@ -653,15 +661,14 @@ fn authorize_grants_then_refuses_a_replayed_nonce() {
 
     // A policy the request does not name is a binding failure, also refused.
     let other = machine_policy(&payer, &wallet(73, "other").address().unwrap(), [9u8; 32]);
-    let (s, body) = post(
-        &node,
-        "/v1/authorize",
-        &serde_json::json!({
-            "policy_hex": hex::encode(other.serialize()),
-            "request_hex": hex::encode(request.serialize()),
-            "nonce": 8,
-        }),
-    );
+    let body = serde_json::json!({
+        "policy_hex": hex::encode(other.serialize()),
+        "policy_sigs_hex": policy_sigs_hex(&payer, &other),
+        "policy_keys_hex": policy_keys_hex(&payer),
+        "request_hex": hex::encode(request.serialize()),
+        "nonce": 8,
+    });
+    let (s, body) = post(&node, "/v1/authorize", &body);
     assert_eq!(s, 409);
     assert_eq!(body["error"], "session_binding");
 }
@@ -742,6 +749,7 @@ fn a_payment_for_another_network_is_refused() {
             expires_at_height: EXPIRES,
             policy_hash: policy.hash(),
         },
+        &[],
     )
     .unwrap();
     let auth = authorize_request(&mut book, &policy, "jounit/testnet", &request, 0, 1).unwrap();
@@ -753,6 +761,7 @@ fn a_payment_for_another_network_is_refused() {
         2_000,
         EXPIRES,
         request.request_id(),
+        &[],
     )
     .unwrap();
     let sigs = Auth::sigs_for(&payer, &auth.signing_hash()).unwrap();
@@ -1545,11 +1554,29 @@ fn a_released_escrow_advances_to_finalized_under_finality() {
     assert_eq!(b["amount_sat"], 1_000);
 }
 
-fn parent_policy() -> SpendPolicy {
+/// The owner's signature over a policy's `signing_hash`, as a hex bundle.
+///
+/// The node refuses a policy its owner did not sign, so every caller presents
+/// real signature material rather than just the rules.
+fn policy_sigs_hex(owner: &Wallet, policy: &SpendPolicy) -> String {
+    use jnt_core::l2::Auth;
+    hex::encode(
+        Auth::sigs_for(owner, &policy.signing_hash())
+            .unwrap()
+            .to_bytes(),
+    )
+}
+
+fn policy_keys_hex(owner: &Wallet) -> String {
+    use jnt_core::l2::Auth;
+    hex::encode(Auth::keys_for(owner).unwrap().to_bytes())
+}
+
+fn parent_policy() -> (Wallet, SpendPolicy) {
     // A wide-enough root that a narrowed child is meaningfully dominated.
     let owner = wallet(50, "deleg-parent");
     let owner_addr = owner.address().unwrap();
-    SpendPolicy {
+    let policy = SpendPolicy {
         version: POLICY_VERSION,
         network_id: NET.to_string(),
         agent_id: derive_agent_id(NET, AgentRole::Machine, &owner_addr),
@@ -1564,7 +1591,8 @@ fn parent_policy() -> SpendPolicy {
         expires_at_height: 10_000,
         revoked: false,
         parent_agent_id: None,
-    }
+    };
+    (owner, policy)
 }
 
 fn child_of(parent: &SpendPolicy) -> SpendPolicy {
@@ -1589,7 +1617,7 @@ fn child_of(parent: &SpendPolicy) -> SpendPolicy {
 #[test]
 fn a_dominated_delegation_link_is_registered_and_a_widening_one_is_refused() {
     let node = start();
-    let parent = parent_policy();
+    let (owner, parent) = parent_policy();
     let child = child_of(&parent);
 
     // A properly narrowed child links, records depth 1, and the child policy is
@@ -1599,7 +1627,11 @@ fn a_dominated_delegation_link_is_registered_and_a_widening_one_is_refused() {
         "/v1/delegation/link",
         &serde_json::json!({
             "parent_policy_hex": hex::encode(parent.serialize()),
+            "parent_sigs_hex": policy_sigs_hex(&owner, &parent),
+            "parent_keys_hex": policy_keys_hex(&owner),
             "child_policy_hex": hex::encode(child.serialize()),
+            "child_sigs_hex": policy_sigs_hex(&owner, &child),
+            "child_keys_hex": policy_keys_hex(&owner),
         }),
     );
     assert_eq!(s, 200, "narrowed link refused: {b}");
@@ -1614,7 +1646,11 @@ fn a_dominated_delegation_link_is_registered_and_a_widening_one_is_refused() {
         "/v1/delegation/link",
         &serde_json::json!({
             "parent_policy_hex": hex::encode(parent.serialize()),
+            "parent_sigs_hex": policy_sigs_hex(&owner, &parent),
+            "parent_keys_hex": policy_keys_hex(&owner),
             "child_policy_hex": hex::encode(child.serialize()),
+            "child_sigs_hex": policy_sigs_hex(&owner, &child),
+            "child_keys_hex": policy_keys_hex(&owner),
         }),
     );
     assert_eq!(s, 409, "re-linking an existing child must be refused: {b}");
@@ -1629,7 +1665,11 @@ fn a_dominated_delegation_link_is_registered_and_a_widening_one_is_refused() {
         "/v1/delegation/link",
         &serde_json::json!({
             "parent_policy_hex": hex::encode(parent.serialize()),
+            "parent_sigs_hex": policy_sigs_hex(&owner, &parent),
+            "parent_keys_hex": policy_keys_hex(&owner),
             "child_policy_hex": hex::encode(widened.serialize()),
+            "child_sigs_hex": policy_sigs_hex(&owner, &widened),
+            "child_keys_hex": policy_keys_hex(&owner),
         }),
     );
     assert_eq!(s, 409, "a widening delegation must be refused: {b}");
@@ -1649,9 +1689,338 @@ fn a_dominated_delegation_link_is_registered_and_a_widening_one_is_refused() {
         "/v1/delegation/link",
         &serde_json::json!({
             "parent_policy_hex": hex::encode(parent.serialize()),
+            "parent_sigs_hex": policy_sigs_hex(&owner, &parent),
+            "parent_keys_hex": policy_keys_hex(&owner),
             "child_policy_hex": hex::encode(foreign.serialize()),
+            "child_sigs_hex": policy_sigs_hex(&owner, &foreign),
+            "child_keys_hex": policy_keys_hex(&owner),
         }),
     );
     assert_eq!(s, 400, "cross-network delegation must be refused: {b}");
     assert_eq!(b["error"], "delegation_refused");
+}
+fn grandchild_of(parent: &SpendPolicy, child: &SpendPolicy) -> SpendPolicy {
+    SpendPolicy {
+        version: POLICY_VERSION,
+        network_id: child.network_id.clone(),
+        agent_id: derive_sub_agent_id(NET, &child.agent_id, child.role),
+        owner: child.owner,
+        role: child.role,
+        per_tx_max_sat: parent.per_tx_max_sat / 4,
+        window_blocks: parent.window_blocks / 4,
+        cumulative_max_sat: parent.cumulative_max_sat / 4,
+        allowed_recipients: vec![parent.allowed_recipients[0]],
+        allowed_services: vec![parent.allowed_services[0]],
+        not_before_height: parent.not_before_height,
+        expires_at_height: parent.expires_at_height,
+        revoked: false,
+        parent_agent_id: Some(child.agent_id),
+    }
+}
+
+#[test]
+fn an_unsigned_policy_is_refused_before_any_authority_is_granted() {
+    // A policy *is* authority: caps, recipients, validity window. A route that
+    // accepts it without the owner's signature lets anyone mint authority for
+    // anyone else, which is the widening a chain exists to stop, one step
+    // earlier.
+    let node = start();
+    let payer = wallet(71, "unsigned-payer");
+    let provider = wallet(72, "unsigned-provider").address().unwrap();
+    let service = derive_service_id(NET, &provider, b"svc");
+    let policy = machine_policy(&payer, &provider, service);
+    let request = build_signed_request(
+        &payer,
+        RequestSpec {
+            network_id: NET.to_string(),
+            payer_type: AgentRole::Machine,
+            service_id: service,
+            recipient: provider,
+            max_amount_sat: 400,
+            expires_at_height: EXPIRES,
+            policy_hash: policy.hash(),
+        },
+        &[],
+    )
+    .unwrap();
+
+    let (s, body) = post(
+        &node,
+        "/v1/authorize",
+        &serde_json::json!({
+            "policy_hex": hex::encode(policy.serialize()),
+            "request_hex": hex::encode(request.serialize()),
+            "nonce": 1,
+        }),
+    );
+    assert_eq!(s, 400, "an unsigned policy must not be granted under");
+    assert_eq!(body["error"], "bad_request");
+
+    // And a policy signed by the wrong key is refused on the owner binding,
+    // not merely on the signature.
+    let stranger = wallet(77, "stranger");
+    let (s, body) = post(
+        &node,
+        "/v1/authorize",
+        &serde_json::json!({
+            "policy_hex": hex::encode(policy.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&stranger, &policy),
+            "policy_keys_hex": policy_keys_hex(&stranger),
+            "request_hex": hex::encode(request.serialize()),
+            "nonce": 1,
+        }),
+    );
+    assert_eq!(s, 400, "{body}");
+}
+
+#[test]
+fn a_delegated_spend_exercises_only_what_its_whole_chain_permits() {
+    // The end-to-end property: a sub-agent request signed by its owner, with
+    // its full ancestry, obtains an authorization; the same request with a
+    // wider leaf, or with no chain at all, does not.
+    let node = start();
+    let (owner, parent) = parent_policy();
+    let child = child_of(&parent);
+    let request = build_signed_request(
+        &owner,
+        RequestSpec {
+            network_id: NET.to_string(),
+            payer_type: AgentRole::Machine,
+            service_id: parent.allowed_services[0],
+            recipient: parent.allowed_recipients[0].into(),
+            max_amount_sat: 100,
+            expires_at_height: 10_000,
+            policy_hash: child.hash(),
+        },
+        &[parent.clone(), child.clone()],
+    )
+    .unwrap();
+
+    let (s, granted) = post(
+        &node,
+        "/v1/authorize",
+        &serde_json::json!({
+            "policy_hex": hex::encode(child.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&owner, &child),
+            "policy_keys_hex": policy_keys_hex(&owner),
+            "request_hex": hex::encode(request.serialize()),
+            "nonce": 1,
+            "chain_hex": [
+                hex::encode(parent.serialize()),
+                hex::encode(child.serialize()),
+            ],
+        }),
+    );
+    assert_eq!(s, 200, "a narrowed chained delegation must be granted: {granted}");
+    assert_eq!(granted["delegation_depth"], 1);
+
+    // With no chain at all, a delegated policy has no provable ancestry, and
+    // the node refuses it rather than treating it as a root.
+    let (s, body) = post(
+        &node,
+        "/v1/authorize",
+        &serde_json::json!({
+            "policy_hex": hex::encode(child.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&owner, &child),
+            "policy_keys_hex": policy_keys_hex(&owner),
+            "request_hex": hex::encode(request.serialize()),
+            "nonce": 2,
+        }),
+    );
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "session_binding");
+}
+
+#[test]
+fn revoking_an_ancestor_disables_its_descendants_at_payment_submission() {
+    // Revocation has to reach the whole recorded subtree, or a kill switch on an
+    // ancestor leaves every delegate below it spending.
+    let node = start();
+    let (owner, parent) = parent_policy();
+    let child = child_of(&parent);
+    let grandchild = grandchild_of(&parent, &child);
+
+    // Link root -> child -> grandchild, so the lineage is recorded.
+    let (s, b) = post(
+        &node,
+        "/v1/delegation/link",
+        &serde_json::json!({
+            "parent_policy_hex": hex::encode(parent.serialize()),
+            "parent_sigs_hex": policy_sigs_hex(&owner, &parent),
+            "parent_keys_hex": policy_keys_hex(&owner),
+            "child_policy_hex": hex::encode(child.serialize()),
+            "child_sigs_hex": policy_sigs_hex(&owner, &child),
+            "child_keys_hex": policy_keys_hex(&owner),
+        }),
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = post(
+        &node,
+        "/v1/delegation/link",
+        &serde_json::json!({
+            "parent_policy_hex": hex::encode(child.serialize()),
+            "parent_sigs_hex": policy_sigs_hex(&owner, &child),
+            "parent_keys_hex": policy_keys_hex(&owner),
+            "child_policy_hex": hex::encode(grandchild.serialize()),
+            "child_sigs_hex": policy_sigs_hex(&owner, &grandchild),
+            "child_keys_hex": policy_keys_hex(&owner),
+        }),
+    );
+    assert_eq!(s, 200, "{b}");
+
+    // Authorizing under the root only: that is what revocation is signed over.
+    let request = build_signed_request(
+        &owner,
+        RequestSpec {
+            network_id: NET.to_string(),
+            payer_type: AgentRole::Machine,
+            service_id: parent.allowed_services[0],
+            recipient: parent.allowed_recipients[0].into(),
+            max_amount_sat: 100,
+            expires_at_height: 10_000,
+            policy_hash: parent.hash(),
+        },
+        &[],
+    )
+    .unwrap();
+    let (s, b) = post(
+        &node,
+        "/v1/authorize",
+        &serde_json::json!({
+            "policy_hex": hex::encode(parent.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&owner, &parent),
+            "policy_keys_hex": policy_keys_hex(&owner),
+            "request_hex": hex::encode(request.serialize()),
+            "nonce": 1,
+        }),
+    );
+    assert_eq!(s, 200, "{b}");
+
+    // Revoke the root with a signed revocation of the *revoked* variant.
+    let mut variant = parent.clone();
+    variant.revoked = true;
+    let (s, b) = post(
+        &node,
+        "/v1/policy/revoke",
+        &serde_json::json!({
+            "policy_hex": hex::encode(variant.serialize()),
+            "sigs_hex": policy_sigs_hex(&owner, &variant),
+            "keys_hex": policy_keys_hex(&owner),
+        }),
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["revoked"], true);
+    assert!(
+        b["descendants_revoked"].as_u64().unwrap() >= 2,
+        "the root's child and grandchild must be revoked with it: {b}"
+    );
+
+    // A payment under the grandchild now carries two revoked ancestors, and the
+    // node refuses it rather than admitting it on the payer's signature alone.
+    let auth_bytes = hex::decode(
+        post_authorization(&node, &owner, &grandchild, &[parent.clone(), child.clone(), grandchild.clone()], 2),
+    )
+    .unwrap();
+    let _ = auth_bytes;
+    let payment = build_signed_payment(
+        &owner,
+        &authorization_from(&node, &owner, &grandchild, &[parent.clone(), child.clone(), grandchild.clone()], 3),
+        NET,
+        AgentRole::Machine,
+        0,
+        10_000,
+        request.request_id(),
+        &[parent.clone(), child.clone(), grandchild.clone()],
+    )
+    .unwrap();
+    let (s, body) = post(
+        &node,
+        "/v1/payment/submit",
+        &serde_json::json!({
+            "payment_hex": hex::encode(payment.serialize()),
+            "authorization_hex": hex::encode(
+                authorization_from_bytes(&node, &owner, &grandchild, &[parent.clone(), child.clone(), grandchild.clone()], 4).serialize()
+            ),
+            "auth_sigs_hex": hex::encode(
+                jnt_core::l2::Auth::sigs_for(
+                    &owner,
+                    &authorization_from_bytes(&node, &owner, &grandchild, &[parent.clone(), child.clone(), grandchild.clone()], 5).signing_hash(),
+                )
+                .unwrap()
+                .to_bytes(),
+            ),
+            "auth_keys_hex": policy_keys_hex(&owner),
+        }),
+    );
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "policy_revoked");
+}
+
+/// Authorize under a policy and return the granted authorization, granting it if
+/// the node has not already.
+fn authorization_from(
+    node: &Node,
+    owner: &Wallet,
+    policy: &SpendPolicy,
+    chain: &[SpendPolicy],
+    nonce: u64,
+) -> jnt_core::agent::Authorization {
+    authorization_from_bytes(node, owner, policy, chain, nonce)
+}
+
+fn authorization_from_bytes(
+    node: &Node,
+    owner: &Wallet,
+    policy: &SpendPolicy,
+    chain: &[SpendPolicy],
+    nonce: u64,
+) -> jnt_core::agent::Authorization {
+    let request = build_signed_request(
+        owner,
+        RequestSpec {
+            network_id: NET.to_string(),
+            payer_type: AgentRole::Machine,
+            service_id: policy
+                .allowed_services
+                .first()
+                .copied()
+                .unwrap_or([9u8; 32]),
+            recipient: policy
+                .allowed_recipients
+                .first()
+                .copied()
+                .unwrap_or([8u8; 20])
+                .into(),
+            max_amount_sat: 100,
+            expires_at_height: 10_000,
+            policy_hash: policy.hash(),
+        },
+        chain,
+    )
+    .unwrap();
+    let (s, granted) = post(
+        node,
+        "/v1/authorize",
+        &serde_json::json!({
+            "policy_hex": hex::encode(policy.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(owner, policy),
+            "policy_keys_hex": policy_keys_hex(owner),
+            "request_hex": hex::encode(request.serialize()),
+            "nonce": nonce,
+            "chain_hex": chain.iter().map(|p| hex::encode(p.serialize())).collect::<Vec<_>>(),
+        }),
+    );
+    assert_eq!(s, 200, "authorization failed: {granted}");
+    let bytes = hex::decode(granted["authorization_hex"].as_str().unwrap()).unwrap();
+    jnt_core::agent::Authorization::deserialize(&bytes).unwrap()
+}
+
+fn post_authorization(
+    node: &Node,
+    owner: &Wallet,
+    policy: &SpendPolicy,
+    chain: &[SpendPolicy],
+    nonce: u64,
+) -> String {
+    hex::encode(authorization_from(node, owner, policy, chain, nonce).serialize())
 }

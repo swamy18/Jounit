@@ -81,6 +81,7 @@ fn machine_request(service: [u8; 32], max_amount: u64) -> (PaymentRequest, Spend
             expires_at_height: EXPIRES,
             policy_hash: policy.hash(),
         },
+        &[],
     )
     .expect("request builds");
     (req, policy)
@@ -108,6 +109,7 @@ fn pay_for(auth: &Authorization, request: &PaymentRequest) -> MachinePayment {
         2_000,
         EXPIRES,
         request.request_id(),
+        &[],
     )
     .expect("payment builds")
 }
@@ -180,6 +182,7 @@ fn human_session_needs_no_authorization() {
             expires_at_height: EXPIRES,
             policy_hash: [0u8; 32],
         },
+        &[],
     )
     .expect("human request");
     let payment = build_direct_payment(
@@ -224,6 +227,7 @@ fn machine_to_human_service_payment_verifies() {
             expires_at_height: EXPIRES,
             policy_hash: policy.hash(),
         },
+        &[],
     )
     .expect("request");
     let mut book = PolicyBook::default();
@@ -299,6 +303,7 @@ fn a_forged_service_response_cannot_authorize_a_payment() {
             expires_at_height: EXPIRES,
             policy_hash: revoked.hash(),
         },
+    &[],
     )
     .unwrap();
     let err = authorize_request(&mut book, &revoked, NET, &revoked_request, HEIGHT, 1)
@@ -610,6 +615,7 @@ fn wrong_network_is_refused_at_the_door() {
             expires_at_height: EXPIRES,
             policy_hash: mini_policy.hash(),
         },
+    &[],
     )
     .unwrap();
     let err = authorize_request(&mut book, &mini_policy, NET, &foreign_request, HEIGHT, 5)

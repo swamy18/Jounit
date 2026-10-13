@@ -83,7 +83,7 @@ use jnt_core::mempool::Mempool;
 use jnt_core::params::{NetworkParams, L2_FEE_SCHEDULE, SAT_PER_JNT};
 use jnt_core::payment::{MachinePayment, PaymentTracker};
 use jnt_core::receipt::{ReceiptBook, ReceiptOutcome};
-use jnt_core::service::{authorize_request, SessionError};
+use jnt_core::service::{authorize_request_with_chain, SessionError};
 use jnt_core::tx::{Transaction, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 use jnt_l2::reputation::ledger_from_state;
 use jnt_l2::task_contract::{ContractState, TaskContract};
@@ -1191,25 +1191,80 @@ async fn l2_broadcast(State(state): State<ApiState>, Json(req): Json<L2Broadcast
 struct AuthorizeReq {
     /// Canonical `SpendPolicy` encoding (public: policies hold rules, keys).
     policy_hex: String,
+    /// Owner signature over `SpendPolicy::signing_hash` (hybrid bundle).
+    policy_sigs_hex: Option<String>,
+    /// Owner public keys, whose address must be the policy's `owner`.
+    policy_keys_hex: Option<String>,
+    /// The ancestry for a delegated policy, oldest first. Required — and
+    /// validated — whenever the policy names a parent.
+    chain_hex: Option<Vec<String>>,
     /// Canonical `PaymentRequest` encoding — must be signed by the payer.
     request_hex: String,
     /// Strictly increasing per policy; the caller's own anti-replay counter.
     nonce: u64,
 }
 
+/// Decode a hex-encoded policy and check that the owner signed it.
+///
+/// A policy is authority: per-transaction caps, recipient allow lists, validity
+/// window. A route that accepts policy bytes without the owner's signature is a
+/// route where anyone may mint authority for anyone else — which is the widening
+/// a delegation chain exists to prevent, arriving one step earlier. The owner's
+/// keys must derive to the address the policy names as `owner`, and the
+/// signature must verify over `signing_hash`, which covers every field.
+fn decode_owned_policy(
+    hex_str: &str,
+    field: &str,
+    sigs_hex: &Option<String>,
+    keys_hex: &Option<String>,
+) -> Result<jnt_core::agent::SpendPolicy, (StatusCode, Json<ErrorBody>)> {
+    let bytes = decode_hex_bytes(hex_str, field)?;
+    let policy = jnt_core::agent::SpendPolicy::deserialize(&bytes)
+        .map_err(|e| bad(format!("{field}: {e}")))?;
+    let (sigs_hex, keys_hex) = match (sigs_hex, keys_hex) {
+        (Some(s), Some(k)) => (s, k),
+        _ => {
+            return Err(bad(format!(
+                "{field} must carry the owner's signature over its signing hash"
+            )))
+        }
+    };
+    let sigs = decode_bundle(sigs_hex, "policy_sigs")?;
+    let keys = decode_bundle(keys_hex, "policy_keys")?;
+    let signing_key = keys
+        .address()
+        .map_err(|e| bad(format!("policy_keys: {e}")))?;
+    if signing_key != policy.owner {
+        return Err(bad(format!(
+            "{field}: the signing key is not the policy's owner"
+        )));
+    }
+    jnt_core::sig::verify_bundle(&sigs, &keys, &policy.signing_hash())
+        .map_err(|e| bad(format!("{field}: {e}")))?;
+    Ok(policy)
+}
+
 async fn authorize(State(state): State<ApiState>, Json(req): Json<AuthorizeReq>) -> ApiResult {
-    let policy_bytes = decode_hex_bytes(&req.policy_hex, "policy")?;
+    let policy = decode_owned_policy(
+        &req.policy_hex,
+        "policy",
+        &req.policy_sigs_hex,
+        &req.policy_keys_hex,
+    )?;
     let request_bytes = decode_hex_bytes(&req.request_hex, "request")?;
-    let policy = jnt_core::agent::SpendPolicy::deserialize(&policy_bytes)
-        .map_err(|e| bad(format!("policy: {e}")))?;
     let request = jnt_core::service::PaymentRequest::deserialize(&request_bytes)
         .map_err(|e| bad(format!("request: {e}")))?;
+    // A delegated policy is authorized with, and only with, its ancestry: the
+    // bytes that prove which root's authority it narrows.
+    let chain = decode_chain(&req.chain_hex, "chain")?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
-        let auth = authorize_request(
+        let auth = authorize_request_with_chain(
             &mut sh.policies,
+            &mut sh.delegations,
             &policy,
+            &chain,
             &network,
             &request,
             height,
@@ -1219,13 +1274,15 @@ async fn authorize(State(state): State<ApiState>, Json(req): Json<AuthorizeReq>)
         // Remember the policy under the hash the authorization carries, so
         // admission later can check the payment names a policy this engine
         // actually issued under. Idempotent: the same bytes hash the same.
-        sh.policy_registry.insert(auth.policy_hash, policy);
+        sh.policy_registry.insert(auth.policy_hash, policy.clone());
         // Unsigned: the *owner* signs `signing_hash` with their wallet. The
         // API never signs and never sees a key.
         Ok(Json(json!({
             "authorization_hex": hex::encode(auth.serialize()),
             "signing_hash": hash_to_hex(&auth.signing_hash()),
             "policy_hash": hash_to_hex(&auth.policy_hash),
+            "agent_id": hex::encode(auth.agent_id),
+            "delegation_depth": sh.delegations.depth_of(&policy),
             "amount_sat": auth.amount_sat,
             "nonce": auth.nonce,
             "height": auth.height,
@@ -1234,12 +1291,44 @@ async fn authorize(State(state): State<ApiState>, Json(req): Json<AuthorizeReq>)
     })?
 }
 
+/// Decode a presented delegation chain, oldest first. An empty list is a root
+/// spend; a non-empty one must be a chain, and it is validated against the
+/// narrowing rule before the caller uses it.
+fn decode_chain(
+    items: &Option<Vec<String>>,
+    field: &str,
+) -> Result<Vec<jnt_core::agent::SpendPolicy>, (StatusCode, Json<ErrorBody>)> {
+    let Some(items) = items else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (i, hex_str) in items.iter().enumerate() {
+        let bytes = decode_hex_bytes(hex_str, field)?;
+        let policy = jnt_core::agent::SpendPolicy::deserialize(&bytes)
+            .map_err(|e| bad(format!("{field}[{i}]: {e}")))?;
+        out.push(policy);
+    }
+    if out.len() > jnt_core::delegation::MAX_DELEGATION_DEPTH {
+        return Err(bad(format!(
+            "{field} is {} policies deep, over the cap of {}",
+            out.len(),
+            jnt_core::delegation::MAX_DELEGATION_DEPTH
+        )));
+    }
+    Ok(out)
+}
+
 #[derive(Deserialize)]
 struct DelegationLinkReq {
     /// The parent policy bytes: the delegator whose authority is being narrowed.
     parent_policy_hex: String,
     /// The child policy bytes: the delegate, already dominated by `parent`.
     child_policy_hex: String,
+    /// Owner signatures over each policy, in the same order: parent first.
+    parent_sigs_hex: Option<String>,
+    parent_keys_hex: Option<String>,
+    child_sigs_hex: Option<String>,
+    child_keys_hex: Option<String>,
 }
 
 /// `POST /v1/delegation/link` — register a parent→child delegation link through
@@ -1254,12 +1343,18 @@ async fn delegation_link(
     State(state): State<ApiState>,
     Json(req): Json<DelegationLinkReq>,
 ) -> ApiResult {
-    let parent_bytes = decode_hex_bytes(&req.parent_policy_hex, "parent_policy")?;
-    let child_bytes = decode_hex_bytes(&req.child_policy_hex, "child_policy")?;
-    let parent = jnt_core::agent::SpendPolicy::deserialize(&parent_bytes)
-        .map_err(|e| bad(format!("parent_policy: {e}")))?;
-    let child = jnt_core::agent::SpendPolicy::deserialize(&child_bytes)
-        .map_err(|e| bad(format!("child_policy: {e}")))?;
+    let parent = decode_owned_policy(
+        &req.parent_policy_hex,
+        "parent_policy",
+        &req.parent_sigs_hex,
+        &req.parent_keys_hex,
+    )?;
+    let child = decode_owned_policy(
+        &req.child_policy_hex,
+        "child_policy",
+        &req.child_sigs_hex,
+        &req.child_keys_hex,
+    )?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         // Lineage only makes sense within one network; a cross-network link is
@@ -1285,7 +1380,7 @@ async fn delegation_link(
             Err(e) => Err(fail(
                 StatusCode::CONFLICT,
                 "delegation_refused",
-                format!("{:?}", e),
+                e.to_string(),
             )),
         }
     })?
@@ -1370,9 +1465,25 @@ async fn policy_revoke(
             ));
         }
         let was_new = sh.revoked_policies.insert(original.hash());
+        // Revocation propagates down the recorded lineage: a kill switch on an
+        // ancestor that left its descendants live would not be a kill switch at
+        // all. The book's own edges decide who is downstream, so a node cannot
+        // be asked to revoke a link it never recorded.
+        let descendants: Vec<[u8; 32]> = sh
+            .delegations
+            .descendants_of(&original.hash())
+            .into_iter()
+            .collect();
+        let mut propagated = 0usize;
+        for hash in descendants {
+            if sh.revoked_policies.insert(hash) {
+                propagated += 1;
+            }
+        }
         Ok(Json(json!({
             "policy_hash": hash_to_hex(&original.hash()),
             "revoked": was_new,
+            "descendants_revoked": propagated,
         })))
     })?
 }
@@ -1392,13 +1503,44 @@ async fn payment_submit(
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
         let id = payment.signing_hash();
-        // A revoked policy admits nothing further, whatever else is in order.
-        if sh.revoked_policies.contains(&payment.policy_hash) {
+        // A revoked policy admits nothing further, whatever else is in order —
+        // and that includes a policy whose *ancestor* was revoked, which is why
+        // the whole chain is checked rather than the hash the payment names.
+        let mut revoked_in_chain = sh.revoked_policies.contains(&payment.policy_hash);
+        for ancestor in &payment.chain {
+            if sh.revoked_policies.contains(&ancestor.hash()) {
+                revoked_in_chain = true;
+            }
+        }
+        if revoked_in_chain {
             return Err(fail(
                 StatusCode::CONFLICT,
                 "policy_revoked",
-                "the policy this payment names has been revoked by its owner",
+                "the policy this payment names, or an ancestor of it, has been revoked by its owner",
             ));
+        }
+        // A delegated spend must be under a lineage this node recorded. The
+        // chain bytes are signed, which proves they narrow; recording proves the
+        // links are the ones this node accepted, so an unrecorded ancestor is
+        // not authority the node can vouch for.
+        if !payment.chain.is_empty() {
+            let recorded = sh
+                .delegations
+                .chain_of(payment.chain.last().unwrap());
+            let provable = recorded.as_ref().map(|chain| {
+                chain.len() == payment.chain.len()
+                    && chain
+                        .iter()
+                        .zip(payment.chain.iter())
+                        .all(|(a, b)| a.hash() == b.hash())
+            });
+            if provable != Some(true) {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "payment_refused",
+                    "the delegation chain this payment names is not a lineage this node recorded",
+                ));
+            }
         }
         // An exact re-submission is idempotent, and it is answered *before*
         // admission: a second admission would reserve the same value twice, and

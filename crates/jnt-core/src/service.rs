@@ -63,7 +63,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Request encoding version. A future format MUST use a new value.
-pub const REQUEST_VERSION: u8 = 1;
+pub const REQUEST_VERSION: u8 = 2;
 /// Domain tag for a derived service identity.
 pub const DOM_SERVICE_ID: &[u8] = b"jounit/service-id/v1";
 /// Domain tag for the payment-request signing hash.
@@ -178,6 +178,13 @@ pub struct PaymentRequest {
     pub expires_at_height: u64,
     /// Governing `SpendPolicy::hash()`. Zero only for human payers.
     pub policy_hash: Hash,
+    /// The delegation chain this request is spent under, oldest first, ending at
+    /// the policy named by `policy_hash`. Empty for a root policy.
+    ///
+    /// Signed, and therefore un-widenable after the fact: a request that names a
+    /// delegated identity claims authority from every link above it, so the
+    /// links are part of what the requester signs.
+    pub chain: Vec<SpendPolicy>,
     /// Payer keys (hybrid bundle).
     pub keys: Bundle,
     /// Payer signatures over [`PaymentRequest::signing_hash`].
@@ -199,6 +206,13 @@ impl PaymentRequest {
             .u64le(self.max_amount_sat)
             .u64le(self.expires_at_height)
             .fixed(&self.policy_hash);
+        // The chain lives inside the signed body for the same reason it lives
+        // inside a payment's: it is the authority the spend exercises.
+        w.u16le(self.chain.len() as u16);
+        for policy in &self.chain {
+            let bytes = policy.serialize();
+            w.u32le(bytes.len() as u32).raw(&bytes);
+        }
         w.into_vec()
     }
 
@@ -224,6 +238,11 @@ impl PaymentRequest {
     pub fn deserialize(bytes: &[u8]) -> Result<Self, PaymentError> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
+        // v1 predates the delegation chain: it decodes by the old layout and
+        // lifts into an empty chain, so an existing request still verifies.
+        if version == 1 {
+            return PaymentRequestV1::decode(bytes);
+        }
         if version != REQUEST_VERSION {
             return Err(PaymentError::UnsupportedVersion(version));
         }
@@ -266,6 +285,7 @@ impl PaymentRequest {
         let policy_hash = r
             .fixed::<32>()
             .map_err(|_| PaymentError::Malformed("policy hash"))?;
+        let chain = decode_request_chain(&mut r)?;
         let keys = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
         let sigs = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
         r.expect_end()
@@ -282,6 +302,7 @@ impl PaymentRequest {
             max_amount_sat,
             expires_at_height,
             policy_hash,
+            chain,
             keys,
             sigs,
         };
@@ -307,8 +328,39 @@ impl PaymentRequest {
             return Err(PaymentError::NoExpiry);
         }
         let expected = derive_agent_id(&self.network_id, self.payer_type, &self.payer);
-        if expected != self.agent_id {
-            return Err(PaymentError::IdentityMismatch);
+        if self.chain.is_empty() {
+            if expected != self.agent_id {
+                return Err(PaymentError::IdentityMismatch);
+            }
+        } else {
+            // A delegated request proves its identity from the chain rather than
+            // from the payer address, so a caller cannot claim a sub-agent id
+            // without the ancestry that derives it.
+            crate::delegation::assert_chain(&self.chain.iter().collect::<Vec<_>>())
+                .map_err(|e| PaymentError::ChainRefused(e.to_string()))?;
+            if self.chain.len() > crate::delegation::MAX_DELEGATION_DEPTH {
+                return Err(PaymentError::ChainRefused(
+                    "delegation chain is deeper than the cap".to_string(),
+                ));
+            }
+            if self.chain[0].parent_agent_id.is_some() {
+                return Err(PaymentError::ChainRefused(
+                    "delegation chain must start at a root policy".to_string(),
+                ));
+            }
+            let leaf = self.chain.last().ok_or(PaymentError::IdentityMismatch)?;
+            if leaf.agent_id != self.agent_id || leaf.owner != self.payer {
+                return Err(PaymentError::IdentityMismatch);
+            }
+            if leaf.network_id != self.network_id {
+                return Err(PaymentError::WrongNetwork {
+                    expected: leaf.network_id.clone(),
+                    got: self.network_id.clone(),
+                });
+            }
+            if leaf.hash() != self.policy_hash {
+                return Err(PaymentError::NotLinkedToAuthorization("policy hash"));
+            }
         }
         if self.payer_type != AgentRole::Human && self.policy_hash == [0u8; 32] {
             return Err(PaymentError::PolicyRequired);
@@ -360,24 +412,136 @@ pub struct RequestSpec {
     pub policy_hash: Hash,
 }
 
+/// A delegation chain is decoded with the same bounds as any other policy list:
+/// the declared count is checked against the cap *and* the bytes actually
+/// present, so a lying count cannot reserve a megabyte.
+fn decode_request_chain(r: &mut Reader<'_>) -> Result<Vec<SpendPolicy>, PaymentError> {
+    let count = r
+        .u16le()
+        .map_err(|_| PaymentError::Malformed("delegation chain count"))? as usize;
+    if count > crate::delegation::MAX_DELEGATION_DEPTH {
+        return Err(PaymentError::ChainRefused(
+            "delegation chain is deeper than the cap".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(count.min(8));
+    for _ in 0..count {
+        let len = r
+            .u32le()
+            .map_err(|_| PaymentError::Malformed("delegation policy length"))?
+            as usize;
+        if len > crate::agent::MAX_NETWORK_ID_LEN * 2 + 1_024 {
+            return Err(PaymentError::Malformed("delegation policy too large"));
+        }
+        let bytes = r
+            .fixed_slice(len)
+            .map_err(|_| PaymentError::Malformed("delegation policy bytes"))?;
+        out.push(
+            SpendPolicy::deserialize(bytes)
+                .map_err(|e| PaymentError::ChainRefused(e.to_string()))?,
+        );
+    }
+    Ok(out)
+}
+
+/// The version-1 request, decoded for compatibility only: it has no chain in
+/// its body, so it decodes by the old layout and lifts into an empty chain.
+struct PaymentRequestV1;
+
+impl PaymentRequestV1 {
+    fn decode(bytes: &[u8]) -> Result<PaymentRequest, PaymentError> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| PaymentError::Malformed("version"))?;
+        debug_assert_eq!(version, 1);
+        let net_len = r
+            .u16le()
+            .map_err(|_| PaymentError::Malformed("network len"))? as usize;
+        if net_len == 0 {
+            return Err(PaymentError::EmptyNetworkId);
+        }
+        if net_len > crate::agent::MAX_NETWORK_ID_LEN {
+            return Err(PaymentError::NetworkIdTooLong(net_len));
+        }
+        let network_id = std::str::from_utf8(
+            r.fixed_slice(net_len)
+                .map_err(|_| PaymentError::Malformed("network id"))?,
+        )
+        .map_err(|_| PaymentError::Malformed("network id is not utf-8"))?
+        .to_string();
+        let payer = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("payer"))?;
+        let payer_type_raw = r.u8().map_err(|_| PaymentError::Malformed("payer type"))?;
+        let payer_type = AgentRole::from_u8(payer_type_raw)
+            .ok_or(PaymentError::Malformed("payer type out of range"))?;
+        let agent_id = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("agent id"))?;
+        let service_id = r
+            .fixed::<32>()
+            .map_err(|_| PaymentError::Malformed("service id"))?;
+        let recipient = r
+            .fixed::<20>()
+            .map_err(|_| PaymentError::Malformed("recipient"))?;
+        let max_amount_sat = r.u64le().map_err(|_| PaymentError::Malformed("max amount"))?;
+        let expires_at_height = r.u64le().map_err(|_| PaymentError::Malformed("expires_at"))?;
+        let policy_hash = r
+            .fixed::<32>()
+            .map_err(|_| PaymentError::Malformed("policy hash"))?;
+        let keys = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
+        let sigs = Bundle::from_reader(&mut r).map_err(PaymentError::from)?;
+        r.expect_end()
+            .map_err(|_| PaymentError::Malformed("trailing bytes"))?;
+        let request = PaymentRequest {
+            version,
+            network_id,
+            payer,
+            payer_type,
+            agent_id,
+            service_id,
+            recipient,
+            max_amount_sat,
+            expires_at_height,
+            policy_hash,
+            chain: Vec::new(),
+            keys,
+            sigs,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
 /// Build and sign a payment request with the payer's wallet. The wallet is
 /// passed in and never stored — the bridge holds no key material.
+///
+/// `chain` is the delegation ancestry the request is spent under, oldest first.
+/// Empty for a root policy, which is the ordinary case and the only one version
+/// 1 could express.
 pub fn build_signed_request(
     wallet: &Wallet,
     spec: RequestSpec,
+    chain: &[SpendPolicy],
 ) -> Result<PaymentRequest, PaymentError> {
     let payer = wallet.address()?;
+    // A delegated request is identified by the leaf of its chain, not by the
+    // payer's address, so the two paths diverge here and nowhere else.
+    let agent_id = match chain.last() {
+        Some(leaf) => leaf.agent_id,
+        None => derive_agent_id(&spec.network_id, spec.payer_type, &payer),
+    };
     let mut request = PaymentRequest {
         version: REQUEST_VERSION,
         network_id: spec.network_id.clone(),
         payer,
         payer_type: spec.payer_type,
-        agent_id: derive_agent_id(&spec.network_id, spec.payer_type, &payer),
+        agent_id,
         service_id: spec.service_id,
         recipient: spec.recipient,
         max_amount_sat: spec.max_amount_sat,
         expires_at_height: spec.expires_at_height,
         policy_hash: spec.policy_hash,
+        chain: chain.to_vec(),
         keys: crate::l2::Auth::keys_for(wallet)?,
         sigs: Bundle::default(),
     };
@@ -421,6 +585,93 @@ pub fn authorize_request(
         nonce,
     };
     Ok(book.authorize(policy, network_id, &areq)?)
+}
+
+/// The delegation-aware sibling of [`authorize_request`].
+///
+/// This is the entry point a *chained* request uses, and the reason it is a
+/// separate function is that the two paths check different things: a root
+/// request's identity is re-derived from the payer, while a chained request's
+/// identity is proved by its ancestry. Handing both to one function would mean
+/// the authorization path silently accepts whichever of the two proofs the
+/// caller found easier to forge.
+///
+/// The chain is validated twice, by two different owners, and both are needed:
+/// `assert_chain` proves the bytes narrow all the way to a root, and
+/// `DelegationBook` proves the links are the ones this node recorded — so a
+/// caller cannot manufacture a lineage by presenting policies nobody linked.
+pub fn authorize_request_with_chain(
+    book: &mut PolicyBook,
+    delegations: &mut crate::delegation::DelegationBook,
+    policy: &SpendPolicy,
+    chain: &[SpendPolicy],
+    network_id: &str,
+    request: &PaymentRequest,
+    height: u64,
+    nonce: u64,
+) -> Result<Authorization, SessionError> {
+    request.verify(network_id, height)?;
+    if request.policy_hash != policy.hash() {
+        return Err(SessionError::Binding("request names a different policy"));
+    }
+    // The chain the request carries is the chain it is authorized under: the
+    // request's bytes and the presented chain are the same ancestry.
+    if request.chain.len() != chain.len() {
+        return Err(SessionError::Binding(
+            "the request carries a delegation chain that does not match the one presented",
+        ));
+    }
+    for (a, b) in request.chain.iter().zip(chain.iter()) {
+        if a.hash() != b.hash() {
+            return Err(SessionError::Binding(
+                "the request carries a delegation chain that does not match the one presented",
+            ));
+        }
+    }
+    // A root request and a chained request are different claims; neither may be
+    // smuggled through the other's entry point.
+    if policy.parent_agent_id.is_some() {
+        if chain.is_empty() || chain[0].parent_agent_id.is_some() {
+            return Err(SessionError::Binding(
+                "a delegated policy must be presented with a whole chain that starts at its root",
+            ));
+        }
+        // Record every link before the spend rule runs, so the authorization
+        // issued is under a lineage the node can later reconstruct and revoke.
+        // Re-presenting a link that is already recorded is the same lineage, not
+        // a second one, so it is idempotent rather than a refusal.
+        for window in chain.windows(2) {
+            let (parent, child) = (&window[0], &window[1]);
+            if delegations.parent_of(child) != Some(parent.hash()) {
+                delegations.link(parent, child).map_err(|e| {
+                    SessionError::Payment(PaymentError::ChainRefused(e.to_string()))
+                })?;
+            }
+        }
+        delegations.record_root(&chain[0]);
+        // The spend rule runs on the leaf, exactly as `authorize_request` runs
+        // it on a root policy: one engine, one set of budget rules, reached
+        // through the narrowing rule instead of through identity derivation.
+        let areq = AuthorizationRequest {
+            agent_id: request.agent_id,
+            recipient: request.recipient,
+            amount_sat: request.max_amount_sat,
+            service: Some(request.service_id),
+            height,
+            nonce,
+        };
+        let refs: Vec<&SpendPolicy> = chain.iter().collect();
+        crate::delegation::authorize_with_chain(book, &refs, network_id, &areq).map_err(|e| {
+            SessionError::Payment(PaymentError::ChainRefused(e.to_string()))
+        })
+    } else {
+        if !chain.is_empty() {
+            return Err(SessionError::Binding(
+                "a root policy cannot be presented with a delegation chain",
+            ));
+        }
+        authorize_request(book, policy, network_id, request, height, nonce)
+    }
 }
 
 /// The **only** admission for a machine payment into a node's record.
@@ -896,6 +1147,7 @@ mod tests {
                 expires_at_height: 9_000,
                 policy_hash: policy.hash(),
             },
+            &[],
         )
         .expect("request builds");
         req.verify(NET, 100).expect("verifies");
@@ -931,6 +1183,7 @@ mod tests {
                     expires_at_height: 9_000,
                     policy_hash: p.hash(),
                 },
+    &[],
             )
             .unwrap();
             let auth = authorize_request(&mut book, &p, NET, &req, 100, (i + 1) as u64).unwrap();
@@ -943,6 +1196,7 @@ mod tests {
                     0,
                     9_000,
                     req.request_id(),
+    &[],
                 )
                 .unwrap(),
             );
@@ -963,6 +1217,7 @@ mod tests {
                     expires_at_height: 9_000,
                     policy_hash: p.hash(),
                 },
+    &[],
             )
             .unwrap();
             let auth = authorize_request(&mut book, &p, NET, &req, 100, 100).unwrap();
@@ -975,6 +1230,7 @@ mod tests {
                     0,
                     9_000,
                     req.request_id(),
+    &[],
                 )
                 .unwrap(),
             );
@@ -1008,6 +1264,7 @@ mod tests {
                 expires_at_height: 9_000,
                 policy_hash: p2.hash(),
             },
+    &[],
         )
         .unwrap();
         let auth2 = authorize_request(&mut book, &p2, NET, &req2, 100, 1).unwrap();
@@ -1019,6 +1276,7 @@ mod tests {
             0,
             9_000,
             req2.request_id(),
+    &[],
         )
         .unwrap();
         let mut mixed = payments.clone();
@@ -1054,6 +1312,7 @@ mod tests {
                 expires_at_height: 9_000,
                 policy_hash: policy.hash(),
             },
+    &[],
         )
         .unwrap();
         let auth = authorize_request(book, &policy, NET, &request, 100, 1).unwrap();
@@ -1065,6 +1324,7 @@ mod tests {
             0,
             9_000,
             request.request_id(),
+    &[],
         )
         .unwrap();
         (policy, auth, payment, request)

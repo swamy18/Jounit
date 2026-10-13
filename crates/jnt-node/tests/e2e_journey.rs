@@ -404,6 +404,7 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
             expires_at_height: 9_000,
             policy_hash: policy.hash(),
         },
+        &[],
     )
     .expect("the payer-signed request builds");
     request
@@ -558,6 +559,7 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
         2_000,
         8_000,
         request.request_id(),
+        &[],
     )
     .expect("a payment linked to the grant");
     payment.verify(&net, settled_at).expect("it verifies");

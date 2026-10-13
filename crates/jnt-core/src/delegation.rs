@@ -101,6 +101,76 @@ pub enum DelegationError {
     AlreadyLinked,
 }
 
+impl std::fmt::Display for DelegationError {
+    /// A named refusal, so every caller — a payment, a node, an operator —
+    /// reports the clause that was actually violated rather than "invalid".
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelegationError::Policy(e) => write!(f, "policy refused: {e}"),
+            DelegationError::EmptyChain => write!(f, "delegation chain is empty"),
+            DelegationError::TooDeep { got, cap } => {
+                write!(f, "delegation chain depth {got} exceeds cap {cap}")
+            }
+            DelegationError::ChildHasNoParent => {
+                write!(f, "a root policy cannot be anyone's child")
+            }
+            DelegationError::WrongParentLink { expected, got } => write!(
+                f,
+                "parent link names {} but the policy above it is {}",
+                hex(expected),
+                hex(got)
+            ),
+            DelegationError::NotDominated(w) => {
+                write!(f, "child is not dominated by its parent: {w}")
+            }
+            DelegationError::NetworkMismatch { parent, child } => {
+                write!(f, "child is on network {child}, parent on {parent}")
+            }
+            DelegationError::OwnerMismatch => write!(f, "child has a different owner"),
+            DelegationError::RoleMismatch => write!(f, "child has a different role"),
+            DelegationError::IdentityMismatch => {
+                write!(f, "child id is not derived from the parent it names")
+            }
+            DelegationError::WindowWidened { parent, child } => {
+                write!(f, "window {child} is wider than the parent's {parent}")
+            }
+            DelegationError::PerTxWidened { parent, child } => write!(
+                f,
+                "per-transaction cap {child} exceeds the parent's {parent}"
+            ),
+            DelegationError::CumulativeWidened { parent, child } => write!(
+                f,
+                "cumulative cap {child} exceeds the parent's {parent}"
+            ),
+            DelegationError::StartsEarlier { parent, child } => {
+                write!(f, "child starts at {child}, before the parent's {parent}")
+            }
+            DelegationError::OutlivesParent { parent, child } => {
+                write!(f, "child expires at {parent}, after the parent's {child}")
+            }
+            DelegationError::RecipientWidened => {
+                write!(f, "child allows a recipient the parent does not")
+            }
+            DelegationError::ServiceWidened => {
+                write!(f, "child allows a service the parent does not")
+            }
+            DelegationError::AncestorRevoked { at } => {
+                write!(f, "an ancestor {} is revoked", hex(at))
+            }
+            DelegationError::AlreadyLinked => {
+                write!(f, "this child is already linked under another lineage")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DelegationError {}
+
+/// Short hex for a message. Full ids are not worth half a line of output.
+fn hex(id: &AgentId) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// True when every field of `child` is inside every field of `parent`.
 ///
 /// Field by field, and each check independent, because "narrower on average" is
@@ -253,6 +323,14 @@ pub struct DelegationBook {
     parents: BTreeMap<[u8; 32], [u8; 32]>,
     /// child agent id → child policy hash, so one agent cannot appear twice.
     agents: BTreeMap<AgentId, [u8; 32]>,
+    /// Every recorded policy, keyed by its own hash.
+    ///
+    /// The book is not a table of hashes: to answer "does this chain still hold?"
+    /// a node has to walk *policies*, and a walk that only has hashes can be fed
+    /// a chain it never saw. Storing the bytes beside the link means the chain a
+    /// node reconstructs is made of policies it recorded, each of which still
+    /// hashes to the key it is stored under.
+    policies: BTreeMap<[u8; 32], SpendPolicy>,
 }
 
 impl DelegationBook {
@@ -267,6 +345,21 @@ impl DelegationBook {
 
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
+    }
+
+    /// Record a **root** policy — one whose owner authorized it directly, with
+    /// no parent. A root has no link to check, so this is what lets a node
+    /// reconstruct the ancestry of a policy that was delegated from it.
+    pub fn record_root(&mut self, policy: &SpendPolicy) {
+        self.policies.insert(policy.hash(), policy.clone());
+    }
+
+    /// Every policy this book has recorded, root-first by hash order.
+    ///
+    /// Used by a node to answer a chain-request from its own records rather than
+    /// trusting the caller's bytes.
+    pub fn recorded(&self) -> impl Iterator<Item = &SpendPolicy> {
+        self.policies.values()
     }
 
     /// Register that `child` (keyed by its policy hash) descends from `parent`.
@@ -303,12 +396,17 @@ impl DelegationBook {
         }
         self.parents.insert(child_hash, parent_hash);
         self.agents.insert(child.agent_id, child_hash);
+        // The bytes are recorded with the link so the chain can be walked later
+        // out of the book's own records rather than out of a caller's memory.
+        self.policies.insert(parent_hash, parent.clone());
+        self.policies.insert(child_hash, child.clone());
         // Depth is enforced here, not only at inspection: a walk bounded by the
         // same cap cannot be stalled by a pathological registration order.
         let depth = self.depth_of(child);
         if depth > MAX_DELEGATION_DEPTH {
             self.parents.remove(&child_hash);
             self.agents.remove(&child.agent_id);
+            self.policies.remove(&child_hash);
             return Err(DelegationError::TooDeep {
                 got: depth,
                 cap: MAX_DELEGATION_DEPTH,
@@ -334,6 +432,68 @@ impl DelegationBook {
             }
         }
         depth
+    }
+
+    /// The ancestry a node can prove for `child`, oldest first, or `None` if the
+    /// recorded links do not reach a root.
+    ///
+    /// This is the difference between a chain a node *trusts* and a chain a node
+    /// was *handed*: the walk visits recorded policies only, so a link that was
+    /// never registered cannot be manufactured by presenting bytes. A walk that
+    /// runs into the depth cap or an unrecorded parent returns `None` — the
+    /// chain is unprovable, which is the same answer as "there is none".
+    pub fn chain_of(&self, child: &SpendPolicy) -> Option<Vec<SpendPolicy>> {
+        let mut out: Vec<SpendPolicy> = vec![child.clone()];
+        let mut cursor = child.hash();
+        for _ in 0..=MAX_DELEGATION_DEPTH {
+            let Some(parent_hash) = self.parents.get(&cursor).copied() else {
+                // No registered parent: the walk reached the head of the chain.
+                // It is only a root if the policy itself says so.
+                if out.len() > 1 || child.parent_agent_id.is_none() {
+                    out.reverse();
+                    return Some(out);
+                }
+                return None;
+            };
+            let parent = self.policies.get(&parent_hash)?.clone();
+            if parent.hash() != parent_hash {
+                return None;
+            }
+            if parent.parent_agent_id.is_none() {
+                out.push(parent);
+                out.reverse();
+                return Some(out);
+            }
+            out.push(parent);
+            cursor = parent_hash;
+        }
+        None
+    }
+
+    /// Every recorded policy that descends from `parent_hash`, the parent's own
+    /// hash included.
+    ///
+    /// Revocation propagation needs exactly this: killing an ancestor has to
+    /// reach every link below it, and the only way to know what is below it is
+    /// to walk the recorded edges. Bounded by the book's own size.
+    pub fn descendants_of(&self, parent_hash: &[u8; 32]) -> Vec<[u8; 32]> {
+        let mut out = vec![*parent_hash];
+        let mut frontier = vec![*parent_hash];
+        while let Some(current) = frontier.pop() {
+            for (child, parent) in &self.parents {
+                if *parent == current && !out.contains(child) {
+                    out.push(*child);
+                    frontier.push(*child);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the book has a recorded link below `parent_hash`. Used to tell an
+    /// operator that revoking a policy will (or will not) affect anyone else.
+    pub fn has_descendants(&self, parent_hash: &[u8; 32]) -> bool {
+        self.parents.values().any(|p| p == parent_hash)
     }
 }
 

@@ -73,6 +73,7 @@ fn fixture() -> Fixture {
             expires_at_height: EXPIRES,
             policy_hash: policy.hash(),
         },
+    &[],
     )
     .unwrap();
     Fixture { policy, request }
@@ -195,6 +196,7 @@ fn authorize_and_pay(f: &Fixture) -> (jnt_core::payment::MachinePayment, Service
         2_000,
         EXPIRES,
         f.request.request_id(),
+    &[],
     )
     .unwrap();
     let mut receipt = ServiceReceipt {

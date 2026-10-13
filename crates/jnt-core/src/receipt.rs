@@ -577,6 +577,7 @@ mod tests {
             policy_hash: [3u8; 32],
             expires_at_height: 900,
             reference: [4u8; 32],
+            chain: Vec::new(),
             keys: Bundle::default(),
             sigs: Bundle::default(),
         };
