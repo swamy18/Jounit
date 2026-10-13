@@ -700,9 +700,9 @@ applies.
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
 | **Escrowed service contracts** | **In development** | The general contract and its transitions, a validated `ServiceContract::open` for non-compute deliverables, one non-compute deliverable shipping. Coin settlement is Item 10 |
-| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; a reservation *encumbers* capacity (free to `reserved`, or a position's principal headroom) so one balance cannot back two admitted payments, and settlement is idempotent per reservation. The position lifecycle (bond post/release, open, repay, default) is reachable over HTTP; the *debit commit* lands at receipt acceptance, and the matching coin move is §19.4 coin settlement (Item 10) |
+| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; a reservation *encumbers* capacity (free to `reserved`, or a position's principal headroom) so one balance cannot back two admitted payments, and settlement is idempotent per reservation. Round-2 hardening: a mixed free+position reservation sweeps the whole free balance, per-position draws are tracked and released by name, a refused admission leaves the book untouched, and interest overflow is refused rather than wrapped. The position lifecycle (bond post/release, open, repay, default) is reachable over HTTP; the *debit commit* lands at receipt acceptance, and the matching coin move is §19.4 coin settlement (Item 10) |
 | **Delegation chains** | **Wired into the payment path** | A payment and a request carry a signed, root-first delegation chain; identity is proved from the chain rather than from the payer address, so a spend cannot claim more than its whole ancestry permits. The node records links, verifies owner signatures on every policy, propagates revocation to descendants, and refuses a chain it did not record. Still non-consensus (no `TXVALIDATOR` policy byte) |
-| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. The transition lives on the escrow (`release_arbiter`/`release_mutual`), the release hash binds network and condition, and an **oracle condition is fail-closed**: it is recorded and can never release, because this codebase implements no oracle verifier. Coin settlement is Item 10 |
+| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. The transition lives on the escrow (`release_arbiter`/`release_mutual`), the escrow id and the release hash both bind network and condition, and an **oracle condition is fail-closed**: it is recorded and can never release, because this codebase implements no oracle verifier. Coin settlement is Item 10 |
 | **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |
@@ -710,7 +710,7 @@ applies.
 | M4 HBM puzzle | **Registered (off on mainnet)** | `hbm_pow.rs` scratchpad PoW is registered as `puzzle_id = 2` (reviewed in `docs/security-review-hbm-2026-10-12.md`); `Chain::pow_satisfies` dispatches by puzzle id. `mini`/`testnet` keep mining `puzzle_id = 1` (hybrid); M4 is recognized but not activated as the mining puzzle |
 | M5 finality | **Off on mainnet** | Both sides built; activation unset |
 | REST API, `/metrics` | **Shipped** | Opt-in, loopback, unauthenticated |
-| Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, **unsigned** |
+| Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, keyless cosign/Sigstore bundle wiring — **no signed release published yet** |
 | **Independent security review** | **In progress** | A focused self-review of the HBM permutation gates M4 registration (`docs/security-review-hbm-2026-10-12.md`); a third-party audit is still required before mainnet |
 
 ### Why M4 is registered but not activated
@@ -751,6 +751,8 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **L1/L2 disagreement** | An exit claim with no L2 record was caught only by `debug_assert`, which compiles out of release builds | **Recorded as `UnbackedClaim`** and exposed, so a release build reports the divergence |
 | **Unchallenged results** | A wrong unchallenged result produced a certificate that `validate()` accepted with no signal | **`asserts_correctness()` / `validate_verified`** make the weak basis unmissable |
 | **HBM** | Registered but not the active mining puzzle | Registered as `puzzle_id = 2` with a security review; `mini`/`testnet`/mainnet still mine `puzzle_id = 1` (hybrid), so registration is an open item made safe, not a mainnet-readiness change |
+| **Escrow identity** | Two escrows with the same parties and amount under different conditions shared one id, so the second open silently replaced the first | **The condition is part of the escrow id**, so different contracts are different escrows |
+| **Credit reservation accounting** | A position-backed reservation left free balance spendable (double-admit), recorded one position of a multi-position spread, and interest overflow wrapped or capped silently | **Free is swept at admission, draws are tracked per position, refused admissions leave the book untouched, and interest overflow is refused**; pinned by 3 new `redteam_round2` regressions |
 
 ---
 
@@ -833,7 +835,7 @@ figures are in JNT.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1048 tests, 0 failures
+cargo test --workspace                                   # 1121 tests, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -850,6 +852,7 @@ cargo test -p jnt-node --test arbitration_path # full fraud lifecycle
 cargo test -p jnt-net  --test arbitration_votes # 3 nodes, real TCP
 cargo test -p jnt-node --test exit_crank_api   # withdrawal flow over HTTP
 cargo test -p jnt-core --test redteam          # adversarial regressions
+cargo test -p jnt-core --test redteam_round2   # round-2 credit regressions
 ```
 
 CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release
@@ -868,8 +871,9 @@ checkpoints; L2 codec, disputes, state and certificates; and the worker. They
 assert capability invariants â€” decode/encode inversion, bounded allocation, value
 conservation under adversarial transaction programs â€” not just panic-freedom.
 
-**Red team.** `crates/jnt-core/tests/redteam.rs` holds 12 adversarial integration
-tests, each confirmed to fail against the code it now guards. The full record of
+**Red team.** `crates/jnt-core/tests/redteam*.rs` holds 21 adversarial integration
+tests across four files (`redteam`, `redteam_credit`, `redteam_delegation`,
+`redteam_round2`), each confirmed to fail against the code it now guards. The full record of
 defects found and fixed is in [docs/status.md](docs/status.md).
 
 ---
@@ -882,10 +886,10 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1048 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1121 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
-| **Operations** | No bootnodes, no log shipping, no published PGP key. Artifacts are unsigned because no signing key is published. |
+| **Operations** | No bootnodes, no log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
 
 What this means in practice: **a fresh `jnt-node init --network mainnet` runs
 today, and on it withdrawals and binding finality are both inactive.** That is
