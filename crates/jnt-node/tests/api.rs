@@ -1046,6 +1046,76 @@ fn a_reserved_line_cannot_back_two_admitted_payments() {
 }
 
 #[test]
+fn a_position_backed_payment_is_refused_up_front_not_locked_forever() {
+    // A reservation that draws on position headroom can never settle through
+    // a receipt, and the node exposes no release for an admitted payment — so
+    // admission must refuse it up front rather than lock the payer's line
+    // forever with no recourse.
+    let node = start();
+    let (payment, _receipt, auth, sigs, keys) = run_bridge(&node, 0);
+    let payer_addr = wallet(61, "api-payer").address().unwrap();
+    let addr_hex = address_to_hex(&payer_addr);
+    assert_eq!(payment.amount_sat, 400);
+
+    // Deposit exactly bond + collateral, leaving zero free: the 400-payment
+    // would have to draw on the position's headroom.
+    let (s, b) = post(
+        &node,
+        "/v1/credit/deposit",
+        &json!({ "address_hex": addr_hex, "amount_sat": 5_000u64 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = post(
+        &node,
+        "/v1/credit/bond",
+        &json!({ "address_hex": addr_hex, "action": "post", "amount_sat": 1_000u64 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    let spec = jnt_core::credit::PositionSpec {
+        terms: jnt_core::credit::CreditTerms::default(),
+        charge: jnt_core::credit::ChargeSchedule {
+            rate_bps_per_window: 0,
+            window_blocks: 100,
+        },
+        borrower: payer_addr,
+        agent_id: [9u8; 32],
+        lender: [2u8; 20],
+        amount_sat: 5_000,
+        bond_sat: 1_000,
+        drawn_at_height: 0,
+        deadline_height: 100,
+    };
+    let (s, b) = post(
+        &node,
+        "/v1/credit/open",
+        &json!({ "spec_hex": hex::encode(spec.encode()) }),
+    );
+    assert_eq!(s, 200, "{b}");
+
+    // Free is now 0, so admission would draw headroom — refused, not stuck.
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 409, "position-backed admission must fail fast: {body}");
+    assert_eq!(body["error"], "payment_refused");
+
+    // The refusal released the encumbrance: nothing reserved, nothing wedged.
+    let (s, b) = get(&node, &format!("/v1/credit/balance/{addr_hex}"));
+    assert_eq!(s, 200);
+    assert_eq!(b["reserved"], 0, "the refused admission holds nothing");
+    assert_eq!(b["available"], 0);
+
+    // And the payer is not wedged: funding free admits the same payment.
+    let (s, b) = post(
+        &node,
+        "/v1/credit/deposit",
+        &json!({ "address_hex": addr_hex, "amount_sat": 400u64 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 200, "funded free balance admits: {body}");
+    assert_eq!(body["duplicate"], false);
+}
+
+#[test]
 fn the_credit_lifecycle_runs_through_the_node() {
     // Item 2 end to end over the node surface: deposit, post a bond, open a
     // position priced with it, and watch the pledge make the bond single-use.

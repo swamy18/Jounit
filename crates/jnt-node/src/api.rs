@@ -1583,6 +1583,22 @@ async fn payment_submit(
             &mut sh.credit,
         )
         .map_err(session_err)?;
+        // A reservation that draws on position headroom can never settle: the
+        // ledger `settle` refuses it by name (headroom is capacity, not value —
+        // its debit is a position-lifecycle event), and this node exposes no
+        // release for an admitted payment. Admitting it would lock the payer's
+        // swept free balance and headroom forever with no recourse, so fail
+        // fast here and give the encumbrance straight back.
+        if !reservation.position_draws.is_empty() {
+            let _ = sh.credit.release(&reservation);
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "payment_refused",
+                "the payer's free balance cannot cover this payment and the \
+                 remainder would draw on position headroom, which never settles \
+                 through a receipt: fund the free balance or repay the position first",
+            ));
+        }
         match sh.payment_tracker.accept(&payment, &network, height) {
             Ok(id) => {
                 // The payment is recorded, so the reservation it holds is real:
