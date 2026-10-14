@@ -189,10 +189,12 @@ pub enum StakePayload {
     /// before lattice registration existed, and for validators that have not
     /// migrated). The lattice key is looked up by BLS identity — it never
     /// replaces the BLS key as the committee identity, so bitmap order and
-    /// `bond_identity` are unchanged by its presence.
+    /// `bond_identity` are unchanged by its presence. Boxed: 1952 bytes would
+    /// otherwise make every stake payload pay for the largest variant, the
+    /// same reason `Slash` is boxed.
     Bond {
         bls_pk: BlsPublicKey,
-        mldsa_pk: Option<[u8; 1952]>,
+        mldsa_pk: Option<Box<[u8; 1952]>>,
     },
     /// `TX_UNBOND`: the bond being released (the BOND transaction's txid).
     Unbond { bond_id: Hash512 },
@@ -227,11 +229,8 @@ impl StakePayload {
         match self {
             StakePayload::Bond { bls_pk, mldsa_pk } => {
                 w.raw(bls_pk.as_bytes());
-                match mldsa_pk {
-                    Some(pk) => {
-                        w.u8(1).raw(pk);
-                    }
-                    None => {}
+                if let Some(pk) = mldsa_pk {
+                    w.u8(1).raw(&pk[..]);
                 }
             }
             StakePayload::Unbond { bond_id } => {
@@ -267,7 +266,7 @@ impl StakePayload {
                     0 => None,
                     1 => {
                         let key: [u8; 1952] = r.fixed()?;
-                        Some(key)
+                        Some(Box::new(key))
                     }
                     _ => return Err(Error::Malformed("bond lattice-key flag")),
                 };

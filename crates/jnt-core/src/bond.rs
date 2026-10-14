@@ -161,8 +161,10 @@ impl BondLedger {
 pub enum BondUndoOp {
     /// A bond this block created: delete it on unwind.
     Inserted(BondId),
-    /// A bond this block removed (unbond/slash): restore it on unwind.
-    Removed(BondId, BondRecord),
+    /// A bond this block removed (unbond/slash): restore it on unwind. Boxed:
+    /// a record carries an optional 1952-byte lattice key, and an undo log
+    /// holding that inline would make every stake op pay for the largest one.
+    Removed(BondId, Box<BondRecord>),
 }
 
 /// Per-block stake accumulator, threaded through block application the way
@@ -185,7 +187,7 @@ pub fn unwind_bond_op(ledger: &mut BondLedger, op: &BondUndoOp) {
             ledger.remove(id);
         }
         BondUndoOp::Removed(id, record) => {
-            ledger.insert(*id, record.clone());
+            ledger.insert(*id, record.as_ref().clone());
         }
     }
 }
@@ -253,7 +255,7 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
         return Err(Error::StakeInvalid("not a bond transaction"));
     }
     let (bls_pk, mldsa_pk) = match &tx.stake {
-        Some(StakePayload::Bond { bls_pk, mldsa_pk }) => (*bls_pk, *mldsa_pk),
+        Some(StakePayload::Bond { bls_pk, mldsa_pk }) => (*bls_pk, mldsa_pk.clone()),
         _ => return Err(Error::StakeInvalid("bond transaction without bond payload")),
     };
     crate::bls::validate_public_key(&bls_pk)
@@ -265,8 +267,8 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
     // simply never verify, and clause 7 will refuse checkpoints that need
     // them. What *is* refused here is sharing: one lattice key under two BLS
     // identities would let one holder sign for two stakes.
-    if let Some(pk) = mldsa_pk {
-        if bonds.records().iter().any(|r| r.mldsa_pk == Some(pk)) {
+    if let Some(pk) = &mldsa_pk {
+        if bonds.records().iter().any(|r| r.mldsa_pk.as_ref() == Some(pk)) {
             return Err(Error::StakeInvalid("lattice key already bonded"));
         }
     }
@@ -291,7 +293,7 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
     Ok(BondDraft {
         bonder,
         bls_pk,
-        mldsa_pk,
+        mldsa_pk: mldsa_pk.map(|b| *b),
         amount_sat: bond_out.value,
     })
 }
@@ -563,7 +565,7 @@ mod tests {
         ledger.insert([9u8; 64], record.clone());
         let back = ledger.remove(&[9u8; 64]).unwrap();
         assert_eq!(back, record);
-        unwind_bond_op(&mut ledger, &BondUndoOp::Removed([9u8; 64], record.clone()));
+        unwind_bond_op(&mut ledger, &BondUndoOp::Removed([9u8; 64], Box::new(record.clone())));
         assert_eq!(ledger.get(&[9u8; 64]), Some(&record));
         // Key index restored too: the same key bonds once.
         assert!(ledger.find_by_key(&record.bls_pk).is_some());

@@ -198,7 +198,7 @@ fn a_bond_with_a_lattice_key_round_trips_and_an_old_bond_decodes_keyless() {
     let lattice = key(4).mldsa_pubkey();
     let new = StakePayload::Bond {
         bls_pk: pk,
-        mldsa_pk: Some(lattice),
+        mldsa_pk: Some(Box::new(lattice)),
     };
     let bytes = new.body_bytes();
     assert_eq!(bytes.len(), 48 + 1 + 1952);

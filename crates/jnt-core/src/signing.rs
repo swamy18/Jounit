@@ -390,7 +390,7 @@ impl Committee {
         // The verifier's order: BLS keys unique per set, so sorting records by
         // key bytes indexes identically to the epoch set's canonical order.
         let mut sorted: Vec<&crate::validators::ValidatorRecord> = records.iter().collect();
-        sorted.sort_by(|a, b| a.bls_pk.0.cmp(&b.bls_pk.0));
+        sorted.sort_by_key(|a| a.bls_pk.0);
         let mut bitmap = vec![0u8; sorted.len().div_ceil(8)];
         let mut signed = 0usize;
         let mut pq_sidecar = Vec::new();

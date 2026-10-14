@@ -871,7 +871,7 @@ impl Chain {
             TX_UNBOND => {
                 let (id, record) = check_unbond_tx(tx, &self.bonds, height)?;
                 self.bonds.remove(&id);
-                stake.ops.push(BondUndoOp::Removed(id, record.clone()));
+                stake.ops.push(BondUndoOp::Removed(id, Box::new(record.clone())));
                 let release = OutPoint {
                     txid: tx.txid(),
                     index: u32::try_from(tx.outputs.len()).map_err(|_| Error::ValueOverflow)?,
@@ -904,7 +904,7 @@ impl Chain {
                     &RealBls,
                 )?;
                 self.bonds.remove(&id);
-                stake.ops.push(BondUndoOp::Removed(id, record.clone()));
+                stake.ops.push(BondUndoOp::Removed(id, Box::new(record.clone())));
                 if stake.vault_before.is_none() {
                     stake.vault_before = Some(self.slash_vault.clone());
                 }
