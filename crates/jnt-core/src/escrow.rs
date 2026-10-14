@@ -462,9 +462,9 @@ impl ConditionalEscrow {
             // Refunded is terminal in its own right: it is not a release, so
             // it never matures into `Finalized` (which means the payee was
             // paid), and re-calling is a no-op exactly like `Finalized`.
-            EscrowState::Open
-            | EscrowState::Finalized { .. }
-            | EscrowState::Refunded { .. } => return Ok(false),
+            EscrowState::Open | EscrowState::Finalized { .. } | EscrowState::Refunded { .. } => {
+                return Ok(false)
+            }
         };
         if now < release_height.saturating_add(activation_height) {
             return Ok(false);

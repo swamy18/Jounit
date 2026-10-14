@@ -42,9 +42,7 @@ const TAG_LEN: usize = 16;
 
 /// The passphrase to encrypt under, if the operator supplied one.
 pub fn passphrase_from_env() -> Option<String> {
-    std::env::var(PASSPHRASE_ENV)
-        .ok()
-        .filter(|p| !p.is_empty())
+    std::env::var(PASSPHRASE_ENV).ok().filter(|p| !p.is_empty())
 }
 
 /// Whether a file's bytes are an encrypted wallet file rather than JSON.
@@ -137,7 +135,9 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
             // directory's ACLs instead; there is no portable std call for it.
             opts.mode(0o600);
         }
-        let mut file = opts.open(tmp).map_err(|e| format!("wallet temp file: {e}"))?;
+        let mut file = opts
+            .open(tmp)
+            .map_err(|e| format!("wallet temp file: {e}"))?;
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
     }
@@ -188,10 +188,8 @@ mod tests {
 
     #[test]
     fn write_private_leaves_no_temp_file_and_replaces_atomically() {
-        let dir = std::env::temp_dir().join(format!(
-            "jnt-wallet-store-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("jnt-wallet-store-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wallets.json");
 
@@ -207,7 +205,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "wallet file must not be group- or world-accessible");
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "wallet file must not be group- or world-accessible"
+            );
         }
 
         let _ = fs::remove_dir_all(&dir);

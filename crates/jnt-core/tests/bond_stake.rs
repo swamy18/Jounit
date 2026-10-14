@@ -594,7 +594,8 @@ fn mempool_admits_a_valid_bond_and_refuses_a_broken_one() {
 #[test]
 fn happy_path_unbond_releases_after_the_lock() {
     let (mut chain, w, ops) = rich_chain();
-    let bonder = w.address().unwrap();    let (sk, _) = bls_pair(7);
+    let bonder = w.address().unwrap();
+    let (sk, _) = bls_pair(7);
     let bond = bond_tx(&chain, &w, &ops[..66], &sk);
     let bond_id = bond.txid();
     submit_block(&mut chain, bonder, vec![bond]).unwrap();
