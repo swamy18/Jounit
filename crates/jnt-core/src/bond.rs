@@ -268,7 +268,11 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
     // them. What *is* refused here is sharing: one lattice key under two BLS
     // identities would let one holder sign for two stakes.
     if let Some(pk) = &mldsa_pk {
-        if bonds.records().iter().any(|r| r.mldsa_pk.as_ref() == Some(pk)) {
+        if bonds
+            .records()
+            .iter()
+            .any(|r| r.mldsa_pk.as_ref() == Some(pk))
+        {
             return Err(Error::StakeInvalid("lattice key already bonded"));
         }
     }
@@ -565,7 +569,10 @@ mod tests {
         ledger.insert([9u8; 64], record.clone());
         let back = ledger.remove(&[9u8; 64]).unwrap();
         assert_eq!(back, record);
-        unwind_bond_op(&mut ledger, &BondUndoOp::Removed([9u8; 64], Box::new(record.clone())));
+        unwind_bond_op(
+            &mut ledger,
+            &BondUndoOp::Removed([9u8; 64], Box::new(record.clone())),
+        );
         assert_eq!(ledger.get(&[9u8; 64]), Some(&record));
         // Key index restored too: the same key bonds once.
         assert!(ledger.find_by_key(&record.bls_pk).is_some());
