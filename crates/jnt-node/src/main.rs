@@ -30,7 +30,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
-use jnt_core::hash::{address_from_hex, address_to_hex, hash_to_hex, Hash};
+use jnt_core::hash::{
+    address_from_hex, address_to_hex, hash512_to_hex, hash_to_hex, Hash512,
+};
 use jnt_core::params::{NetworkParams, SAT_PER_JNT};
 use jnt_core::supply::{block_reward_sat, cumulative_supply_sat, halvings, max_issuance_sat};
 use jnt_core::tx::{OutPoint, Output, Transaction};
@@ -368,7 +370,7 @@ impl Store {
         fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let meta = serde_json::json!({
             "network": self.params.name,
-            "genesis_hash": hash_to_hex(&chain.block_hash_at(0).unwrap_or([0u8; 32])),
+            "genesis_hash": hash512_to_hex(&chain.block_hash_at(0).unwrap_or([0u8; 64])),
             "height": chain.height(),
         });
         let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
@@ -494,7 +496,7 @@ fn cmd_init(args: &Args) -> Result<(), String> {
 
     println!();
     println!("network        {}", store.params.name);
-    println!("genesis        {}", hash_to_hex(&chain.tip_hash()));
+    println!("genesis        {}", hash512_to_hex(&chain.tip_hash()));
     println!("block time     {} ms", store.params.target_block_time_ms);
     println!(
         "issuance       ladder then a permanent tail; rate-anchored at 1% of issued per halving period (no stock cap, Decision 18)"
@@ -547,7 +549,7 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
             height,
             difficulty,
             jnt(block_reward_sat(chain.params(), height)),
-            &hash_to_hex(&hash)[..16]
+            &hash512_to_hex(&hash)[..16]
         );
         mined += 1;
         if interval > 0 {
@@ -647,7 +649,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     let tx = sender
         .build_tx(&chosen, outputs, fee)
         .map_err(|e| e.to_string())?;
-    let txid = jnt_core::hash::hash_to_hex(&tx.txid());
+    let txid = jnt_core::hash::hash512_to_hex(&tx.txid());
 
     // `--relay <addr>` hands the signed transaction to a running node over the
     // real P2P protocol instead of mining it here (SPEC.md §13.14). Without it
@@ -744,7 +746,7 @@ fn cmd_status(args: &Args) -> Result<(), String> {
     println!("network        {}", store.params.name);
     println!("height         {}", chain.height());
     println!("finalized      {}", chain.finalized_height());
-    println!("tip            {}", hash_to_hex(&chain.tip_hash()));
+    println!("tip            {}", hash512_to_hex(&chain.tip_hash()));
     println!("difficulty     {}", tip.header.difficulty);
     println!("base fee       {} sat", tip.header.base_fee_sat);
     println!(
@@ -903,7 +905,7 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         println!(
             "  skipped height {:>6}  {}  {}",
             s.height,
-            &hash_to_hex(&s.txid)[..16],
+            &hash512_to_hex(&s.txid)[..16],
             s.error
         );
     }
@@ -914,7 +916,7 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         println!(
             "  pending height {:>6}  {}:{}  {} sat (spendable at {})",
             p.deposit.height,
-            &hash_to_hex(&p.deposit.txid)[..16],
+            &hash512_to_hex(&p.deposit.txid)[..16],
             p.deposit.index,
             p.deposit.amount_sat,
             p.matures_at
@@ -927,7 +929,7 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
         println!(
             "  ignored height {:>6}  {}:{}  {} sat ({:?})",
             ig.height,
-            &hash_to_hex(&ig.txid)[..16],
+            &hash512_to_hex(&ig.txid)[..16],
             ig.index,
             ig.amount_sat,
             ig.reason
@@ -976,7 +978,7 @@ fn cmd_balance(args: &Args) -> Result<(), String> {
         total += u.out.value;
         println!(
             "{}:{}  {:>16} JNT  height {:>6}  {}",
-            &hash_to_hex(&op.txid)[..16],
+            &hash512_to_hex(&op.txid)[..16],
             op.index,
             jnt(u.out.value),
             u.height,
@@ -1212,7 +1214,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
 
     println!("network        {}", store.params.name);
     println!("height         {}", chain.height());
-    println!("tip            {}", hash_to_hex(&chain.tip_hash()));
+    println!("tip            {}", hash512_to_hex(&chain.tip_hash()));
     if let Some(addr) = listen_addr {
         println!("listening      {addr}");
     }
@@ -1271,7 +1273,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
 
         // What the API accepted since the last iteration. Relayed after the
         // lock drops: announcing needs the P2P node, not the state.
-        let relay_now: Vec<Hash> = std::mem::take(&mut sh.tx_to_relay);
+        let relay_now: Vec<Hash512> = std::mem::take(&mut sh.tx_to_relay);
 
         // Decision 17 — the alarm half: a breached node keeps running but must
         // never be *quiet* about it. The closure is only invoked when the alarm
@@ -1339,7 +1341,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 let height = block.header.height;
                 store.save_chain(&sh.chain).ok();
                 store.write_meta(&sh.chain).ok();
-                println!("mined height {height}  {}", &hash_to_hex(&hash)[..16]);
+                println!("mined height {height}  {}", &hash512_to_hex(&hash)[..16]);
                 node.broadcast_block(hash, None);
             }
 

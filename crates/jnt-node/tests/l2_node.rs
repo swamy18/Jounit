@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
 use jnt_core::compute_ir::{ComputeBackend, ComputeTask};
-use jnt_core::hash::hash_to_hex;
+use jnt_core::hash::hash512_to_hex;
 use jnt_core::l2::{
     ClaimTaskPayload, L2Payload, L2Transaction, PostTaskPayload, SettlePayload, Verdict,
 };
@@ -469,7 +469,7 @@ fn l1_invalid_block_does_not_mutate_l2_state() {
     assert!(chain.submit(dup).is_err());
     // A block with no known parent is rejected too.
     let mut orphan = chain.block_at(1).unwrap().clone();
-    orphan.header.prev_hash = [0xEEu8; 32];
+    orphan.header.prev_hash = [0xEEu8; 64];
     assert!(chain.submit(orphan).is_err());
 
     assert_eq!(view.sync(&chain).outcome, SyncOutcome::Unchanged);
@@ -732,6 +732,6 @@ fn node_reports_enough_to_verify_processing_happened() {
     // And the skip names everything an operator needs: height, txid, reason.
     let skip = &view.skipped()[0];
     assert_eq!(skip.height, 1);
-    assert_eq!(hash_to_hex(&skip.txid).len(), 64);
+    assert_eq!(hash512_to_hex(&skip.txid).len(), 128);
     assert!(!format!("{}", skip.error).is_empty());
 }

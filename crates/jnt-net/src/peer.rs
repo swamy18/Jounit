@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jnt_core::block::genesis_block;
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::params::NetworkParams;
 
 use crate::error::{NetError, NetResult};
@@ -28,13 +28,13 @@ pub const BAN_SCORE_THRESHOLD: u32 = 100;
 pub struct HandshakeConfig {
     pub params: NetworkParams,
     pub height: u64,
-    pub tip_hash: Hash,
+    pub tip_hash: Hash512,
     pub user_agent: String,
     pub services: u64,
 }
 
 impl HandshakeConfig {
-    pub fn new(params: NetworkParams, height: u64, tip_hash: Hash) -> Self {
+    pub fn new(params: NetworkParams, height: u64, tip_hash: Hash512) -> Self {
         Self {
             params,
             height,
@@ -316,7 +316,7 @@ pub fn perform_handshake(
 fn validate_peer_version(
     ver: &Version,
     params: &NetworkParams,
-    genesis_hash: &Hash,
+    genesis_hash: &Hash512,
 ) -> NetResult<()> {
     check_network(params, ver.network_magic, &ver.network_id)?;
     if ver.protocol_version > PROTOCOL_VERSION {

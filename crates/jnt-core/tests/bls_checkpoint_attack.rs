@@ -50,7 +50,7 @@ fn committee(n: usize) -> Committee {
 fn payload(height: u64, epoch: u64) -> CheckpointPayload {
     CheckpointPayload {
         height,
-        block_hash: sha256(&[b"block", &height.to_le_bytes()]),
+        block_hash: jnt_core::hash::sha512(&[b"block", &height.to_le_bytes()]),
         network_id: "jounit/mini".into(),
         epoch,
     }
@@ -200,7 +200,7 @@ fn a_tampered_payload_invalidates_the_signature() {
 fn a_swapped_block_hash_invalidates_the_signature() {
     let c = committee(4);
     let mut cp = signed_checkpoint(&c, payload(100, 10), &[0, 1, 2, 3]);
-    cp.payload.block_hash = sha256(&[b"attacker block"]);
+    cp.payload.block_hash = jnt_core::hash::sha512(&[b"attacker block"]);
     assert!(verify_checkpoint(&cp, &c.set, &RealBls).is_err());
 }
 

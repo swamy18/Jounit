@@ -77,7 +77,10 @@ use jnt_core::agent::{derive_agent_id, AgentRole};
 use jnt_core::chain::Chain;
 use jnt_core::credit::CreditGate;
 use jnt_core::fees;
-use jnt_core::hash::{address_from_hex, address_to_hex, hash_from_hex, hash_to_hex, Address, Hash};
+use jnt_core::hash::{
+    address_from_hex, address_to_hex, hash512_from_hex, hash512_to_hex, hash_from_hex, hash_to_hex,
+    Address, Hash, Hash512,
+};
 use jnt_core::l2::L2Transaction;
 use jnt_core::mempool::Mempool;
 use jnt_core::params::{NetworkParams, L2_FEE_SCHEDULE, SAT_PER_JNT};
@@ -156,7 +159,7 @@ pub struct SharedNode {
     pub revoked_policies: BTreeSet<Hash>,
     /// L1 txids the API accepted; drained by the serve loop, which owns the
     /// P2P node and announces them to peers.
-    pub tx_to_relay: Vec<Hash>,
+    pub tx_to_relay: Vec<Hash512>,
     /// L2 transactions that passed the dry-run; drained by the serve loop
     /// into the next mined block's trailer.
     pub l2_to_include: Vec<L2Transaction>,
@@ -262,6 +265,12 @@ fn decode_hash(s: &str) -> Result<Hash, (StatusCode, Json<ErrorBody>)> {
     hash_from_hex(s).map_err(|e| bad(format!("hash: {e}")))
 }
 
+/// Block hashes and txids are the 512-bit identities; requests that name one
+/// parse with this, every other id keeps [`decode_hash`].
+fn decode_hash512(s: &str) -> Result<Hash512, (StatusCode, Json<ErrorBody>)> {
+    hash512_from_hex(s).map_err(|e| bad(format!("hash: {e}")))
+}
+
 fn decode_hex_bytes(s: &str, what: &str) -> Result<Vec<u8>, (StatusCode, Json<ErrorBody>)> {
     let raw = s.trim().trim_start_matches("0x");
     hex::decode(raw).map_err(|e| bad(format!("{what} hex: {e}")))
@@ -313,7 +322,7 @@ async fn status(State(state): State<ApiState>) -> ApiResult {
             "network": p.name,
             "network_id": p.network_id,
             "height": sh.chain.height(),
-            "tip_hash": hash_to_hex(&sh.chain.tip_hash()),
+            "tip_hash": hash512_to_hex(&sh.chain.tip_hash()),
             "peers": state.peers.load(Ordering::Relaxed),
             "base_fee_sat": sh.chain.expected_base_fee_for_next_block(),
             "total_supply_sat": sh.chain.total_supply_sat(),
@@ -655,7 +664,7 @@ async fn utxos(State(state): State<ApiState>, Path(addr): Path<String>) -> ApiRe
         for (op, u) in sh.chain.utxo().iter() {
             if u.out.address == addr {
                 out.push(json!({
-                    "txid": hash_to_hex(&op.txid),
+                    "txid": hash512_to_hex(&op.txid),
                     "index": op.index,
                     "value_sat": u.out.value,
                     "height": u.height,
@@ -674,13 +683,13 @@ async fn block_latest(State(state): State<ApiState>) -> ApiResult {
         let value = serde_json::to_value(block)
             .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
         Ok(Json(
-            json!({ "hash": hash_to_hex(&block.block_hash()), "block": value }),
+            json!({ "hash": hash512_to_hex(&block.block_hash()), "block": value }),
         ))
     })?
 }
 
 async fn block_by_hash(State(state): State<ApiState>, Path(hash): Path<String>) -> ApiResult {
-    let hash = decode_hash(&hash)?;
+    let hash = decode_hash512(&hash)?;
     with_shared(&state, |sh| {
         let block = sh
             .chain
@@ -688,12 +697,12 @@ async fn block_by_hash(State(state): State<ApiState>, Path(hash): Path<String>) 
             .ok_or_else(|| not_found("unknown block"))?;
         let value = serde_json::to_value(block)
             .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
-        Ok(Json(json!({ "hash": hash_to_hex(&hash), "block": value })))
+        Ok(Json(json!({ "hash": hash512_to_hex(&hash), "block": value })))
     })?
 }
 
 async fn tx_lookup(State(state): State<ApiState>, Path(hash): Path<String>) -> ApiResult {
-    let hash = decode_hash(&hash)?;
+    let hash = decode_hash512(&hash)?;
     with_shared(&state, |sh| {
         // Canonical scan: O(tip) per lookup, which is the honest cost of a
         // node with no tx index. Documented in the status docs.
@@ -706,7 +715,7 @@ async fn tx_lookup(State(state): State<ApiState>, Path(hash): Path<String>) -> A
                     let value = serde_json::to_value(tx).unwrap_or(Value::Null);
                     return Ok(Json(json!({
                         "status": "confirmed",
-                        "block_hash": hash_to_hex(&block.block_hash()),
+                        "block_hash": hash512_to_hex(&block.block_hash()),
                         "block_height": height,
                         "tx": value,
                     })));
@@ -728,7 +737,7 @@ async fn mempool_view(State(state): State<ApiState>) -> ApiResult {
             .entries()
             .map(|(txid, e)| {
                 json!({
-                    "tx_hash": hash_to_hex(txid),
+                    "tx_hash": hash512_to_hex(txid),
                     "fee_rate": e.fee_rate,
                     "fee_sat": e.fee_total,
                     "inputs": e.tx.inputs.len(),
@@ -1021,7 +1030,7 @@ async fn tx_build(State(state): State<ApiState>, Json(req): Json<TxBuildReq>) ->
         );
         let selected: Vec<Value> = chosen
             .iter()
-            .map(|op| json!({ "txid": hash_to_hex(&op.txid), "index": op.index }))
+            .map(|op| json!({ "txid": hash512_to_hex(&op.txid), "index": op.index }))
             .collect();
         Ok(Json(json!({
             "unsigned_tx_hex": hex::encode(unsigned.serialize()),
@@ -1144,12 +1153,12 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
         match outcome {
             Ok(txid) => {
                 sh.tx_to_relay.push(txid);
-                Ok(Json(json!({ "tx_hash": hash_to_hex(&txid) })))
+                Ok(Json(json!({ "tx_hash": hash512_to_hex(&txid) })))
             }
             // Idempotent: the same signed transaction arriving twice is the
             // same request, not an error — dedup is by txid.
             Err(jnt_core::mempool::MempoolError::AlreadyKnown) => Ok(Json(
-                json!({ "tx_hash": hash_to_hex(&txid), "already_known": true }),
+                json!({ "tx_hash": hash512_to_hex(&txid), "already_known": true }),
             )),
             Err(e) => Err(fail(StatusCode::BAD_REQUEST, "tx_refused", e.to_string())),
         }
@@ -1173,7 +1182,7 @@ async fn l2_broadcast(State(state): State<ApiState>, Json(req): Json<L2Broadcast
     with_shared(&state, |sh| {
         if sh.l2_to_include.iter().any(|t| t.txid() == txid) {
             return Ok(Json(
-                json!({ "txid": hash_to_hex(&txid), "already_queued": true }),
+                json!({ "txid": hash512_to_hex(&txid), "already_queued": true }),
             ));
         }
         // Dry-run against a *clone*: the real L2 state is derived from
@@ -1183,7 +1192,7 @@ async fn l2_broadcast(State(state): State<ApiState>, Json(req): Json<L2Broadcast
             .check(&tx, sh.chain.height() + 1)
             .map_err(|e| fail(StatusCode::CONFLICT, "l2_refused", format!("{e}")))?;
         sh.l2_to_include.push(tx);
-        Ok(Json(json!({ "txid": hash_to_hex(&txid), "queued": true })))
+        Ok(Json(json!({ "txid": hash512_to_hex(&txid), "queued": true })))
     })?
 }
 
@@ -1763,7 +1772,7 @@ async fn exit_crankable(
                 json!({
                     "encoding": "hex",
                     "bytes": hex::encode(claim.serialize()),
-                    "claim_id": hash_to_hex(&claim.claim_id()),
+                    "claim_id": hash512_to_hex(&claim.claim_id()),
                     "owner": address_to_hex(&claim.owner),
                     "nonce": claim.nonce,
                     "amount_sat": claim.amount_sat,

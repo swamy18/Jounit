@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use jnt_core::block::genesis_block;
 use jnt_core::chain::Chain;
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::mempool::Mempool;
 use jnt_core::params::NetworkParams;
 use jnt_net::magic::check_network;
@@ -33,7 +33,7 @@ fn fresh_chain() -> Chain {
     Chain::new(mini()).expect("genesis ok")
 }
 
-fn genesis_hash(params: &NetworkParams) -> Hash {
+fn genesis_hash(params: &NetworkParams) -> Hash512 {
     genesis_block(params.genesis_difficulty).block_hash()
 }
 
@@ -369,7 +369,7 @@ fn find_fork_collects_inv_from_common_ancestor() {
     assert_eq!(locator[0], chain_b.tip_hash());
 
     // Ask chain_a for blocks past the fork (genesis is the common ancestor).
-    let inv = find_fork_and_collect_inv(&chain_a, &locator, &Hash::default());
+    let inv = find_fork_and_collect_inv(&chain_a, &locator, &jnt_core::hash::ZERO_HASH512);
 
     assert!(
         !inv.is_empty(),

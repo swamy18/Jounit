@@ -23,7 +23,7 @@
 //! SPEC.md §M2.
 
 use crate::error::{Error, Result};
-use crate::hash::Hash;
+use crate::hash::Hash512;
 use crate::ser::{Reader, Writer};
 
 /// Blocks over which slashed stake vests on mainnet (365 days × 144 blocks/day).
@@ -41,7 +41,7 @@ pub const VESTING_BLOCKS_MINI: u64 = 2_000;
 pub struct SlashRecord {
     /// Unique identifier — txid of the slashing transaction or task attestation
     /// that triggered the slash.
-    pub slash_id: Hash,
+    pub slash_id: Hash512,
     /// Block height at which the slash was applied.
     pub slash_height: u64,
     /// Block height at which vesting ends (slash_height + vesting_period).
@@ -69,7 +69,7 @@ impl SlashRecord {
     /// - `vesting_period`     — number of blocks over which the vest half unlocks
     /// - `validator_address`  — where vested amounts are sent
     pub fn new(
-        slash_id: Hash,
+        slash_id: Hash512,
         stake_sat: u64,
         slash_height: u64,
         vesting_period: u64,
@@ -135,7 +135,7 @@ impl SlashVault {
     /// Register a new slash event. Returns a reference to the created record.
     pub fn slash(
         &mut self,
-        slash_id: Hash,
+        slash_id: Hash512,
         stake_sat: u64,
         slash_height: u64,
         vesting_period: u64,
@@ -216,7 +216,7 @@ impl SlashRecord {
     /// Decode [`SlashRecord::encode`]: the exact inverse, bounded and
     /// fail-closed on a truncated or over-long buffer.
     pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
-        let slash_id = r.fixed::<32>().map_err(|_| Error::Malformed("slash id"))?;
+        let slash_id = r.fixed::<64>().map_err(|_| Error::Malformed("slash id"))?;
         let slash_height = r.u64le().map_err(|_| Error::Malformed("slash height"))?;
         let unlock_height = r.u64le().map_err(|_| Error::Malformed("unlock height"))?;
         let vest_total = r.u64le().map_err(|_| Error::Malformed("vest total"))?;
@@ -301,8 +301,8 @@ impl From<&SlashRecord> for SlashOutcome {
 mod tests {
     use super::*;
 
-    fn dummy_id(n: u8) -> Hash {
-        [n; 32]
+    fn dummy_id(n: u8) -> Hash512 {
+        [n; 64]
     }
 
     fn addr(n: u8) -> [u8; 20] {

@@ -52,7 +52,7 @@ fn signed(payload: CheckpointPayload, indices: &[usize]) -> Checkpoint {
 fn payload(height: u64) -> CheckpointPayload {
     CheckpointPayload {
         height,
-        block_hash: [0xAB; 32],
+        block_hash: [0xAB; 64],
         network_id: "jounit/mini".into(),
         epoch: height / 10,
     }
@@ -60,6 +60,7 @@ fn payload(height: u64) -> CheckpointPayload {
 
 /// Accept a certificate against the payload's own declared block hash, which is
 /// all the observation tests need.
+#[allow(clippy::result_large_err)]
 fn accept(
     fm: &mut FinalityManager,
     cp: &Checkpoint,
@@ -174,7 +175,7 @@ fn mainnet_with_no_committee_accepts_nothing() {
     let cp = Checkpoint {
         payload: CheckpointPayload {
             height: 100,
-            block_hash: [0xCD; 32],
+            block_hash: [0xCD; 64],
             network_id: "jounit/mainnet".into(),
             epoch: 1,
         },

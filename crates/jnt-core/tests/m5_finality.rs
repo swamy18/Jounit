@@ -24,7 +24,7 @@ use jnt_core::bls_checkpoint::{
 use jnt_core::chain::Chain;
 use jnt_core::error::Error;
 use jnt_core::finality::{FinalityError, FinalityManager, MAX_EQUIVOCATION_EVIDENCE};
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::params::{mini_committee_secrets, testnet_committee_secrets, NetworkParams};
 use jnt_core::validators::{equivocation_evidence, ValidatorError};
 use jnt_core::wallet::Wallet;
@@ -66,7 +66,7 @@ fn foreign_committee() -> Vec<(SecretKey, BlsPublicKey)> {
     pairs
 }
 
-fn payload(height: u64, block_hash: Hash) -> CheckpointPayload {
+fn payload(height: u64, block_hash: Hash512) -> CheckpointPayload {
     CheckpointPayload {
         height,
         block_hash,
@@ -96,7 +96,7 @@ fn signed_with(
     }
 }
 
-fn signed(height: u64, block_hash: Hash, indices: &[usize]) -> Checkpoint {
+fn signed(height: u64, block_hash: Hash512, indices: &[usize]) -> Checkpoint {
     signed_with(&committee(), payload(height, block_hash), indices)
 }
 
@@ -118,6 +118,7 @@ fn chain_to(to: u64) -> Chain {
     chain
 }
 
+#[allow(clippy::result_large_err)]
 fn apply(chain: &mut Chain, cp: &Checkpoint) -> Result<(), FinalityError> {
     chain.apply_checkpoint(cp, &RealBls)
 }
@@ -394,7 +395,7 @@ fn a_stale_certificate_for_a_old_height_is_refused() {
 fn a_future_certificate_is_refused() {
     // Chain tip is 24; height 30 has no canonical block to bind to.
     let mut chain = chain_to(24);
-    let cp = signed(30, [0xEE; 32], &[0, 1, 2]);
+    let cp = signed(30, [0xEE; 64], &[0, 1, 2]);
     let err = refused(&mut chain, &cp, "future height");
     assert!(matches!(err, FinalityError::NotCanonical { height: 30 }));
 }
@@ -404,7 +405,7 @@ fn a_certificate_for_a_non_canonical_block_is_refused() {
     // Valid quorum, valid epoch, valid network — but the hash names no block
     // this chain holds at height 5, and nothing is retained to conflict with.
     let mut chain = chain_to(24);
-    let cp = signed(5, [0xAB; 32], &[0, 1, 2]);
+    let cp = signed(5, [0xAB; 64], &[0, 1, 2]);
     let err = refused(&mut chain, &cp, "non-canonical block");
     assert!(matches!(err, FinalityError::NotCanonical { height: 5 }));
 }
@@ -460,7 +461,7 @@ fn a_conflicting_certificate_is_refused_and_never_finalizes_both_hashes() {
     assert_eq!(chain.finalized_point(), Some((20, h20)));
 
     // Anotherwise-valid certificate for a *different* hash at the same height.
-    let conflicting: Hash = [0xCD; 32];
+    let conflicting: Hash512 = [0xCD; 64];
     let b = signed(20, conflicting, &[0, 1, 2]);
     let before_evidence = chain.finality().evidence().len();
     let err = refused(&mut chain, &b, "conflicting finality");
@@ -670,8 +671,8 @@ fn a_reorg_forking_above_the_finalized_height_is_allowed() {
 #[test]
 fn conflicting_certificates_produce_order_independent_evidence() {
     let params = NetworkParams::testnet();
-    let a = signed_with(&committee(), payload(20, [0xA1; 32]), &[0, 1, 2]);
-    let b = signed_with(&committee(), payload(20, [0xB2; 32]), &[0, 1, 2]);
+    let a = signed_with(&committee(), payload(20, [0xA1; 64]), &[0, 1, 2]);
+    let b = signed_with(&committee(), payload(20, [0xB2; 64]), &[0, 1, 2]);
 
     // Node 1 sees A, then B. Node 2 sees B, then A. Each refuses the second
     // and retains evidence.
@@ -707,9 +708,9 @@ fn non_conflicting_checkpoints_produce_no_evidence() {
     let params = NetworkParams::testnet();
     let mut fm = FinalityManager::new(&params);
 
-    let a = signed_with(&committee(), payload(10, [0x01; 32]), &[0, 1, 2]);
+    let a = signed_with(&committee(), payload(10, [0x01; 64]), &[0, 1, 2]);
     fm.accept(&a, Some(a.payload.block_hash), &RealBls).unwrap();
-    let b = signed_with(&committee(), payload(20, [0x02; 32]), &[0, 1, 2]);
+    let b = signed_with(&committee(), payload(20, [0x02; 64]), &[0, 1, 2]);
     fm.accept(&b, Some(b.payload.block_hash), &RealBls).unwrap();
 
     // Replay of a: same payload — not equivocation, just a repeat.
@@ -719,13 +720,13 @@ fn non_conflicting_checkpoints_produce_no_evidence() {
     ));
     // A different signer set over the *same* payload at height 20: still the
     // same statement, so still not equivocation.
-    let c = signed_with(&committee(), payload(20, [0x02; 32]), &[1, 2, 3]);
+    let c = signed_with(&committee(), payload(20, [0x02; 64]), &[1, 2, 3]);
     assert!(matches!(
         fm.accept(&c, Some(c.payload.block_hash), &RealBls),
         Err(FinalityError::NotMonotonic { .. })
     ));
     // A brand-new valid height: no conflict anywhere.
-    let d = signed_with(&committee(), payload(30, [0x03; 32]), &[0, 1, 3]);
+    let d = signed_with(&committee(), payload(30, [0x03; 64]), &[0, 1, 3]);
     fm.accept(&d, Some(d.payload.block_hash), &RealBls).unwrap();
 
     assert!(
@@ -742,7 +743,7 @@ fn evidence_retention_is_bounded() {
     let params = NetworkParams::testnet();
     let mut fm = FinalityManager::new(&params);
     let base = Checkpoint {
-        payload: payload(20, [0u8; 32]),
+        payload: payload(20, [0u8; 64]),
         aggregate_sig: BlsSignature([7u8; 96]),
         signer_bitmap: vec![0b0000_0111],
         signer_count: 3,
@@ -752,7 +753,7 @@ fn evidence_retention_is_bounded() {
 
     let attempts = MAX_EQUIVOCATION_EVIDENCE + 5;
     for i in 1..=attempts {
-        let mut h = [0u8; 32];
+        let mut h = [0u8; 64];
         h[0] = i as u8;
         h[1] = (i >> 8) as u8;
         let cp = Checkpoint {
@@ -805,7 +806,7 @@ fn the_finalized_point_restores_onto_the_exact_canonical_chain_only() {
     );
 
     // A forged or stale row cannot finalize what the chain does not hold.
-    assert!(!reborn.restore_finality(point.0, [0x99; 32]), "wrong hash");
+    assert!(!reborn.restore_finality(point.0, [0x99; 64]), "wrong hash");
     assert!(!reborn.restore_finality(99, point.1), "beyond the tip");
     assert_eq!(reborn.finalized_point(), None);
 
@@ -865,7 +866,7 @@ fn two_chains_accepting_the_same_certificates_reach_the_same_finality_state() {
         let h20 = chain.block_hash_at(20).unwrap();
         apply(chain, &signed(10, h10, &[0, 1, 2])).unwrap();
         apply(chain, &signed(20, h20, &[0, 1, 2])).unwrap();
-        let cp30 = signed(30, [0xEE; 32], &[0, 1, 2]);
+        let cp30 = signed(30, [0xEE; 64], &[0, 1, 2]);
         let _ = apply(chain, &cp30); // same refusal on both: future height
     }
 

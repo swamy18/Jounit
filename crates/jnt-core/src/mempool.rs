@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::bond::BondLedger;
 use crate::fees::required_fee;
-use crate::hash::Hash;
+use crate::hash::Hash512;
 use crate::ledger::{check_tx, UtxoSet};
 use crate::params::NetworkParams;
 use crate::tx::{OutPoint, Transaction};
@@ -105,12 +105,12 @@ impl MempoolEntry {
 /// Bounded pool of unconfirmed transactions.
 #[derive(Debug, Clone)]
 pub struct Mempool {
-    entries: BTreeMap<Hash, MempoolEntry>,
+    entries: BTreeMap<Hash512, MempoolEntry>,
     /// Reverse index: outpoint -> the pooled transaction consuming it.
     ///
     /// Without this, conflict detection is O(n) per admission and there is no
     /// way to find the *dependent* transactions when an entry is evicted.
-    spends: HashMap<OutPoint, Hash>,
+    spends: HashMap<OutPoint, Hash512>,
     max_bytes: usize,
     bytes: usize,
 }
@@ -159,11 +159,11 @@ impl Mempool {
     /// Iterate the pool in txid order — the same order on any two nodes
     /// holding the same set (a `BTreeMap`, never hashed iteration). The
     /// service API reads the pool through this.
-    pub fn entries(&self) -> impl Iterator<Item = (&Hash, &MempoolEntry)> {
+    pub fn entries(&self) -> impl Iterator<Item = (&Hash512, &MempoolEntry)> {
         self.entries.iter()
     }
 
-    pub fn contains(&self, txid: &Hash) -> bool {
+    pub fn contains(&self, txid: &Hash512) -> bool {
         self.entries.contains_key(txid)
     }
 
@@ -174,11 +174,11 @@ impl Mempool {
     /// entries, or which transactions get announced when the pool is larger than
     /// one `INV` becomes a function of local history. Ordering by txid is a
     /// property of the entries alone.
-    pub fn txids(&self) -> Vec<Hash> {
+    pub fn txids(&self) -> Vec<Hash512> {
         self.entries.keys().copied().collect()
     }
 
-    pub fn get(&self, txid: &Hash) -> Option<&MempoolEntry> {
+    pub fn get(&self, txid: &Hash512) -> Option<&MempoolEntry> {
         self.entries.get(txid)
     }
 
@@ -196,7 +196,7 @@ impl Mempool {
         params: &NetworkParams,
         base_fee: u64,
         bonds: &BondLedger,
-    ) -> Result<Hash, MempoolError> {
+    ) -> Result<Hash512, MempoolError> {
         let txid = tx.txid();
         if self.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyKnown);
@@ -339,7 +339,7 @@ impl Mempool {
     /// "confirmed" means: a reorg makes a block's transactions unconfirmed again,
     /// and the caller may need to do nothing at all.
     pub fn evict_confirmed(&mut self, confirmed: &[Transaction]) {
-        let confirmed_ids: HashSet<Hash> = confirmed.iter().map(|t| t.txid()).collect();
+        let confirmed_ids: HashSet<Hash512> = confirmed.iter().map(|t| t.txid()).collect();
         let spent: HashSet<OutPoint> = confirmed
             .iter()
             .flat_map(|t| t.inputs.iter().map(|i| i.outpoint()))
@@ -357,7 +357,7 @@ impl Mempool {
         // this outpoint") cannot answer that question, so a child two hops from
         // the block survived — and so did a direct child, because the index only
         // ever pointed at the child itself.
-        let mut gone: HashSet<Hash> = HashSet::new();
+        let mut gone: HashSet<Hash512> = HashSet::new();
         for txid in &confirmed_ids {
             if let Some(entry) = self.entries.remove(txid) {
                 self.forget(txid, &entry);
@@ -368,7 +368,7 @@ impl Mempool {
         // Transitively remove anything that spends an output the block consumed
         // or an output created by a transaction the cascade has already removed.
         loop {
-            let doomed: Vec<Hash> = self
+            let doomed: Vec<Hash512> = self
                 .entries
                 .iter()
                 .filter(|(_, entry)| {
@@ -400,7 +400,7 @@ impl Mempool {
         self.bytes = 0;
     }
 
-    fn forget(&mut self, txid: &Hash, entry: &MempoolEntry) {
+    fn forget(&mut self, txid: &Hash512, entry: &MempoolEntry) {
         for input in &entry.tx.inputs {
             if self.spends.get(&input.outpoint()) == Some(txid) {
                 self.spends.remove(&input.outpoint());
@@ -514,7 +514,7 @@ mod tests {
         let mut ops = Vec::new();
         for i in 0..n {
             let op = OutPoint {
-                txid: [i; 32],
+                txid: [i; 64],
                 index: 0,
             };
             set.insert(

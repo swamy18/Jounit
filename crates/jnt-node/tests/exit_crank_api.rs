@@ -291,7 +291,7 @@ fn a_matured_exit_is_handed_over_as_a_claim_consensus_accepts() {
     // are all decided by the proven record, not by the caller.
     assert_eq!(
         claim["claim_id"],
-        jnt_core::hash::hash_to_hex(&decoded.claim_id()),
+        jnt_core::hash::hash512_to_hex(&decoded.claim_id()),
         "{body}"
     );
     assert!(

@@ -119,7 +119,7 @@ mod tests {
         let inputs: Vec<Input> = (0..n_in)
             .map(|i| {
                 Input::unsigned(&OutPoint {
-                    txid: [i as u8; 32],
+                    txid: [i as u8; 64],
                     index: 0,
                 })
             })

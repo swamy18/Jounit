@@ -534,7 +534,7 @@ mod tests {
             result_hash: Some([3u8; 32]),
             anchor: Some(ReceiptAnchor {
                 height: 12,
-                block_hash: [4u8; 32],
+                block_hash: [4u8; 64],
             }),
             keys: Bundle::default(),
             sigs: Bundle::default(),

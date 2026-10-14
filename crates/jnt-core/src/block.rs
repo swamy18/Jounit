@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::exit::{ExitClaim, EXIT_CLAIM_MIN_ENCODED_LEN};
-use crate::hash::{sha256, sha256_dom, Hash, DOM_BLOCK};
+use crate::hash::{sha256, sha512_dom, Hash, Hash512, DOM_BLOCK512, ZERO_HASH512};
+#[cfg(test)]
+use crate::hash::{DOM_BLOCK, sha256_dom};
 use crate::l2::L2Transaction;
 use crate::ser::{Reader, Writer};
 use crate::tx::{Output, Transaction, TX_COINBASE};
@@ -15,7 +17,7 @@ use crate::tx::{Output, Transaction, TX_COINBASE};
 /// the same discipline §3 and §13.5 apply to every other count field.
 const L2_TX_MIN_ENCODED_LEN: usize = 9;
 
-pub const HEADER_SERIALIZED_LEN: usize = 145;
+pub const HEADER_SERIALIZED_LEN: usize = 177;
 pub const BLOCK_VERSION: u32 = 1;
 
 /// Frozen genesis timestamp: 2026-01-01T00:00:00Z.
@@ -28,8 +30,10 @@ pub const GENESIS_TIMESTAMP_MS: u64 = 1_767_225_600_000;
 pub struct Header {
     pub version: u32,
     pub height: u64,
-    #[serde(with = "crate::hexserde::h32")]
-    pub prev_hash: Hash,
+    /// Parent block hash. 512-bit: see [`Hash512`]. This is what makes the
+    /// *chain* — not just a block — resist a quantum collision search.
+    #[serde(with = "crate::hexserde::h64")]
+    pub prev_hash: Hash512,
     #[serde(with = "crate::hexserde::h32")]
     pub merkle_root: Hash,
     pub timestamp_ms: u64,
@@ -50,7 +54,7 @@ impl Header {
         Header {
             version: BLOCK_VERSION,
             height: 0,
-            prev_hash: [0u8; 32],
+            prev_hash: ZERO_HASH512,
             merkle_root,
             timestamp_ms: GENESIS_TIMESTAMP_MS,
             base_fee_sat: 0,
@@ -107,8 +111,8 @@ impl Header {
         Ok(h)
     }
 
-    pub fn block_hash(&self) -> Hash {
-        sha256_dom(DOM_BLOCK, &[&self.serialize()])
+    pub fn block_hash(&self) -> Hash512 {
+        sha512_dom(DOM_BLOCK512, &[&self.serialize()])
     }
 
     pub fn expected_epoch(&self, nn_epoch_blocks: u64) -> u32 {
@@ -301,7 +305,7 @@ impl Block {
         })
     }
 
-    pub fn block_hash(&self) -> Hash {
+    pub fn block_hash(&self) -> Hash512 {
         self.header.block_hash()
     }
 
@@ -430,7 +434,7 @@ fn merkle_from_leaves(mut level: Vec<Hash>) -> Hash {
 /// the 0% premine promised in the design doc (Section 16) is enforced by code.
 pub fn genesis_block(difficulty: u128) -> Block {
     let coinbase = Transaction::coinbase(
-        [0u8; 32],
+        ZERO_HASH512,
         0,
         Output {
             value: 0,
@@ -464,7 +468,7 @@ mod tests {
     fn tx_with_tag(tag: u8) -> Transaction {
         Transaction::standard(
             vec![Input::unsigned(&crate::tx::OutPoint {
-                txid: [tag; 32],
+                txid: [tag; 64],
                 index: 0,
             })],
             vec![Output {
@@ -475,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn header_is_exactly_145_bytes_and_roundtrips() {
+    fn header_is_exactly_177_bytes_and_roundtrips() {
         let g = genesis_block(1);
         let bytes = g.header.serialize();
         assert_eq!(bytes.len(), HEADER_SERIALIZED_LEN);
@@ -483,13 +487,16 @@ mod tests {
     }
 
     #[test]
-    fn header_hash_is_domain_separated() {
+    fn header_hash_is_domain_separated_and_512_bit() {
         let g = genesis_block(1);
         assert_eq!(
             g.header.block_hash(),
-            sha256_dom(DOM_BLOCK, &[&g.header.serialize()])
+            sha512_dom(DOM_BLOCK512, &[&g.header.serialize()])
         );
-        assert_ne!(g.header.block_hash(), sha256(&[&g.header.serialize()]));
+        // The 256-bit construction under the *old* tag must give a different
+        // answer even truncated, or the widening would be cosmetic.
+        let narrow = sha256_dom(DOM_BLOCK, &[&g.header.serialize()]);
+        assert_ne!(&g.header.block_hash()[..32], &narrow[..]);
     }
 
     #[test]
@@ -545,7 +552,7 @@ mod tests {
         assert_eq!(g.txs[0].value_out(), 0);
         assert_eq!(g.header.height, 0);
         assert_eq!(g.header.difficulty, 1);
-        assert_eq!(g.header.prev_hash, [0u8; 32]);
+        assert_eq!(g.header.prev_hash, [0u8; 64]);
         assert_eq!(g.header.merkle_root, g.merkle_root());
     }
 
@@ -602,7 +609,7 @@ mod tests {
     fn every_truncation_of_a_valid_block_is_rejected_not_panicked() {
         let mut b = genesis_block(1);
         b.header.height = 1;
-        b.header.prev_hash = [7u8; 32];
+        b.header.prev_hash = [7u8; 64];
         b.header.timestamp_ms = GENESIS_TIMESTAMP_MS + 600_000;
         b.header.difficulty = 1;
         b.header.nonce = 1;

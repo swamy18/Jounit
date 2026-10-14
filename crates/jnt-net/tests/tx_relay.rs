@@ -180,7 +180,7 @@ fn signed_spend(w: &Wallet, op: OutPoint, pay: u64, to: Address) -> Transaction 
 }
 
 /// Admit locally, exactly as a node with a wallet submission path would.
-fn admit_locally(peer: &mut Peer, tx: Transaction) -> Result<[u8; 32], String> {
+fn admit_locally(peer: &mut Peer, tx: Transaction) -> Result<[u8; 64], String> {
     peer.pool
         .add(
             tx,
@@ -384,7 +384,7 @@ fn await_inbound(peer: &mut Peer) {
     );
 }
 
-fn tx_inv(txid: [u8; 32]) -> InvEntry {
+fn tx_inv(txid: [u8; 64]) -> InvEntry {
     InvEntry {
         kind: INV_TYPE_TX,
         hash: txid,
@@ -636,7 +636,7 @@ fn collect(
     attacker: &mut Hostile,
     rounds: usize,
     stop_early: bool,
-    out: &mut (Vec<[u8; 32]>, Vec<[u8; 32]>),
+    out: &mut (Vec<[u8; 64]>, Vec<[u8; 64]>),
 ) {
     for _ in 0..rounds {
         victim.poll();
@@ -712,7 +712,7 @@ fn an_announced_transaction_is_requested_delivered_and_then_served() {
     //    nothing. Serving it would make the node a relay for a transaction it
     //    does not hold, which §13.14 forbids.
     let mut out = (Vec::new(), Vec::new());
-    attacker.send_get_data(&[tx_inv([0xAB; 32])]);
+    attacker.send_get_data(&[tx_inv([0xAB; 64])]);
     collect(&mut victim, &mut attacker, 20, false, &mut out);
     assert!(
         out.1.is_empty(),

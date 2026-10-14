@@ -391,7 +391,7 @@ mod tests {
         let w = wallet();
         let addr = w.address().unwrap();
         let op = OutPoint {
-            txid: [11u8; 32],
+            txid: [11u8; 64],
             index: 2,
         };
         let mut tx = Transaction::standard(
@@ -410,7 +410,7 @@ mod tests {
         let w = wallet();
         let addr = w.address().unwrap();
         let op = OutPoint {
-            txid: [12u8; 32],
+            txid: [12u8; 64],
             index: 0,
         };
         let mut tx = Transaction::standard(
@@ -440,7 +440,7 @@ mod tests {
     fn coinbase_is_never_signed() {
         let w = wallet();
         let mut cb = Transaction::coinbase(
-            [0u8; 32],
+            [0u8; 64],
             1,
             Output {
                 value: 1,

@@ -16,7 +16,7 @@
 //! [`EquivocationEvidence`], and nothing is burned — there is no bond to burn.
 
 use crate::bls_checkpoint::{BlsPublicKey, BlsVerifier, Checkpoint, ValidatorSet};
-use crate::hash::Hash;
+use crate::hash::{Hash512, ZERO_HASH512};
 use crate::params::NetworkParams;
 use crate::validators::{
     derive_set, equivocation_evidence, genesis_epoch_set_at, validate_checkpoint_against_set,
@@ -44,8 +44,8 @@ pub enum FinalityError {
     /// Retained as equivocation evidence; fail closed.
     ConflictingFinality {
         height: u64,
-        finalized: Hash,
-        conflicting: Hash,
+        finalized: Hash512,
+        conflicting: Hash512,
     },
 }
 
@@ -76,7 +76,7 @@ impl std::error::Error for FinalityError {}
 
 /// The node's view of the committee's certificates and the resulting finalized
 /// point. Owned by [`crate::chain::Chain`]; consulted by `adopt()`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct FinalityManager {
     /// The fixed genesis committee (Decision 11). Empty means no committee, so
     /// every certificate fails closed. Used as the fallback while no bonds exist;
@@ -101,7 +101,7 @@ pub struct FinalityManager {
     /// Highest binding-finalized height (0 = not activated / none).
     finalized_height: u64,
     /// Canonical block hash finalized at `finalized_height`.
-    finalized_hash: Hash,
+    finalized_hash: Hash512,
     /// The certificate that set the binding height, kept for conflict evidence.
     finalized_checkpoint: Option<Checkpoint>,
     /// A bounded ring of recent accepted certificates, for conflict evidence at
@@ -126,7 +126,7 @@ impl FinalityManager {
             activation_height: params.finality_activation_height,
             accepted_height: 0,
             finalized_height: 0,
-            finalized_hash: [0u8; 32],
+            finalized_hash: ZERO_HASH512,
             finalized_checkpoint: None,
             recent: Vec::new(),
             evidence: Vec::new(),
@@ -196,7 +196,7 @@ impl FinalityManager {
     }
 
     /// Canonical hash finalized at the binding height (zero if none).
-    pub fn binding_finalized_hash(&self) -> Hash {
+    pub fn binding_finalized_hash(&self) -> Hash512 {
         self.finalized_hash
     }
 
@@ -232,10 +232,11 @@ impl FinalityManager {
     /// non-canonical block — or a future block — never finalizes.
     ///
     /// Fails closed: a rejection records nothing and never moves finality.
+    #[allow(clippy::result_large_err)]
     pub fn accept(
         &mut self,
         checkpoint: &Checkpoint,
-        canonical: Option<Hash>,
+        canonical: Option<Hash512>,
         verify: &dyn BlsVerifier,
     ) -> Result<(), FinalityError> {
         let height = checkpoint.payload.height;
@@ -325,7 +326,7 @@ impl FinalityManager {
     /// Restore a persisted binding-finalized point after a restart. The caller
     /// (`Chain`) must have validated that `hash` is the canonical block at
     /// `height`; this only installs the value.
-    pub fn restore_finalized(&mut self, height: u64, hash: Hash) {
+    pub fn restore_finalized(&mut self, height: u64, hash: Hash512) {
         if height > self.finalized_height {
             self.finalized_height = height;
             self.finalized_hash = hash;
@@ -403,4 +404,25 @@ fn conflict_evidence(
         (b, a)
     };
     equivocation_evidence(&offender, first, second)
+}
+
+impl Default for FinalityManager {
+    /// Same shape as an all-default manager. Written by hand because the
+    /// 512-bit `finalized_hash` has no `Default` (arrays above 32 elements do
+    /// not implement it).
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            sets: EpochSetCache::default(),
+            network_id: String::new(),
+            epoch_blocks: 0,
+            activation_height: 0,
+            accepted_height: 0,
+            finalized_height: 0,
+            finalized_hash: ZERO_HASH512,
+            finalized_checkpoint: None,
+            recent: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
 }

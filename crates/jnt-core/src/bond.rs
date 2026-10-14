@@ -44,7 +44,7 @@
 
 use crate::bls_checkpoint::{verify_checkpoint, BlsPublicKey, ValidatorSet};
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, Address, Hash};
+use crate::hash::{sha256_dom, Address, Hash512};
 use crate::slash::{VESTING_BLOCKS_MAINNET, VESTING_BLOCKS_MINI};
 use crate::tx::{StakePayload, Transaction, TX_BOND, TX_SLASH, TX_UNBOND};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -62,7 +62,7 @@ pub const MAX_COMMITTEE_SIZE: usize = 21;
 pub const DOM_BOND_IDENTITY: &[u8] = b"jounit/bond-identity/v1";
 
 /// A bond's id is the txid of the `TX_BOND` transaction that created it.
-pub type BondId = Hash;
+pub type BondId = Hash512;
 
 /// One active bond. Records exist only while bonded: unbonding deletes the
 /// record and releases the value, slashing deletes it into the vault — so no
@@ -465,7 +465,7 @@ mod tests {
 
     fn unsigned_input() -> Input {
         Input::unsigned(&OutPoint {
-            txid: [1u8; 32],
+            txid: [1u8; 64],
             index: 0,
         })
     }
@@ -485,7 +485,7 @@ mod tests {
         for i in 0u8..25 {
             let height = 100 + u64::from(i);
             ledger.insert(
-                [i; 32],
+                [i; 64],
                 BondRecord {
                     bonder: [i; 20],
                     bls_pk: bls_key(i + 1),
@@ -535,15 +535,15 @@ mod tests {
             bond_height: 10,
             bond_index: 1,
         };
-        ledger.insert([9u8; 32], record.clone());
-        unwind_bond_op(&mut ledger, &BondUndoOp::Inserted([9u8; 32]));
+        ledger.insert([9u8; 64], record.clone());
+        unwind_bond_op(&mut ledger, &BondUndoOp::Inserted([9u8; 64]));
         assert!(ledger.is_empty());
 
-        ledger.insert([9u8; 32], record.clone());
-        let back = ledger.remove(&[9u8; 32]).unwrap();
+        ledger.insert([9u8; 64], record.clone());
+        let back = ledger.remove(&[9u8; 64]).unwrap();
         assert_eq!(back, record);
-        unwind_bond_op(&mut ledger, &BondUndoOp::Removed([9u8; 32], record.clone()));
-        assert_eq!(ledger.get(&[9u8; 32]), Some(&record));
+        unwind_bond_op(&mut ledger, &BondUndoOp::Removed([9u8; 64], record.clone()));
+        assert_eq!(ledger.get(&[9u8; 64]), Some(&record));
         // Key index restored too: the same key bonds once.
         assert!(ledger.find_by_key(&record.bls_pk).is_some());
     }

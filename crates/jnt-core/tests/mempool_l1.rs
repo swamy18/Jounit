@@ -106,7 +106,7 @@ fn signed_spend(w: &Wallet, op: OutPoint, pay: u64, to: Address) -> Transaction 
 
 /// Admit against the state the next block will actually be built on — the same
 /// numbers `reconcile_mempool` and `mine_from_pool` use internally.
-fn admit(chain: &Chain, pool: &mut Mempool, tx: Transaction) -> Result<[u8; 32], MempoolError> {
+fn admit(chain: &Chain, pool: &mut Mempool, tx: Transaction) -> Result<[u8; 64], MempoolError> {
     pool.add(
         tx,
         chain.utxo(),
@@ -254,7 +254,7 @@ fn a_malformed_transaction_cannot_stop_the_chain() {
     let ghost = signed_spend(
         &miner,
         OutPoint {
-            txid: [0xAB; 32],
+            txid: [0xAB; 64],
             index: 7,
         },
         value - FEE,

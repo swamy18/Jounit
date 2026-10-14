@@ -164,7 +164,7 @@ fn a_rejected_block_must_not_leave_utxo_state_behind() {
     // outpoint that does not exist.
     let poison = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [0xEEu8; 32],
+            txid: [0xEEu8; 64],
             index: 7,
         })],
         vec![Output {
@@ -224,11 +224,11 @@ fn a_rejected_block_must_not_leave_utxo_state_behind() {
 fn apply_tx_is_atomic_when_an_input_is_missing() {
     let w = Wallet::new_random("victim");
     let good_op = OutPoint {
-        txid: [1u8; 32],
+        txid: [1u8; 64],
         index: 0,
     };
     let missing_op = OutPoint {
-        txid: [2u8; 32],
+        txid: [2u8; 64],
         index: 0,
     };
     const VALUE: u64 = 5_000_000_000;
@@ -339,7 +339,7 @@ fn an_unapplicable_block_must_not_be_retained_or_counted_as_work() {
     // so `apply_block` must refuse it.
     let poison = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [0xEEu8; 32],
+            txid: [0xEEu8; 64],
             index: 7,
         })],
         vec![Output {
@@ -471,7 +471,7 @@ fn build_tx_does_not_silently_discard_the_fee_it_was_given() {
     let w = Wallet::new_random("payer");
     let dest = [7u8; 20];
     let op = OutPoint {
-        txid: [3u8; 32],
+        txid: [3u8; 64],
         index: 0,
     };
     const VALUE: u64 = 10_000_000;
@@ -667,7 +667,7 @@ fn a_count_field_cannot_reserve_more_than_the_buffer_could_hold() {
     // And the honest shapes still round-trip.
     let tx = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [1u8; 32],
+            txid: [1u8; 64],
             index: 0,
         })],
         vec![Output {

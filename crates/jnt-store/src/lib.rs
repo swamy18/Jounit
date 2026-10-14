@@ -86,9 +86,9 @@ pub enum StoreError {
     RecordTooLarge { len: usize, max: u32 },
     /// A block's parent is not in the store, so a canonical chain cannot be
     /// walked to it.
-    MissingParent { hash: [u8; 32] },
+    MissingParent { hash: [u8; 64] },
     /// Metadata names a tip the log does not hold.
-    MissingBlock { hash: [u8; 32] },
+    MissingBlock { hash: [u8; 64] },
     /// A block that could not be decoded.
     BadBlock { detail: String },
     /// Metadata is unreadable even though its checksum matched its write.
@@ -154,8 +154,8 @@ impl std::error::Error for StoreError {
     }
 }
 
-pub(crate) fn hex(h: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
+pub(crate) fn hex(h: &[u8]) -> String {
+    let mut s = String::with_capacity(h.len() * 2);
     for b in h {
         s.push_str(&format!("{b:02x}"));
     }

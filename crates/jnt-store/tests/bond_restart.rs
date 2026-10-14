@@ -55,7 +55,7 @@ fn mine_empty_to(chain: &mut Chain, miner: Address, to: u64) {
 
 /// A chain with a live bond, its outputs spent, and enough history that the
 /// unbonding lock has not expired.
-fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash) {
+fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash512) {
     let params = NetworkParams::mini();
     let w = wallet(1);
     let bonder = w.address().unwrap();

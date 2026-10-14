@@ -43,7 +43,7 @@
 //! it against the `MachinePayment` it claims, field by field.
 
 use crate::agent::{derive_agent_id, AgentId, AgentRole};
-use crate::hash::{sha256_dom, Address, Hash};
+use crate::hash::{sha256_dom, Address, Hash, Hash512};
 use crate::payment::MachinePayment;
 use crate::ser::{Reader, Writer};
 use crate::sig::Bundle;
@@ -155,7 +155,7 @@ impl From<crate::error::Error> for ReceiptError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiptAnchor {
     pub height: u64,
-    pub block_hash: Hash,
+    pub block_hash: Hash512,
 }
 
 /// The canonical service receipt. Verifiable offline; tamper-evident;
@@ -323,7 +323,7 @@ impl ServiceReceipt {
                     .u64le()
                     .map_err(|_| ReceiptError::Malformed("anchor height"))?;
                 let block_hash = r
-                    .fixed::<32>()
+                    .fixed::<64>()
                     .map_err(|_| ReceiptError::Malformed("anchor block"))?;
                 Some(ReceiptAnchor { height, block_hash })
             }
@@ -600,7 +600,7 @@ mod tests {
             result_hash: Some([6u8; 32]),
             anchor: Some(ReceiptAnchor {
                 height: 42,
-                block_hash: [8u8; 32],
+                block_hash: [8u8; 64],
             }),
             keys: Bundle::default(),
             sigs: Bundle::default(),

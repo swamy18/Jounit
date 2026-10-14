@@ -18,7 +18,7 @@
 use jnt_core::bls::{RealBls, SecretKey};
 use jnt_core::bls_checkpoint::ValidatorSet;
 use jnt_core::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{
     ClaimTaskPayload, DisputePayload, L2Payload, L2Transaction, PostTaskPayload, SettlePayload,
     SubmitResultPayload, Verdict,
@@ -83,7 +83,7 @@ fn compute_task(task_id: Hash, deadline: u64) -> ComputeTask {
 /// we want: the submitted and disputed tasks are filed inside a five-block
 /// window of the final `advance_block`, so the auto-settlement and the dispute
 /// lapse are both still in the future when the fixture stops.
-fn fully_populated_state() -> (L2State, Vec<Hash>) {
+fn fully_populated_state() -> (L2State, Vec<Hash512>) {
     let mut state = L2State::new(L2Config::mini());
     state
         .apply_genesis(&jnt_l2::L2Genesis::for_params(
@@ -487,7 +487,7 @@ fn an_empty_but_well_formed_state_round_trips() {
 #[test]
 fn a_vault_with_records_round_trips() {
     let mut vault = SlashVault::new();
-    vault.slash([1u8; 32], 1_000, 5, 100, addr(&wallet(9)));
+    vault.slash([1u8; 64], 1_000, 5, 100, addr(&wallet(9)));
     let mut w = jnt_core::ser::Writer::new();
     w.raw(&vault.encode());
     let bytes = w.into_vec();

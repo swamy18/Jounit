@@ -597,7 +597,7 @@ mod tests {
         // shapes are actually producible and self-consistent.
         let w = wallet();
         let op = crate::tx::OutPoint {
-            txid: [3u8; 32],
+            txid: [3u8; 64],
             index: 0,
         };
         let dest = [1u8; 20];
@@ -641,7 +641,7 @@ mod tests {
     fn requiring_a_hybrid_rejects_a_single_scheme_input() {
         let w = wallet();
         let op = crate::tx::OutPoint {
-            txid: [4u8; 32],
+            txid: [4u8; 64],
             index: 0,
         };
         let mut tx = crate::tx::Transaction::standard(

@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use jnt_core::chain::Chain;
-use jnt_core::hash::Hash;
+use jnt_core::hash::{Hash512, ZERO_HASH512};
 use jnt_core::mempool::{Mempool, MempoolError};
 use jnt_core::params::NetworkParams;
 
@@ -169,7 +169,7 @@ pub struct P2pNode {
 
 impl P2pNode {
     /// Bind the listener (if configured) and start the P2P networking layer.
-    pub fn start(config: P2pConfig, initial_height: u64, initial_tip: Hash) -> NetResult<Self> {
+    pub fn start(config: P2pConfig, initial_height: u64, initial_tip: Hash512) -> NetResult<Self> {
         let (event_tx, event_rx) = channel();
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let inbound_count = Arc::new(AtomicUsize::new(0));
@@ -314,7 +314,7 @@ impl P2pNode {
         let locator = create_locator(chain);
         let _ = handle.send(Message::GetBlocks {
             locator,
-            stop: Hash::default(),
+            stop: ZERO_HASH512,
         });
 
         // `spawn_peer` already registered it, before its reader thread started.
@@ -333,7 +333,7 @@ impl P2pNode {
     }
 
     /// Announce a new canonical block to all peers.
-    pub fn broadcast_block(&self, block_hash: Hash, exclude_peer: Option<usize>) {
+    pub fn broadcast_block(&self, block_hash: Hash512, exclude_peer: Option<usize>) {
         self.broadcast_inv(
             vec![InvEntry {
                 kind: INV_TYPE_BLOCK,
@@ -389,7 +389,7 @@ impl P2pNode {
     /// deliberately takes txids rather than transactions: the only way to have a
     /// txid is to have the transaction, and the only way to have a transaction
     /// the node will relay is to have pooled it.
-    pub fn broadcast_tx(&self, txids: &[Hash], exclude_peer: Option<usize>) {
+    pub fn broadcast_tx(&self, txids: &[Hash512], exclude_peer: Option<usize>) {
         if txids.is_empty() {
             return;
         }
@@ -434,7 +434,7 @@ impl P2pNode {
                         if let Some(peer) = self.peers.lock().unwrap().get(&peer_id) {
                             let _ = peer.send(Message::GetBlocks {
                                 locator,
-                                stop: Hash::default(),
+                                stop: ZERO_HASH512,
                             });
                         }
                     }

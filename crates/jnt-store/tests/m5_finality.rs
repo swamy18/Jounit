@@ -160,7 +160,7 @@ fn set_finalized_fails_closed_on_every_lying_row() {
     // Beyond the stored tip: the store has no block to prove it against.
     assert!(bs.set_finalized(99, h20).is_err());
     // A hash that is not the canonical block at a real height.
-    assert!(bs.set_finalized(20, [0x99; 32]).is_err());
+    assert!(bs.set_finalized(20, [0x99; 64]).is_err());
     assert_eq!(bs.finalized(), None, "nothing partial was written");
 
     // The honest claim lands.
@@ -173,9 +173,9 @@ fn set_finalized_fails_closed_on_every_lying_row() {
     assert!(bs.set_finalized(5, h5).is_err());
     // A different hash at the already-final height — the equivocation shape —
     // is refused rather than silently re-finalized.
-    assert!(bs.set_finalized(20, [0x88; 32]).is_err());
+    assert!(bs.set_finalized(20, [0x88; 64]).is_err());
     // Above the tip after finality exists too.
-    assert!(bs.set_finalized(30, [0x88; 32]).is_err());
+    assert!(bs.set_finalized(30, [0x88; 64]).is_err());
 
     assert_eq!(
         bs.finalized(),

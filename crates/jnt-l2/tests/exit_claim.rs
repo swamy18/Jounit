@@ -486,7 +486,7 @@ fn pre_activation_claim_is_refused() {
         exit_fee_sat: 0,
         queued_height: 1,
         inputs: vec![OutPoint {
-            txid: [0x55u8; 32],
+            txid: [0x55u8; 64],
             index: 0,
         }],
         proof: jnt_core::state_root::InclusionProof {

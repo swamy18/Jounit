@@ -62,7 +62,7 @@ fn a_post_quantum_signed_input_spends_only_from_its_own_pq_address() {
     let w = wallet();
     let mut tx = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [3u8; 32],
+            txid: [3u8; 64],
             index: 0,
         })],
         vec![Output {
@@ -94,7 +94,7 @@ fn a_crqc_attacker_cannot_spend_a_post_quantum_output() {
     //    the owner, so the address check refuses before any crypto runs.
     let mut mine_theirs = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [3u8; 32],
+            txid: [3u8; 64],
             index: 0,
         })],
         vec![Output {
@@ -149,7 +149,7 @@ fn other_msg() -> [u8; 32] {
 fn honest_tx_message() -> [u8; 32] {
     let tx = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [3u8; 32],
+            txid: [3u8; 64],
             index: 0,
         })],
         vec![Output {
@@ -186,7 +186,7 @@ fn the_hybrid_requirement_is_about_arity_and_the_pq_requirement_is_about_content
     let w = wallet();
     let mut tx = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [3u8; 32],
+            txid: [3u8; 64],
             index: 0,
         })],
         vec![Output {

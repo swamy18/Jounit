@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 
 use jnt_core::bls_checkpoint::{BlsSignature, BlsVerifier, ValidatorSet};
 use jnt_core::fees::split_flat_fee;
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{
     settle_fee_sat, ClaimTaskPayload, DisputePayload, ExitQueuePayload, L2Payload, L2Transaction,
     PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
@@ -113,7 +113,7 @@ pub struct L2State {
     accounts: HashMap<Address, u64>,
     tasks: HashMap<Hash, TaskContract>,
     /// Transaction ids that have been applied. Replay protection.
-    applied: HashSet<Hash>,
+    applied: HashSet<Hash512>,
     /// Every satoshi ever released into L2: genesis allocation plus test
     /// credits. Append-only. `conservation_total() == funded_total()` is the
     /// M2 invariant — value is moved, never created — and a production state
@@ -129,7 +129,7 @@ pub struct L2State {
     /// item 5, SPEC.md §19.5). The same L1 bytes in a later block hit this set
     /// and are refused — replay protection for value that arrives via blocks
     /// rather than via L2 transactions (which have the separate `applied` set).
-    deposits: HashSet<(Hash, u32)>,
+    deposits: HashSet<(Hash512, u32)>,
     /// Satoshis credited through deposits, append-only. Feeds `funded_total`
     /// (every deposit credit counts there too) and lets `verify` prove
     /// `funded == escrow + deposits` — i.e. no unauthorized funding — without
@@ -284,7 +284,7 @@ impl L2State {
         &mut self,
         recipient: Address,
         amount_sat: u64,
-        id: (Hash, u32),
+        id: (Hash512, u32),
     ) -> L2Result<()> {
         if self.deposits.contains(&id) {
             return Err(L2Error::DuplicateDeposit);
@@ -302,7 +302,7 @@ impl L2State {
     }
 
     /// Whether this deposit identity already credited.
-    pub fn deposit_credited(&self, id: &(Hash, u32)) -> bool {
+    pub fn deposit_credited(&self, id: &(Hash512, u32)) -> bool {
         self.deposits.contains(id)
     }
 
@@ -778,7 +778,7 @@ impl L2State {
     fn apply_settle(
         &mut self,
         p: &SettlePayload,
-        txid: Hash,
+        txid: Hash512,
         height: u64,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
@@ -872,7 +872,7 @@ impl L2State {
         worker: Option<Address>,
         challenger: Option<Address>,
         o: SettlementOutcome,
-        txid: Hash,
+        txid: Hash512,
         height: u64,
     ) -> L2Result<u64> {
         // The submitter is always owed a refund on the paths that refund them
@@ -960,7 +960,7 @@ impl L2State {
             };
             if let Some(((submitter, worker, challenger), result, outcome)) = settled {
                 let bonus = self
-                    .apply_settlement(submitter, worker, challenger, outcome, [0u8; 32], height)
+                    .apply_settlement(submitter, worker, challenger, outcome, [0u8; 64], height)
                     .unwrap_or(0);
                 // An implicit settlement carries no aggregate (nothing was
                 // transacted), so its certificate is `WindowElapsed` (§17.5).
@@ -1237,14 +1237,14 @@ impl L2State {
             w.fixed(id).u32le(bytes.len() as u32).raw(&bytes);
         }
 
-        let mut applied: Vec<&Hash> = self.applied.iter().collect();
+        let mut applied: Vec<&Hash512> = self.applied.iter().collect();
         applied.sort();
         w.u64le(applied.len() as u64);
         for id in applied {
             w.fixed(id);
         }
 
-        let mut deposits: Vec<&(Hash, u32)> = self.deposits.iter().collect();
+        let mut deposits: Vec<&(Hash512, u32)> = self.deposits.iter().collect();
         deposits.sort_by_key(|d| d.0);
         w.u64le(deposits.len() as u64);
         for d in deposits {
@@ -1368,7 +1368,7 @@ impl L2State {
         )?;
         let mut applied = HashSet::with_capacity(n_applied);
         for _ in 0..n_applied {
-            let id: Hash = r.fixed().map_err(|_| codec_err("applied id"))?;
+            let id: Hash512 = r.fixed().map_err(|_| codec_err("applied id"))?;
             if !applied.insert(id) {
                 return Err(codec_err("duplicate applied id"));
             }
@@ -1383,7 +1383,7 @@ impl L2State {
         )?;
         let mut deposits = HashSet::with_capacity(n_deposits);
         for _ in 0..n_deposits {
-            let txid: Hash = r.fixed().map_err(|_| codec_err("deposit txid"))?;
+            let txid: Hash512 = r.fixed().map_err(|_| codec_err("deposit txid"))?;
             let idx = r.u32le().map_err(|_| codec_err("deposit index"))?;
             if !deposits.insert((txid, idx)) {
                 return Err(codec_err("duplicate deposit identity"));

@@ -15,7 +15,6 @@
 //! and that check is still owed.
 
 use jnt_core::chain::Chain;
-use jnt_core::hash::Hash;
 use jnt_core::params::NetworkParams;
 use jnt_core::tx::{Input, OutPoint, Output, Transaction};
 use jnt_net::frame::{read_frame, write_frame, MAX_FRAME_PAYLOAD};
@@ -58,7 +57,7 @@ fn checkpoint_vector() -> jnt_core::bls_checkpoint::Checkpoint {
     Checkpoint {
         payload: CheckpointPayload {
             height: 100,
-            block_hash: [0x21u8; 32],
+            block_hash: [0x21u8; 64],
             network_id: "jounit/mini".into(),
             epoch: 10,
         },
@@ -96,7 +95,7 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
             protocol_version: PROTOCOL_VERSION,
             services: 1,
             height: 42,
-            tip_hash: [0x5Au8; 32],
+            tip_hash: [0x5Au8; 64],
             user_agent: "/jnt-net:0.2".into(),
             nonce: 0x0123_4567_89AB_CDEF,
         };
@@ -115,11 +114,11 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
             Message::Inv(vec![
                 InvEntry {
                     kind: INV_TYPE_BLOCK,
-                    hash: [0x11u8; 32],
+                    hash: [0x11u8; 64],
                 },
                 InvEntry {
                     kind: INV_TYPE_BLOCK,
-                    hash: [0x22u8; 32],
+                    hash: [0x22u8; 64],
                 },
             ]),
         ),
@@ -127,14 +126,14 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
             "getdata",
             Message::GetData(vec![InvEntry {
                 kind: INV_TYPE_BLOCK,
-                hash: [0x33u8; 32],
+                hash: [0x33u8; 64],
             }]),
         ),
         (
             "getblocks",
             Message::GetBlocks {
-                locator: vec![[0x44u8; 32], [0x55u8; 32]],
-                stop: [0x66u8; 32],
+                locator: vec![[0x44u8; 64], [0x55u8; 64]],
+                stop: [0x66u8; 64],
             },
         ),
         (
@@ -159,7 +158,7 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
     // alone: both bundles are `count = 0`, and nothing here depends on a key.
     let wire_tx = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [0x77u8; 32],
+            txid: [0x77u8; 64],
             index: 1,
         })],
         vec![Output {
@@ -175,14 +174,14 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
         hex_of(
             &Message::Inv(vec![InvEntry {
                 kind: INV_TYPE_TX,
-                hash: [0x99u8; 32],
+                hash: [0x99u8; 64],
             }])
             .encode(),
         ),
     ));
-    // count(2 LE) + one entry(33). The count is 2 bytes, not 4 — see the
-    // independent check in `sim/net_reference.py`, which caught 4 + 1 + 32 here.
-    facts.push(("inv_tx_len".into(), 2 + 1 + 32));
+    // count(2 LE) + one entry(65). The count is 2 bytes, not 4 — see the
+    // independent check in `sim/net_reference.py`, which caught 4 + 1 + 64 here.
+    facts.push(("inv_tx_len".into(), 2 + 1 + 64));
 
     let tx_enc = Message::Tx(Box::new(wire_tx.clone())).encode();
     facts.push(("tx_len".into(), tx_enc.len() as u64));
@@ -257,7 +256,7 @@ fn build_vectors() -> (Vec<Item>, Vec<Fact>) {
     // A requester at genesis gets heights 1..=200, capped at max_inv_per_msg.
     let genesis_only = Chain::new(NetworkParams::mini()).unwrap();
     let loc = create_locator(&genesis_only);
-    let inv = find_fork_and_collect_inv(&chain, &loc, &Hash::default());
+    let inv = find_fork_and_collect_inv(&chain, &loc, &jnt_core::hash::ZERO_HASH512);
     facts.push(("inv_from_genesis_len".into(), inv.len() as u64));
     items.push(("inv_from_genesis_first".into(), hex_of(&inv[0].hash)));
 
@@ -363,8 +362,8 @@ fn net_vectors_are_stable() {
     // Independent restatements of the §13.5 layout, so a vector file that was
     // regenerated from wrong code cannot pass silently. VERSION is
     // magic(4) + id_len(1) + id + proto(4) + services(8) + height(8) +
-    // tip(32) + ua_len(1) + ua + nonce(8).
-    const FIXED: u64 = 4 + 1 + 4 + 8 + 8 + 32 + 1 + 8;
+    // tip(64) + ua_len(1) + ua + nonce(8).
+    const FIXED: u64 = 4 + 1 + 4 + 8 + 8 + 64 + 1 + 8;
     let fact = |name: &str| -> u64 {
         listed_facts
             .iter()
@@ -390,19 +389,19 @@ fn net_vectors_are_stable() {
 
     // §13.14. Restated from the field tables rather than read back from the
     // encoder: a transaction is version(4) + tx_type(1) + lock_time(8) +
-    // input_count(4) + one fixed-width unsigned input (32 + 4 + 1 + 1) +
+    // input_count(4) + one fixed-width unsigned input (64 + 4 + 1 + 1) +
     // output_count(4) + one output (28). An unsigned input carries two empty
     // bundles, one byte each — and that is the part most likely to drift, since
     // adding a length prefix to a bundle would not change any round trip.
     assert_eq!(
         fact("tx_len"),
-        4 + 1 + 8 + 4 + (32 + 4 + 1 + 1) + 4 + 28,
+        4 + 1 + 8 + 4 + (64 + 4 + 1 + 1) + 4 + 28,
         "TX payload layout (13.5, 3.1-3.3)"
     );
     assert_eq!(
         fact("inv_tx_len"),
-        2 + 33,
-        "an INV payload is count(2 LE) + kind(1) + hash(32)"
+        2 + 1 + 64,
+        "an INV payload is count(2 LE) + kind(1) + hash(64)"
     );
     // `kind = 0` for transactions is the field a v0.2 node uses to decide whether
     // an INV entry is a block or a transaction; changing it would make the two

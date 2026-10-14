@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
 use jnt_core::error::Error;
-use jnt_core::hash::Hash;
+use jnt_core::hash::{Hash512, ZERO_HASH512};
 
 use crate::msg::{InvEntry, INV_TYPE_BLOCK, MAX_INV_PER_MSG, MAX_LOCATOR_ENTRIES};
 
@@ -46,7 +46,7 @@ pub const MAX_PENDING_INV: usize = 4 * MAX_INV_PER_MSG;
 /// The genesis entry is reserved inside the cap: the spec bounds the locator at
 /// `max_locator_len`, so appending genesis on top of a full locator would send
 /// one more entry than the bound allows.
-pub fn create_locator(chain: &Chain) -> Vec<Hash> {
+pub fn create_locator(chain: &Chain) -> Vec<Hash512> {
     let mut locator = Vec::new();
     let tip_height = chain.height();
     locator.push(chain.tip_hash());
@@ -86,7 +86,7 @@ pub fn create_locator(chain: &Chain) -> Vec<Hash> {
 
 /// Find the highest common canonical block from the locator and return an INV
 /// batch of up to 500 subsequent blocks along the canonical chain. SPEC.md §13.7.
-pub fn find_fork_and_collect_inv(chain: &Chain, locator: &[Hash], stop: &Hash) -> Vec<InvEntry> {
+pub fn find_fork_and_collect_inv(chain: &Chain, locator: &[Hash512], stop: &Hash512) -> Vec<InvEntry> {
     let mut fork_height = 0;
     let mut found = false;
 
@@ -116,7 +116,7 @@ pub fn find_fork_and_collect_inv(chain: &Chain, locator: &[Hash], stop: &Hash) -
                 kind: INV_TYPE_BLOCK,
                 hash,
             });
-            if *stop != Hash::default() && hash == *stop {
+            if *stop != ZERO_HASH512 && hash == *stop {
                 break;
             }
         }
@@ -131,11 +131,11 @@ pub enum SyncResult {
     /// Block was accepted; `extended_tip` indicates if the canonical tip advanced.
     Accepted {
         extended_tip: bool,
-        new_tip: Hash,
-        orphans_resolved: Vec<Hash>,
+        new_tip: Hash512,
+        orphans_resolved: Vec<Hash512>,
     },
     /// Block had an unknown parent and was deposited in the orphan pool.
-    Orphan { missing_parent: Hash },
+    Orphan { missing_parent: Hash512 },
     /// Block is already known to the node.
     AlreadyKnown,
     /// Block failed consensus validation.
@@ -150,14 +150,14 @@ pub enum SyncResult {
 /// those blocks — a peer could stall a node's sync just by hanging up.
 pub struct SyncManager {
     /// Blocks indexed by missing parent hash: parent_hash -> Vec<Block>
-    orphans_by_parent: HashMap<Hash, Vec<Block>>,
+    orphans_by_parent: HashMap<Hash512, Vec<Block>>,
     /// Insertion order of `orphans_by_parent` keys, so eviction is oldest-first
     /// and deterministic rather than dependent on hash-map iteration order.
-    orphan_order: VecDeque<Hash>,
+    orphan_order: VecDeque<Hash512>,
     /// Total count of orphan blocks stored
     orphan_count: usize,
     /// Outstanding `GETDATA` requests: block hash -> peer we asked.
-    requested: HashMap<Hash, usize>,
+    requested: HashMap<Hash512, usize>,
     /// Advertised hashes not yet requested, with the peer that advertised them.
     pending: VecDeque<(usize, InvEntry)>,
 }
@@ -225,7 +225,7 @@ impl SyncManager {
         }
 
         let mut taken: Vec<InvEntry> = Vec::with_capacity(want);
-        let mut taken_hashes: HashSet<Hash> = HashSet::with_capacity(want);
+        let mut taken_hashes: HashSet<Hash512> = HashSet::with_capacity(want);
         for (pid, e) in self.pending.iter() {
             if taken.len() >= want {
                 break;
@@ -317,7 +317,7 @@ impl SyncManager {
         }
     }
 
-    fn add_orphan(&mut self, parent: Hash, block: Block) {
+    fn add_orphan(&mut self, parent: Hash512, block: Block) {
         while self.orphan_count >= ORPHAN_POOL_MAX {
             // Evict the oldest parent queue. Evicting an arbitrary hash-map key
             // made which orphans survived depend on iteration order, so a node's
@@ -342,7 +342,7 @@ impl SyncManager {
         self.orphan_count += 1;
     }
 
-    fn resolve_orphans(&mut self, parent: Hash, chain: &mut Chain, resolved: &mut Vec<Hash>) {
+    fn resolve_orphans(&mut self, parent: Hash512, chain: &mut Chain, resolved: &mut Vec<Hash512>) {
         if let Some(children) = self.orphans_by_parent.remove(&parent) {
             self.orphan_count = self.orphan_count.saturating_sub(children.len());
             for child in children {
@@ -437,7 +437,7 @@ mod tests {
             let entries: Vec<InvEntry> = (0..MAX_INV_PER_MSG)
                 .map(|i| InvEntry {
                     kind: INV_TYPE_BLOCK,
-                    hash: [round.wrapping_mul(31).wrapping_add(i as u8); 32],
+                    hash: [round.wrapping_mul(31).wrapping_add(i as u8); 64],
                 })
                 .collect();
             syncer.handle_inv(1, &entries, &sink);

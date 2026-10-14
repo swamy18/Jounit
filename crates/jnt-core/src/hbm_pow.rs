@@ -264,7 +264,7 @@ mod tests {
         let cfg = test_cfg();
         let mh = memory_hash(&block.header, cfg.lanes, cfg.accesses);
         let bh = block.block_hash();
-        assert_ne!(mh, bh, "HBM hash and block hash must differ");
+        assert_ne!(mh, bh[..32], "HBM hash and block hash must differ");
     }
 
     #[test]

@@ -34,7 +34,7 @@ use jnt_core::agent::{
 use jnt_core::block::GENESIS_TIMESTAMP_MS;
 use jnt_core::chain::Chain;
 use jnt_core::compute_ir::{ComputeBackend, ComputeTask};
-use jnt_core::hash::{address_to_hex, hash_to_hex};
+use jnt_core::hash::{address_to_hex, hash_to_hex, hash512_to_hex};
 use jnt_core::l2::{Auth, L2Payload, L2Transaction, PostTaskPayload};
 use jnt_core::params::NetworkParams;
 use jnt_core::payment::{build_signed_payment, MachinePayment};
@@ -197,7 +197,7 @@ fn health_status_fees_and_finality_answer() {
 
     let (s, latest) = get(&node, "/v1/block/latest");
     assert_eq!(s, 200);
-    assert!(latest["hash"].as_str().unwrap().len() == 64);
+    assert!(latest["hash"].as_str().unwrap().len() == 128);
 
     let (s, pool) = get(&node, "/v1/mempool");
     assert_eq!(s, 200);
@@ -302,12 +302,13 @@ fn an_unknown_balance_address_reads_zero_and_a_malformed_one_is_a_client_error()
 fn unknown_hashes_are_404_never_500() {
     let node = start();
     let unknown = hash_to_hex(&[0xABu8; 32]);
+    let unknown512 = hash512_to_hex(&[0xABu8; 64]);
 
-    let (s, body) = get(&node, &format!("/v1/tx/{unknown}"));
+    let (s, body) = get(&node, &format!("/v1/tx/{unknown512}"));
     assert_eq!(s, 404);
     assert_eq!(body["error"], "not_found");
 
-    let (s, _) = get(&node, &format!("/v1/block/{unknown}"));
+    let (s, _) = get(&node, &format!("/v1/block/{unknown512}"));
     assert_eq!(s, 404);
 
     let (s, _) = get(&node, &format!("/v1/payment/{unknown}"));
@@ -425,7 +426,7 @@ fn a_local_transaction_is_built_signed_broadcast_then_looked_up() {
     );
     assert_eq!(s, 200, "broadcast failed: {body}");
     let txid = body["tx_hash"].as_str().unwrap().to_string();
-    assert_eq!(txid, hash_to_hex(&tx.txid()));
+    assert_eq!(txid, hash512_to_hex(&tx.txid()));
 
     // It is pending, and a re-broadcast of the same bytes is idempotent.
     let (s, body) = get(&node, &format!("/v1/tx/{txid}"));
@@ -609,7 +610,7 @@ fn run_bridge(
         result_hash: Some(result_hash_of(b"model-output-v1")),
         anchor: Some(ReceiptAnchor {
             height: 120,
-            block_hash: [7u8; 32],
+            block_hash: [7u8; 64],
         }),
         keys: Default::default(),
         sigs: Default::default(),

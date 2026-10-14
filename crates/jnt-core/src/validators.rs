@@ -772,7 +772,7 @@ mod tests {
         use crate::bls::SecretKey as S;
         let payload = crate::bls_checkpoint::CheckpointPayload {
             height,
-            block_hash: crate::hash::sha256(&[b"block", &height.to_le_bytes()]),
+            block_hash: crate::hash::sha512(&[b"block", &height.to_le_bytes()]),
             network_id: "jounit/mini".into(),
             epoch,
         };

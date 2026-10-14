@@ -92,8 +92,10 @@ impl Writer {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    /// Write a fixed 32-byte hash.
-    pub fn write_bytes(&mut self, v: &[u8; 32]) {
+    /// Write a fixed-width hash. Generic over the width so the 256-bit and
+    /// 512-bit identities both go through one path rather than the wider one
+    /// needing a second method that could drift.
+    pub fn write_bytes<const N: usize>(&mut self, v: &[u8; N]) {
         self.buf.extend_from_slice(v);
     }
 

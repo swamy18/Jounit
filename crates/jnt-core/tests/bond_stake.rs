@@ -166,13 +166,13 @@ fn lone_checkpoint(sk: &SecretKey, payload: CheckpointPayload) -> Checkpoint {
 fn conflicting_pair(sk: &SecretKey, height: u64, network_id: &str) -> (Checkpoint, Checkpoint) {
     let a = CheckpointPayload {
         height,
-        block_hash: [0xAAu8; 32],
+        block_hash: [0xAAu8; 64],
         network_id: network_id.to_string(),
         epoch: 0,
     };
     let b = CheckpointPayload {
         height,
-        block_hash: [0xBBu8; 32],
+        block_hash: [0xBBu8; 64],
         network_id: network_id.to_string(),
         epoch: 0,
     };
@@ -208,7 +208,7 @@ fn slash_tx(
     tx
 }
 
-fn unbond_tx(chain: &Chain, w: &Wallet, ops: &[OutPoint], bond_id: [u8; 32]) -> Transaction {
+fn unbond_tx(chain: &Chain, w: &Wallet, ops: &[OutPoint], bond_id: jnt_core::hash::Hash512) -> Transaction {
     let total = utxo_total(chain, ops);
     let fee = fee_for(chain, ops.len(), 1);
     let to = w.address().unwrap();
@@ -421,7 +421,7 @@ fn unknown_tx_type_is_refused_not_interpreted() {
     let mut utxo = jnt_core::ledger::UtxoSet::new();
     let w = wallet(1);
     let op = OutPoint {
-        txid: [4u8; 32],
+        txid: [4u8; 64],
         index: 0,
     };
     utxo.insert(
@@ -565,7 +565,7 @@ fn unbond_refusals_name_their_rule() {
     submit_block(&mut chain, bonder, vec![bond]).unwrap();
 
     // Unknown bond.
-    let ghost = unbond_tx(&chain, &w, &ops[67..68], [0xFFu8; 32]);
+    let ghost = unbond_tx(&chain, &w, &ops[67..68], [0xFFu8; 64]);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![ghost]).unwrap_err(),
         Error::StakeInvalid("unbond of unknown bond")

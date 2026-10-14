@@ -16,7 +16,7 @@ use jnt_core::bls_checkpoint::{
     BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload, ValidatorSet,
 };
 use jnt_core::chain::Chain;
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash512};
 use jnt_core::params::{testnet_committee_secrets, NetworkParams, SAT_PER_JNT};
 use jnt_core::tx::{OutPoint, Output};
 use jnt_core::wallet::Wallet;
@@ -102,7 +102,7 @@ fn deposit_block(chain: &mut Chain, miner: Address, from: &Wallet) -> u64 {
 /// Sign a checkpoint over the chain's canonical block at `height` with the
 /// declared testnet committee (quorum 3 of 4) and apply it.
 fn checkpoint(chain: &mut Chain, height: u64) {
-    let block_hash: Hash = chain.block_hash_at(height).unwrap();
+    let block_hash: Hash512 = chain.block_hash_at(height).unwrap();
     let mut pairs: Vec<(SecretKey, BlsPublicKey)> = testnet_committee_secrets()
         .into_iter()
         .map(|sk| {

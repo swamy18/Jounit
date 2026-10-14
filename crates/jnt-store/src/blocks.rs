@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use jnt_core::block::Block;
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::params::NetworkParams;
 
 use crate::log::{RecordLog, RecordRef};
@@ -38,14 +38,14 @@ pub struct BlockStore {
     meta_file: MetaFile,
     meta: Meta,
     /// Block hash → record ref. Rebuilt from the log at open.
-    by_hash: HashMap<Hash, RecordRef>,
+    by_hash: HashMap<Hash512, RecordRef>,
     /// Canonical height → block hash. Rebuilt from the tip at open; extended by
     /// `set_tip`.
-    by_height: HashMap<u64, Hash>,
+    by_height: HashMap<u64, Hash512>,
     /// Blocks whose parent is not in the store, waiting for it. Bounded by the
     /// caller (the sync layer already bounds unconnected-block queues); the
     /// store itself never evicts a block it accepted.
-    orphans: Vec<Hash>,
+    orphans: Vec<Hash512>,
 }
 
 /// What appending a block did.
@@ -115,7 +115,7 @@ impl BlockStore {
         // block that no longer decodes is damage, not a crash: refuse, because
         // silently holding less than it did is the failure this store exists to
         // make impossible.
-        let mut by_hash: HashMap<Hash, RecordRef> = HashMap::with_capacity(log.len());
+        let mut by_hash: HashMap<Hash512, RecordRef> = HashMap::with_capacity(log.len());
         for r in log.refs().to_vec() {
             let bytes = log.read(r)?;
             if payload_is_utxo(&bytes) {
@@ -158,7 +158,7 @@ impl BlockStore {
         let by_height = rebuild_height_index(&mut log, &log_path, &by_hash, &meta)?;
         // A side branch that forked at genesis has no parent in common with the
         // canonical walk; anything whose parent is unknown is an orphan.
-        let orphans: Vec<Hash> = by_hash
+        let orphans: Vec<Hash512> = by_hash
             .keys()
             .filter(|h| !by_height.values().any(|v| v == *h) && **h != meta.genesis)
             .copied()
@@ -191,13 +191,13 @@ impl BlockStore {
     }
 
     /// Current canonical tip hash and height.
-    pub fn tip(&self) -> (Hash, u64) {
+    pub fn tip(&self) -> (Hash512, u64) {
         (self.meta.tip, self.meta.height)
     }
 
     /// The persisted binding-finalized point, or `None` when no checkpoint has
     /// ever finalized (Decision 12).
-    pub fn finalized(&self) -> Option<(u64, Hash)> {
+    pub fn finalized(&self) -> Option<(u64, Hash512)> {
         if self.meta.finalized_height == 0 {
             None
         } else {
@@ -212,7 +212,7 @@ impl BlockStore {
     /// must hash to `hash`. A finalized height can never move backwards or to a
     /// different hash — that would "un-finalize" history the node already
     /// committed to, which is precisely the transition this exists to prevent.
-    pub fn set_finalized(&mut self, height: u64, hash: Hash) -> Result<(), StoreError> {
+    pub fn set_finalized(&mut self, height: u64, hash: Hash512) -> Result<(), StoreError> {
         if height == 0 || height > self.meta.height {
             return Err(StoreError::BadMeta {
                 detail: "finalized height must be within the stored chain".into(),
@@ -243,7 +243,7 @@ impl BlockStore {
     ///
     /// Reads are bounded by the record's own length, which was itself bounded at
     /// append time; no lookup can allocate beyond what this node once stored.
-    pub fn block_by_hash(&mut self, h: &Hash) -> Result<Option<Block>, StoreError> {
+    pub fn block_by_hash(&mut self, h: &Hash512) -> Result<Option<Block>, StoreError> {
         let Some(&r) = self.by_hash.get(h) else {
             return Ok(None);
         };
@@ -264,7 +264,7 @@ impl BlockStore {
     }
 
     /// The hash recorded for a canonical height, without decoding the block.
-    pub fn hash_at_height(&self, height: u64) -> Option<Hash> {
+    pub fn hash_at_height(&self, height: u64) -> Option<Hash512> {
         self.by_height.get(&height).copied()
     }
 
@@ -303,7 +303,7 @@ impl BlockStore {
     /// metadata is left untouched, so a failed reorg can never leave the store
     /// pointing at a chain it cannot prove. Only after the walk succeeds is the
     /// metadata replaced atomically.
-    pub fn set_tip(&mut self, new_tip: &Hash) -> Result<(), StoreError> {
+    pub fn set_tip(&mut self, new_tip: &Hash512) -> Result<(), StoreError> {
         if *new_tip == self.meta.genesis {
             // Resetting to genesis is a legal decision the node can make after
             // a total invalidation; it needs no walk.
@@ -315,7 +315,7 @@ impl BlockStore {
         }
 
         // Walk the candidate's ancestry to genesis, collecting the heights.
-        let mut chain: Vec<(u64, Hash)> = Vec::new();
+        let mut chain: Vec<(u64, Hash512)> = Vec::new();
         let mut cur = *new_tip;
         let mut at_tip = true;
         loop {
@@ -368,7 +368,7 @@ impl BlockStore {
     }
 
     /// Blocks accepted whose parent was unknown at the time.
-    pub fn orphans(&self) -> &[Hash] {
+    pub fn orphans(&self) -> &[Hash512] {
         &self.orphans
     }
 
@@ -376,7 +376,7 @@ impl BlockStore {
     ///
     /// The block itself stays in the log: storage is append-only, and the node
     /// may still connect it later.
-    pub fn resolve_orphan(&mut self, h: &Hash) {
+    pub fn resolve_orphan(&mut self, h: &Hash512) {
         self.orphans.retain(|x| x != h);
     }
 
@@ -421,7 +421,7 @@ impl BlockStore {
     }
 
     /// Every block hash in the store, in append order.
-    pub fn all_hashes(&self) -> Vec<Hash> {
+    pub fn all_hashes(&self) -> Vec<Hash512> {
         self.by_hash.keys().copied().collect()
     }
 }
@@ -442,9 +442,9 @@ fn payload_is_utxo(bytes: &[u8]) -> bool {
 fn rebuild_height_index(
     log: &mut RecordLog,
     log_path: &Path,
-    by_hash: &HashMap<Hash, RecordRef>,
+    by_hash: &HashMap<Hash512, RecordRef>,
     meta: &Meta,
-) -> Result<HashMap<u64, Hash>, StoreError> {
+) -> Result<HashMap<u64, Hash512>, StoreError> {
     let mut by_height = HashMap::new();
     if meta.height == 0 {
         return Ok(by_height);
@@ -486,7 +486,7 @@ fn rebuild_height_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jnt_core::hash::Hash;
+    use jnt_core::hash::Hash512;
     use std::path::PathBuf;
 
     fn tmp_dir(name: &str) -> PathBuf {
@@ -512,7 +512,7 @@ mod tests {
 
     /// Build a small honest chain on top of genesis, mining each block so the
     /// hashes and signatures are the real thing the store will see in prod.
-    fn mined_chain(n: u64) -> Vec<(Hash, Vec<u8>)> {
+    fn mined_chain(n: u64) -> Vec<(Hash512, Vec<u8>)> {
         use jnt_core::chain::Chain;
         let mut chain = Chain::new(mini_params()).unwrap();
         let mut blocks = Vec::new();
@@ -661,7 +661,7 @@ mod tests {
         // store: a block for a chain the node has not seen the start of.
         let mut fake = Block::deserialize(&blocks[0].1).unwrap();
         fake.header.height = 99;
-        fake.header.prev_hash = [0xEE; 32];
+        fake.header.prev_hash = [0xEE; 64];
         let (mut store, _) = BlockStore::open(&dir, &params).unwrap();
         let out = store.append_block(&fake).unwrap();
         assert_eq!(out, AppendOutcome::Orphaned);
@@ -687,7 +687,7 @@ mod tests {
         let before = store.tip();
 
         // A hash that is not in the store at all.
-        let ghost = [0x5A; 32];
+        let ghost = [0x5A; 64];
         assert!(matches!(
             store.set_tip(&ghost),
             Err(StoreError::MissingBlock { .. })
@@ -698,7 +698,7 @@ mod tests {
         // height-99 orphan from the other test's trick).
         let mut fake = Block::deserialize(&blocks[1].1).unwrap();
         fake.header.height = 99;
-        fake.header.prev_hash = [0xEE; 32];
+        fake.header.prev_hash = [0xEE; 64];
         let fh = fake.block_hash();
         store.append_block(&fake).unwrap();
         assert!(matches!(

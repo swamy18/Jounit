@@ -267,6 +267,17 @@ pub struct NetworkParams {
     /// `1` (active from the first block, so exits are exercisable in tests);
     /// `mainnet` carries `0` until the launch decision sets a height.
     pub exit_activation_height: u64,
+    /// Height at which the network begins enforcing post-quantum (ML-DSA-65,
+    /// scheme 3) spends. `0` means never: the rule is inert and every profile
+    /// is byte-identical to the current consensus, so flipping it is the single
+    /// switch that activates the migration.
+    ///
+    /// Scope is age-gated, not blanket: once active, only outputs created at or
+    /// after this height must be spent with a bundle carrying scheme 3. Outputs
+    /// created before it (including plain ECDSA ones) keep spending under their
+    /// original bundle, so history is never invalidated — a wallet can move its
+    /// old funds exactly as before, and only newly created outputs demand PQ.
+    pub pq_activation_height: u64,
 }
 
 impl NetworkParams {
@@ -392,6 +403,9 @@ impl NetworkParams {
             // Exits never activate on mainnet until the launch decision sets a
             // height (approved P1): `0` refuses queueing outright.
             exit_activation_height: 0,
+            // PQ spend enforcement is off on mainnet until the post-quantum
+            // launch decision sets a height.
+            pq_activation_height: 0,
         }
     }
 
@@ -470,6 +484,9 @@ impl NetworkParams {
             // Exits are active from the first block on mini, so the queue →
             // mature → release loop is exercisable in tests.
             exit_activation_height: 1,
+            // PQ enforcement off on mini; the migration tests build their own
+            // profile with a nonzero activation height.
+            pq_activation_height: 0,
         }
     }
 
@@ -533,6 +550,8 @@ impl NetworkParams {
             finality_activation_height: 20,
             // Exits are active from the first block on testnet, like mini.
             exit_activation_height: 1,
+            // PQ enforcement off on testnet too; activated by governance.
+            pq_activation_height: 0,
         }
     }
 

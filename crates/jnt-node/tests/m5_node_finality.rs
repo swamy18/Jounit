@@ -18,7 +18,7 @@ use jnt_core::bls_checkpoint::{
 };
 use jnt_core::chain::Chain;
 use jnt_core::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{
     ClaimTaskPayload, L2Payload, L2Transaction, PostTaskPayload, SettlePayload,
     SubmitResultPayload, Verdict,
@@ -392,7 +392,7 @@ fn testnet_deposit_block(chain: &mut Chain, from: &Wallet) -> u64 {
 }
 
 fn checkpoint_at(chain: &mut Chain, height: u64) {
-    let block_hash: Hash = chain.block_hash_at(height).unwrap();
+    let block_hash: Hash512 = chain.block_hash_at(height).unwrap();
     let pairs = declared_committee(chain.params());
     let p = CheckpointPayload {
         height,

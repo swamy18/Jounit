@@ -11,7 +11,7 @@ use jnt_core::bls::RealBls;
 use jnt_core::bls_checkpoint::{BlsSignature, Checkpoint, CheckpointPayload};
 
 use jnt_core::bond::BondLedger;
-use jnt_core::hash::{sha256, Hash};
+use jnt_core::hash::{sha256, Hash512};
 use jnt_core::ledger::UtxoSet;
 use jnt_core::mempool::Mempool;
 use jnt_core::params::NetworkParams;
@@ -76,7 +76,7 @@ fn tx_decode_never_panics_on_adversarial_bytes() {
 fn tx_decode_rejects_every_truncation_of_a_valid_tx() {
     let mut tx = Transaction::standard(
         vec![Input::unsigned(&OutPoint {
-            txid: [5u8; 32],
+            txid: [5u8; 64],
             index: 0,
         })],
         vec![Output {
@@ -192,7 +192,7 @@ fn block_decode_survives_bitflips_of_a_valid_block() {
 
 fn funding_utxo() -> UtxoSet {
     let mut utxo = UtxoSet::default();
-    let funding_txid: Hash = [7u8; 32];
+    let funding_txid: Hash512 = [7u8; 64];
     utxo.insert(
         OutPoint {
             txid: funding_txid,
@@ -223,7 +223,7 @@ fn funding_utxo() -> UtxoSet {
 }
 
 fn spend_tx(n_inputs: usize, outputs: Vec<Output>) -> Transaction {
-    let funding_txid: Hash = [7u8; 32];
+    let funding_txid: Hash512 = [7u8; 64];
     let mut tx = Transaction::standard(
         (0..n_inputs)
             .map(|i| {
@@ -381,7 +381,7 @@ fn candidate_set(n: u8, epoch: u64) -> jnt_core::validators::EpochSet {
 fn payload_for(height: u64, epoch: u64) -> CheckpointPayload {
     CheckpointPayload {
         height,
-        block_hash: sha256(&[b"inv", &height.to_le_bytes()]),
+        block_hash: jnt_core::hash::sha512(&[b"inv", &height.to_le_bytes()]),
         network_id: "jounit/mini".into(),
         epoch,
     }

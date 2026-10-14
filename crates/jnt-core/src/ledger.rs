@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::error::{Error, Result};
-use crate::hash::{Address, Hash};
+use crate::hash::{Address, Hash512};
 use crate::params::NetworkParams;
 use crate::tx::{OutPoint, Output, Transaction, TX_BOND, TX_SLASH, TX_STANDARD, TX_UNBOND};
 
@@ -17,7 +17,7 @@ pub struct Utxo {
     pub height: u64,
 }
 
-type Key = (Hash, u32);
+type Key = (Hash512, u32);
 
 #[derive(Debug, Clone, Default)]
 pub struct UtxoSet {
@@ -224,6 +224,27 @@ pub fn check_tx(
         if held.out.value == 0 {
             return Err(Error::BadFee("spending a zero-value output"));
         }
+        // Post-quantum migration rule (age-gated, backward-compatible): once
+        // `pq_activation_height` is set, inputs that spend outputs created at or
+        // after that height must carry an ML-DSA-65 (scheme 3) signature
+        // component. Outputs created before it — including plain ECDSA ones —
+        // are exempt, so the rule never strands history: a wallet can still move
+        // its old funds under their original bundle, and only future outputs are
+        // tightened to demand a post-quantum component. `require_hybrid`'s
+        // `>= 2 components` test would let a Schnorr-only bundle through, so the
+        // scheme-3 membership check is what makes the requirement post-quantum,
+        // not merely multi-scheme. The rule is inert when the height is 0.
+        let pq_epoch = params.pq_activation_height;
+        if pq_epoch != 0
+            && height >= pq_epoch
+            && held.height >= pq_epoch
+            && !input
+                .sigs
+                .schemes()
+                .contains(&crate::sig::SCHEME_ML_DSA_65)
+        {
+            return Err(Error::PostQuantumRequired);
+        }
         tx.verify_input(k, &held.out.address, require_hybrid(params))?;
         value_in = value_in
             .checked_add(held.out.value)
@@ -269,7 +290,7 @@ mod tests {
     use super::*;
     use crate::params::NetworkParams;
     use crate::tx::{Input, TX_COINBASE};
-    use crate::wallet::Wallet;
+    use crate::wallet::{SignMode, Wallet};
 
     fn tagged(value: u64, tag: u8) -> Output {
         Output {
@@ -302,7 +323,7 @@ mod tests {
     fn funded_set(wallet: &Wallet) -> (UtxoSet, OutPoint) {
         let mut s = UtxoSet::new();
         let op = OutPoint {
-            txid: [4u8; 32],
+            txid: [4u8; 64],
             index: 0,
         };
         s.insert(
@@ -357,7 +378,7 @@ mod tests {
         let (mut s, op) = funded_set(&w);
         s.insert(
             OutPoint {
-                txid: [5u8; 32],
+                txid: [5u8; 64],
                 index: 0,
             },
             Utxo {
@@ -385,7 +406,7 @@ mod tests {
         let dest = [9u8; 20];
         let mut s = UtxoSet::new();
         let op = OutPoint {
-            txid: [6u8; 32],
+            txid: [6u8; 64],
             index: 0,
         };
         s.insert(
@@ -421,7 +442,7 @@ mod tests {
         let dest = [9u8; 20];
         let mut s = UtxoSet::new();
         let op = OutPoint {
-            txid: [7u8; 32],
+            txid: [7u8; 64],
             index: 0,
         };
         s.insert(
@@ -484,7 +505,7 @@ mod tests {
     #[test]
     fn coinbase_is_not_a_normal_tx() {
         let s = UtxoSet::new();
-        let cb = Transaction::coinbase([1u8; 32], 1, tagged(1, 0));
+        let cb = Transaction::coinbase([1u8; 64], 1, tagged(1, 0));
         assert!(cb.tx_type == TX_COINBASE);
         assert!(check_tx(&s, &cb, 1, &NetworkParams::mini(), 0, 10).is_err());
     }
@@ -565,7 +586,7 @@ mod tests {
         for i in 0..4u8 {
             s.insert(
                 OutPoint {
-                    txid: [i; 32],
+                    txid: [i; 64],
                     index: 0,
                 },
                 Utxo {
@@ -606,5 +627,99 @@ mod tests {
             s.apply_tx(&tx, 10).unwrap();
             assert!(s.total_value() <= FUNDED, "set grew beyond the funding");
         }
+    }
+
+    // --- Post-quantum migration rule (Step 4, backward-compatible) -------------
+    //
+    // `pq_activation_height` is off (0) on every shipped profile, so these are
+    // the only tests that exercise the rule: a hand-built profile with a
+    // nonzero activation height.
+
+    fn pq_params(at: u64) -> NetworkParams {
+        let mut p = NetworkParams::mini();
+        p.pq_activation_height = at;
+        p
+    }
+
+    fn utxo_at(op: OutPoint, addr: [u8; 20], created: u64) -> UtxoSet {
+        let mut s = UtxoSet::new();
+        s.insert(
+            op,
+            Utxo {
+                out: Output {
+                    value: FUNDED,
+                    address: addr,
+                },
+                height: created,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn pq_activation_rejects_new_outputs_spent_without_scheme3() {
+        // Activate PQ spends at height 5.
+        let p = pq_params(5);
+        let w = Wallet::from_private_key_bytes(&[7u8; 32], "pq").unwrap();
+
+        // A post-activation output (created at height 6) at the wallet's hybrid
+        // address. A hybrid bundle matches that address and would otherwise
+        // verify, so rejecting it isolates the PQ rule from the address check.
+        let op = OutPoint {
+            txid: [2u8; 64],
+            index: 0,
+        };
+        let s = utxo_at(op, w.address().unwrap(), 6);
+        let mut tx = Transaction::standard(
+            vec![Input::unsigned(&op)],
+            vec![Output {
+                value: FUNDED - 100,
+                address: [9u8; 20],
+            }],
+        );
+        w.sign(&mut tx).unwrap();
+        assert!(matches!(
+            check_tx(&s, &tx, 20, &p, 0, 10),
+            Err(Error::PostQuantumRequired)
+        ));
+
+        // The rule is satisfiable: a PQ bundle (scheme 3) is accepted for the
+        // same output, which must be at the PQ address to match.
+        let s_pq = utxo_at(op, w.pq_address().unwrap(), 6);
+        let mut tx2 = Transaction::standard(
+            vec![Input::unsigned(&op)],
+            vec![Output {
+                value: FUNDED - 100,
+                address: [9u8; 20],
+            }],
+        );
+        w.sign_mode(&mut tx2, SignMode::PostQuantum).unwrap();
+        assert!(check_tx(&s_pq, &tx2, 20, &p, 0, 10).is_ok());
+    }
+
+    #[test]
+    fn pq_activation_leaves_legacy_outputs_spendable() {
+        let p = pq_params(5);
+        let w = Wallet::from_private_key_bytes(&[7u8; 32], "pq-legacy").unwrap();
+
+        // Legacy output (created at height 0, before activation). Even after
+        // activation a hybrid bundle must still move it: history is not stranded.
+        let op = OutPoint {
+            txid: [3u8; 64],
+            index: 0,
+        };
+        let s = utxo_at(op, w.address().unwrap(), 0);
+        let tx = signed_spend(&w, op, FUNDED - 100, [8u8; 20]);
+        assert!(check_tx(&s, &tx, 11, &p, 0, 10).is_ok());
+    }
+
+    #[test]
+    fn pq_activation_off_by_default_rejects_nothing() {
+        // Default profiles ship with pq_activation_height == 0: the rule is
+        // inert, so a plain hybrid spend passes exactly as before.
+        let w = Wallet::from_private_key_bytes(&[7u8; 32], "pq-off").unwrap();
+        let (s, op) = funded_set(&w);
+        let tx = signed_spend(&w, op, FUNDED - 100, [8u8; 20]);
+        assert!(check_tx(&s, &tx, 11, &NetworkParams::mini(), 0, 10).is_ok());
     }
 }

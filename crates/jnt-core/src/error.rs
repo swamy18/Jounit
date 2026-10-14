@@ -69,6 +69,9 @@ pub enum Error {
     MissingKeyForScheme(u8),
     /// the input carries a single-scheme bundle where a hybrid is required
     HybridRequired,
+    /// the input spends a post-quantum output (created after scheme-3
+    /// activation) without an ML-DSA-65 component
+    PostQuantumRequired,
     /// pubkey is not a valid compressed secp256k1 point
     BadPubkey,
     /// address derived from the input pubkey does not own the spent output
@@ -168,6 +171,9 @@ impl fmt::Display for Error {
             ),
             Error::HybridRequired => {
                 write!(f, "a hybrid signature bundle is required here")
+            }
+            Error::PostQuantumRequired => {
+                write!(f, "a post-quantum (ML-DSA-65) signature component is required here")
             }
             Error::BadPubkey => write!(f, "invalid compressed secp256k1 pubkey"),
             Error::WrongAddress => write!(f, "pubkey does not own the spent output"),

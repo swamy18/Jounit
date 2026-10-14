@@ -54,10 +54,8 @@
 
 use jnt_core::bls_checkpoint::{BlsVerifier, ValidatorSet};
 use jnt_core::chain::Chain;
-use jnt_core::hash::Address;
+use jnt_core::hash::{Address, Hash512};
 use jnt_core::state_root::InclusionProof;
-use jnt_core::Hash;
-
 use crate::deposits::{
     scan_block, DepositIgnoreReason, DepositParams, DetectedDeposit, IgnoredDeposit, PendingDeposit,
 };
@@ -74,7 +72,7 @@ pub struct SkippedL2 {
     /// Height of the block that carried it.
     pub height: u64,
     /// Canonical transaction id, so the payload can be named without holding it.
-    pub txid: Hash,
+    pub txid: Hash512,
     /// The named reason it did not apply.
     pub error: L2Error,
 }

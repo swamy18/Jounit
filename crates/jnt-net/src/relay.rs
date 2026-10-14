@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::mempool::{Mempool, MempoolEntry};
 use jnt_core::tx::Transaction;
 
@@ -86,15 +86,15 @@ pub struct RelayManager {
     /// that stalled block sync before session 5 fixed it — and timestamped so a
     /// peer that stays connected but never answers cannot hold them forever
     /// either (see `TX_REQUEST_TIMEOUT_MS`).
-    requested: HashMap<Hash, Requested>,
+    requested: HashMap<Hash512, Requested>,
     /// Advertised but not yet requested, oldest first.
-    pending: VecDeque<(Hash, usize)>,
+    pending: VecDeque<(Hash512, usize)>,
     /// Recently seen txids (pooled, relayed, or refused) for loop suppression.
-    known: HashSet<Hash>,
+    known: HashSet<Hash512>,
     /// Insertion order for `known`, so eviction is oldest-first rather than
     /// arbitrary. `HashSet` iteration order is not stable and using it would make
     /// which txid survives depend on hashing.
-    known_order: VecDeque<Hash>,
+    known_order: VecDeque<Hash512>,
     /// Per-peer rate windows. Keyed by peer id, which is bounded by `max_peers`.
     per_peer: HashMap<usize, PeerRate>,
     /// Transactions this node admitted from a peer, and refused.
@@ -148,12 +148,12 @@ impl RelayManager {
 
     /// Whether this txid has been seen recently. Approximate by design — the
     /// known set evicts (see the module note).
-    pub fn is_known(&self, txid: &Hash) -> bool {
+    pub fn is_known(&self, txid: &Hash512) -> bool {
         self.known.contains(txid)
     }
 
     /// Remember a txid so it is not announced or requested again.
-    pub fn mark_known(&mut self, txid: Hash) {
+    pub fn mark_known(&mut self, txid: Hash512) {
         if self.known.insert(txid) {
             self.known_order.push_back(txid);
             while self.known_order.len() > MAX_RELAY_KNOWN {
@@ -264,7 +264,7 @@ impl RelayManager {
     /// Release the request slot for a txid we have now received, whether or not
     /// the pool accepted it. A refusal is still an answer, and holding the slot
     /// would let a peer stall relay indefinitely by sending junk.
-    pub fn release(&mut self, txid: &Hash) {
+    pub fn release(&mut self, txid: &Hash512) {
         self.requested.remove(txid);
     }
 
@@ -343,14 +343,14 @@ mod tests {
     fn tx_entry(byte: u8) -> InvEntry {
         InvEntry {
             kind: INV_TYPE_TX,
-            hash: [byte; 32],
+            hash: [byte; 64],
         }
     }
 
     fn block_entry(byte: u8) -> InvEntry {
         InvEntry {
             kind: crate::msg::INV_TYPE_BLOCK,
-            hash: [byte; 32],
+            hash: [byte; 64],
         }
     }
 
@@ -404,7 +404,7 @@ mod tests {
     fn the_known_set_evicts_oldest_first_and_stays_bounded() {
         let mut relay = RelayManager::new();
         for i in 0..(MAX_RELAY_KNOWN + 10) as u32 {
-            let mut h = [0u8; 32];
+            let mut h = [0u8; 64];
             h[..4].copy_from_slice(&i.to_le_bytes());
             relay.mark_known(h);
         }
@@ -414,13 +414,13 @@ mod tests {
             "the known set is not bounded"
         );
         // The oldest are gone, the newest are present.
-        let mut oldest = [0u8; 32];
+        let mut oldest = [0u8; 64];
         oldest[..4].copy_from_slice(&0u32.to_le_bytes());
         assert!(
             !relay.is_known(&oldest),
             "oldest-first eviction did not evict the oldest"
         );
-        let mut newest = [0u8; 32];
+        let mut newest = [0u8; 64];
         newest[..4].copy_from_slice(&(MAX_RELAY_KNOWN as u32 + 9).to_le_bytes());
         assert!(relay.is_known(&newest));
     }
@@ -462,7 +462,7 @@ mod tests {
         use jnt_core::tx::{Input, OutPoint, Output, Transaction};
         let tx = Transaction::standard(
             vec![Input::unsigned(&OutPoint {
-                txid: [byte; 32],
+                txid: [byte; 64],
                 index: 0,
             })],
             (0..outputs)
@@ -566,7 +566,7 @@ mod tests {
             1,
             "an unfulfilled request stalled relay for every other peer"
         );
-        assert_eq!(out[0].hash, [200u8; 32]);
+        assert_eq!(out[0].hash, [200u8; 64]);
     }
 
     /// A request that is answered in time is not expired, so expiry cannot be so
@@ -576,7 +576,7 @@ mod tests {
         let pool = Mempool::default();
         let mut relay = RelayManager::new();
         assert_eq!(relay.handle_inv_tx(1, &[tx_entry(7)], &pool, 0).len(), 1);
-        relay.release(&[7u8; 32]);
+        relay.release(&[7u8; 64]);
         // Delivered and released: a re-announce inside the window is still a
         // duplicate, because the request set no longer holds it and the known
         // set does not either — the pool does, and the caller passes it in.

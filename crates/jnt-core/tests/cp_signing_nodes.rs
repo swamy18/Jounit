@@ -22,7 +22,7 @@ use jnt_core::bls::SecretKey;
 use jnt_core::bls_checkpoint::BlsPublicKey;
 use jnt_core::chain::Chain;
 use jnt_core::finality::FinalityManager;
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::params::NetworkParams;
 use jnt_core::signing::{CheckpointSigner, Committee, ValidatorKey};
 
@@ -62,7 +62,7 @@ fn verifier(keys: &[BlsPublicKey]) -> FinalityManager {
 }
 
 /// Mine to `n` and return the chain with its canonical tip hash at that height.
-fn chain_to(n: u64) -> (Chain, Hash) {
+fn chain_to(n: u64) -> (Chain, Hash512) {
     let mut chain = Chain::new(params()).unwrap();
     let miner = jnt_core::wallet::Wallet::from_private_key_bytes(&[7u8; 32], "cp-signing")
         .unwrap()
@@ -340,7 +340,7 @@ fn a_one_key_signature_places_the_right_index_in_a_larger_set() {
 
     let payload = jnt_core::bls_checkpoint::CheckpointPayload {
         height: MINE_TO,
-        block_hash: [9u8; 32],
+        block_hash: [9u8; 64],
         network_id: net.clone(),
         epoch: MINE_TO / params().checkpoint_interval_blocks,
     };
@@ -365,7 +365,7 @@ fn a_one_key_signature_places_the_right_index_in_a_larger_set() {
     // which validator signed. Under the old indexing the same bytes would have
     // named validator zero and been refused as a non-member or an index error.
     let mut mgr = verifier(&pks);
-    let acc = mgr.accept(&cp, Some([9u8; 32]), &jnt_core::bls::RealBls);
+    let acc = mgr.accept(&cp, Some([9u8; 64]), &jnt_core::bls::RealBls);
     match acc {
         Err(jnt_core::finality::FinalityError::InvalidCertificate(
             jnt_core::validators::ValidatorError::CheckpointQuorumShort { have, need },
@@ -386,7 +386,7 @@ fn a_key_outside_the_set_cannot_sign_against_it() {
     let member = committee([99], &net);
     let payload = jnt_core::bls_checkpoint::CheckpointPayload {
         height: MINE_TO,
-        block_hash: [9u8; 32],
+        block_hash: [9u8; 64],
         network_id: net,
         epoch: MINE_TO / params().checkpoint_interval_blocks,
     };

@@ -6,7 +6,7 @@
 //! length-prefixed by a single byte, both being bounded to 64.
 
 use jnt_core::block::Block;
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::ser::{Reader, Writer};
 use jnt_core::tx::Transaction;
 
@@ -99,8 +99,8 @@ pub enum Message {
     GetData(Vec<InvEntry>),
     Block(Box<Block>),
     GetBlocks {
-        locator: Vec<Hash>,
-        stop: Hash,
+        locator: Vec<Hash512>,
+        stop: Hash512,
     },
     Addr(Vec<SocketAddr>),
     /// A relayed transaction (§13.14). Boxed because a transaction is by far the
@@ -126,7 +126,7 @@ pub enum Message {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvEntry {
     pub kind: u8,
-    pub hash: Hash,
+    pub hash: Hash512,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +136,7 @@ pub struct Version {
     pub protocol_version: u32,
     pub services: u64,
     pub height: u64,
-    pub tip_hash: Hash,
+    pub tip_hash: Hash512,
     pub user_agent: String,
     pub nonce: u64,
 }
@@ -301,7 +301,7 @@ fn decode_version(r: &mut Reader<'_>) -> NetResult<Version> {
     let protocol_version = r.u32le()?;
     let services = r.u64le()?;
     let height = r.u64le()?;
-    let tip_hash: Hash = r.fixed()?;
+    let tip_hash: Hash512 = r.fixed()?;
     let ua_len = r.u8()? as usize;
     if ua_len > MAX_HANDSHAKE_STR_LEN {
         return Err(NetError::Decode(format!("user_agent too long: {ua_len}")));
@@ -335,13 +335,13 @@ fn decode_inv(r: &mut Reader<'_>) -> NetResult<Vec<InvEntry>> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let kind = r.u8()?;
-        let hash: Hash = r.fixed()?;
+        let hash: Hash512 = r.fixed()?;
         out.push(InvEntry { kind, hash });
     }
     Ok(out)
 }
 
-fn decode_locator(r: &mut Reader<'_>) -> NetResult<Vec<Hash>> {
+fn decode_locator(r: &mut Reader<'_>) -> NetResult<Vec<Hash512>> {
     let count = r.u16le()? as usize;
     if count > MAX_LOCATOR_ENTRIES {
         return Err(NetError::Decode(format!(
@@ -391,7 +391,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             services: 0,
             height: 31,
-            tip_hash: [0xAB; 32],
+            tip_hash: [0xAB; 64],
             user_agent: "/jnt-net:0.2".into(),
             nonce: 0x0123_4567_89AB_CDEF,
         };
@@ -432,11 +432,11 @@ mod tests {
         let inv = Message::Inv(vec![
             InvEntry {
                 kind: INV_TYPE_BLOCK,
-                hash: [0x11; 32],
+                hash: [0x11; 64],
             },
             InvEntry {
                 kind: INV_TYPE_BLOCK,
-                hash: [0x22; 32],
+                hash: [0x22; 64],
             },
         ]);
         let dec = Message::decode(5, &inv.encode()).unwrap();

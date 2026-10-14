@@ -27,7 +27,7 @@
 //! deterministic and directly fuzzable.
 
 use jnt_core::block::Block;
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash512};
 use jnt_core::params::NetworkParams;
 use jnt_core::tx::Transaction;
 
@@ -60,7 +60,7 @@ pub struct DetectedDeposit {
     /// Block height carrying it (for maturity).
     pub height: u64,
     /// Replay identity, first half.
-    pub txid: Hash,
+    pub txid: Hash512,
     /// Replay identity, second half: index into the transaction's outputs.
     pub index: u32,
     /// Common owner of the inputs (Decision 10 item 2).
@@ -77,7 +77,7 @@ impl DetectedDeposit {
     }
 
     /// Replay identity: `(txid, output_index)` (Decision 10 item 5).
-    pub fn id(&self) -> (Hash, u32) {
+    pub fn id(&self) -> (Hash512, u32) {
         (self.txid, self.index)
     }
 }
@@ -96,7 +96,7 @@ pub struct PendingDeposit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IgnoredDeposit {
     pub height: u64,
-    pub txid: Hash,
+    pub txid: Hash512,
     pub index: u32,
     pub amount_sat: u64,
     pub reason: DepositIgnoreReason,

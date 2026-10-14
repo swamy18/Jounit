@@ -469,7 +469,7 @@ mod tests {
 
         let payload = CheckpointPayload {
             height: 100,
-            block_hash: crate::hash::sha256(&[b"block at 100"]),
+            block_hash: crate::hash::sha512(&[b"block at 100"]),
             network_id: "jounit/mini".into(),
             epoch: 10,
         };
@@ -523,7 +523,7 @@ mod tests {
         // differ, so a mini signature cannot verify a mainnet checkpoint.
         let mini = CheckpointPayload {
             height: 10,
-            block_hash: [7u8; 32],
+            block_hash: [7u8; 64],
             network_id: "jounit/mini".into(),
             epoch: 1,
         };

@@ -57,7 +57,7 @@ use jnt_core::bls::RealBls;
 use jnt_core::bls_checkpoint::ValidatorSet;
 use jnt_core::chain::Chain;
 use jnt_core::exit::MAX_CLAIM_INPUTS;
-use jnt_core::hash::Hash;
+use jnt_core::hash::{Hash, Hash512};
 use jnt_core::params::NetworkParams;
 use jnt_core::tx::{GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 use jnt_l2::{
@@ -196,7 +196,7 @@ pub struct NodeL2 {
     /// construction so every replay and incremental step in this view verifies
     /// settlements against the same set.
     validators: ValidatorSet,
-    synced_tip: Option<Hash>,
+    synced_tip: Option<Hash512>,
     synced_height: u64,
 }
 
@@ -571,7 +571,7 @@ impl NodeL2 {
     }
 
     /// The tip this view was derived from, if it has synced anything yet.
-    pub fn synced_tip(&self) -> Option<Hash> {
+    pub fn synced_tip(&self) -> Option<Hash512> {
         self.synced_tip
     }
 

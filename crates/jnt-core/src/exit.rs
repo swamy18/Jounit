@@ -19,7 +19,7 @@
 //! not contain the record.
 
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, Address, Hash};
+use crate::hash::{sha512_dom, Address, Hash, Hash512};
 use crate::ser::{Reader, Writer};
 use crate::state_root::{exit_record_leaf, verify_inclusion, InclusionProof};
 use crate::tx::{OutPoint, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
@@ -27,6 +27,10 @@ use crate::tx::{OutPoint, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 /// Domain tag for the claim identity. Covers every consensus field, so a
 /// claim cannot be reinterpreted as anything else that hashes bytes.
 pub const DOM_EXIT_CLAIM: &[u8] = b"jounit/exit-claim/v1";
+/// 512-bit claim id. The claim id is used as the `txid` of the release
+/// outpoints it creates, so it is one of the chain-identity hashes and carries
+/// the widened width; the tag is new for the same reason as `DOM_BLOCK512`.
+pub const DOM_EXIT_CLAIM512: &[u8] = b"jounit/exit-claim512/v1";
 
 /// Hard cap on sink inputs per claim. Each input is a 36-byte outpoint that
 /// must resolve to a real sink output; the bound keeps a hostile claim from
@@ -36,7 +40,7 @@ pub const MAX_CLAIM_INPUTS: usize = 16;
 /// Smallest a claim can serialize to: all fixed fields (20+8+8+20+20+8+8),
 /// an input count (4), one outpoint (36), a proof length (4) and an empty
 /// proof (8+8+8). Bounds a declared claim count before anything is reserved.
-pub const EXIT_CLAIM_MIN_ENCODED_LEN: usize = 20 + 8 + 8 + 20 + 20 + 8 + 8 + 4 + 36 + 4 + 24;
+pub const EXIT_CLAIM_MIN_ENCODED_LEN: usize = 20 + 8 + 8 + 20 + 20 + 8 + 8 + 4 + 68 + 4 + 24;
 
 /// A permissionless release crank (approved P1, E-2): anyone may submit it,
 /// and consensus pays only the recorded destination (E-3). The claimant named
@@ -89,8 +93,8 @@ impl ExitClaim {
     /// release are `(claim_id, 0)` for the destination and `(claim_id, 1)` for
     /// the claimant, so two claims can never create the same outpoint and a
     /// replayed claim is the same bytes with the same id.
-    pub fn claim_id(&self) -> Hash {
-        sha256_dom(DOM_EXIT_CLAIM, &[&self.serialize()])
+    pub fn claim_id(&self) -> Hash512 {
+        sha512_dom(DOM_EXIT_CLAIM512, &[&self.serialize()])
     }
 
     /// Verify the record proof against the root the queue block committed.
@@ -148,12 +152,12 @@ impl ExitClaim {
         if n_in == 0 || n_in > MAX_CLAIM_INPUTS {
             return Err(Error::Malformed("exit claim input count out of range"));
         }
-        if n_in > r.remaining() / 36 {
+        if n_in > r.remaining() / 68 {
             return Err(Error::Malformed("exit claim inputs exceed buffer"));
         }
         let mut inputs = Vec::with_capacity(n_in);
         for _ in 0..n_in {
-            let txid: Hash = r.fixed()?;
+            let txid: Hash512 = r.fixed()?;
             let index = r.u32le()?;
             inputs.push(OutPoint { txid, index });
         }
@@ -212,7 +216,7 @@ mod tests {
             exit_fee_sat: 500,
             queued_height: 41,
             inputs: vec![OutPoint {
-                txid: [0x44u8; 32],
+                txid: [0x44u8; 64],
                 index: 0,
             }],
             proof: InclusionProof {

@@ -41,7 +41,7 @@ fn sink() -> Address {
 /// derivation matters here.
 fn input_owned_by(seed: u8) -> Input {
     Input {
-        prev_hash: [seed; 32],
+        prev_hash: [seed; 64],
         prev_index: 0,
         sigs: Bundle::default(),
         keys: Auth::keys_for(&wallet(seed)).unwrap(),
@@ -59,7 +59,7 @@ fn block_with(tx: Transaction, height: u64) -> Block {
     // Hand-built: the scan reads only `txs`, so the header is a placeholder
     // carrying the height under test. Chain-level tests use mined blocks.
     let coinbase = Transaction::coinbase(
-        [0u8; 32],
+        [0u8; 64],
         height,
         Output {
             value: 1,
@@ -150,7 +150,7 @@ fn coinbase_to_sink_is_never_a_deposit() {
     // A miner paying the sink from a coinbase has no signed inputs and hence
     // no proven owner: burn, not deposit. (The scan skips tx 0 regardless.)
     let p = params();
-    let coinbase_to_sink = Transaction::coinbase([0u8; 32], 9, sink_output(50_000_000));
+    let coinbase_to_sink = Transaction::coinbase([0u8; 64], 9, sink_output(50_000_000));
     let mut header = Header::genesis([0u8; 32], 1);
     header.height = 9;
     let block = Block {
@@ -216,7 +216,7 @@ fn wrong_sink_and_non_sink_outputs_are_silent() {
 #[test]
 fn apply_deposit_credits_once_and_conserves() {
     let mut s = L2State::new(L2Config::mini());
-    let id = ([0xDBu8; 32], 0u32);
+    let id = ([0xDBu8; 64], 0u32);
     s.apply_deposit(addr_of(40), 2_000_000, id).unwrap();
     assert_eq!(s.balance(&addr_of(40)), 2_000_000);
     assert_eq!(s.deposited_total(), 2_000_000);
@@ -232,7 +232,7 @@ fn apply_deposit_credits_once_and_conserves() {
 
     // Zero is not a deposit even if it reaches here.
     assert_eq!(
-        s.apply_deposit(addr_of(40), 0, ([0xDBu8; 32], 1u32))
+        s.apply_deposit(addr_of(40), 0, ([0xDBu8; 64], 1u32))
             .unwrap_err(),
         L2Error::ZeroAmount("deposit")
     );

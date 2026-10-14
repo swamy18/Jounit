@@ -16,7 +16,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use jnt_core::hash::{hash_from_hex, hash_to_hex, sha256, Hash};
+use jnt_core::hash::{hash512_from_hex, hash512_to_hex, sha256, Hash512};
 
 use crate::log::LOG_MAGIC;
 use crate::StoreError;
@@ -31,9 +31,9 @@ pub struct Meta {
     /// Network name, so a store cannot be opened against another chain's data.
     pub network: String,
     /// Genesis hash, which identifies the chain as much as the name does.
-    pub genesis: Hash,
+    pub genesis: Hash512,
     /// Hash of the canonical tip.
-    pub tip: Hash,
+    pub tip: Hash512,
     /// Height of the canonical tip. `0` means genesis.
     pub height: u64,
     /// Binding-finalized height (Decision 12), or `0` for none/unactivated.
@@ -42,11 +42,11 @@ pub struct Meta {
     /// `finalized_hash`.
     pub finalized_height: u64,
     /// Canonical hash finalized at `finalized_height` (zero when none).
-    pub finalized_hash: Hash,
+    pub finalized_hash: Hash512,
 }
 
 impl Meta {
-    pub fn new(network: impl Into<String>, genesis: Hash) -> Self {
+    pub fn new(network: impl Into<String>, genesis: Hash512) -> Self {
         Meta {
             version: META_VERSION,
             network: network.into(),
@@ -54,12 +54,12 @@ impl Meta {
             tip: genesis,
             height: 0,
             finalized_height: 0,
-            finalized_hash: [0u8; 32],
+            finalized_hash: [0u8; 64],
         }
     }
 
     /// Attach the binding-finalized point (Decision 12) for persistence.
-    pub fn with_finalized(mut self, finalized_height: u64, finalized_hash: Hash) -> Self {
+    pub fn with_finalized(mut self, finalized_height: u64, finalized_hash: Hash512) -> Self {
         self.finalized_height = finalized_height;
         self.finalized_hash = finalized_hash;
         self
@@ -83,7 +83,7 @@ impl Meta {
             // finalized point to 0 is the fail-closed choice, re-derived from
             // the depth rule until new checkpoints arrive.
             finalized_height: 0,
-            finalized_hash: [0u8; 32],
+            finalized_hash: [0u8; 64],
         }
     }
 
@@ -94,11 +94,11 @@ impl Meta {
             "{{\n  \"version\": {},\n  \"network\": \"{}\",\n  \"genesis\": \"{}\",\n  \"tip\": \"{}\",\n  \"height\": {},\n  \"finalized_height\": {},\n  \"finalized_hash\": \"{}\"\n}}",
             self.version,
             escape(&self.network),
-            hash_to_hex(&self.genesis),
-            hash_to_hex(&self.tip),
+            hash512_to_hex(&self.genesis),
+            hash512_to_hex(&self.tip),
             self.height,
             self.finalized_height,
-            hash_to_hex(&self.finalized_hash)
+            hash512_to_hex(&self.finalized_hash)
         );
         let sum = sha256(&[body.as_bytes()]);
         format!("{body}\n{}\n", jnt_core::hash::to_hex(&sum))
@@ -176,10 +176,10 @@ fn parse_body(body: &str) -> Result<Meta, StoreError> {
         });
     }
     let network = field("network")?;
-    let genesis = hash_from_hex(&field("genesis")?).map_err(|e| StoreError::BadMeta {
+    let genesis = hash512_from_hex(&field("genesis")?).map_err(|e| StoreError::BadMeta {
         detail: format!("genesis hash: {e}"),
     })?;
-    let tip = hash_from_hex(&field("tip")?).map_err(|e| StoreError::BadMeta {
+    let tip = hash512_from_hex(&field("tip")?).map_err(|e| StoreError::BadMeta {
         detail: format!("tip hash: {e}"),
     })?;
     let height: u64 = field("height")?.parse().map_err(|_| StoreError::BadMeta {
@@ -200,12 +200,12 @@ fn parse_body(body: &str) -> Result<Meta, StoreError> {
         None => 0,
     };
     let finalized_hash = match optional_field(body, "finalized_hash")? {
-        Some(s) => hash_from_hex(&s).map_err(|e| StoreError::BadMeta {
+        Some(s) => hash512_from_hex(&s).map_err(|e| StoreError::BadMeta {
             detail: format!("finalized hash: {e}"),
         })?,
-        None => [0u8; 32],
+        None => [0u8; 64],
     };
-    if finalized_height == 0 && finalized_hash != [0u8; 32] {
+    if finalized_height == 0 && finalized_hash != [0u8; 64] {
         return Err(StoreError::BadMeta {
             detail: "finalized_height 0 with a nonzero finalized hash".into(),
         });
@@ -336,8 +336,8 @@ mod tests {
         dir.join(name)
     }
 
-    fn genesis() -> Hash {
-        [0xAB; 32]
+    fn genesis() -> Hash512 {
+        [0xAB; 64]
     }
 
     #[test]
@@ -347,10 +347,10 @@ mod tests {
             version: META_VERSION,
             network: "mini".into(),
             genesis: genesis(),
-            tip: [7u8; 32],
+            tip: [7u8; 64],
             height: 42,
             finalized_height: 0,
-            finalized_hash: [0u8; 32],
+            finalized_hash: [0u8; 64],
         };
         f.save(&m).unwrap();
         assert_eq!(f.load().unwrap(), Some(m));
@@ -371,7 +371,7 @@ mod tests {
         f.save(&Meta::new("mini", genesis())).unwrap();
         let mut text = fs::read_to_string(f.path()).unwrap();
         // Change the tip without touching the checksum.
-        text = text.replace(&hash_to_hex(&genesis()), &hash_to_hex(&[0x11; 32]));
+        text = text.replace(&hash512_to_hex(&genesis()), &hash512_to_hex(&[0x11; 64]));
         fs::write(f.path(), text).unwrap();
         assert!(matches!(f.load(), Err(StoreError::BadMeta { .. })));
     }
@@ -385,10 +385,10 @@ mod tests {
             version: META_VERSION,
             network: "mini".into(),
             genesis: genesis(),
-            tip: [3u8; 32],
+            tip: [3u8; 64],
             height: 9,
             finalized_height: 0,
-            finalized_hash: [0u8; 32],
+            finalized_hash: [0u8; 64],
         })
         .unwrap();
         let text = fs::read_to_string(f.path()).unwrap();
@@ -417,16 +417,16 @@ mod tests {
             version: META_VERSION,
             network: "mini".into(),
             genesis: genesis(),
-            tip: [9u8; 32],
+            tip: [9u8; 64],
             height: 100,
             finalized_height: 60,
-            finalized_hash: [0xAB; 32],
+            finalized_hash: [0xAB; 64],
         };
         let r = m.recover_to_genesis();
         assert_eq!(r.tip, genesis());
         assert_eq!(r.height, 0);
         assert_eq!(r.finalized_height, 0, "recovery drops finality");
-        assert_eq!(r.finalized_hash, [0u8; 32]);
+        assert_eq!(r.finalized_hash, [0u8; 64]);
         assert_eq!(r.genesis, genesis());
         assert_eq!(r.network, "mini");
     }

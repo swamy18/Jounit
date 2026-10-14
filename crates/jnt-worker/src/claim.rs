@@ -5,7 +5,7 @@
 //! wrapped in `L2Transaction::new` — no other construction exists. Local
 //! preconditions run before broadcast; the protocol alone has final authority.
 
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{ClaimTaskPayload, L2Payload, L2Transaction};
 use jnt_core::wallet::Wallet;
 use jnt_l2::state::L2State;
@@ -21,7 +21,7 @@ use crate::node::{Host, L2Broadcaster, L2NodeView};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimPlan {
     pub tx: L2Transaction,
-    pub txid: Hash,
+    pub txid: Hash512,
     pub task_id: Hash,
     pub worker: Address,
 }

@@ -7,7 +7,7 @@
 //! arbitrator set, and the SDK consumes verdicts, never produces them.
 
 use jnt_core::compute_ir::ComputeAttestation;
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{DisputePayload, L2Payload, L2Transaction};
 use jnt_core::wallet::Wallet;
 use jnt_l2::dispute::DisputeEvidence;
@@ -121,7 +121,7 @@ pub const DEFAULT_CHALLENGE_DEPOSIT_SAT: u64 = 50_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisputePlan {
     pub tx: L2Transaction,
-    pub txid: Hash,
+    pub txid: Hash512,
     pub task_id: Hash,
 }
 

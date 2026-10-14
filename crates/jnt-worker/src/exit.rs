@@ -36,7 +36,7 @@ pub struct ExitPlan {
     /// Total debited from the L2 balance by this queue.
     pub total_debit_sat: u64,
     /// Transaction id, for reconciling a broadcast whose outcome is unknown.
-    pub txid: jnt_core::hash::Hash,
+    pub txid: jnt_core::hash::Hash512,
 }
 
 /// Build the exit queue transaction without broadcasting it.

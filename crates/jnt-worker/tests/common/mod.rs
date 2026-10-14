@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use jnt_core::bls_checkpoint::{BlsVerifier, ValidatorSet};
-use jnt_core::hash::Hash;
+use jnt_core::hash::Hash512;
 use jnt_core::l2::L2Transaction;
 use jnt_core::wallet::Wallet;
 use jnt_l2::{L2Config, L2State};
@@ -48,7 +48,7 @@ impl Core {
     }
 
     /// Apply like a node would, refusing replays and invalid payloads.
-    pub fn apply(&mut self, tx: &L2Transaction) -> Result<Hash, String> {
+    pub fn apply(&mut self, tx: &L2Transaction) -> Result<Hash512, String> {
         if let Some(err) = self.fail_next.pop() {
             return Err(match err {
                 BroadcastError::Retryable(s) => format!("retryable: {s}"),

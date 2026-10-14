@@ -34,7 +34,7 @@
 //! SPEC.md §M5.
 
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, Hash};
+use crate::hash::{sha256_dom, Hash, Hash512};
 use crate::ser::{Reader, Writer};
 
 /// Checkpoint period: one checkpoint every N blocks.
@@ -94,7 +94,7 @@ pub struct CheckpointPayload {
     /// Height of the block being checkpointed.
     pub height: u64,
     /// Hash of the canonical block at `height`.
-    pub block_hash: Hash,
+    pub block_hash: Hash512,
     /// Chain network ID ("jounit/mainnet" or "jounit/mini").
     /// Prevents replay across networks.
     pub network_id: String,
@@ -138,7 +138,7 @@ impl CheckpointPayload {
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let height = r.u64le()?;
-        let block_hash: Hash = r.fixed()?;
+        let block_hash: Hash512 = r.fixed()?;
         let id_len = r.u32le()? as usize;
         if id_len > 64 {
             return Err(Error::Malformed("network_id too long"));
@@ -447,7 +447,7 @@ mod tests {
     fn make_payload(height: u64) -> CheckpointPayload {
         CheckpointPayload {
             height,
-            block_hash: [height as u8; 32],
+            block_hash: [height as u8; 64],
             network_id: "jounit/mini".into(),
             epoch: CheckpointPayload::epoch_for(height, CHECKPOINT_INTERVAL_MINI),
         }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::bls_checkpoint::{BlsPublicKey, Checkpoint};
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, Address, Hash, DOM_SIG, DOM_TX, DOM_TXBODY};
+use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512, DOM_SIG, DOM_TXBODY, DOM_TX512};
 use crate::hexserde;
 use crate::ser::{Reader, Writer};
 
@@ -27,11 +27,11 @@ pub const TX_SLASH: u8 = 4;
 /// an allocation off the actual buffer.
 pub const MAX_SLASH_CHECKPOINT_BYTES: usize = 2048;
 
-/// Fixed part of a serialized input: `prev_hash(32) + prev_index(4)`. The
+/// Fixed part of a serialized input: `prev_hash(64) + prev_index(4)`. The
 /// signature and key bundles that follow are variable-length (SPEC.md §3.2),
 /// because a post-quantum signature is ~2.4 KB and no fixed field sized to
 /// today's ECDSA could ever hold one.
-pub const INPUT_FIXED_LEN: usize = 36;
+pub const INPUT_FIXED_LEN: usize = 68;
 
 /// Smallest an input can serialize to: the fixed prefix plus two empty bundle
 /// counts. Used to bound a declared `input_count` before anything is reserved.
@@ -51,17 +51,17 @@ pub const GAS_PER_OUTPUT: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OutPoint {
-    #[serde(with = "hexserde::h32")]
-    pub txid: Hash,
+    #[serde(with = "hexserde::h64")]
+    pub txid: Hash512,
     pub index: u32,
 }
 
 impl OutPoint {
-    pub fn to_bytes(&self) -> [u8; 36] {
-        let mut w = Writer::with_capacity(36);
+    pub fn to_bytes(&self) -> [u8; 68] {
+        let mut w = Writer::with_capacity(68);
         w.fixed(&self.txid).u32le(self.index);
         let v = w.into_vec();
-        let mut out = [0u8; 36];
+        let mut out = [0u8; 68];
         out.copy_from_slice(&v);
         out
     }
@@ -75,8 +75,8 @@ impl OutPoint {
 /// primitive being broken. See `sig.rs` for why "all must verify" is the rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Input {
-    #[serde(with = "hexserde::h32")]
-    pub prev_hash: Hash,
+    #[serde(with = "hexserde::h64")]
+    pub prev_hash: Hash512,
     pub prev_index: u32,
     pub sigs: crate::sig::Bundle,
     pub keys: crate::sig::Bundle,
@@ -119,7 +119,7 @@ impl Input {
     }
 
     pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
-        let prev_hash: Hash = r.fixed()?;
+        let prev_hash: Hash512 = r.fixed()?;
         let prev_index = r.u32le()?;
         let sigs = crate::sig::Bundle::from_reader(r)?;
         let keys = crate::sig::Bundle::from_reader(r)?;
@@ -182,7 +182,7 @@ pub enum StakePayload {
     /// `TX_BOND`: the BLS key this bond authorizes for checkpoints.
     Bond { bls_pk: BlsPublicKey },
     /// `TX_UNBOND`: the bond being released (the BOND transaction's txid).
-    Unbond { bond_id: Hash },
+    Unbond { bond_id: Hash512 },
     /// `TX_SLASH`: two conflicting checkpoints proving equivocation. Boxed:
     /// two checkpoints are ~400 bytes and every `Transaction` carries this
     /// enum inline, so the box keeps ordinary transactions small.
@@ -233,7 +233,7 @@ impl StakePayload {
                 })
             }
             TX_UNBOND => {
-                let bond_id = r.fixed::<32>().map_err(|_| Error::Malformed("bond id"))?;
+                let bond_id = r.fixed::<64>().map_err(|_| Error::Malformed("bond id"))?;
                 Ok(StakePayload::Unbond { bond_id })
             }
             TX_SLASH => {
@@ -311,7 +311,7 @@ impl Transaction {
         }
     }
 
-    pub fn coinbase(prev_hash: Hash, height: u64, output: Output) -> Self {
+    pub fn coinbase(prev_hash: Hash512, height: u64, output: Output) -> Self {
         Transaction {
             version: 1,
             tx_type: TX_COINBASE,
@@ -425,8 +425,8 @@ impl Transaction {
         })
     }
 
-    pub fn txid(&self) -> Hash {
-        sha256_dom(DOM_TX, &[&self.serialize()])
+    pub fn txid(&self) -> Hash512 {
+        sha512_dom(DOM_TX512, &[&self.serialize()])
     }
 
     /// Hash of the transaction with all signatures and pubkeys blanked.
@@ -548,7 +548,7 @@ mod tests {
         // The signature and key bundles are length-prefixed, so an unsigned
         // input is `prev_hash(32) + prev_index(4) + count(0) + count(0)`.
         let i = Input::unsigned(&OutPoint {
-            txid: [7u8; 32],
+            txid: [7u8; 64],
             index: 3,
         });
         assert_eq!(i.to_bytes().len(), INPUT_FIXED_LEN + 2);
@@ -568,7 +568,7 @@ mod tests {
     fn transaction_roundtrips() {
         let tx = Transaction::standard(
             vec![Input::unsigned(&OutPoint {
-                txid: [1u8; 32],
+                txid: [1u8; 64],
                 index: 0,
             })],
             vec![Output {
@@ -613,7 +613,7 @@ mod tests {
     fn sighash_ignores_signatures_but_covers_outputs() {
         let base = Transaction::standard(
             vec![Input::unsigned(&OutPoint {
-                txid: [2u8; 32],
+                txid: [2u8; 64],
                 index: 1,
             })],
             vec![Output {
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn duplicate_inputs_detected() {
         let prev = OutPoint {
-            txid: [5u8; 32],
+            txid: [5u8; 64],
             index: 0,
         };
         let tx = Transaction::standard(
@@ -659,7 +659,7 @@ mod tests {
             vec![
                 Input::unsigned(&prev),
                 Input::unsigned(&OutPoint {
-                    txid: [5u8; 32],
+                    txid: [5u8; 64],
                     index: 1,
                 }),
             ],
@@ -675,7 +675,7 @@ mod tests {
     fn wrong_owner_address_is_rejected() {
         let mut tx = Transaction::standard(
             vec![Input::unsigned(&OutPoint {
-                txid: [1u8; 32],
+                txid: [1u8; 64],
                 index: 0,
             })],
             vec![Output {
@@ -714,7 +714,7 @@ mod tests {
         // and `value_out` saturates rather than lying about the total.
         let tx = Transaction::standard(
             vec![Input::unsigned(&OutPoint {
-                txid: [0; 32],
+                txid: [0; 64],
                 index: 0,
             })],
             vec![
@@ -734,7 +734,7 @@ mod tests {
         // And a representable total must not be reported as overflow.
         let ok = Transaction::standard(
             vec![Input::unsigned(&OutPoint {
-                txid: [0; 32],
+                txid: [0; 64],
                 index: 0,
             })],
             vec![
@@ -756,7 +756,7 @@ mod tests {
     fn gas_is_linear_in_size() {
         let one = Transaction::standard(
             vec![Input::unsigned(&OutPoint {
-                txid: [0; 32],
+                txid: [0; 64],
                 index: 0,
             })],
             vec![Output {
@@ -784,7 +784,7 @@ mod tests {
         ecdsa_pub[0] = 0x02; // compressed secp256k1 prefix
         let schnorr_pub = [0x11u8; 32];
         let input = Input {
-            prev_hash: [0xABu8; 32],
+            prev_hash: [0xABu8; 64],
             prev_index: 0xDEAD_BEEF,
             keys: crate::sig::Bundle {
                 components: vec![
@@ -868,7 +868,7 @@ Do not hand-edit.\",\n",
             )
         });
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["input_fixed_len"].as_u64().unwrap(), 36, "SPEC.md 3.2");
+        assert_eq!(v["input_fixed_len"].as_u64().unwrap(), 68, "SPEC.md 3.2");
         assert_eq!(v["output_len"].as_u64().unwrap(), 28, "SPEC.md 3.3");
 
         let listed = v["items"].as_array().expect("items must be an array");

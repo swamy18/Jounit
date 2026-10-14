@@ -35,7 +35,7 @@
 
 use crate::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, Address, Hash};
+use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512};
 use crate::params::{
     FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_EXIT_QUEUE_SAT, FEE_TX_POST_TASK_SAT,
     FEE_TX_SUBMIT_RESULT_SAT, SETTLE_FEE_MIN_SAT,
@@ -56,6 +56,9 @@ pub const DOM_L2_SUBMIT: &[u8] = b"jounit/l2/submit/v1";
 pub const DOM_L2_DISPUTE: &[u8] = b"jounit/l2/dispute/v1";
 pub const DOM_L2_SETTLE: &[u8] = b"jounit/l2/settle/v1";
 pub const DOM_L2_TXID: &[u8] = b"jounit/l2/txid/v1";
+/// 512-bit L2 transaction id. An L2 txid is a transaction id, so it carries
+/// the widened width for the same reason the L1 one does.
+pub const DOM_L2_TXID512: &[u8] = b"jounit/l2/txid512/v1";
 /// Exit queue authorization (approved P1, E-1…E-3). Covers the owner, the
 /// per-owner nonce, the amount, the destination and the prepaid release fee —
 /// exactly the record the L1 release proof re-states, so a queue
@@ -936,8 +939,8 @@ impl L2Transaction {
     }
 
     /// Unique transaction id, used for replay protection.
-    pub fn txid(&self) -> Hash {
-        sha256_dom(DOM_L2_TXID, &[&self.serialize()])
+    pub fn txid(&self) -> Hash512 {
+        sha512_dom(DOM_L2_TXID512, &[&self.serialize()])
     }
 }
 

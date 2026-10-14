@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::bls::{RealBls, SecretKey};
 use crate::bls_checkpoint::{BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload};
 use crate::error::Error;
-use crate::hash::Hash;
+use crate::hash::{Hash, Hash512};
 
 /// The on-disk format of a validator key file.
 ///
@@ -357,7 +357,7 @@ impl CheckpointSigner {
     /// The epoch is `height / epoch_blocks`, which is the derivation
     /// `CheckpointPayload::epoch_for` uses and the same one verification checks,
     /// so the two cannot drift.
-    pub fn payload(&self, height: u64, block_hash: Hash) -> CheckpointPayload {
+    pub fn payload(&self, height: u64, block_hash: Hash512) -> CheckpointPayload {
         CheckpointPayload {
             height,
             block_hash,
@@ -376,7 +376,7 @@ impl CheckpointSigner {
     pub fn sign(
         &self,
         height: u64,
-        block_hash: Hash,
+        block_hash: Hash512,
         committee: &Committee,
     ) -> Option<Result<Checkpoint, Error>> {
         let payload = self.payload(height, block_hash);
@@ -388,7 +388,7 @@ impl CheckpointSigner {
     pub fn sign_for_set(
         &self,
         height: u64,
-        block_hash: Hash,
+        block_hash: Hash512,
         committee: &Committee,
         set_keys: &[crate::bls_checkpoint::BlsPublicKey],
     ) -> Option<Result<Checkpoint, Error>> {
@@ -513,10 +513,10 @@ mod tests {
         // explicitly; the profile's declared set is a different pair of keys.
         m.set_keys(committee.public_keys());
         let cp = CheckpointSigner::new(net(), epoch_blocks())
-            .sign(100, [0xEEu8; 32], &committee)
+            .sign(100, [0xEEu8; 64], &committee)
             .expect("a non-empty committee signs")
             .expect("aggregation of valid signatures cannot fail");
-        m.accept(&cp, Some([0xEEu8; 32]), &RealBls)
+        m.accept(&cp, Some([0xEEu8; 64]), &RealBls)
             .expect("the production path must accept what this module produces");
         assert_eq!(cp.signer_count, 4);
         // The observable outcome a node reports.
@@ -531,7 +531,7 @@ mod tests {
         let forward = committee_of(1..=4u8);
         let reversed = committee_of((1..=4u8).rev());
         let signer = CheckpointSigner::new(net(), epoch_blocks());
-        let payload = signer.payload(100, [0xEEu8; 32]);
+        let payload = signer.payload(100, [0xEEu8; 64]);
         assert_eq!(
             forward.sign(&payload).unwrap().unwrap().signer_bitmap,
             reversed.sign(&payload).unwrap().unwrap().signer_bitmap,
@@ -542,7 +542,7 @@ mod tests {
         m.set_keys(forward.public_keys());
         m.accept(
             &forward.sign(&payload).unwrap().unwrap(),
-            Some([0xEEu8; 32]),
+            Some([0xEEu8; 64]),
             &RealBls,
         )
         .expect("a committee of the declared keys must be accepted");
@@ -554,7 +554,7 @@ mod tests {
         // risk; this pins both sides to the same arithmetic.
         let signer = CheckpointSigner::new(net(), epoch_blocks());
         for &height in &[0u64, 1, 9, 10, 11, 25, 100, 101] {
-            let payload = signer.payload(height, [0xEEu8; 32]);
+            let payload = signer.payload(height, [0xEEu8; 64]);
             assert_eq!(
                 payload.epoch,
                 CheckpointPayload::epoch_for(height, epoch_blocks()),
@@ -577,7 +577,7 @@ mod tests {
         // A certificate with a hole in its bitmap is refused by every peer;
         // producing one would make an operator believe they participated.
         let signer = CheckpointSigner::new(net(), epoch_blocks());
-        assert!(signer.sign(100, [0xEEu8; 32], &Committee::new()).is_none());
+        assert!(signer.sign(100, [0xEEu8; 64], &Committee::new()).is_none());
     }
 
     #[test]
@@ -588,11 +588,11 @@ mod tests {
         // block hash.
         let committee = committee_of(1..=4u8);
         let cp = CheckpointSigner::new("jounit/mainnet", epoch_blocks())
-            .sign(100, [0xEEu8; 32], &committee)
+            .sign(100, [0xEEu8; 64], &committee)
             .unwrap()
             .unwrap();
         assert!(
-            manager().accept(&cp, Some([0xEEu8; 32]), &RealBls).is_err(),
+            manager().accept(&cp, Some([0xEEu8; 64]), &RealBls).is_err(),
             "a certificate signed for another network must not be accepted"
         );
     }
@@ -606,7 +606,7 @@ mod tests {
         let five = committee_of(1..=5u8);
         let signer = CheckpointSigner::new(net(), epoch_blocks());
         let cp = three
-            .sign(&signer.payload(100, [0xEEu8; 32]))
+            .sign(&signer.payload(100, [0xEEu8; 64]))
             .unwrap()
             .unwrap();
         let set = crate::bls_checkpoint::ValidatorSet::new(five.public_keys());
@@ -623,11 +623,11 @@ mod tests {
         // — which is what stops a certificate for block A finalizing block B.
         let committee = committee_of(1..=4u8);
         let cp = CheckpointSigner::new(net(), epoch_blocks())
-            .sign(100, [0xEEu8; 32], &committee)
+            .sign(100, [0xEEu8; 64], &committee)
             .unwrap()
             .unwrap();
         assert!(
-            manager().accept(&cp, Some([0xFFu8; 32]), &RealBls).is_err(),
+            manager().accept(&cp, Some([0xFFu8; 64]), &RealBls).is_err(),
             "a certificate naming a block the node does not hold must be refused"
         );
     }
@@ -640,11 +640,11 @@ mod tests {
         let committee = committee_of(1..=4u8);
         let signer = CheckpointSigner::new(net(), epoch_blocks());
         let cp = committee
-            .sign(&signer.payload(100, [0xEEu8; 32]))
+            .sign(&signer.payload(100, [0xEEu8; 64]))
             .unwrap()
             .unwrap();
         let mut forged = cp.clone();
-        forged.payload.block_hash = [0xFFu8; 32];
+        forged.payload.block_hash = [0xFFu8; 64];
         let set = crate::bls_checkpoint::ValidatorSet::new(committee.public_keys());
         crate::bls_checkpoint::verify_checkpoint(&forged, &set, &RealBls)
             .expect_err("the aggregate no longer matches the message");
@@ -657,11 +657,11 @@ mod tests {
         // that division of responsibility rather than the signer being clever.
         let committee = committee_of(1..=4u8);
         let cp = CheckpointSigner::new(net(), epoch_blocks())
-            .sign(105, [0xEEu8; 32], &committee)
+            .sign(105, [0xEEu8; 64], &committee)
             .unwrap()
             .unwrap();
         assert!(
-            manager().accept(&cp, Some([0xEEu8; 32]), &RealBls).is_err(),
+            manager().accept(&cp, Some([0xEEu8; 64]), &RealBls).is_err(),
             "height 105 is not an epoch boundary for a 10-block epoch"
         );
     }

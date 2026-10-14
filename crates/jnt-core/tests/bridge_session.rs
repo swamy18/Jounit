@@ -133,7 +133,7 @@ fn receipt_for(
         result_hash: Some(result_hash_of(b"model-output-v1")),
         anchor: Some(ReceiptAnchor {
             height: 120,
-            block_hash: [7u8; 32],
+            block_hash: [7u8; 64],
         }),
         keys: Default::default(),
         sigs: Default::default(),

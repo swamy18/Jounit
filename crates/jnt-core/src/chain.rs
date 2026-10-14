@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::exit::ExitClaim;
 use crate::fees::{next_base_fee, required_fee, split_fees, FeeSplit};
 use crate::finality::{FinalityError, FinalityManager};
-use crate::hash::{Address, Hash, DOM_BLOCK};
+use crate::hash::{Address, Hash, Hash512, DOM_BLOCK512};
 use crate::hbm_pow;
 use crate::ledger::{check_tx, Undo, Utxo, UtxoSet};
 use crate::mempool::{Mempool, ReconcileReport};
@@ -41,19 +41,19 @@ pub const DEFAULT_MAX_ATTEMPTS: u64 = 200_000_000;
 
 #[derive(Debug, Clone)]
 struct Snapshot {
-    canon: Vec<Hash>,
+    canon: Vec<Hash512>,
     utxo: UtxoSet,
-    undo: HashMap<Hash, Undo>,
+    undo: HashMap<Hash512, Undo>,
     pscb_reserve: u64,
-    pscb_undo: HashMap<Hash, u64>,
+    pscb_undo: HashMap<Hash512, u64>,
     burned_fees_total: u64,
-    burned_undo: HashMap<Hash, u64>,
+    burned_undo: HashMap<Hash512, u64>,
     released_exits: HashSet<(Address, u64)>,
-    exit_undo: HashMap<Hash, Vec<(Address, u64)>>,
+    exit_undo: HashMap<Hash512, Vec<(Address, u64)>>,
     bonds: BondLedger,
-    bond_undo: HashMap<Hash, Vec<BondUndoOp>>,
+    bond_undo: HashMap<Hash512, Vec<BondUndoOp>>,
     slash_vault: SlashVault,
-    slash_undo: HashMap<Hash, SlashVault>,
+    slash_undo: HashMap<Hash512, SlashVault>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,15 +62,15 @@ pub struct Chain {
     registry: PuzzleRegistry,
     /// Caches the active epoch's neural weights across mining attempts.
     solver: PuzzleSolver,
-    blocks: HashMap<Hash, Block>,
+    blocks: HashMap<Hash512, Block>,
     /// `cumulative_work` for each stored block, recorded at insert as
     /// `parent_work + difficulty`. Lets fork choice be O(1) per block instead of
     /// a walk to genesis, which makes `best_candidate` O(stored) rather than
     /// O(stored²). Every block in `blocks` has an entry here.
-    work: HashMap<Hash, u128>,
-    canon: Vec<Hash>,
+    work: HashMap<Hash512, u128>,
+    canon: Vec<Hash512>,
     utxo: UtxoSet,
-    undo: HashMap<Hash, Undo>,
+    undo: HashMap<Hash512, Undo>,
     /// Accumulated PSCB (Protocol Security & Compute Buffer) reserve.
     /// M1 protocol mechanism: 50% of every block's base-fee portion is routed
     /// here rather than burned. The reserve backs the M2 Time-Locked Compute
@@ -80,7 +80,7 @@ pub struct Chain {
     /// Per-block PSCB deltas, keyed by block hash. Required for reorg
     /// correctness: when a canonical block is rolled back, its PSCB contribution
     /// must be subtracted from the running total.
-    pscb_undo: HashMap<Hash, u64>,
+    pscb_undo: HashMap<Hash512, u64>,
     /// Exit identities already released to L1, keyed by `(owner, nonce)`
     /// (approved P1). One release per identity, ever: consensus refuses a
     /// replay by this set rather than by bookkeeping, so a re-submitted
@@ -90,7 +90,7 @@ pub struct Chain {
     /// correctness exactly like the PSCB deltas: rolling a block back unmarks
     /// its releases, so a reorged-away release can happen again on the
     /// winning branch — and a release the winner keeps stays released.
-    exit_undo: HashMap<Hash, Vec<(Address, u64)>>,
+    exit_undo: HashMap<Hash512, Vec<(Address, u64)>>,
     /// Accumulated base-fee burn (M1's destroyed half, Stage SA-4). The other
     /// half is the PSCB reserve above; together they are everything usage
     /// ever removed from live supply, so `issued integral − (burned +
@@ -98,14 +98,14 @@ pub struct Chain {
     burned_fees_total: u64,
     /// Per-block burn deltas, keyed by block hash — rewound exactly like the
     /// PSCB deltas, for the same reason.
-    burned_undo: HashMap<Hash, u64>,
+    burned_undo: HashMap<Hash512, u64>,
     /// Active validator bonds (Decision 20 — P2). Bond value parks in
     /// unspendable bond-identity outputs in the UTXO set; the *rights* live
     /// here, maintained with the same undo discipline as the ledger.
     bonds: BondLedger,
     /// Per-block bond inverses, keyed by block hash — rewound exactly like
     /// the UTXO undo records, for the same reason.
-    bond_undo: HashMap<Hash, Vec<BondUndoOp>>,
+    bond_undo: HashMap<Hash512, Vec<BondUndoOp>>,
     /// M2 slash vault (Decision 2 item 4, Decision 20 item 4): equivocation
     /// slashes write full-bond records here — half burned at once, half
     /// vested to the PSCB reserve over time. Rebuilt by replay like every
@@ -114,7 +114,7 @@ pub struct Chain {
     /// Pre-block vault states for blocks that touched the vault, keyed by
     /// block hash. Stored only when touched: an empty, untouched vault needs
     /// no undo because there is nothing to restore.
-    slash_undo: HashMap<Hash, SlashVault>,
+    slash_undo: HashMap<Hash512, SlashVault>,
     /// Non-coinbase transactions the most recent successful reorg rolled back,
     /// oldest block first. Drained by the caller so the mempool can re-admit
     /// them.
@@ -142,7 +142,7 @@ impl Chain {
         let hash = genesis.block_hash();
         debug_assert_eq!(hash, {
             let hb = genesis.header.serialize();
-            crate::hash::sha256_dom(DOM_BLOCK, &[&hb])
+            crate::hash::sha512_dom(DOM_BLOCK512, &[&hb])
         });
 
         let mut chain = Chain {
@@ -189,7 +189,7 @@ impl Chain {
         (self.canon.len() - 1) as u64
     }
 
-    pub fn tip_hash(&self) -> Hash {
+    pub fn tip_hash(&self) -> Hash512 {
         *self.canon.last().expect("chain always has a genesis block")
     }
 
@@ -198,7 +198,7 @@ impl Chain {
             .expect("tip is in canon")
     }
 
-    pub fn block_hash_at(&self, height: u64) -> Option<Hash> {
+    pub fn block_hash_at(&self, height: u64) -> Option<Hash512> {
         self.canon.get(height as usize).copied()
     }
 
@@ -207,7 +207,7 @@ impl Chain {
         self.block_by_hash(&h)
     }
 
-    pub fn block_by_hash(&self, h: &Hash) -> Option<&Block> {
+    pub fn block_by_hash(&self, h: &Hash512) -> Option<&Block> {
         self.blocks.get(h)
     }
 
@@ -272,6 +272,7 @@ impl Chain {
     /// refused (`NotCanonical`). Passing a height already finalized to a
     /// *different* hash is refused as conflicting finality and retained as
     /// evidence (Decision 14).
+    #[allow(clippy::result_large_err)]
     pub fn apply_checkpoint(
         &mut self,
         checkpoint: &crate::bls_checkpoint::Checkpoint,
@@ -290,7 +291,7 @@ impl Chain {
     /// canonically at that height — a stale or forged metadata row cannot
     /// finalize a block the chain does not have. Returns whether it was
     /// installed.
-    pub fn restore_finality(&mut self, height: u64, hash: Hash) -> bool {
+    pub fn restore_finality(&mut self, height: u64, hash: Hash512) -> bool {
         if height == 0 {
             return false;
         }
@@ -303,7 +304,7 @@ impl Chain {
 
     /// The `(height, hash)` of the binding-finalized point, for persistence.
     /// `None` when binding finality has not activated or has not advanced.
-    pub fn finalized_point(&self) -> Option<(u64, Hash)> {
+    pub fn finalized_point(&self) -> Option<(u64, Hash512)> {
         let h = self.finality.binding_finalized_height();
         if h == 0 {
             None
@@ -383,7 +384,7 @@ impl Chain {
     /// error, but the walk is kept as a defensive fallback so the value stays
     /// correct for any block added outside that path; no consensus outcome
     /// depends on which branch runs.
-    fn cumulative_work(&self, hash: &Hash) -> u128 {
+    fn cumulative_work(&self, hash: &Hash512) -> u128 {
         if let Some(&w) = self.work.get(hash) {
             return w;
         }
@@ -502,7 +503,7 @@ impl Chain {
         // share this single rule.
         if !self.pow_satisfies(&block.header)? {
             return Err(Error::PowInvalid {
-                hash: crate::hash::hash_to_hex(&block.block_hash()),
+                hash: crate::hash::hash512_to_hex(&block.block_hash()),
                 difficulty: block.header.difficulty,
             });
         }
@@ -1236,7 +1237,7 @@ impl Chain {
         }
     }
 
-    fn rollback_block(&mut self, hash: &Hash) {
+    fn rollback_block(&mut self, hash: &Hash512) {
         let Some(block) = self.blocks.get(hash).cloned() else {
             return;
         };
@@ -1332,7 +1333,7 @@ impl Chain {
         self.slash_undo = s.slash_undo;
     }
 
-    fn path_to(&self, target: &Hash) -> Option<Vec<Hash>> {
+    fn path_to(&self, target: &Hash512) -> Option<Vec<Hash512>> {
         let mut path = Vec::new();
         let mut cursor = *target;
         loop {
@@ -1353,12 +1354,12 @@ impl Chain {
     /// depend on the order blocks happened to be delivered — two nodes holding
     /// an identical set of valid blocks could and did choose different tips,
     /// which is a consensus split rather than a rounding difference.
-    fn best_candidate(&self) -> Hash {
+    fn best_candidate(&self) -> Hash512 {
         let tip = self.tip_hash();
         let mut best = tip;
         let mut best_key = self.fork_choice_key(&tip);
 
-        let mut candidates: Vec<(&Hash, &Block)> = self.blocks.iter().collect();
+        let mut candidates: Vec<(&Hash512, &Block)> = self.blocks.iter().collect();
         candidates.sort_by(|a, b| a.0.cmp(b.0)); // deterministic iteration
         for (hash, block) in candidates {
             let key = self.fork_choice_key(hash);
@@ -1375,8 +1376,8 @@ impl Chain {
     /// first)`. Derived only from the block graph, never from arrival order.
     fn fork_choice_key(
         &self,
-        hash: &Hash,
-    ) -> (u128, std::cmp::Reverse<u64>, std::cmp::Reverse<Hash>) {
+        hash: &Hash512,
+    ) -> (u128, std::cmp::Reverse<u64>, std::cmp::Reverse<Hash512>) {
         let work = self.cumulative_work(hash);
         let height = self.blocks.get(hash).map(|b| b.header.height).unwrap_or(0);
         (work, std::cmp::Reverse(height), std::cmp::Reverse(*hash))
@@ -1439,7 +1440,7 @@ impl Chain {
     }
 
     /// Run fork choice over the stored blocks and apply whatever wins.
-    fn reselect(&mut self, submitted: Hash) -> Result<()> {
+    fn reselect(&mut self, submitted: Hash512) -> Result<()> {
         // Nothing is cleared here, and that is deliberate. Transactions
         // disconnected by an earlier reorg are still disconnected, and they stay
         // pending until the caller drains them — a reorg landing before the
@@ -1466,7 +1467,7 @@ impl Chain {
         Ok(())
     }
 
-    fn adopt(&mut self, target: Hash) -> Result<()> {
+    fn adopt(&mut self, target: Hash512) -> Result<()> {
         let new_canon = self.path_to(&target).ok_or(Error::UnknownParent)?;
         let saved = self.snapshot();
 
@@ -1670,7 +1671,7 @@ impl Chain {
             exit_claims,
         };
         Err(Error::PowInvalid {
-            hash: crate::hash::hash_to_hex(&unmined.block_hash()),
+            hash: crate::hash::hash512_to_hex(&unmined.block_hash()),
             difficulty: unmined.header.difficulty,
         })
     }
@@ -1980,21 +1981,21 @@ impl Chain {
         let tip_height = self.height();
         let cutoff = tip_height.saturating_sub(self.params.finality_depth);
 
-        let mut canonical: HashMap<Hash, ()> = HashMap::with_capacity(self.canon.len());
+        let mut canonical: HashMap<Hash512, ()> = HashMap::with_capacity(self.canon.len());
         for hash in &self.canon {
             canonical.insert(*hash, ());
         }
 
         // Decide by ascending height so a block is only dropped after its parent
         // has been decided; a survivor therefore always has a surviving parent.
-        let mut by_height: Vec<(u64, Hash)> = self
+        let mut by_height: Vec<(u64, Hash512)> = self
             .blocks
             .iter()
             .map(|(h, b)| (b.header.height, *h))
             .collect();
         by_height.sort_unstable();
 
-        let mut keep: HashMap<Hash, ()> =
+        let mut keep: HashMap<Hash512, ()> =
             HashMap::with_capacity(self.canon.len() + by_height.len());
         for hash in &self.canon {
             keep.insert(*hash, ());

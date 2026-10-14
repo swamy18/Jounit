@@ -7,7 +7,7 @@
 //! the final authority is the L2 state machine.
 
 use jnt_core::compute_ir::ComputeBackend;
-use jnt_core::hash::{Address, Hash};
+use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{L2Payload, L2Transaction, SubmitResultPayload};
 use jnt_core::wallet::Wallet;
 use jnt_l2::state::L2State;
@@ -21,7 +21,7 @@ use crate::node::{Host, L2Broadcaster, L2NodeView};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitPlan {
     pub tx: L2Transaction,
-    pub txid: Hash,
+    pub txid: Hash512,
     pub task_id: Hash,
     pub result_hash: Hash,
     pub worker: Address,
