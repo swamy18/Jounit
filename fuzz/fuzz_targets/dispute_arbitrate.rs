@@ -75,14 +75,14 @@ fuzz_target!(|data: &[u8]| {
                     assert_eq!(v.verdict(), None, "inconclusive is not a wire verdict");
                     assert_eq!(v.vwc_hash(), None, "inconclusive settles nothing");
                     assert!(
-                        v.settle_payload([0u8; 96], vec![0xFF], 1).is_err(),
+                        v.settle_payload([0u8; 96], vec![0xFF], 1, Vec::new()).is_err(),
                         "an inconclusive arbitration must have no settle payload"
                     );
                 }
                 Arbiter::WorkerCorrect | Arbiter::ChallengerCorrect => {
                     assert!(v.verdict().is_some());
                     assert_eq!(v.vwc_hash(), Some(reference));
-                    assert!(v.settle_payload([0u8; 96], vec![0xFF], 1).is_ok());
+                    assert!(v.settle_payload([0u8; 96], vec![0xFF], 1, Vec::new()).is_ok());
                 }
             }
             // Determinism: the same inputs must yield the same verdict.
