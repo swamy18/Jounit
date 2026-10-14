@@ -755,6 +755,7 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **Escrow identity** | Two escrows with the same parties and amount under different conditions shared one id, so the second open silently replaced the first | **The condition is part of the escrow id**, so different contracts are different escrows |
 | **Credit reservation accounting** | A position-backed reservation left free balance spendable (double-admit), recorded one position of a multi-position spread, and interest overflow wrapped or capped silently | **Free is swept at admission, draws are tracked per position, refused admissions leave the book untouched, and interest overflow is refused**; pinned by 3 new `redteam_round2` regressions |
 | **Chain identity hashes** | `txid` and `block_hash` were 32-byte SHA-256: ~128-bit preimage and ~85-bit collision resistance against a quantum attacker | **Widened to 64-byte SHA-512** under new domain tags (`DOM_TX512`, `DOM_BLOCK512`), as a separate `Hash512` type. PoW target math, Merkle nodes and addresses keep their widths; vectors regenerated |
+| **Quantum succession** | A CRQC breaks secp256k1 and BLS12-381, so spends, checkpoints and VWCs were all classically signed | **Three dual-signature paths**: spends accept an ML-DSA-65 component (scheme 3) inside the hybrid bundle, checkpoints carry a lattice sidecar verified as clause 7, and settlements and their VWCs carry one their votes sign. Validators register lattice keys in their bonds. Every rule is accepted-not-required: `pq_activation_height` is `0` on every profile until a rehearsal flips it |
 
 ---
 
@@ -801,9 +802,14 @@ Same code, different numbers.
 | Genesis validators | **none** | 4 deterministic | 4 deterministic |
 | Binding finality | **off** | on at height 20 | off |
 | Exits | **off** | on at height 1 | on at height 1 |
+| PQ spend requirement | **off** | off | off |
 
 `mainnet` deliberately ships with no committee and no activation, so it fails
-closed rather than verifying against nothing.
+closed rather than verifying against nothing. The PQ row is the
+`pq_activation_height` of Decision 24: `0` means no input is refused for
+lacking an ML-DSA-65 component, and the rule is age-gated when it is flipped —
+only outputs created at or after the height must carry the component, so
+history is never stranded.
 
 ---
 

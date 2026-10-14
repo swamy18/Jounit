@@ -206,9 +206,12 @@ and compares it to the address that owns the spent output, so a bundle a
 caller invents for an output it does not own is refused before any
 cryptographic check.
 
-Scheme `3` is accepted by consensus but **not required yet**: there is no
-activation height at which a bundle lacking it becomes invalid. Turning that on
-is the PQ-activation decision recorded in `docs/decisions.md`.
+Scheme `3` is accepted by consensus but **not required yet**:
+`pq_activation_height` is `0` on every profile (§9.3, §10). Once a profile sets
+it, an input spending an output created at or after that height must carry an
+ML-DSA-65 component; outputs predating it are exempt, so the rule is age-gated
+and never strands history. Turning it on is the PQ-activation decision recorded
+in `docs/decisions.md` (Decision 24).
 
 ```
 txid = SHA512( DOM_TX512 ‖ serialize(tx) )          // 64 bytes
@@ -588,6 +591,7 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 | `coinbase_maturity` | blocks before coinbase value is spendable |
 | `finality_depth` | `h ≤ tip − finality_depth` is immutable; a reorg crossing it is rejected as `ReorgWouldCrossFinality` |
 | `finality_activation_height` | height from which a valid canonical checkpoint certificate becomes binding finality on top of the depth rule (§14.8); `0` = never |
+| `pq_activation_height` | height from which a bundle without an ML-DSA-65 component is refused when spending outputs created at or after it (§1, Decision 24); `0` = never. Age-gated, so outputs predating the height stay spendable under their original bundle — history is never stranded |
 
 Mainnet: maturity `100`, finality `100`, activation `0`. Mini: `10`, `20`, `0`.
 Testnet: `10`, `20`, activation `20` (§14.8).
@@ -621,6 +625,7 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `network_magic` | `6A 4E 54 01` | (distinct) | `6A 4E 54 03` |
 | `checkpoint_interval_blocks` | `100` | `10` | `10` |
 | `finality_activation_height` | `0` | `0` | `20` |
+| `pq_activation_height` | `0` (**never**) | `0` | `0` |
 | `genesis_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
 | `exit_activation_height` | `0` (**never**) | `1` | `1` |
 | `l2_genesis_escrow_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
