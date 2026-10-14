@@ -45,6 +45,7 @@ fn run_checkpoint_validation(data: &[u8]) {
                 stake_address: [i; 20],
                 bls_pk: sk.public_key(),
                 stake_sat: u64::from(i) * 100,
+                mldsa_pk: None,
             }
         })
         .collect();
@@ -65,6 +66,7 @@ fn run_checkpoint_validation(data: &[u8]) {
         aggregate_sig: BlsSignature(sig_bytes),
         signer_bitmap: bitmap,
         signer_count: u32::MAX, // hostile count; clause 3b must catch lies
+        pq_sidecar: Vec::new(),
     };
 
     let finalized = 0;
@@ -157,6 +159,7 @@ fn run_finality_state(data: &[u8]) {
             aggregate_sig: BlsSignature([if sig_nonzero { 7 } else { 0 }; 96]),
             signer_bitmap: vec![signers],
             signer_count: count as u32,
+            pq_sidecar: Vec::new(),
         };
         let canonical = match canonical_mode {
             0 => Some(block_hash),
@@ -219,6 +222,7 @@ fn run_finality_state(data: &[u8]) {
             aggregate_sig: sig,
             signer_bitmap: vec![signers],
             signer_count: count as u32,
+            pq_sidecar: Vec::new(),
         };
         let key = params.genesis_validators[0];
         let same = equivocation_evidence(&key, &cp, &cp);
