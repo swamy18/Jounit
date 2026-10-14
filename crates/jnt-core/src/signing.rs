@@ -325,6 +325,7 @@ impl Committee {
             aggregate_sig: aggregate,
             signer_bitmap: bitmap,
             signer_count: signed as u32,
+            pq_sidecar: Vec::new(),
         }))
     }
 }

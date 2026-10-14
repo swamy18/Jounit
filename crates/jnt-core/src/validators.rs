@@ -804,6 +804,7 @@ mod tests {
                 bm
             },
             signer_count: indices.len() as u32,
+            pq_sidecar: Vec::new(),
         }
     }
 

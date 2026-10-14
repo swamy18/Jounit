@@ -46,6 +46,7 @@ fn signed(payload: CheckpointPayload, indices: &[usize]) -> Checkpoint {
         aggregate_sig: agg,
         signer_bitmap: bitmap,
         signer_count: indices.len() as u32,
+        pq_sidecar: Vec::new(),
     }
 }
 
@@ -182,6 +183,7 @@ fn mainnet_with_no_committee_accepts_nothing() {
         aggregate_sig: BlsSignature([0x11; 96]),
         signer_bitmap: vec![],
         signer_count: 0,
+        pq_sidecar: Vec::new(),
     };
     assert!(accept(&mut fm, &cp).is_err());
     assert_eq!(fm.accepted_height(), 0);

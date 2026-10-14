@@ -107,6 +107,31 @@ pub const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 256;
 /// Maximum signer bitmap size (512 validators × 1 bit = 64 bytes; generous headroom).
 pub const MAX_SIGNER_BITMAP_BYTES: usize = 512;
 
+/// Maximum ML-DSA sidecar entries on one checkpoint. Committees are capped at
+/// 21 (`bond::MAX_COMMITTEE_SIZE`), so 64 is 3× headroom, not a second cap a
+/// legitimate committee could ever hit — and it bounds one certificate to
+/// ~212 KB, far inside the relay frame. A larger committee is a separate
+/// consensus change that raises this number with it.
+pub const MAX_PQ_SIDECAR_ENTRIES: usize = 64;
+
+/// Encoded ML-DSA-65 signature length inside a sidecar entry.
+pub const PQ_SIDECAR_SIGNATURE_BYTES: usize = 3309;
+
+/// One validator's lattice signature over a checkpoint decision.
+///
+/// ML-DSA has no pairing-based aggregation, so the "aggregate" half of a
+/// dual-signed checkpoint is a list of these, one per lattice signer, each
+/// naming its bitmap index. The index — not the key — is what binds an entry
+/// to a committee member: the verifier looks the key up in its own epoch set,
+/// so a caller cannot smuggle in a key the committee never registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqSidecarEntry {
+    /// Bitmap index of the signer in the epoch set's canonical order.
+    pub signer_index: u32,
+    /// ML-DSA-65 signature over the payload's signing hash (empty context).
+    pub signature: [u8; PQ_SIDECAR_SIGNATURE_BYTES],
+}
+
 impl CheckpointPayload {
     /// Canonical serialization for signing.
     pub fn serialize(&self) -> Vec<u8> {
@@ -235,6 +260,12 @@ pub struct Checkpoint {
     /// Number of validators that signed (derived from bitmap; stored for
     /// fast quorum checks without re-counting the bitmap).
     pub signer_count: u32,
+    /// Lattice sidecar: one ML-DSA-65 signature per bitmap signer that holds
+    /// a registered lattice key, over the same signing hash the BLS aggregate
+    /// covers. Empty while no committee member has registered a key, in which
+    /// case verification is BLS-only exactly as before. See clause 7 in
+    /// `validators::validate_checkpoint_against_set`.
+    pub pq_sidecar: Vec<PqSidecarEntry>,
 }
 
 impl Checkpoint {
@@ -253,12 +284,27 @@ impl Checkpoint {
         w.write_u32(self.signer_bitmap.len() as u32);
         w.write_raw(&self.signer_bitmap);
         w.write_u32(self.signer_count);
+        // The sidecar rides last so its absence costs four zero bytes and its
+        // presence is length-prefixed like every other repeated field.
+        w.write_u32(self.pq_sidecar.len() as u32);
+        for e in &self.pq_sidecar {
+            w.write_u32(e.signer_index);
+            w.write_raw(&e.signature);
+        }
         w.finish()
     }
 
     /// Bounded deserialize. Fails if any length field exceeds its limit,
     /// if the bitmap popcount disagrees with `signer_count`, or if
     /// trailing bytes remain.
+    ///
+    /// Certificates written before the sidecar existed end right after
+    /// `signer_count`, and those decode to an empty sidecar rather than an
+    /// error — so history, vectors and slash evidence over old certificates
+    /// keep reading. This is not a downgrade hole: stripping a sidecar off a
+    /// new certificate leaves bitmap signers holding registered lattice keys
+    /// with no entries for them, and clause 7 refuses exactly that. The parse
+    /// is lenient; the verification is not.
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let payload_len = r.u32le()? as usize;
@@ -274,12 +320,29 @@ impl Checkpoint {
         }
         let signer_bitmap = r.fixed_slice(bitmap_len)?.to_vec();
         let signer_count = r.u32le()?;
+        let mut pq_sidecar = Vec::new();
+        if r.remaining() > 0 {
+            let sidecar_len = r.u32le()? as usize;
+            if sidecar_len > MAX_PQ_SIDECAR_ENTRIES {
+                return Err(Error::Malformed("pq sidecar too large"));
+            }
+            pq_sidecar.reserve(sidecar_len.min(8));
+            for _ in 0..sidecar_len {
+                let signer_index = r.u32le()?;
+                let signature: [u8; PQ_SIDECAR_SIGNATURE_BYTES] = r.fixed()?;
+                pq_sidecar.push(PqSidecarEntry {
+                    signer_index,
+                    signature,
+                });
+            }
+        }
         r.expect_end()?;
         let s = Self {
             payload,
             aggregate_sig,
             signer_bitmap,
             signer_count,
+            pq_sidecar,
         };
         s.assert_coherent()?;
         Ok(s)
@@ -459,6 +522,7 @@ mod tests {
             aggregate_sig: dummy_sig(),
             signer_bitmap: bitmap,
             signer_count: signers,
+            pq_sidecar: Vec::new(),
         }
     }
 

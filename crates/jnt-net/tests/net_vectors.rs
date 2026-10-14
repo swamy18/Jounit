@@ -64,6 +64,7 @@ fn checkpoint_vector() -> jnt_core::bls_checkpoint::Checkpoint {
         aggregate_sig: BlsSignature([0x37u8; 96]),
         signer_bitmap: vec![0b0000_0111],
         signer_count: 3,
+        pq_sidecar: Vec::new(),
     }
 }
 

@@ -429,6 +429,7 @@ fn checkpoint_validation_rejects_every_adversarial_mutation() {
         aggregate_sig: honest_sig,
         signer_bitmap: bitmap.clone(),
         signer_count: signer_idx.len() as u32,
+        pq_sidecar: Vec::new(),
     };
     validate_checkpoint_against_set(&honest, set_for_epoch, finalized, epoch_blocks, &RealBls)
         .expect("an honest majority checkpoint must validate");

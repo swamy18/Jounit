@@ -415,6 +415,7 @@ fn checkpoint_at(chain: &mut Chain, height: u64) {
         aggregate_sig: agg,
         signer_bitmap: bitmap,
         signer_count: 3,
+        pq_sidecar: Vec::new(),
     };
     chain.apply_checkpoint(&cp, &RealBls).unwrap();
 }

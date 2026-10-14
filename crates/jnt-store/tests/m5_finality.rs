@@ -114,6 +114,7 @@ fn the_finalized_point_survives_reopen_and_equals_the_pre_restart_point() {
             aggregate_sig: agg,
             signer_bitmap: bitmap,
             signer_count: 3,
+            pq_sidecar: Vec::new(),
         }
     };
     live.apply_checkpoint(&cp, &RealBls).unwrap();

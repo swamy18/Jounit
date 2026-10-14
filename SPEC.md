@@ -137,7 +137,7 @@ Stake payloads (Decision 20), positional by `tx_type`:
 |---|---|
 | `2` (bond) | `bls_pk` (48) — the BLS key the bond authorizes |
 | `3` (unbond) | `bond_id` (32) — the txid of the `TX_BOND` that created the bond |
-| `4` (slash) | `len_a` (4 LE) + checkpoint A + `len_b` (4 LE) + checkpoint B (each ≤ 2 048 bytes) — two conflicting checkpoints as equivocation evidence |
+| `4` (slash) | `len_a` (4 LE) + checkpoint A + `len_b` (4 LE) + checkpoint B (each ≤ 262 144 bytes) — two conflicting checkpoints as equivocation evidence (sized for dual-signed certificates carrying up to 64 lattice signatures) |
 
 ### 3.5 Signature and key bundles
 

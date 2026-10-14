@@ -93,6 +93,7 @@ fn signed_with(
         aggregate_sig: agg,
         signer_bitmap: bitmap,
         signer_count: indices.len() as u32,
+        pq_sidecar: Vec::new(),
     }
 }
 
@@ -444,6 +445,7 @@ fn a_malformed_certificate_is_refused() {
         aggregate_sig: BlsSignature([0u8; 96]),
         signer_bitmap: Vec::new(),
         signer_count: 0,
+        pq_sidecar: Vec::new(),
     };
     let err = refused(&mut chain, &cp, "empty bitmap");
     assert!(matches!(
@@ -747,6 +749,7 @@ fn evidence_retention_is_bounded() {
         aggregate_sig: BlsSignature([7u8; 96]),
         signer_bitmap: vec![0b0000_0111],
         signer_count: 3,
+        pq_sidecar: Vec::new(),
     };
     fm.accept(&base, Some(base.payload.block_hash), &MockBls)
         .unwrap();
@@ -761,6 +764,7 @@ fn evidence_retention_is_bounded() {
             aggregate_sig: BlsSignature([7u8; 96]),
             signer_bitmap: vec![0b0000_0111],
             signer_count: 3,
+            pq_sidecar: Vec::new(),
         };
         let err = fm
             .accept(&cp, Some(base.payload.block_hash), &MockBls)

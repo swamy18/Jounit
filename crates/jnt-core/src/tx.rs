@@ -22,10 +22,15 @@ pub const TX_BOND: u8 = 2;
 pub const TX_UNBOND: u8 = 3;
 pub const TX_SLASH: u8 = 4;
 
-/// Maximum bytes of one checkpoint inside a slash payload. Real checkpoints
-/// are a few hundred bytes; the cap only stops a declared length from driving
-/// an allocation off the actual buffer.
-pub const MAX_SLASH_CHECKPOINT_BYTES: usize = 2048;
+/// Maximum bytes of one checkpoint inside a slash payload.
+///
+/// A BLS-only checkpoint is a few hundred bytes, but a dual-signed one carries
+/// up to 64 lattice signatures at 3 313 bytes each (~212 KB worst case). The
+/// cap must admit the largest honest evidence or equivocation with a sidecar
+/// becomes unslashable — which is exactly the equivocation a quantum adversary
+/// would commit. It still stops a declared length from driving an allocation
+/// off the actual buffer; that job does not depend on the number.
+pub const MAX_SLASH_CHECKPOINT_BYTES: usize = 262_144;
 
 /// Fixed part of a serialized input: `prev_hash(64) + prev_index(4)`. The
 /// signature and key bundles that follow are variable-length (SPEC.md §3.2),

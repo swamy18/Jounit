@@ -160,6 +160,7 @@ fn lone_checkpoint(sk: &SecretKey, payload: CheckpointPayload) -> Checkpoint {
         aggregate_sig: agg,
         signer_bitmap: vec![1u8],
         signer_count: 1,
+        pq_sidecar: Vec::new(),
     }
 }
 

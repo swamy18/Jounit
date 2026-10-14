@@ -66,6 +66,7 @@ fn signed_checkpoint(c: &Committee, p: CheckpointPayload, indices: &[usize]) -> 
         aggregate_sig: agg,
         signer_bitmap: c.set.bitmap_from_indices(indices),
         signer_count: indices.len() as u32,
+        pq_sidecar: Vec::new(),
     }
 }
 
@@ -238,6 +239,7 @@ fn a_zero_public_key_in_the_set_breaks_verification_cleanly() {
         let evil = Checkpoint {
             signer_bitmap: poisoned.bitmap_from_indices(&idx),
             signer_count: idx.len() as u32,
+            pq_sidecar: Vec::new(),
             ..cp.clone()
         };
         let _ = verify_checkpoint(&evil, &poisoned, &RealBls);

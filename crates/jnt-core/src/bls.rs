@@ -482,6 +482,7 @@ mod tests {
             aggregate_sig: agg,
             signer_bitmap: set.bitmap_from_indices(&[0, 1, 2]),
             signer_count: 3,
+            pq_sidecar: Vec::new(),
         };
         assert!(crate::bls_checkpoint::verify_checkpoint(&cp, &set, &RealBls).is_ok());
 
@@ -496,6 +497,7 @@ mod tests {
             },
             signer_bitmap: set.bitmap_from_indices(&[0, 1, 2]),
             signer_count: 3,
+            pq_sidecar: Vec::new(),
         };
         assert!(
             crate::bls_checkpoint::verify_checkpoint(&forged, &set, &MockBls).is_ok(),
