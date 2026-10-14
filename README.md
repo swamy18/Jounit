@@ -754,6 +754,7 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **HBM** | Registered but not the active mining puzzle | Registered as `puzzle_id = 2` with a security review; `mini`/`testnet`/mainnet still mine `puzzle_id = 1` (hybrid), so registration is an open item made safe, not a mainnet-readiness change |
 | **Escrow identity** | Two escrows with the same parties and amount under different conditions shared one id, so the second open silently replaced the first | **The condition is part of the escrow id**, so different contracts are different escrows |
 | **Credit reservation accounting** | A position-backed reservation left free balance spendable (double-admit), recorded one position of a multi-position spread, and interest overflow wrapped or capped silently | **Free is swept at admission, draws are tracked per position, refused admissions leave the book untouched, and interest overflow is refused**; pinned by 3 new `redteam_round2` regressions |
+| **Chain identity hashes** | `txid` and `block_hash` were 32-byte SHA-256: ~128-bit preimage and ~85-bit collision resistance against a quantum attacker | **Widened to 64-byte SHA-512** under new domain tags (`DOM_TX512`, `DOM_BLOCK512`), as a separate `Hash512` type. PoW target math, Merkle nodes and addresses keep their widths; vectors regenerated |
 
 ---
 

@@ -19,7 +19,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum bytes of `user_agent` and `network_id` text.
 pub const MAX_HANDSHAKE_STR_LEN: usize = 64;
 
-/// Upper bounds on repeated fields. Each entry is `kind(1) ‖ hash(32)` = 33
+/// Upper bounds on repeated fields. Each entry is `kind(1) ‖ hash(64)` = 65
 /// bytes, so the cap also bounds the worst-case allocation.
 pub const MAX_INV_PER_MSG: usize = 500;
 pub const MAX_LOCATOR_ENTRIES: usize = 500;

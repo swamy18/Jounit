@@ -12,7 +12,8 @@ This document is the **normative reference**. Any implementation in any language
 
 | Rule | Value |
 |---|---|
-| Hash | SHA-256 (FIPS 180-4), 32 bytes |
+| Hash | SHA-256 (FIPS 180-4), 32 bytes — internal commitments, Merkle nodes, PoW evidence |
+| Chain identity hash | SHA-512 (FIPS 180-4), 64 bytes — `txid` and `block_hash` only. A 256-bit digest keeps ~128 bits of preimage resistance against Grover and ~85 bits of collision resistance against a quantum (BHT) collision search; doubling the width of the two ids an attacker most wants to forge restores a full 256-bit margin. Nothing else widens: the PoW target comparison, Merkle nodes and addresses keep their widths |
 | Signature | secp256k1, ECDSA, compact 64-byte `r‖s`, low-`s` enforced |
 | Integer arithmetic | Signed/unsigned integers only. **No floating point anywhere in consensus.** |
 | Byte order | Explicit `LE` (little-endian) or raw (byte sequence as written) on every field |
@@ -26,7 +27,9 @@ This document is the **normative reference**. Any implementation in any language
 | Tag | Bytes |
 |---|---|
 | `DOM_BLOCK` | `jounit/blockhash/v1` |
+| `DOM_BLOCK512` | `jounit/blockhash512/v1` |
 | `DOM_TX` | `jounit/txid/v1` |
+| `DOM_TX512` | `jounit/txid512/v1` |
 | `DOM_TXBODY` | `jounit/txbody/v1` |
 | `DOM_SIG` | `jounit/sig/v1` |
 | `DOM_ADDR` | `jounit/addr/v1` |
@@ -97,12 +100,12 @@ All lengths are implied by the field list. Integers marked `LE` are little-endia
 
 | Field | Size |
 |---|---|
-| `prevout_hash` | 32 raw |
+| `prevout_hash` | 64 raw |
 | `prevout_index` | 4 LE |
 | `sigs` | signature bundle (§3.5) |
 | `keys` | public-key bundle (§3.5) |
 
-Fixed prefix is 36 bytes. The two bundles are length-prefixed, so the input is
+Fixed prefix is 68 bytes. The two bundles are length-prefixed, so the input is
 variable-length. This is deliberate: a post-quantum signature is ~2.4 KB
 (ML-DSA-44) to 3.3 KB (ML-DSA-65), and no fixed field sized to today's 64-byte
 ECDSA could ever hold one. A cap that admits a real post-quantum signature would
@@ -208,16 +211,16 @@ activation height at which a bundle lacking it becomes invalid. Turning that on
 is the PQ-activation decision recorded in `docs/decisions.md`.
 
 ```
-txid = SHA256( DOM_TX ‖ serialize(tx) )
+txid = SHA512( DOM_TX512 ‖ serialize(tx) )          // 64 bytes
 ```
 
-### 3.4 `Header` — exactly 145 bytes
+### 3.4 `Header` — exactly 177 bytes
 
 | Field | Size | Notes |
 |---|---|---|
 | `version` | 4 LE | block version |
 | `height` | 8 LE | `0` for genesis |
-| `prev_hash` | 32 raw | previous block hash |
+| `prev_hash` | 64 raw | previous block hash (512-bit identity) |
 | `merkle_root` | 32 raw | |
 | `timestamp_ms` | 8 LE | Unix milliseconds |
 | `base_fee_sat` | 8 LE | base fee for the *next* block (§8) |
@@ -229,7 +232,7 @@ txid = SHA256( DOM_TX ‖ serialize(tx) )
 | `sig_scheme` | 1 | |
 
 ```
-block_hash = SHA256( DOM_BLOCK ‖ serialize(header) )
+block_hash = SHA512( DOM_BLOCK512 ‖ serialize(header) )          // 64 bytes
 ```
 
 ### 3.5 `Block`
@@ -641,7 +644,7 @@ closed by configuration rather than by a missing mechanism.
 ```
 header.version      = 1
 header.height       = 0
-header.prev_hash    = 32 zero bytes
+header.prev_hash    = 64 zero bytes
 header.merkle_root  = merkle_root([coinbase])
 header.timestamp_ms = 0
 header.difficulty   = params.genesis_difficulty        // 1 ⇒ any hash valid
@@ -651,7 +654,7 @@ header.epoch_id     = 0
 header.extra_nonce  = "jounit-genesis" padded to 16 bytes
 header.sig_scheme   = 1
 coinbase            = version 1, tx_type 1, lock_time 0,
-                      input { prev_hash = 32 zeros, index = 0, sig = 64 zeros, pubkey = 33 zeros },
+                      input { prev_hash = 64 zeros, index = 0, sig = 64 zeros, pubkey = 33 zeros },
                       output { value = 0, address = 20 zero bytes }
 ```
 
@@ -811,7 +814,7 @@ connection.
 | `protocol_version` | 4 LE | `1` in v0.2 |
 | `services` | 8 LE | bit 0 = serves blocks; v0.2 all nodes set it |
 | `height` | 8 LE | best height, `0` if at genesis |
-| `tip_hash` | 32 raw | tip block hash |
+| `tip_hash` | 64 raw | tip block hash (512-bit identity) |
 | `user_agent` | `1 + n` | length-prefixed, `≤ 64` bytes |
 | `nonce` | 8 LE | see below |
 
@@ -843,10 +846,10 @@ without disconnecting, so a later version can add messages safely.
 | `2` | `VERACK` | echoed `nonce` (8) |
 | `3` | `PING` | `nonce` (8) |
 | `4` | `PONG` | `nonce` (8) |
-| `5` | `INV` | `count(2 LE) ‖ count × (kind(1) ‖ hash(32))` |
+| `5` | `INV` | `count(2 LE) ‖ count × (kind(1) ‖ hash(64))` |
 | `6` | `GETDATA` | same shape as `INV` |
 | `7` | `BLOCK` | `serialize(block)` (§3.5) |
-| `8` | `GETBLOCKS` | `count(2 LE) ‖ locator(count × 32) ‖ stop_hash(32)` |
+| `8` | `GETBLOCKS` | `count(2 LE) ‖ locator(count × 64) ‖ stop_hash(64)` |
 | `9` | `ADDR` | `count(2 LE) ‖ count × (port(2 LE) ‖ ip(16))` |
 | `10` | `TX` | `serialize(transaction)` (§3.6) |
 | `11` | `CHECKPOINT` | `payload_len(4 LE) ‖ payload ‖ aggregate_sig(96) ‖ bitmap_len(4 LE) ‖ bitmap ‖ signer_count(4 LE)` |
@@ -873,8 +876,8 @@ every length field is bounded (`MAX_CHECKPOINT_PAYLOAD_BYTES`,
 `MAX_SIGNER_BITMAP_BYTES`) before allocation, per the rule below.
 
 Every `count` field MUST be bounded by the smallest entry that could follow,
-checked before allocating — `INV` entries are 33 bytes, `ADDR` entries 18,
-`GETBLOCKS` locators 32. Bounding by remaining bytes alone is the defect already
+checked before allocating — `INV` entries are 65 bytes, `ADDR` entries 18,
+`GETBLOCKS` locators 64. Bounding by remaining bytes alone is the defect already
 fixed in §3; the same bound applies here.
 
 `count` MUST additionally be capped at `max_inv_per_msg` (§13.8).
@@ -943,9 +946,9 @@ remotely triggerable failure, so these are requirements, not tuning.
 | Bound | Value | Protects |
 |---|---|---|
 | `max_frame_bytes` | `4 100 000` | one `max_block_bytes` block + envelope |
-| `max_inv_per_msg` | `500` | 500 × 33 = 16.5 KB per `INV` |
+| `max_inv_per_msg` | `500` | 500 × 65 = 32.5 KB per `INV` |
 | `max_addr_per_msg` | `100` | 100 × 18 = 1.8 KB per `ADDR` |
-| `max_locator_len` | `500` | 500 × 32 = 16 KB per `GETBLOCKS` |
+| `max_locator_len` | `500` | 500 × 64 = 32 KB per `GETBLOCKS` |
 | `max_peers` | `125` | thread count, fd count |
 | `max_inbound` | `32` | inbound connection flood |
 | `handshake_timeout` | `20 s` | half-open connection exhaustion |
@@ -1133,8 +1136,8 @@ Delivery uses `TX` (§13.5).
   could announce `max_relay_in_flight` transactions, deliver none, and stop the
   node requesting transactions from *every* peer for as long as it stayed
   connected — and the withheld txids would be marked as already requested, so a
-  peer that did hold them would be ignored too. Thirty-two bytes per announcement
-  would buy a permanent, node-wide relay stall. Expiry bounds the worst case to a
+   peer that did hold them would be ignored too. Sixty-four bytes per announcement
+   would buy a permanent, node-wide relay stall. Expiry bounds the worst case to a
   delay, and a request that expires is retried against whoever announces the txid
   next; the txid is never blacklisted.
 - The set of txids remembered for relay-loop suppression is capped at
@@ -1305,7 +1308,7 @@ Validation at verification time, never trusted from the wire alone.
 
     msg = sha256_dom([0xB1], [CheckpointPayload.serialize()])
 
-    CheckpointPayload = height(u64) ‖ block_hash(32) ‖ net_id_len(u32) ‖
+    CheckpointPayload = height(u64) ‖ block_hash(64) ‖ net_id_len(u32) ‖
                         net_id(bytes) ‖ epoch(u64)
 
 All integers little-endian. The message handed to BLS is the 32-byte hash; two
@@ -2465,7 +2468,7 @@ the L2 leaves, in block order. L1 and L2 leaves use **distinct domain tags**
 presented as an L1 transaction leaf or vice versa.
 
 This is the rule that makes the carriage safe, and it is worth being precise
-about why: `block_hash = SHA256(DOM_BLOCK ‖ serialize(header))` (§3.4), so the
+about why: `block_hash = SHA512(DOM_BLOCK512 ‖ serialize(header))` (§3.4), so the
 header binds the body *only* through `merkle_root`. Committing L2 leaves to that
 same root means the existing `MerkleRootMismatch` rule (§9.1) already refuses a
 block whose L2 section was stripped, reordered or altered — **no new L1 block
