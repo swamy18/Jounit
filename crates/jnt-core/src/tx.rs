@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::bls_checkpoint::{BlsPublicKey, Checkpoint};
+use crate::bls_checkpoint::{BlsPublicKey, BlsSignature, Checkpoint};
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512, DOM_SIG, DOM_TX512, DOM_TXBODY};
 use crate::hexserde;
@@ -177,23 +177,32 @@ pub struct Transaction {
 
 /// Stake-operation payload for bonded-stake transactions (Decision 20).
 ///
-/// The canonical encoding is positional by `tx_type` — `Bond` is 48 key bytes,
-/// `Unbond` is a 32-byte bond id, `Slash` is two length-prefixed checkpoints —
+/// The canonical encoding is positional by `tx_type` — `Bond` is 48 key bytes
+/// plus a 96-byte proof of possession (and optionally a lattice key), `Unbond`
+/// is a 32-byte bond id, `Slash` is two length-prefixed checkpoints —
 /// so there is exactly one byte string per operation. Semantic checks (single
 /// signer, minimum stake, maturity, evidence validity) live in `bond.rs`, not
 /// here: the codec stays dumb and total.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StakePayload {
-    /// `TX_BOND`: the BLS key this bond authorizes for checkpoints, plus the
-    /// validator's lattice key when it registers one (`None` for bonds written
-    /// before lattice registration existed, and for validators that have not
-    /// migrated). The lattice key is looked up by BLS identity — it never
-    /// replaces the BLS key as the committee identity, so bitmap order and
-    /// `bond_identity` are unchanged by its presence. Boxed: 1952 bytes would
-    /// otherwise make every stake payload pay for the largest variant, the
-    /// same reason `Slash` is boxed.
+    /// `TX_BOND`: the BLS key this bond authorizes for checkpoints, that key's
+    /// proof of possession, plus the validator's lattice key when it registers
+    /// one (`None` for bonds written before lattice registration existed, and
+    /// for validators that have not migrated). The lattice key is looked up by
+    /// BLS identity — it never replaces the BLS key as the committee identity,
+    /// so bitmap order and `bond_identity` are unchanged by its presence.
+    /// Boxed: 1952 bytes would otherwise make every stake payload pay for the
+    /// largest variant, the same reason `Slash` is boxed.
+    ///
+    /// `pop` is mandatory: it is the BLS signature over
+    /// [`crate::bond::bond_pop_message`] that proves the bonder holds the
+    /// secret key behind `bls_pk`. Without it anyone could bond a public key
+    /// they do not own — griefing a real validator out of their own key, or
+    /// registering a rogue key chosen to cancel another key in an aggregate.
+    /// See `bond::check_bond_tx`.
     Bond {
         bls_pk: BlsPublicKey,
+        pop: BlsSignature,
         mldsa_pk: Option<Box<[u8; 1952]>>,
     },
     /// `TX_UNBOND`: the bond being released (the BOND transaction's txid).
@@ -219,16 +228,25 @@ impl StakePayload {
 
     /// Canonical payload bytes (without any tag — `tx_type` says the shape).
     ///
-    /// A bond is `bls_pk(48)` alone when no lattice key is registered, and
-    /// `bls_pk(48) ‖ 0x01 ‖ mldsa_pk(1952)` when one is. The short shape is
-    /// exactly the pre-registration encoding, so old bonds decode unchanged;
-    /// a `0x00` flag byte is accepted and also means absent, so both spellings
-    /// of "no key" name the same payload.
+    /// A bond is `bls_pk(48) ‖ pop(96)` when no lattice key is registered, and
+    /// `bls_pk(48) ‖ pop(96) ‖ 0x01 ‖ mldsa_pk(1952)` when one is. A `0x00`
+    /// flag byte is accepted and also means absent, so both spellings of "no
+    /// key" name the same payload.
+    ///
+    /// The proof of possession is positional and always present, which is what
+    /// makes a payload *without* one undecodable: the pre-PoP shape
+    /// (`bls_pk(48)` alone) is refused by [`Self::from_reader`] rather than
+    /// silently upgraded to a bond nobody proved they could sign for.
     pub fn body_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
-            StakePayload::Bond { bls_pk, mldsa_pk } => {
+            StakePayload::Bond {
+                bls_pk,
+                pop,
+                mldsa_pk,
+            } => {
                 w.raw(bls_pk.as_bytes());
+                w.raw(pop.as_bytes());
                 if let Some(pk) = mldsa_pk {
                     w.u8(1).raw(&pk[..]);
                 }
@@ -252,12 +270,19 @@ impl StakePayload {
         match tx_type {
             TX_BOND => {
                 let raw = r.fixed::<48>().map_err(|_| Error::Malformed("bond key"))?;
-                // Backcompat: a bare 48-byte payload is a bond with no lattice
-                // key. Anything else must be the flag byte plus, for `0x01`,
-                // exactly one 1952-byte key — then end of payload.
+                // The proof of possession is not optional: a payload that
+                // stops after the key is the pre-PoP encoding, and a bond
+                // nobody proved possession of is exactly what this field
+                // exists to prevent.
+                let pop: [u8; 96] = r
+                    .fixed()
+                    .map_err(|_| Error::Malformed("bond proof of possession"))?;
+                // Anything past the proof must be the flag byte plus, for
+                // `0x01`, exactly one 1952-byte key — then end of payload.
                 if r.remaining() == 0 {
                     return Ok(StakePayload::Bond {
                         bls_pk: BlsPublicKey(raw),
+                        pop: BlsSignature(pop),
                         mldsa_pk: None,
                     });
                 }
@@ -273,6 +298,7 @@ impl StakePayload {
                 r.expect_end()?;
                 Ok(StakePayload::Bond {
                     bls_pk: BlsPublicKey(raw),
+                    pop: BlsSignature(pop),
                     mldsa_pk,
                 })
             }

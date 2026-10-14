@@ -69,7 +69,8 @@ fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash512) {
             index: 0,
         })
         .collect();
-    let pk = SecretKey::derive(&[7u8; 32]).unwrap().public_key();
+    let sk = SecretKey::derive(&[7u8; 32]).unwrap();
+    let pk = sk.public_key();
     let identity = jnt_core::bond::bond_identity(&chain.params().network_id, &bonder, &pk);
     let total: u64 = ops
         .iter()
@@ -96,6 +97,7 @@ fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash512) {
     tx.tx_type = TX_BOND;
     tx.stake = Some(StakePayload::Bond {
         bls_pk: pk,
+        pop: jnt_core::bond::bond_pop(&sk, &chain.params().network_id, &bonder),
         mldsa_pk: None,
     });
     w.sign(&mut tx).unwrap();

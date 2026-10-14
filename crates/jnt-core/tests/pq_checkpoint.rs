@@ -192,28 +192,35 @@ fn a_sidecar_entry_for_a_keyless_member_is_refused() {
 }
 
 #[test]
-fn a_bond_with_a_lattice_key_round_trips_and_an_old_bond_decodes_keyless() {
+fn a_bond_round_trips_with_its_proof_of_possession_and_the_pre_pop_shape_is_refused() {
+    use jnt_core::bls_checkpoint::BlsSignature;
     use jnt_core::tx::StakePayload;
     let pk = key(4).public_key();
     let lattice = key(4).mldsa_pubkey();
+    // Codec-level proof: `from_reader` does not verify it, it only has to be
+    // present and the right length. Verification lives in `check_bond_tx`.
+    let pop = BlsSignature([0x5A; 96]);
     let new = StakePayload::Bond {
         bls_pk: pk,
+        pop,
         mldsa_pk: Some(Box::new(lattice)),
     };
     let bytes = new.body_bytes();
-    assert_eq!(bytes.len(), 48 + 1 + 1952);
+    assert_eq!(bytes.len(), 48 + 96 + 1 + 1952);
     let mut r = jnt_core::ser::Reader::new(&bytes);
     let back = StakePayload::from_reader(&mut r, jnt_core::tx::TX_BOND).unwrap();
     assert_eq!(back, new);
 
-    // The pre-registration shape — a bare 48-byte key — decodes to no key.
+    // The pre-PoP shape -- a bare 48-byte key -- no longer decodes at all.
+    // Accepting it would mean a bond could enter the ledger without anyone
+    // proving they hold the key it registers.
     let mut r = jnt_core::ser::Reader::new(&pk.0);
-    let old = StakePayload::from_reader(&mut r, jnt_core::tx::TX_BOND).unwrap();
-    assert_eq!(
-        old,
-        StakePayload::Bond {
-            bls_pk: pk,
-            mldsa_pk: None
-        }
+    let err = StakePayload::from_reader(&mut r, jnt_core::tx::TX_BOND).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            jnt_core::error::Error::Malformed("bond proof of possession")
+        ),
+        "the pre-PoP encoding must be refused by name, got {err:?}"
     );
 }

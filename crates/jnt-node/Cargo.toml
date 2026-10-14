@@ -16,6 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 rand.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 

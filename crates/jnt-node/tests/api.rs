@@ -1389,7 +1389,8 @@ fn escrow_open_records_then_refuses_an_unauthorized_arbiter_release_and_accepts_
     let id_hex = b["escrow_id"].as_str().unwrap();
 
     // Reconstruct the escrow purely to compute the exact release-signing hash
-    // the node will check. The hash is a pure function of the open fields.
+    // the node will check. The hash is a pure function of the open fields (the
+    // open height only starts the refund timeout, so any height works here).
     let e = ConditionalEscrow::open(
         "jounit/test".to_string(),
         payer_addr,
@@ -1399,6 +1400,7 @@ fn escrow_open_records_then_refuses_an_unauthorized_arbiter_release_and_accepts_
         arb_pk,
         1_000,
         1,
+        0,
     )
     .unwrap();
     let release_hash = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
@@ -1489,6 +1491,7 @@ fn a_mutual_release_is_accepted_when_both_parties_sign_and_refused_when_one_is_m
         arb_pk,
         1_000,
         2,
+        0,
     )
     .unwrap();
     let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
@@ -1588,6 +1591,7 @@ fn a_released_escrow_advances_to_finalized_under_finality() {
         arb_pk,
         1_000,
         1,
+        0,
     )
     .unwrap();
     let id = e.id();

@@ -142,14 +142,23 @@ impl SecretKey {
 /// Validate a compressed G1 point. Rejects infinity, wrong subgroup, and
 /// bytes that are not a point at all — a key that fails this cannot enter a
 /// validator set (§14.5).
+///
+/// `key_validate` is `from_bytes` **plus** `validate()`; `uncompress` alone
+/// only decodes the point and would accept one in the wrong subgroup, which is
+/// exactly the input a rogue-key attack feeds an aggregate verification.
 pub fn validate_public_key(pk: &BlsPublicKey) -> Result<min_pk::PublicKey, BlsError> {
-    min_pk::PublicKey::uncompress(pk.as_bytes())
+    min_pk::PublicKey::key_validate(pk.as_bytes())
         .map_err(|_| BlsError::BadPoint { what: "public key" })
 }
 
-/// Validate a compressed G2 point without verifying any message.
+/// Validate a compressed G2 point without verifying any message: decode,
+/// reject the point at infinity, and check the subgroup.
+///
+/// As with keys, `uncompress` on its own skips the subgroup check — blst's
+/// `sig_validate` is the decode plus that check, so a signature that reaches
+/// verification has already been proven to be a usable curve point.
 pub fn validate_signature(sig: &BlsSignature) -> Result<min_pk::Signature, BlsError> {
-    min_pk::Signature::uncompress(sig.as_bytes())
+    min_pk::Signature::sig_validate(sig.as_bytes(), true)
         .map_err(|_| BlsError::BadPoint { what: "signature" })
 }
 
@@ -167,7 +176,7 @@ impl RealBls {
         let Ok(sig) = validate_signature(sig) else {
             return false;
         };
-        sig.verify(false, message, DST_CHECKPOINT, &[], &pk, false) == BLST_ERROR::BLST_SUCCESS
+        sig.verify(true, message, DST_CHECKPOINT, &[], &pk, false) == BLST_ERROR::BLST_SUCCESS
     }
 
     /// Aggregate distinct signatures (same message) into one G2 point.
@@ -216,9 +225,12 @@ impl RealBls {
         };
         let pk_refs: Vec<&min_pk::PublicKey> = pks.iter().collect();
         // fast_aggregate_verify: sum the keys, one pairing against the
-        // aggregate. Group check on the signature runs here; key validation
-        // already happened above.
-        sig.fast_aggregate_verify(false, message, DST_CHECKPOINT, &pk_refs)
+        // aggregate. The first argument is the signature group check — it is
+        // `true` so a point outside the G2 subgroup is refused here rather
+        // than assumed; key validation already happened above. (blst's own
+        // doc for this call assumes the keys carry proof of possession, which
+        // `bond::check_bond_tx` now requires at bond time.)
+        sig.fast_aggregate_verify(true, message, DST_CHECKPOINT, &pk_refs)
             == BLST_ERROR::BLST_SUCCESS
     }
 }
@@ -430,6 +442,36 @@ mod tests {
 
         // Silence the unused-variable lint for `junk` reuse below.
         let _ = &mut junk;
+    }
+
+    /// The exact gap `key_validate`/`sig_validate` close over bare
+    /// `uncompress`: the compressed point-at-infinity encoding *decodes* just
+    /// fine, and only the validate step refuses it. A committee that skipped
+    /// that step would admit the all-important rogue element into an aggregate
+    /// sum.
+    #[test]
+    fn the_point_at_infinity_decodes_but_never_validates() {
+        let mut inf_pk = [0u8; 48];
+        inf_pk[0] = 0xC0; // compressed | infinity
+        assert!(
+            blst::min_pk::PublicKey::uncompress(&inf_pk).is_ok(),
+            "uncompress alone decodes infinity - this is the gap being tested"
+        );
+        assert!(matches!(
+            validate_public_key(&BlsPublicKey(inf_pk)),
+            Err(BlsError::BadPoint { what: "public key" })
+        ));
+
+        let mut inf_sig = [0u8; 96];
+        inf_sig[0] = 0xC0;
+        assert!(
+            blst::min_pk::Signature::uncompress(&inf_sig).is_ok(),
+            "uncompress alone decodes infinity - this is the gap being tested"
+        );
+        assert!(matches!(
+            validate_signature(&BlsSignature(inf_sig)),
+            Err(BlsError::BadPoint { what: "signature" })
+        ));
     }
 
     #[test]

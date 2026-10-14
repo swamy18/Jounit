@@ -945,10 +945,12 @@ impl Chain {
         }
     }
 
-    /// Active checkpoint committee (Decision 20 item 2): the first 21 bonds
-    /// by bond order. An empty ledger falls back to the profile's declared
-    /// committee (the Decision 8/13 test bootstrap); mainnet declares none,
-    /// so its committee is purely bond-derived from the first bond on.
+    /// Active checkpoint committee (Decision 20 item 2): the 21
+    /// highest-staked bonds, per [`BondLedger::committee`] — the one
+    /// definition shared with slashing and with the epoch set. An empty ledger
+    /// falls back to the profile's declared committee (the Decision 8/13 test
+    /// bootstrap); mainnet declares none, so its committee is purely
+    /// bond-derived from the first bond on.
     pub fn committee_keys(&self) -> Vec<BlsPublicKey> {
         let bonded = self.bonds.committee();
         if bonded.is_empty() {
@@ -990,17 +992,21 @@ impl Chain {
     }
 
     /// Stake-backed validator records for the current epoch's committee
-    /// derivation (Item 5). One `ValidatorRecord` per active bond: the bond's
-    /// identity address (network-bound, so a mainnet bond cannot masquerade as a
-    /// mini bond), its BLS key, its registered lattice key if any, and its
-    /// locked value as `stake_sat`. `derive_set`
-    /// (TopN) consumes these to pick the top 21 by stake and bind the `stake_address`
-    /// into the epoch set hash — the bit that turns "a bonded key signs checkpoints"
-    /// into "the highest-staked 21 keys form the committee".
+    /// derivation (Item 5). One `ValidatorRecord` per committee member: the
+    /// bond's identity address (network-bound, so a mainnet bond cannot
+    /// masquerade as a mini bond), its BLS key, its registered lattice key if
+    /// any, and its locked value as `stake_sat`.
+    ///
+    /// The members come from [`BondLedger::committee`] — the same 21
+    /// signing/slashing already uses — so `derive_set`'s TopN pass over this
+    /// list re-selects exactly those 21 and the epoch set cannot drift from
+    /// the set that signed. Feeding it *every* bond instead was the bug: with
+    /// a 22nd bond, finality verified against the top 21 by stake while
+    /// validators had signed as the first 21 by bond order.
     pub fn committee_records(&self) -> Vec<crate::validators::ValidatorRecord> {
         use crate::bond::bond_identity;
         self.bonds
-            .records()
+            .committee()
             .into_iter()
             .map(|r| crate::validators::ValidatorRecord {
                 stake_address: bond_identity(&self.params.network_id, &r.bonder, &r.bls_pk),

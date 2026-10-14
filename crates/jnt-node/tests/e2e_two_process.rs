@@ -69,6 +69,10 @@ fn init_chain(dir: &Path) -> Result<(), String> {
             "--label",
             "miner",
         ])
+        // The node refuses to write plaintext private keys unless it is asked
+        // to; supply the passphrase the same way an operator would, so this
+        // test also exercises the encrypted-wallet path.
+        .env("JNT_WALLET_PASSPHRASE", "e2e-two-process-test-passphrase")
         .output()
         .map_err(|e| format!("init failed: {e}"))?;
     if !out.status.success() {
@@ -102,6 +106,9 @@ fn start_serving(dir: &Path) -> Result<ServingNode, String> {
             "--interval",
             &MINE_INTERVAL_MS.to_string(),
         ])
+        // Same passphrase as `init_chain`, or the node cannot read the
+        // wallets.json that init just wrote encrypted.
+        .env("JNT_WALLET_PASSPHRASE", "e2e-two-process-test-passphrase")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

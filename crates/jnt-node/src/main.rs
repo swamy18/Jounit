@@ -42,6 +42,7 @@ use jnt_net::peer::{perform_handshake, HandshakeConfig};
 use jnt_net::relay::RelayManager;
 use jnt_net::syncer::SyncManager;
 use jnt_node::l2::NodeL2;
+use jnt_node::wallet_store;
 use jnt_store::{AppendOutcome, BlockStore};
 use std::io::Write as _;
 
@@ -76,6 +77,10 @@ SEND OPTIONS:
 COMMON OPTIONS:
   --network <mainnet|mini>   Default: mini
   --data-dir <path>          Default: ./chain
+  --allow-plaintext-wallet   Permit wallets.json to hold unencrypted keys
+                             (default: refuse; set JNT_WALLET_PASSPHRASE to
+                             encrypt the file with Argon2id + ChaCha20-Poly1305
+                             and 0600 permissions instead)
 
 SERVE OPTIONS:
   --listen <host:port>       TCP address to accept inbound peers (optional)
@@ -216,6 +221,10 @@ struct Store {
     /// The append-only block store. Opened lazily alongside the JSON chain
     /// during migration; once present it is the authoritative block data.
     block_store: Option<BlockStore>,
+    /// `--allow-plaintext-wallet`: the explicit opt-in that lets
+    /// `save_wallets` write unencrypted private keys. Absent means refuse —
+    /// an operator who has not thought about at-rest protection still gets it.
+    allow_plaintext_wallet: bool,
 }
 
 impl Store {
@@ -225,6 +234,7 @@ impl Store {
             dir: args.data_dir.clone(),
             params,
             block_store: None,
+            allow_plaintext_wallet: args.has("allow-plaintext-wallet"),
         })
     }
 
@@ -349,19 +359,61 @@ impl Store {
         bs.sync().map_err(|e| e.to_string())
     }
 
+    /// Read the wallet file — encrypted when it was saved that way.
+    ///
+    /// An encrypted file with no passphrase is an error, not a fallback: there
+    /// is nothing else the file could usefully be, and silently returning an
+    /// empty wallet list would make a node look like it had lost its keys.
     fn load_wallets(&self) -> Result<Vec<Wallet>, String> {
         let path = self.wallets_path();
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+        let text = if wallet_store::is_encrypted(&bytes) {
+            let passphrase = wallet_store::passphrase_from_env().ok_or_else(|| {
+                format!(
+                    "{} is encrypted; set {} to read it",
+                    path.display(),
+                    wallet_store::PASSPHRASE_ENV
+                )
+            })?;
+            let plain = wallet_store::decrypt(&passphrase, &bytes)?;
+            String::from_utf8(plain).map_err(|_| "wallet file is not UTF-8".to_string())?
+        } else {
+            // One note, not a refusal: refusing to *read* an existing plaintext
+            // file would lock the operator out of their own keys. The refusal
+            // lives in `save_wallets`, where the next write happens.
+            eprintln!(
+                "note: {} holds plaintext private keys; set {} and save to encrypt it",
+                path.display(),
+                wallet_store::PASSPHRASE_ENV
+            );
+            String::from_utf8(bytes).map_err(|_| "wallet file is not UTF-8".to_string())?
+        };
         serde_json::from_str(&text).map_err(|e| e.to_string())
     }
 
+    /// Persist wallets encrypted under `JNT_WALLET_PASSPHRASE`, written 0600
+    /// and atomically so a crash cannot leave a torn or briefly-readable key
+    /// file. Without a passphrase, plaintext is refused unless
+    /// `--allow-plaintext-wallet` says the operator has decided to accept it.
     fn save_wallets(&self, wallets: &[Wallet]) -> Result<(), String> {
         fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let text = serde_json::to_string_pretty(wallets).map_err(|e| e.to_string())?;
-        fs::write(self.wallets_path(), text).map_err(|e| e.to_string())
+        let payload = match wallet_store::passphrase_from_env() {
+            Some(passphrase) => wallet_store::encrypt(&passphrase, text.as_bytes())?,
+            None if self.allow_plaintext_wallet => text.into_bytes(),
+            None => {
+                return Err(format!(
+                    "refusing to write plaintext private keys to {}: set {} to \
+                     encrypt them, or pass --allow-plaintext-wallet to accept the risk",
+                    self.wallets_path().display(),
+                    wallet_store::PASSPHRASE_ENV
+                ));
+            }
+        };
+        wallet_store::write_private(&self.wallets_path(), &payload)
     }
 
     fn write_meta(&self, chain: &Chain) -> Result<(), String> {

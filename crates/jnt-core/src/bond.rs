@@ -10,8 +10,8 @@
 //! # What this module is
 //!
 //! - [`BondLedger`]: the live map of active bonds plus a bond-order index, so
-//!   the committee is always the first 21 eligible bonds by
-//!   `(bond_height, bond_index)` — no history walk, no snapshots.
+//!   the committee is always the 21 highest-staked bonds — one definition
+//!   shared by signing, slashing and finality, no history walk, no snapshots.
 //! - Pure validators — [`check_bond_tx`], [`check_unbond_tx`],
 //!   [`check_slash_tx`] — shared by block application and mempool admission,
 //!   so the pool never holds what a block would refuse.
@@ -30,8 +30,9 @@
 //!
 //! # Fail-closed rules (locked)
 //!
-//! - below-minimum bonds, duplicate bonds, duplicate BLS keys, bad keys and
-//!   multi-signer bond transactions are refused by name;
+//! - below-minimum bonds, duplicate bonds, duplicate BLS keys, bad keys,
+//!   bonds whose BLS key has no proof of possession, and multi-signer bond
+//!   transactions are refused by name;
 //! - unbonding before `bond_height + UNBONDING_PERIOD_BLOCKS`, by anyone but
 //!   the bonder, or of an unknown bond is refused;
 //! - slashing requires two checkpoints that both verify against the current
@@ -42,9 +43,9 @@
 //!   window with no special case;
 //! - every refusal names its rule (`Error::StakeInvalid`) and commits nothing.
 
-use crate::bls_checkpoint::{verify_checkpoint, BlsPublicKey, ValidatorSet};
+use crate::bls_checkpoint::{verify_checkpoint, BlsPublicKey, BlsSignature, ValidatorSet};
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, Address, Hash512};
+use crate::hash::{sha256_dom, Address, Hash, Hash512};
 use crate::slash::{VESTING_BLOCKS_MAINNET, VESTING_BLOCKS_MINI};
 use crate::tx::{StakePayload, Transaction, TX_BOND, TX_SLASH, TX_UNBOND};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -56,10 +57,17 @@ pub const MIN_VALIDATOR_STAKE_SAT: u64 = 5_000 * crate::params::SAT_PER_JNT;
 /// item 3, fixed). On 1-second test profiles the same count is ~17 minutes,
 /// which is a faster test cycle, not a weaker rule.
 pub const UNBONDING_PERIOD_BLOCKS: u64 = 1008;
-/// Committee size: first 21 eligible bonds (Decision 20 item 2, Decision 2 N).
+/// Committee size: the 21 highest-staked bonds (Decision 20 item 2 fixes the
+/// size at 21; the *selection* is stake-top-N, `SelectionRule::TopN`, so that
+/// signing, slashing and finality all name the same 21 keys).
 pub const MAX_COMMITTEE_SIZE: usize = 21;
 /// Domain tag for the derived bond identity.
 pub const DOM_BOND_IDENTITY: &[u8] = b"jounit/bond-identity/v1";
+/// Domain tag for a bond's proof of possession (rogue-key defence).
+///
+/// Distinct from [`DOM_BOND_IDENTITY`]: a signature proving key possession
+/// must never be interchangeable with anything else a key is bound to.
+pub const DOM_BOND_POP: &[u8] = b"jounit/bond-pop/v1";
 
 /// A bond's id is the txid of the `TX_BOND` transaction that created it.
 pub type BondId = Hash512;
@@ -142,17 +150,40 @@ impl BondLedger {
         Some(record)
     }
 
-    /// The committee: the first 21 bonds by `(bond_height, bond_index,
-    /// bond_id)`, per Decision 20 item 2. The trailing `bond_id` only breaks
-    /// ties that height+index already make impossible on one chain — it keeps
-    /// the order total even across hypothetical states, never deciding a real
-    /// race.
+    /// The committee: the `MAX_COMMITTEE_SIZE` highest-staked bonds, returned
+    /// in canonical key order.
+    ///
+    /// This is the *single* committee definition. It is consumed by signing
+    /// (`Chain::committee_keys` / `committee_signing_records`), by slashing
+    /// (`Chain::apply_block`'s `TX_SLASH` arm) and by finality
+    /// (`Chain::committee_records`, whose `derive_set(TopN)` re-derives the
+    /// same 21) — three callers that previously disagreed: signing and slashing
+    /// took the *first* 21 bonds by `(bond_height, bond_index)` while finality
+    /// took the *top* 21 by stake, so once a 22nd bond existed the two sides of
+    /// a certificate named different key sets and no checkpoint could verify.
+    ///
+    /// Selection reproduces `validators::derive_set`'s TopN rule byte for byte
+    /// — stake descending, ties broken by the record's canonical key order,
+    /// capped at 21 — and the result is sorted into the same canonical key
+    /// order the epoch set uses, so bitmap indices mean the same thing
+    /// whichever caller asked. Bond order is deliberately *not* part of it:
+    /// the earliest 21 bonds holding seats forever is both a permanent
+    /// incumbency and the one property that could not be re-derived from
+    /// stake.
     pub fn committee(&self) -> Vec<BondRecord> {
-        self.order
-            .iter()
+        let mut by_stake: Vec<&BondRecord> = self.bonds.values().collect();
+        by_stake.sort_by(|a, b| {
+            b.amount_sat
+                .cmp(&a.amount_sat)
+                .then_with(|| a.bls_pk.as_bytes().cmp(b.bls_pk.as_bytes()))
+        });
+        let mut chosen: Vec<BondRecord> = by_stake
+            .into_iter()
             .take(MAX_COMMITTEE_SIZE)
-            .filter_map(|(_, _, id)| self.bonds.get(id).cloned())
-            .collect()
+            .cloned()
+            .collect();
+        chosen.sort_by(|a, b| a.bls_pk.as_bytes().cmp(b.bls_pk.as_bytes()));
+        chosen
     }
 }
 
@@ -216,6 +247,27 @@ pub fn slash_vesting_period(network_id: &str) -> u64 {
     }
 }
 
+/// The message a bonder signs to prove they hold the BLS secret key behind a
+/// proposed bond key: `sha256_dom(DOM_BOND_POP, network ‖ bonder ‖ pk)`.
+///
+/// Bound to the network (a mini proof cannot authorize a mainnet bond), to the
+/// bonder (so a proof cannot be lifted into someone else's bond transaction),
+/// and to the key itself (so one proof cannot cover a different key).
+pub fn bond_pop_message(network_id: &str, bonder: &Address, pk: &BlsPublicKey) -> Hash {
+    sha256_dom(
+        DOM_BOND_POP,
+        &[network_id.as_bytes(), bonder, pk.as_bytes()],
+    )
+}
+
+/// Produce a proof of possession for `sk`'s own public key. The public key is
+/// derived from the secret key rather than passed in, so a caller cannot
+/// accidentally certify somebody else's key with their own signature.
+pub fn bond_pop(sk: &crate::bls::SecretKey, network_id: &str, bonder: &Address) -> BlsSignature {
+    let pk = sk.public_key();
+    sk.sign(&bond_pop_message(network_id, bonder, &pk))
+}
+
 /// The single signer of a stake transaction's inputs. Bond operations speak
 /// for exactly one identity: inputs from two wallets are refused rather than
 /// assigned to the first.
@@ -246,20 +298,49 @@ pub struct BondDraft {
     pub amount_sat: u64,
 }
 
-/// Validate a `TX_BOND` against the ledger: shape, key, signer, identity and
-/// minimum. UTXO checks (signatures, conservation, fees) already ran in
-/// `check_tx`; this is the stake overlay alone, so mempool and block
-/// application share it byte for byte.
+/// Validate a `TX_BOND` against the ledger: shape, key, proof of possession,
+/// signer, identity and minimum. UTXO checks (signatures, conservation, fees)
+/// already ran in `check_tx`; this is the stake overlay alone, so mempool and
+/// block application share it byte for byte.
+///
+/// The proof of possession is what stops two attacks that a plain key check
+/// cannot:
+///
+/// - **key squatting** — bonding *someone else's* published BLS key first so
+///   their own bond is refused as a duplicate, freezing them out of the
+///   committee forever;
+/// - **rogue-key aggregation** — registering a key chosen relative to a
+///   victim's key (`g^a · Y^-1`) so a later aggregate verifies under the
+///   attacker's control. Requiring a signature *from* the key at bond time is
+///   the standard defence: producing it requires knowing its discrete log,
+///   which the rogue construction does not have.
+///
+/// The proof is verified against the real BLS verifier, not a mock: a bond is
+/// admitted by consensus, so the check must be the same on every node.
 pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> Result<BondDraft> {
     if tx.tx_type != TX_BOND {
         return Err(Error::StakeInvalid("not a bond transaction"));
     }
-    let (bls_pk, mldsa_pk) = match &tx.stake {
-        Some(StakePayload::Bond { bls_pk, mldsa_pk }) => (*bls_pk, mldsa_pk.clone()),
+    let (bls_pk, pop, mldsa_pk) = match &tx.stake {
+        Some(StakePayload::Bond {
+            bls_pk,
+            pop,
+            mldsa_pk,
+        }) => (*bls_pk, *pop, mldsa_pk.clone()),
         _ => return Err(Error::StakeInvalid("bond transaction without bond payload")),
     };
+    let bonder = bonder_of(tx)?;
     crate::bls::validate_public_key(&bls_pk)
         .map_err(|_| Error::StakeInvalid("bond BLS key invalid"))?;
+    // Proof of possession, bound to this network, this bonder and this key.
+    // Checked before anything ledger-shaped: if the bonder cannot sign for the
+    // key there is no bond here, whatever the outputs say.
+    let pop_msg = bond_pop_message(network_id, &bonder, &bls_pk);
+    if !crate::bls::RealBls::verify(&bls_pk, &pop_msg, &pop) {
+        return Err(Error::StakeInvalid(
+            "bond proof of possession did not verify",
+        ));
+    }
     // The lattice key needs no cryptographic check here: any 1952 bytes decode
     // structurally (FIPS 204 vkDecode is total), and the check that matters —
     // that its signatures verify — runs at checkpoint time, not bond time. A
@@ -279,7 +360,6 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
     if bonds.find_by_key(&bls_pk).is_some() {
         return Err(Error::StakeInvalid("BLS key already bonded"));
     }
-    let bonder = bonder_of(tx)?;
     let expect = bond_identity(network_id, &bonder, &bls_pk);
     let mut bond_outs = tx.outputs.iter().filter(|o| o.address == expect);
     let (first, second) = (bond_outs.next(), bond_outs.next());
@@ -505,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn committee_takes_the_first_21_bonds_in_order() {
+    fn committee_takes_the_top_21_by_stake_in_key_order() {
         let mut ledger = BondLedger::default();
         for i in 0u8..25 {
             let height = 100 + u64::from(i);
@@ -515,7 +595,10 @@ mod tests {
                     bonder: [i; 20],
                     bls_pk: bls_key(i + 1),
                     mldsa_pk: None,
-                    amount_sat: MIN_VALIDATOR_STAKE_SAT,
+                    // Stake rises with i, so the four earliest bonds are also
+                    // the four lowest: under the old "first 21 by bond order"
+                    // rule they kept their seats, under TopN they are cut.
+                    amount_sat: MIN_VALIDATOR_STAKE_SAT + u64::from(i) * 1_000,
                     bond_height: height,
                     bond_index: 0,
                 },
@@ -523,8 +606,26 @@ mod tests {
         }
         let committee = ledger.committee();
         assert_eq!(committee.len(), MAX_COMMITTEE_SIZE);
-        assert_eq!(committee[0].bond_height, 100);
-        assert_eq!(committee[20].bond_height, 120);
+        let selected: Vec<crate::bls_checkpoint::BlsPublicKey> =
+            committee.iter().map(|r| r.bls_pk).collect();
+        // The 21 highest stakes are in, the four lowest are out.
+        for i in 4u8..25 {
+            assert!(
+                selected.contains(&bls_key(i + 1)),
+                "bond {i} is above the stake cut and must be seated"
+            );
+        }
+        for i in 0u8..4 {
+            assert!(
+                !selected.contains(&bls_key(i + 1)),
+                "bond {i} is below the stake cut and must lose its seat"
+            );
+        }
+        // Canonical key order: the same order `derive_set` puts the epoch set
+        // in, so a bitmap index means the same member to every caller.
+        let mut sorted = selected.clone();
+        sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(selected, sorted, "committee must be in canonical key order");
     }
 
     #[test]

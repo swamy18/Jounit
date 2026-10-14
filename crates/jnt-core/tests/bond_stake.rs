@@ -5,14 +5,15 @@
 //! that refuses it. The properties that matter are (1) no bond, unbond or
 //! slash commits unless every rule holds, (2) a refused block leaves the bond
 //! ledger and the vault exactly as found, and (3) the committee always follows
-//! the ledger â€” first 21 bonds by bond order, genesis fallback when empty.
+//! the ledger â€” the 21 highest-staked bonds (one shared committee definition), genesis
+//! fallback when empty.
 //!
 //! Run with `cargo test -p jnt-core --test bond_stake`.
 
 use jnt_core::block::GENESIS_TIMESTAMP_MS;
 use jnt_core::bls::{RealBls, SecretKey};
 use jnt_core::bls_checkpoint::{BlsPublicKey, Checkpoint, CheckpointPayload};
-use jnt_core::bond::{bond_identity, MIN_VALIDATOR_STAKE_SAT, UNBONDING_PERIOD_BLOCKS};
+use jnt_core::bond::{bond_identity, bond_pop, MIN_VALIDATOR_STAKE_SAT, UNBONDING_PERIOD_BLOCKS};
 use jnt_core::chain::Chain;
 use jnt_core::error::Error;
 use jnt_core::hash::Address;
@@ -103,17 +104,21 @@ fn utxo_total(chain: &Chain, ops: &[OutPoint]) -> u64 {
 /// Bond transaction spending `ops`, locking exactly `BOND` to the derived
 /// identity, change back to the wallet. Re-signed after the payload is set â€”
 /// the sighash covers the stake bytes, so a payload swap breaks every input.
-fn bond_tx(chain: &Chain, w: &Wallet, ops: &[OutPoint], pk: BlsPublicKey) -> Transaction {
-    bond_tx_value(chain, w, ops, pk, BOND)
+fn bond_tx(chain: &Chain, w: &Wallet, ops: &[OutPoint], sk: &SecretKey) -> Transaction {
+    bond_tx_value(chain, w, ops, sk, BOND)
 }
 
+/// Takes the *secret* key rather than the public one: the payload carries a
+/// proof of possession, which only the holder of `sk` can produce, so a caller
+/// holding just a public key cannot build a bond at all.
 fn bond_tx_value(
     chain: &Chain,
     w: &Wallet,
     ops: &[OutPoint],
-    pk: BlsPublicKey,
+    sk: &SecretKey,
     value: u64,
 ) -> Transaction {
+    let pk = sk.public_key();
     let bonder = w.address().unwrap();
     let net = chain.params();
     let total = utxo_total(chain, ops);
@@ -141,6 +146,7 @@ fn bond_tx_value(
     tx.tx_type = TX_BOND;
     tx.stake = Some(StakePayload::Bond {
         bls_pk: pk,
+        pop: bond_pop(sk, &net.network_id, &bonder),
         mldsa_pk: None,
     });
     w.sign(&mut tx).unwrap();
@@ -248,8 +254,8 @@ fn mine_to(chain: &mut Chain, to: Address, target: u64) {
 fn happy_path_bond_registers_and_joins_the_committee() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
-    let (_, pk) = bls_pair(7);
-    let bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let (sk, pk) = bls_pair(7);
+    let bond = bond_tx(&chain, &w, &ops[..66], &sk);
     let bond_id = bond.txid();
     submit_block(&mut chain, bonder, vec![bond]).unwrap();
 
@@ -271,7 +277,6 @@ fn happy_path_bond_registers_and_joins_the_committee() {
         network_id: "jounit/mini".into(),
         epoch: CheckpointPayload::epoch_for(h, interval),
     };
-    let (sk, _) = bls_pair(7);
     let cp = lone_checkpoint(&sk, payload);
     chain.apply_checkpoint(&cp, &RealBls).unwrap();
     assert_eq!(chain.finality().accepted_height(), h);
@@ -281,8 +286,8 @@ fn happy_path_bond_registers_and_joins_the_committee() {
 fn a_checkpoint_from_outside_the_bonded_committee_is_refused() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
-    let (_, pk) = bls_pair(7);
-    let first_bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let (sk, pk) = bls_pair(7);
+    let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
     assert_eq!(chain.committee_keys(), vec![pk]);
 
@@ -307,13 +312,13 @@ fn bond_refusals_name_their_rule_and_record_nothing() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
     let net_id = chain.params().network_id.clone();
-    let (_, pk) = bls_pair(7);
+    let (sk, pk) = bls_pair(7);
     let (_, other_pk) = bls_pair(8);
     let fee = fee_for(&chain, 1, 2);
     let total = utxo_total(&chain, &ops[..1]);
 
     // Below-minimum bond, fully funded so the refusal is the minimum rule.
-    let small = bond_tx_value(&chain, &w, &ops[..66], pk, MIN_VALIDATOR_STAKE_SAT - 1);
+    let small = bond_tx_value(&chain, &w, &ops[..66], &sk, MIN_VALIDATOR_STAKE_SAT - 1);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![small]).unwrap_err(),
         Error::StakeInvalid("bond below minimum stake")
@@ -360,6 +365,7 @@ fn bond_refusals_name_their_rule_and_record_nothing() {
     wrong_addr.tx_type = TX_BOND;
     wrong_addr.stake = Some(StakePayload::Bond {
         bls_pk: pk,
+        pop: bond_pop(&sk, &net_id, &bonder),
         mldsa_pk: None,
     });
     w.sign(&mut wrong_addr).unwrap();
@@ -373,6 +379,80 @@ fn bond_refusals_name_their_rule_and_record_nothing() {
         chain.committee_keys(),
         chain.params().genesis_validators.clone(),
         "committee stays on the genesis fallback"
+    );
+}
+
+/// The rogue-key defence: a bond is admitted only if the bonder proves they
+/// hold the secret key behind the BLS key they register. Two shapes of the
+/// same attack, both refused by name:
+///
+/// (a) squatting — registering *someone else's* published key first so their
+///     own bond is later refused as a duplicate;
+/// (b) a proof bound to the wrong network — a mainnet proof cannot open a mini
+///     bond, so proofs cannot be replayed across chains.
+#[test]
+fn a_bond_without_a_valid_proof_of_possession_is_refused() {
+    let (mut chain, w, ops) = rich_chain();
+    let bonder = w.address().unwrap();
+    let net_id = chain.params().network_id.clone();
+    let fee = fee_for(&chain, 66, 2);
+    let total = utxo_total(&chain, &ops[..66]);
+    let build = |pk: BlsPublicKey| {
+        let mut tx = w
+            .build_tx(
+                &ops[..66],
+                vec![
+                    Output {
+                        value: BOND,
+                        address: bond_identity(&net_id, &bonder, &pk),
+                    },
+                    Output {
+                        value: total - BOND - fee,
+                        address: bonder,
+                    },
+                ],
+                fee,
+            )
+            .unwrap();
+        tx.tx_type = TX_BOND;
+        tx
+    };
+
+    // (a) An attacker's key signs for the victim's public key. The proof is
+    // well formed — it is simply made by the wrong key, which is exactly what
+    // a squatter or a rogue-key registrant cannot get around.
+    let (_, victim_pk) = bls_pair(7);
+    let (attacker_sk, _) = bls_pair(9);
+    let mut squat = build(victim_pk);
+    squat.stake = Some(StakePayload::Bond {
+        bls_pk: victim_pk,
+        pop: bond_pop(&attacker_sk, &net_id, &bonder),
+        mldsa_pk: None,
+    });
+    w.sign(&mut squat).unwrap();
+    assert_eq!(
+        submit_block(&mut chain, bonder, vec![squat]).unwrap_err(),
+        Error::StakeInvalid("bond proof of possession did not verify")
+    );
+
+    // (b) The right key, the right bonder, the wrong network in the message.
+    let (sk, pk) = bls_pair(7);
+    let mut cross = build(pk);
+    cross.stake = Some(StakePayload::Bond {
+        bls_pk: pk,
+        pop: bond_pop(&sk, "jounit/mainnet", &bonder),
+        mldsa_pk: None,
+    });
+    w.sign(&mut cross).unwrap();
+    assert_eq!(
+        submit_block(&mut chain, bonder, vec![cross]).unwrap_err(),
+        Error::StakeInvalid("bond proof of possession did not verify")
+    );
+
+    assert!(chain.bonds().is_empty(), "an unproved bond records nothing");
+    assert!(
+        chain.bonds().find_by_key(&victim_pk).is_none(),
+        "an unproved bond must not squat the key either"
     );
 }
 
@@ -390,13 +470,13 @@ fn duplicate_bonds_and_duplicate_keys_are_refused() {
             index: 0,
         });
     }
-    let (_, pk) = bls_pair(7);
-    let first_bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let (sk, _) = bls_pair(7);
+    let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
     assert_eq!(chain.bonds().len(), 1);
 
     // Same bonder, same key again â€” well funded, refused as a duplicate.
-    let again = bond_tx(&chain, &w, &ops[66..132], pk);
+    let again = bond_tx(&chain, &w, &ops[66..132], &sk);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![again]).unwrap_err(),
         Error::StakeInvalid("BLS key already bonded")
@@ -419,7 +499,7 @@ fn duplicate_bonds_and_duplicate_keys_are_refused() {
         }
     }
     assert!(ops2.len() >= 66, "stranger needs a funded bond attempt");
-    let stranger = bond_tx(&chain, &w2, &ops2[..66], pk);
+    let stranger = bond_tx(&chain, &w2, &ops2[..66], &sk);
     assert_eq!(
         submit_block(&mut chain, bonder2, vec![stranger]).unwrap_err(),
         Error::StakeInvalid("BLS key already bonded")
@@ -465,13 +545,13 @@ fn unknown_tx_type_is_refused_not_interpreted() {
 fn mempool_admits_a_valid_bond_and_refuses_a_broken_one() {
     let (chain, w, ops) = rich_chain();
     let net = chain.params().clone();
-    let (_, pk) = bls_pair(7);
+    let (sk, pk) = bls_pair(7);
     let mut pool = Mempool::default();
     let h = chain.height() + 1;
     let base = chain.expected_base_fee_for_next_block();
 
     // A well-formed bond is poolable.
-    let bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let bond = bond_tx(&chain, &w, &ops[..66], &sk);
     pool.add(bond, chain.utxo(), h, &net, base, chain.bonds())
         .expect("a valid bond must pool");
 
@@ -498,6 +578,7 @@ fn mempool_admits_a_valid_bond_and_refuses_a_broken_one() {
     small.tx_type = TX_BOND;
     small.stake = Some(StakePayload::Bond {
         bls_pk: pk,
+        pop: bond_pop(&sk, &net.network_id, &bonder),
         mldsa_pk: None,
     });
     w.sign(&mut small).unwrap();
@@ -513,11 +594,11 @@ fn mempool_admits_a_valid_bond_and_refuses_a_broken_one() {
 #[test]
 fn happy_path_unbond_releases_after_the_lock() {
     let (mut chain, w, ops) = rich_chain();
-    let bonder = w.address().unwrap();
-    let (_, pk) = bls_pair(7);
-    let bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let bonder = w.address().unwrap();    let (sk, _) = bls_pair(7);
+    let bond = bond_tx(&chain, &w, &ops[..66], &sk);
     let bond_id = bond.txid();
     submit_block(&mut chain, bonder, vec![bond]).unwrap();
+
     let bond_height = chain.height();
 
     // The lock is exact: one block before maturity refuses.
@@ -574,8 +655,8 @@ fn happy_path_unbond_releases_after_the_lock() {
 fn unbond_refusals_name_their_rule() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
-    let (_, pk) = bls_pair(7);
-    let bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let (sk, _) = bls_pair(7);
+    let bond = bond_tx(&chain, &w, &ops[..66], &sk);
     let bond_id = bond.txid();
     submit_block(&mut chain, bonder, vec![bond]).unwrap();
 
@@ -609,7 +690,7 @@ fn happy_path_slash_burns_the_full_bond() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
     let (sk, pk) = bls_pair(7);
-    let first_bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
     assert_eq!(chain.committee_keys(), vec![pk]);
 
@@ -645,8 +726,8 @@ fn happy_path_slash_burns_the_full_bond() {
 fn slash_refusals_name_their_rule() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
-    let (sk, pk) = bls_pair(7);
-    let first_bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let (sk, _) = bls_pair(7);
+    let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
     let h = chain.height();
     let net = "jounit/mini";
@@ -704,8 +785,8 @@ fn slash_refusals_name_their_rule() {
 fn a_reorg_unwinds_the_bond_exactly() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
-    let (_, pk) = bls_pair(7);
-    let first_bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let (sk, _) = bls_pair(7);
+    let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
     let bond_tip = chain.height();
     assert_eq!(chain.bonds().len(), 1);
@@ -751,11 +832,10 @@ fn committee_falls_back_to_genesis_when_no_bonds_exist() {
 #[test]
 fn stake_transaction_codec_round_trips_exactly() {
     let (chain, w, ops) = rich_chain();
-    let (_, pk) = bls_pair(7);
     let (sk, _) = bls_pair(7);
     let h = chain.height();
 
-    let bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let bond = bond_tx(&chain, &w, &ops[..66], &sk);
     let bytes = bond.serialize();
     let back = Transaction::deserialize(&bytes).expect("bond must decode");
     assert_eq!(back, bond);
@@ -785,8 +865,8 @@ fn stake_transaction_codec_round_trips_exactly() {
 fn a_reorged_bond_leaves_no_undo_record_behind() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
-    let (_, pk) = bls_pair(9);
-    let bond = bond_tx(&chain, &w, &ops[..66], pk);
+    let (sk, _) = bls_pair(9);
+    let bond = bond_tx(&chain, &w, &ops[..66], &sk);
 
     // Fork with the bond, then out-work it. The bond block is briefly
     // canonical, so it owns a `bond_undo` entry; once the reorg unwinds it that
@@ -845,10 +925,10 @@ fn committee_is_derived_by_stake_topn_not_bond_order() {
     let low = bls_pair(11);
     let mid = bls_pair(12);
     let high = bls_pair(13);
-    let bonds = [(low.1, BOND), (mid.1, BOND), (high.1, BOND)];
+    let bonds = [(low.0, BOND), (mid.0, BOND), (high.0, BOND)];
     let mut cursor = 0usize;
-    for (pk, stake) in bonds {
-        let tx = bond_tx_value(&chain, &w, &ops[cursor..cursor + 66], pk, stake);
+    for (sk, stake) in bonds {
+        let tx = bond_tx_value(&chain, &w, &ops[cursor..cursor + 66], &sk, stake);
         cursor += 66;
         let h = chain.height() + 1;
         let block = chain.mine_block(bonder, vec![tx], ts(h)).unwrap();
@@ -876,12 +956,16 @@ fn committee_is_derived_by_stake_topn_not_bond_order() {
         3,
         "all three bonded validators must make the stake-derived committee"
     );
-    // Canonical order (key first) differs from the bond insertion order the
-    // signing committee returns â€” that is what proves derive_set ran, not the
-    // order-preserving `committee()`.
-    assert_ne!(
-        set_keys, keys,
-        "the epoch set must be canonically ordered, not bond-insertion ordered"
+    // One shared definition: the signing committee and the epoch set name the
+    // same members in the same canonical key order. They used to disagree --
+    // signing took the first 21 bonds by order while derive_set took the top
+    // 21 by stake -- so from a 22nd bond on, the two sides of one certificate
+    // named different key sets and no checkpoint could verify.
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(
+        set_keys, keys_sorted,
+        "signing committee and epoch set must name the same members"
     );
     // And it must be sorted by the ValidatorRecord total order (key-first).
     let mut canonical = set_keys.clone();

@@ -195,6 +195,13 @@ impl SharedNode {
         let now = self.chain.height();
         let activation = self.chain.params().finality_activation_height;
         for escrow in self.escrows.values_mut() {
+            // The timeout first: an open escrow past `ESCROW_EXPIRY_BLOCKS`
+            // refunds its payer, which is what stops a silent or unreachable
+            // arbitrator from holding the value forever. Only a *released*
+            // escrow can then mature to Finalized; a refunded one is terminal.
+            if escrow.expired_at(now) {
+                let _ = escrow.refund(now);
+            }
             let _ = escrow.finalize(now, activation);
         }
     }
@@ -2019,13 +2026,15 @@ struct EscrowOpenReq {
 
 /// `POST /v1/escrow/open` — open an escrow naming a chosen arbitrator. The node
 /// records the state machine only; the locked value still comes from the payer's
-/// L1/L2 balance at settlement, not from this call.
+/// L1/L2 balance at settlement, not from this call. The chain height rides in so
+/// the escrow's refund timeout starts here rather than at some guessed value.
 async fn escrow_open(State(state): State<ApiState>, Json(req): Json<EscrowOpenReq>) -> ApiResult {
     let payer = decode_address(&req.payer)?;
     let payee = decode_address(&req.payee)?;
     let payer_key = decode_public_key(&req.payer_bls, "payer_bls")?;
     let payee_key = decode_public_key(&req.payee_bls, "payee_bls")?;
     let arbitrator = decode_public_key(&req.arbitrator, "arbitrator")?;
+    let height = with_shared(&state, |sh| sh.chain.height())?;
     let escrow = jnt_core::escrow::ConditionalEscrow::open(
         req.network_id.clone(),
         payer,
@@ -2035,6 +2044,7 @@ async fn escrow_open(State(state): State<ApiState>, Json(req): Json<EscrowOpenRe
         arbitrator,
         req.amount_sat,
         req.nonce,
+        height,
     )
     .map_err(|e| fail(StatusCode::BAD_REQUEST, "escrow_refused", e.to_string()))?;
     let id = escrow.id();
@@ -2090,6 +2100,7 @@ fn escrow_state_name(s: &jnt_core::escrow::EscrowState) -> &'static str {
         jnt_core::escrow::EscrowState::ReleasedMutual { .. } => "released_mutual",
         jnt_core::escrow::EscrowState::ReleasedArbiter { .. } => "released_arbiter",
         jnt_core::escrow::EscrowState::Finalized { .. } => "finalized",
+        jnt_core::escrow::EscrowState::Refunded { .. } => "refunded",
     }
 }
 

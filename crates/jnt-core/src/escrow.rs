@@ -18,12 +18,25 @@
 //! ```text
 //! Open -> Released(Mutual)  # both parties agreed
 //! Open -> Released(Arbiter) # the designated arbitrator decided
+//! Open -> Refunded          # expired: the value returns to the payer
 //! Released -> Finalized    # settlement committed (irreversible)
 //! ```
 //!
 //! Open is the only live state. Once released, the escrow is terminal — its
 //! bytes are consumed by the settlement that follows, which is the ordinary
 //! §1 L1/L2 payout path, not a new coin type.
+//!
+//! # Why an expiry exists
+//!
+//! Without one, an escrow whose release nobody can produce locks its value
+//! forever: a non-responsive arbitrator, a lost key, or a condition no verifier
+//! can satisfy all used to be permanent states. [`ConditionalEscrow::refund`]
+//! is the timeout that makes "nobody ever signed" a recoverable outcome — after
+//! [`ESCROW_EXPIRY_BLOCKS`] the payer alone can take the value back, with no
+//! signature from anyone else, because the payer is the party the value would
+//! have been released *from* anyway. Release is refused after expiry for the
+//! same reason: a late signature must not race a refund that already happened,
+//! and the escrow cannot be both.
 //!
 //! # Why this reuses ArbitrationVote
 //!
@@ -52,7 +65,14 @@ use crate::ser::{Reader, Writer};
 pub const DOM_ESCROW: &[u8] = b"jounit/escrow/v1";
 
 /// Escrow encoding version.
-pub const ESCROW_VERSION: u8 = 1;
+/// Escrow encoding version. Bumped to 2 when `opened_height` (the expiry
+/// clock) and the `Refunded` state joined the wire format.
+pub const ESCROW_VERSION: u8 = 2;
+
+/// Blocks after which an open escrow expires and refunds its payer. The same
+/// 7-day schedule as a bond's unbonding lock (Decision 20 item 3), so an
+/// operator learns one number rather than two.
+pub const ESCROW_EXPIRY_BLOCKS: u64 = crate::bond::UNBONDING_PERIOD_BLOCKS;
 
 /// Maximum `network_id` length, matching the arbitration vote bound (§13.4).
 pub const MAX_ESCROW_NETWORK_ID: usize = 64;
@@ -86,6 +106,10 @@ pub struct ConditionalEscrow {
     /// Per-contract nonce, picked by the payer, so two escrows between the same
     /// parties do not collide.
     pub nonce: u64,
+    /// Chain height at which this escrow was opened — the start of the
+    /// [`ESCROW_EXPIRY_BLOCKS`] countdown that eventually refunds the payer.
+    /// Part of the encoding, so a round-trip cannot reset the clock.
+    pub opened_height: u64,
     /// What must be true before the value can move. Signed into the id and the
     /// release hash, so the parties agreed on exactly this condition.
     pub condition: EscrowCondition,
@@ -114,6 +138,13 @@ pub enum EscrowState {
     /// in motion toward the payee.
     Finalized {
         /// Height the settlement landed.
+        at_height: u64,
+    },
+    /// Terminal: the escrow outlived [`ESCROW_EXPIRY_BLOCKS`] without anyone
+    /// releasing it, so the value went back to the payer. This is the branch
+    /// that makes a stalled escrow recoverable instead of a permanent lock.
+    Refunded {
+        /// Height the refund was committed at.
         at_height: u64,
     },
 }
@@ -165,7 +196,10 @@ impl ConditionalEscrow {
         )
     }
 
-    /// Open an escrow, validating its fields.
+    /// Open an escrow, validating its fields. `height` is the chain height at
+    /// open — it starts the [`ESCROW_EXPIRY_BLOCKS`] countdown, so a caller
+    /// that forgets it cannot compile rather than silently minting an escrow
+    /// that is already expired.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         network_id: String,
@@ -176,6 +210,7 @@ impl ConditionalEscrow {
         arbitrator: BlsPublicKey,
         amount_sat: u64,
         nonce: u64,
+        height: u64,
     ) -> Result<Self> {
         Self::open_with_condition(
             network_id,
@@ -187,6 +222,7 @@ impl ConditionalEscrow {
             amount_sat,
             nonce,
             EscrowCondition::ReleaseToPayee,
+            height,
         )
     }
 
@@ -208,9 +244,20 @@ impl ConditionalEscrow {
         amount_sat: u64,
         nonce: u64,
         condition: EscrowCondition,
+        height: u64,
     ) -> Result<Self> {
         if amount_sat == 0 {
             return Err(Error::Malformed("an escrow locks a positive amount"));
+        }
+        // Refuse an oracle condition at open, not at release. Nothing in this
+        // codebase verifies an oracle claim, so an oracle escrow is a contract
+        // that can never be satisfied — and before the expiry existed, one that
+        // could never return the value either. Failing here means the mistake
+        // is caught while the payer still holds their money.
+        if matches!(condition, EscrowCondition::Oracle { .. }) {
+            return Err(Error::Malformed(
+                "oracle escrows cannot be opened: no oracle verifier exists",
+            ));
         }
         if network_id.len() > MAX_ESCROW_NETWORK_ID {
             return Err(Error::Malformed("escrow network_id over cap"));
@@ -237,6 +284,7 @@ impl ConditionalEscrow {
             arbitrator,
             amount_sat,
             nonce,
+            opened_height: height,
             condition,
             state: EscrowState::default(),
         })
@@ -254,7 +302,8 @@ impl ConditionalEscrow {
             .fixed(self.payee_key.as_bytes())
             .fixed(self.arbitrator.as_bytes())
             .u64le(self.amount_sat)
-            .u64le(self.nonce);
+            .u64le(self.nonce)
+            .u64le(self.opened_height);
         w.raw(&self.condition.encode());
         self.encode_state(&mut w);
         w.into_vec()
@@ -273,6 +322,9 @@ impl ConditionalEscrow {
             }
             EscrowState::Finalized { at_height } => {
                 w.u8(3).u64le(*at_height);
+            }
+            EscrowState::Refunded { at_height } => {
+                w.u8(4).u64le(*at_height);
             }
         }
     }
@@ -305,6 +357,7 @@ impl ConditionalEscrow {
         let arbitrator = BlsPublicKey(arb_bytes);
         let amount_sat = r.u64le()?;
         let nonce = r.u64le()?;
+        let opened_height = r.u64le()?;
         let condition = EscrowCondition::decode(r)?;
         let state = Self::decode_state(r)?;
         Ok(ConditionalEscrow {
@@ -317,6 +370,7 @@ impl ConditionalEscrow {
             arbitrator,
             amount_sat,
             nonce,
+            opened_height,
             condition,
             state,
         })
@@ -333,6 +387,9 @@ impl ConditionalEscrow {
                 at_height: r.u64le()?,
             }),
             3 => Ok(EscrowState::Finalized {
+                at_height: r.u64le()?,
+            }),
+            4 => Ok(EscrowState::Refunded {
                 at_height: r.u64le()?,
             }),
             _ => Err(Error::Malformed("unknown escrow state tag")),
@@ -402,7 +459,12 @@ impl ConditionalEscrow {
             EscrowState::ReleasedMutual { at_height }
             | EscrowState::ReleasedArbiter { at_height } => *at_height,
             // Not releasable yet, or already committed: nothing to do.
-            EscrowState::Open | EscrowState::Finalized { .. } => return Ok(false),
+            // Refunded is terminal in its own right: it is not a release, so
+            // it never matures into `Finalized` (which means the payee was
+            // paid), and re-calling is a no-op exactly like `Finalized`.
+            EscrowState::Open
+            | EscrowState::Finalized { .. }
+            | EscrowState::Refunded { .. } => return Ok(false),
         };
         if now < release_height.saturating_add(activation_height) {
             return Ok(false);
@@ -425,6 +487,7 @@ impl ConditionalEscrow {
         at_height: u64,
         verifier: &dyn BlsVerifier,
     ) -> Result<()> {
+        self.refuse_if_expired(at_height)?;
         self.verify_arbiter_release(sig, verifier)?;
         if matches!(self.condition, EscrowCondition::Oracle { .. }) {
             return Err(Error::Malformed(
@@ -443,6 +506,7 @@ impl ConditionalEscrow {
         at_height: u64,
         verifier: &dyn BlsVerifier,
     ) -> Result<()> {
+        self.refuse_if_expired(at_height)?;
         self.verify_mutual_release(sigs, keys, verifier)?;
         if matches!(self.condition, EscrowCondition::Oracle { .. }) {
             return Err(Error::Malformed(
@@ -450,6 +514,47 @@ impl ConditionalEscrow {
             ));
         }
         self.state = EscrowState::ReleasedMutual { at_height };
+        Ok(())
+    }
+
+    /// Whether the escrow has passed its timeout at `height`.
+    ///
+    /// Only an `Open` escrow can expire: a released one has already committed
+    /// to a direction, and a refunded or finalized one is terminal.
+    pub fn expired_at(&self, height: u64) -> bool {
+        matches!(self.state, EscrowState::Open)
+            && height >= self.opened_height.saturating_add(ESCROW_EXPIRY_BLOCKS)
+    }
+
+    /// The timeout half of the escrow: refund an expired escrow to its payer.
+    ///
+    /// No signature is required, deliberately. This is the path that exists
+    /// for the case where *nobody will ever sign* — an unreachable arbitrator,
+    /// a lost key — and requiring a signature from a party who by definition
+    /// will not produce one would make the refund as unreachable as the
+    /// release it replaces. The payer is the only party whose interest is
+    /// never to release, so refunding to them cannot take value from anyone
+    /// who had a claim to it.
+    pub fn refund(&mut self, at_height: u64) -> Result<()> {
+        if !matches!(self.state, EscrowState::Open) {
+            return Err(Error::Malformed("escrow is not live"));
+        }
+        if !self.expired_at(at_height) {
+            return Err(Error::Malformed("escrow has not expired"));
+        }
+        self.state = EscrowState::Refunded { at_height };
+        Ok(())
+    }
+
+    /// Refuse a release once the timeout has passed: past expiry the only
+    /// remaining transition is [`Self::refund`], and letting a late signature
+    /// race it would make the escrow's direction depend on arrival order.
+    fn refuse_if_expired(&self, at_height: u64) -> Result<()> {
+        if self.expired_at(at_height) {
+            return Err(Error::Malformed(
+                "escrow expired; only a refund can move it now",
+            ));
+        }
         Ok(())
     }
 
@@ -581,6 +686,7 @@ mod tests {
                 arb_pk,
                 1_000,
                 1,
+                0,
             )
             .unwrap(),
             payer_sk,
@@ -619,6 +725,7 @@ mod tests {
             BlsPublicKey([0u8; 48]),
             1_000,
             1,
+            0,
         );
         assert!(err.is_err());
     }
@@ -637,6 +744,7 @@ mod tests {
             arb_pk,
             1_000,
             1,
+            0,
         );
         assert!(err.is_err());
     }
@@ -802,6 +910,7 @@ mod escrow_condition_tests {
             1_000,
             7,
             condition,
+            0,
         )
         .unwrap();
         (e, payer_sk, payee_sk, arb_sk)
@@ -827,24 +936,35 @@ mod escrow_condition_tests {
     }
 
     #[test]
-    fn an_oracle_gated_escrow_fails_closed_no_signature_releases_it() {
+    fn an_oracle_gated_escrow_cannot_even_be_opened() {
         // There is no implemented oracle verifier in this codebase, so there is
-        // no honest signature for an oracle condition. The refusal is by name
-        // and in advance, rather than an escrow that accepts signatures and
-        // then holds the value forever.
-        let (e, _, _, arb) = escrow_with_keys(EscrowCondition::Oracle {
-            question_hash: [9u8; 32],
-        });
-        assert!(!e.releasable(), "no verifier exists");
-        let mut released = e.clone();
-        let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
-        let err = released
-            .release_arbiter(&sign(&arb, &msg), 10, &RealBls)
-            .unwrap_err();
-        assert!(err.to_string().contains("oracle"), "{err}");
+        // no honest signature for an oracle condition. The refusal moved from
+        // release time to open time: an escrow that accepts a condition nobody
+        // can satisfy is one that holds the payer's value until the timeout,
+        // and the payer should learn about the dead end while they still have
+        // the money in hand.
+        // Drive the constructor directly: `escrow_with_keys` unwraps, and a
+        // refusal is exactly what this asserts.
+        let payer_sk = SecretKey::from_scalar(&[11u8; 32]).unwrap();
+        let payee_sk = SecretKey::from_scalar(&[22u8; 32]).unwrap();
+        let arb_sk = SecretKey::from_scalar(&[33u8; 32]).unwrap();
+        let opened = ConditionalEscrow::open_with_condition(
+            "jounit/mini".into(),
+            [1u8; 20],
+            payer_sk.public_key(),
+            [2u8; 20],
+            payee_sk.public_key(),
+            arb_sk.public_key(),
+            1_000,
+            7,
+            EscrowCondition::Oracle {
+                question_hash: [9u8; 32],
+            },
+            0,
+        );
         assert!(
-            matches!(released.state, EscrowState::Open),
-            "the escrow must still be live, not released"
+            matches!(opened, Err(Error::Malformed(msg)) if msg.contains("oracle")),
+            "an oracle escrow must be refused at open, got {opened:?}"
         );
     }
 
@@ -854,9 +974,18 @@ mod escrow_condition_tests {
         // network were not in the hash, one signature would release an escrow
         // with the same parties and amount under a different condition.
         let (plain_escrow, ..) = escrow_with_keys(plain());
-        let (oracle, ..) = escrow_with_keys(EscrowCondition::Oracle {
+        // A record *decoded* from the wire can still name an oracle condition
+        // (opening one is refused, parsing is not), so the release hash must
+        // keep distinguishing them.
+        let mut oracle = plain_escrow.clone();
+        oracle.condition = EscrowCondition::Oracle {
             question_hash: [4u8; 32],
-        });
+        };
+        assert!(!oracle.releasable(), "no verifier exists");
+        assert!(
+            matches!(oracle.state, EscrowState::Open),
+            "mutating the condition does not change the state"
+        );
         assert_ne!(
             plain_escrow.release_signing_hash(EscrowVerdict::ReleasedToPayee),
             oracle.release_signing_hash(EscrowVerdict::ReleasedToPayee),
@@ -872,6 +1001,7 @@ mod escrow_condition_tests {
             1_000,
             7,
             plain(),
+            0,
         )
         .unwrap();
         assert_ne!(
@@ -909,6 +1039,7 @@ mod escrow_condition_tests {
             arb_sk.public_key(),
             1_000,
             8,
+            0,
         )
         .unwrap();
         (e, payer_sk, payee_sk, arb_sk)
@@ -962,6 +1093,77 @@ mod escrow_condition_tests {
             .unwrap_err();
         assert!(err.to_string().contains("two signatures"), "{err}");
         assert!(matches!(escrow.state, EscrowState::Open));
+    }
+
+    #[test]
+    fn an_open_escrow_refunds_the_payer_once_the_timeout_passes() {
+        // `escrow_with_keys` opens at height 0, so the timeout lands exactly
+        // at ESCROW_EXPIRY_BLOCKS.
+        let (e, ..) = escrow_with_keys(plain());
+        let mut escrow = e.clone();
+        let deadline = ESCROW_EXPIRY_BLOCKS;
+
+        assert!(
+            !escrow.expired_at(deadline - 1),
+            "one block short of the timeout is still live"
+        );
+        assert!(
+            matches!(escrow.refund(deadline - 1), Err(Error::Malformed(m)) if m.contains("not expired")),
+            "a live escrow must not refund"
+        );
+
+        assert!(escrow.expired_at(deadline), "the timeout is exact");
+        escrow.refund(deadline).unwrap();
+        assert!(matches!(
+            escrow.state,
+            EscrowState::Refunded { at_height } if at_height == deadline
+        ));
+        // Terminal: no second refund, and the state survives the codec so a
+        // restart cannot forget that the value already went back.
+        assert!(escrow.refund(deadline + 1).is_err());
+        let bytes = escrow.encode();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(
+            ConditionalEscrow::decode(&mut r).unwrap(),
+            escrow,
+            "a refunded escrow and its expiry clock survive a round trip"
+        );
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn a_release_after_expiry_is_refused_so_the_refund_cannot_be_raced() {
+        let (e, payer, payee, arb) = escrow_with_keys(plain());
+        let mut escrow = e.clone();
+        let msg = e.release_signing_hash(EscrowVerdict::ReleasedToPayee);
+        let deadline = ESCROW_EXPIRY_BLOCKS;
+
+        // At the timeout, even a perfect arbitrator signature is refused by
+        // name: the escrow's direction must not depend on which of the two
+        // transitions a node happens to see first.
+        let err = escrow
+            .release_arbiter(&sign(&arb, &msg), deadline, &RealBls)
+            .unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+        assert!(
+            matches!(escrow.state, EscrowState::Open),
+            "a refused release changes nothing"
+        );
+        // The mutual path is the same rule, not a second one.
+        let err = escrow
+            .release_mutual(
+                &[sign(&payer, &msg), sign(&payee, &msg)],
+                &[e.payer_key, e.payee_key],
+                deadline + 1,
+                &RealBls,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+        assert!(matches!(escrow.state, EscrowState::Open));
+
+        // Which leaves the refund as the only move left.
+        escrow.refund(deadline + 1).unwrap();
+        assert!(matches!(escrow.state, EscrowState::Refunded { .. }));
     }
 
     #[test]
