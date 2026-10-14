@@ -11,7 +11,7 @@ protocol decisions — and the blockers are named at the end.
 **Author and copyright holder:** Swamy Gadila (© 2026). The three blockers at
 the end are the launch gate: mainnet stays **NO-GO** until all three are closed,
 and none of the three can be satisfied by writing more code. The same gate is
-recorded in `memory.md`.
+recorded in the README (*Not ready to launch*) and, dated, in `CHANGELOG.md`.
 
 ## What is actually implemented
 

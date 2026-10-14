@@ -804,8 +804,9 @@ reopen after an adversarial tail, accepted checkpoint ⇒ honest count + quorum
 
 Execution environment note: Windows' nightly MSVC toolchain does not ship the
 ASan runtime (`clang_rt.asan_dynamic-x86_64.dll`), so the campaign ran in WSL
-Ubuntu (nightly + cargo-fuzz + ASan). One-time env setup is recorded in
-memory.md. Results, one 60-second ASan campaign per target, all exit 0, no
+Ubuntu (nightly + cargo-fuzz + ASan). One-time env setup for that campaign
+lived in the project's working notes (`memory.md`, since removed from the
+repo). Results, one 60-second ASan campaign per target, all exit 0, no
 crashes, no leaks, no OOMs:
 
 | target              | execs     |

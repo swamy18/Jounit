@@ -79,6 +79,10 @@ cargo build --release
 ```
 
 ```sh
+# Wallet keys are encrypted at rest: set a passphrase for this shell, or add
+# --allow-plaintext-wallet to init if you deliberately want a plaintext file.
+export JNT_WALLET_PASSPHRASE=change-me
+
 # Create a chain directory and a miner wallet.
 ./target/release/jnt-node init   --network testnet --data-dir ./chain
 
@@ -243,8 +247,12 @@ Payment that releases against a stated condition rather than a manual approval:
 "release when the result matches," "release when latency stayed under a
 threshold." This is designed so that only conditions a third party can evaluate
 deterministically are admitted, which is the discipline that keeps the escrow from
-acquiring a trusted party. Conditions that genuinely require an oracle are held
-until the protocol answers who operators the oracle.
+acquiring a trusted party. Conditions that genuinely require an oracle are
+refused when the escrow opens: this codebase implements no oracle verifier, so
+an oracle-gated escrow would be a contract nobody could ever satisfy. Every
+escrow also expires `ESCROW_EXPIRY_BLOCKS` (1 008 blocks, seven days) after it
+opens and refunds its payer, so a lost key or a silent arbitrator can no longer
+hold value forever.
 
 **What it supports:** pay-as-you-use and outcome-based pricing that settles
 itself, without a human in the loop to release funds.
@@ -645,6 +653,14 @@ and `stake_sat`, derived from canonical chain state — a reorg unwinds the set.
 With no bonds the committee falls back to the profile's declared
 `genesis_validators`, so empty-stake is still well-defined on mainnet.
 
+This is the **one** committee definition: signing (`committee_keys` /
+`committee_signing_records`), slashing (`TX_SLASH`) and finality
+(`committee_records` feeding the epoch set) all read
+`BondLedger::committee()`, so a certificate's bitmap indexes the same 21 keys
+the verifier checks it against. Bonds only admit keys whose holder proves they
+hold them: `TX_BOND` carries a 96-byte proof-of-possession signature bound to
+network, bonder and key, and a payload without one does not decode.
+
 **Checkpoint signing** (`signing.rs`) is the other half of M5. Verification has
 existed since the gadget landed â€” six clauses with real BLS12-381 pairings,
 bound to the canonical block at the certificate's height. What was missing was any
@@ -662,6 +678,10 @@ from `wallets.json` â€” a wallet holds funds this node spends, a validator 
 signs consensus messages. `serve` loads them, signs a checkpoint at each epoch
 boundary for a block it holds as its own canonical tip, and broadcasts it. A node
 with no keys signs nothing and still verifies and relays.
+
+`wallets.json` itself is written mode 0600 through a temp-file rename and
+encrypted under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305);
+writing plaintext keys requires an explicit `--allow-plaintext-wallet`.
 
 Signing is not a privilege. A certificate is accepted only if a quorum of the
 *chain-derived* committee signed the *chain's own* hash, so a signer producing
@@ -693,17 +713,18 @@ applies.
 | **Arbitrator key custody** | **Decided (Decision 9)** | The arbitration quorum is organisational (run by Jounit operators). Separately, conditional *escrow* release names a contract-selected independent BLS arbitrator per escrow — no Jounit-held release key. |
 | **Slash transaction for vote equivocation** | **Wired** | `TX_SLASH` (two conflicting, same-height, shared-signer checkpoints) verifies via `check_slash_tx` (`bond.rs`), is admitted by the mempool (`admit_stake_tx`) and applied in `apply_state_tx`: the bond is removed and 50% of its value burns in the M2 vault immediately, 50% vests to the PSCB reserve (`slash.rs`). A node API to *build* a slash tx is not exposed (submit it like any stake tx) |
 | Verified Work Certificates | **Shipped** | `Quorum` verifiable; `WindowElapsed` refused by `validate_verified` |
-| Bonded stake, unbonding, slashing | **Shipped** | 15 attack-first tests |
+| Bonded stake, unbonding, slashing | **Shipped** | 16 attack-first tests, including proof-of-possession refusals |
 | Checkpoint signing | **Shipped** | 18 unit + 6 cross-node tests |
 | **A live validator committee** | **Does not exist** | No operator is bonding 5 000 JNT |
 | Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | **Post-quantum signatures** | **Accepted, not required** | Scheme `3` = ML-DSA-65 (FIPS 204) verifies inside the hybrid bundle: a spend can be signed `ECDSA + Schnorr + ML-DSA`, every component must verify, and the address commits to the whole key set so a bundle cannot be reduced to its classical half. Checkpoints carry a lattice sidecar verified as clause 7 — every bitmap signer holding a registered lattice key needs a valid entry, signers without one pass on BLS. Settlements and the VWCs they issue carry the same sidecar: arbitration votes sign it, `apply_settle` and certificate validation verify it. Validators register lattice keys in their bonds; the production loop signs both halves. Migration: moving funds is an ordinary spend to a `pq_address`; the `verify_input_pq` enforcement primitive is built and pinned, activation NOT set (Decision 24) |
 | Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
-| **Escrowed service contracts** | **In development** | The general contract and its transitions, a validated `ServiceContract::open` for non-compute deliverables, one non-compute deliverable shipping. Coin settlement is Item 10 |
-| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; a reservation *encumbers* capacity (free to `reserved`, or a position's principal headroom) so one balance cannot back two admitted payments, and settlement is idempotent per reservation. Round-2 hardening: a mixed free+position reservation sweeps the whole free balance, per-position draws are tracked and released by name, a refused admission leaves the book untouched, and interest overflow is refused rather than wrapped. The position lifecycle (bond post/release, open, repay, default) is reachable over HTTP; the *debit commit* lands at receipt acceptance, and the matching coin move is §19.4 coin settlement (Item 10) |
+| **Escrowed service contracts** | **In development** | The general contract and its transitions, a validated `ServiceContract::open` for non-compute deliverables, one non-compute deliverable shipping. Item 10 settlement is the non-custodial ledger commit (`ConditionalEscrow::finalize`, `Released` → `Finalized`, gated on `finality_activation_height` and advanced by the serve loop); there is no on-chain payout |
+| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; a reservation *encumbers* capacity (free to `reserved`, or a position's principal headroom) so one balance cannot back two admitted payments, and settlement is idempotent per reservation. Round-2 hardening: a mixed free+position reservation sweeps the whole free balance, per-position draws are tracked and released by name, a refused admission leaves the book untouched, and interest overflow is refused rather than wrapped. The position lifecycle (bond post/release, open, repay, default) is reachable over HTTP; the *debit commit* lands at receipt acceptance, and the matching debit is the Item 10 ledger settlement (`credit.settle`, behind the `settled_payments` conservation bucket), idempotent per reservation |
 | **Delegation chains** | **Wired into the payment path** | A payment and a request carry a signed, root-first delegation chain; identity is proved from the chain rather than from the payer address, so a spend cannot claim more than its whole ancestry permits. The node records links, verifies owner signatures on every policy, propagates revocation to descendants, and refuses a chain it did not record. Still non-consensus (no `TXVALIDATOR` policy byte) |
-| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. The transition lives on the escrow (`release_arbiter`/`release_mutual`), the escrow id and the release hash both bind network and condition, and an **oracle condition is fail-closed**: it is recorded and can never release, because this codebase implements no oracle verifier. Coin settlement is Item 10 |
+| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. The transition lives on the escrow (`release_arbiter`/`release_mutual`), the escrow id and the release hash both bind network and condition, and **oracle conditions are refused at open** — with no oracle verifier implemented, an escrow that could never release cannot be opened at all. Every escrow **expires 1 008 blocks after open and refunds its payer**, and a release past that timeout is refused, so a lost key or a silent arbitrator cannot hold value. Settlement is the non-custodial Item 10 ledger commit, not an on-chain payout |
+| **Wallet keys at rest** | **Hardened** | `wallets.json` is written mode 0600 through a temp-file rename and encrypted under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305); an encrypted file without the passphrase is refused by name, and plaintext writes require `--allow-plaintext-wallet` |
 | **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |
@@ -756,6 +777,12 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **Credit reservation accounting** | A position-backed reservation left free balance spendable (double-admit), recorded one position of a multi-position spread, and interest overflow wrapped or capped silently | **Free is swept at admission, draws are tracked per position, refused admissions leave the book untouched, and interest overflow is refused**; pinned by 3 new `redteam_round2` regressions |
 | **Chain identity hashes** | `txid` and `block_hash` were 32-byte SHA-256: ~128-bit preimage and ~85-bit collision resistance against a quantum attacker | **Widened to 64-byte SHA-512** under new domain tags (`DOM_TX512`, `DOM_BLOCK512`), as a separate `Hash512` type. PoW target math, Merkle nodes and addresses keep their widths; vectors regenerated |
 | **Quantum succession** | A CRQC breaks secp256k1 and BLS12-381, so spends, checkpoints and VWCs were all classically signed | **Three dual-signature paths**: spends accept an ML-DSA-65 component (scheme 3) inside the hybrid bundle, checkpoints carry a lattice sidecar verified as clause 7, and settlements and their VWCs carry one their votes sign. Validators register lattice keys in their bonds. Every rule is accepted-not-required: `pq_activation_height` is `0` on every profile until a rehearsal flips it |
+| **Bond admission** | Anyone could hand the chain a published public key they do not own: squatting a validator out of their own key, or registering a rogue key chosen to cancel another key inside an aggregate | **Proof of possession is mandatory**: `TX_BOND` carries a 96-byte signature over network + bonder + key, checked by `check_bond_tx`, and a payload without one does not decode |
+| **BLS validation** | `uncompress` decoded a point without `validate()`, and verification passed `sig_groupcheck=false`, so the subgroup check the module's own comments promised never ran | **`key_validate`/`sig_validate` at parse and `sig_groupcheck=true`** on single and aggregate verification; the point-at-infinity encoding is pinned by a regression test |
+| **Committee definition** | Two definitions coexisted: signing and slashing took the first 21 bonds by order while finality took the top 21 by stake, so from a 22nd bond the two sides of one certificate named different key sets | **One definition**: `BondLedger::committee()` (top 21 by stake, canonical key order) feeds signing, slashing and finality alike |
+| **Escrow timeouts** | No expiry and no refund: a lost key or a silent arbitrator held the value forever, and an oracle escrow could be opened although nothing could ever release it | **A 7-day expiry refunds the payer** (`opened_height` + `ESCROW_EXPIRY_BLOCKS`), a release past the timeout is refused, and oracle conditions are refused at open |
+| **Wallet keys at rest** | `wallets.json` held plain-hex private keys at whatever permissions the umask allowed | **Mode 0600 via temp-file rename and encrypted** under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305); plaintext writes require `--allow-plaintext-wallet` |
+| **Item 10 settlement** | A credit reservation could never settle and a released escrow never committed: the debit and the state change had no landing place | **Non-custodial ledger settlement**: `credit.settle` commits at receipt acceptance behind a `settled_payments` conservation bucket, and `ConditionalEscrow::finalize` commits `Released` → `Finalized` under finality, driven by the serve loop |
 
 ---
 
@@ -843,7 +870,7 @@ figures are in JNT.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1121 tests, 0 failures
+cargo test --workspace                                   # 1154 tests, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -895,7 +922,7 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1121 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1154 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnodes, no log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
