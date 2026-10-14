@@ -248,23 +248,34 @@ def checkpoint_payload(
 
 
 def checkpoint_payload_wire(
-    payload: bytes, aggregate_sig: bytes, bitmap: bytes, signer_count: int
+    payload: bytes,
+    aggregate_sig: bytes,
+    bitmap: bytes,
+    signer_count: int,
+    sidecar: list = [],
 ) -> bytes:
     """CHECKPOINT -- SPEC.md section 13.5, msg_type = 11.
 
     payload_len(4 LE) | payload | aggregate_sig(96) |
-    bitmap_len(4 LE) | bitmap | signer_count(4 LE)
+    bitmap_len(4 LE) | bitmap | signer_count(4 LE) |
+    sidecar_count(4 LE) | sidecar_count x (signer_index(4 LE) | sig(3309))
     """
     if len(aggregate_sig) != 96:
         raise ValueError("aggregate_sig must be 96 bytes")
-    return (
+    wire = (
         u32le(len(payload))
         + payload
         + aggregate_sig
         + u32le(len(bitmap))
         + bitmap
         + u32le(signer_count)
+        + u32le(len(sidecar))
     )
+    for index, sig in sidecar:
+        if len(sig) != 3309:
+            raise ValueError("sidecar signatures must be 3309 bytes")
+        wire += u32le(index) + sig
+    return wire
 
 
 # --- the values net_vectors.json pins -------------------------------------
