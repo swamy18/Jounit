@@ -1374,8 +1374,7 @@ Options considered and rejected:
 is (compatibility: old verifiers keep reading the BLS half), and an ML-DSA-65
 sidecar carries the same decision under each signer's lattice key. A
 checkpoint is binding only when *both* halves verify against the same
-committee. VWC `Quorum` keeps its BLS evidence and records the sidecar when
-present. No new curve, no trusted setup, and it reuses the scheme-3 key
+committee. VWC `Quorum` keeps its BLS evidence; the sidecar there is deferred: a sidecar there would need an arbitrator lattice-key registry that does not exist (settle quorums are ad-hoc per dispute, not a registered committee), and carrying unverified sidecar bytes would be false assurance. The binding threat (checkpoints moving finality) is closed; the evidence threat waits on that registry. No new curve, no trusted setup, and it reuses the scheme-3 key
 material the staking path already knows how to hold.
 
 Open wiring, stated up front: validators today hold BLS keys, not lattice

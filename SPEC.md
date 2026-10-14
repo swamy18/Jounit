@@ -135,8 +135,8 @@ Stake payloads (Decision 20), positional by `tx_type`:
 
 | Type | Payload |
 |---|---|
-| `2` (bond) | `bls_pk` (48) — the BLS key the bond authorizes |
-| `3` (unbond) | `bond_id` (32) — the txid of the `TX_BOND` that created the bond |
+| `2` (bond) | `bls_pk` (48) ‖ optional `0x01 ‖ mldsa_pk` (1952) — the BLS key the bond authorizes, plus the validator's lattice key when it registers one. A bare 48-byte payload is a bond with no lattice key; a `0x00` flag byte means the same. The lattice key never replaces the BLS key as the committee identity |
+| `3` (unbond) | `bond_id` (64) — the txid of the `TX_BOND` that created the bond |
 | `4` (slash) | `len_a` (4 LE) + checkpoint A + `len_b` (4 LE) + checkpoint B (each ≤ 262 144 bytes) — two conflicting checkpoints as equivocation evidence (sized for dual-signed certificates carrying up to 64 lattice signatures) |
 
 ### 3.5 Signature and key bundles
@@ -1336,6 +1336,21 @@ the bitmap; each validator contributes at most one key by construction, so a
 MUST reject any hand-aggregated signature claiming to represent a signer list
 with repeats — the bitmap makes repeats unrepresentable, which is the point.
 
+**Lattice sidecar (post-quantum dual signature).** ML-DSA has no
+pairing-based aggregation, so the quantum half of a checkpoint is a list, not
+an aggregate: one `PqSidecarEntry = signer_index(u32) ‖ signature(3309)` per
+bitmap signer holding a registered lattice key, over the same 32-byte message
+above with an empty ML-DSA context. Wire shape, riding last so its absence
+costs four zero bytes:
+
+    sidecar_count(u32) ‖ sidecar_count × entry, at most 64 entries
+
+Certificates written before the sidecar existed end after `signer_count` and
+decode to an empty sidecar. Verification is clause 7 of §14.6: the index names
+the member, the verifier's own epoch set names the key, the caller names
+neither — and a bitmap signer with a registered key and no entry fails,
+including a sidecar stripped off in transit.
+
 **Replay protection.** A checkpoint is replay-protected by construction:
 (epoch, height, block_hash, network_id) is unique per signing event because
 heights advance monotonically and `CheckpointChain::accept` refuses a height
@@ -1399,21 +1414,31 @@ prescribes no economics and touches no consensus path.
 
 **Validator identity.** A validator is a pair `(stake_address, bls_pk)` where
 `stake_address` is the 20-byte address (§1) that controls the stake and
-`bls_pk` is a validated 48-byte G1 key (§14.5). The binding is committed in
+`bls_pk` is a validated 48-byte G1 key (§14.5). A validator MAY additionally
+register a 1952-byte ML-DSA-65 lattice key in its bond for checkpoint
+sidecars; the lattice key is never the identity and never affects ordering —
+bitmap bit `i` stays aligned with §14.4's bitmap semantics with or without it.
+The binding is committed in
 the set hash, so a key cannot be moved between addresses without changing the
 set identity. A validator MUST NOT appear twice with the same `bls_pk` under
 different addresses — a key that signs for two slots could double its quorum
-weight; the derivation rules below make that construction fail closed.
+weight; the derivation rules below make that construction fail closed. The
+same holds for a lattice key under two BLS identities: one holder signing for
+two stakes would make the sidecar ambiguous about whose stake each lattice
+signature backs.
 
 **Set representation and identity.** The validator set for epoch `e` is a
-sorted vector of `(stake_address, bls_pk)` pairs, sorted by
+sorted vector of `(stake_address, bls_pk[, mldsa_pk])` triples, sorted by
 `(bls_pk, stake_address)` — key first, because the key is what signatures
 verify against, so bitmap bit `i` stays aligned with §14.4's bitmap semantics.
 Identity is
 
     set_hash(e) = sha256_dom([0xB2], [ epoch(u64) ‖ n(u32) ‖
                                      for each validator sorted:
-                                        addr(20) ‖ pk(48) ])
+                                        addr(20) ‖ pk(48) ‖ (0x01 ‖ lattice(1952))? ])
+
+A validator without a registered lattice key contributes nothing further, so
+a set in which nobody registered hashes exactly as before.
 
 Binding the epoch makes a set for epoch 5 unusable as the set for epoch 6 even
 if membership is identical; a checkpoint for epoch `e` is only ever verifiable
@@ -1456,6 +1481,13 @@ epoch `e` at height `h` is valid iff:
 5. the aggregate verifies (§14.5) against the signers' keys under the
    checkpoint DST;
 6. `h` is beyond the current finalized height.
+7. the lattice sidecar verifies: for every bitmap signer holding a registered
+   lattice key, exactly one sidecar entry with that bitmap index verifies over
+   the same signing hash the aggregate covers. Signers without a registered
+   key pass on the aggregate alone. An entry for a non-signer, a duplicate
+   index, an entry for a keyless member, or a missing entry for a keyed
+   signer is a refusal — including a sidecar stripped off in transit, which
+   lands here as "missing", never as valid-without.
 
 Failure of any clause is a rejection with the clause named; a checkpoint that
 fails clause 2 (wrong set) MUST count toward the peer's ban score, because a
@@ -1550,8 +1582,8 @@ a rule that could never fire is refused rather than silently inert. `mini` and
 binding finalized point only if all five hold:
 
 1. its block hash is the **canonical** block this chain holds at `H`;
-2. the certificate is valid — the six clauses of §14.5/§14.6 (epoch, derived
-   set, bitmap, count, quorum, aggregate signature), with the network id
+2. the certificate is valid — the seven clauses of §14.5/§14.6 (epoch, derived
+   set, bitmap, count, quorum, aggregate signature, lattice sidecar), with the network id
    checked before any signature work;
 3. it satisfies the existing quorum `ceil(n × 6667 / 10000)` — unchanged,
    never stake-weighted;
