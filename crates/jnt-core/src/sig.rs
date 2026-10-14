@@ -317,26 +317,38 @@ fn verify_one(scheme: u8, pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(
             let parsed = k256::schnorr::Signature::try_from(sig).map_err(|_| bad.clone())?;
             key.verify_raw(msg, &parsed).map_err(|_| bad)
         }
-        SCHEME_ML_DSA_65 => {
-            // FIPS 204 verification over the 32-byte digest as the message.
-            // The digest is already domain-separated upstream, so the ML-DSA
-            // context is empty: no second domain tag inside the primitive.
-            use ml_dsa::{EncodedVerifyingKey, MlDsa65, Signature, Verifier as _, VerifyingKey};
-            let bad = Error::BadSignature { scheme };
-            if sig.len() != ML_DSA_65_SIGNATURE_BYTES {
-                return Err(Error::BadComponentLength(sig.len()));
-            }
-            if pubkey.len() != ML_DSA_65_PUBLIC_KEY_BYTES {
-                return Err(Error::BadComponentLength(pubkey.len()));
-            }
-            let parsed = Signature::<MlDsa65>::try_from(sig).map_err(|_| bad.clone())?;
-            let enc =
-                EncodedVerifyingKey::<MlDsa65>::try_from(pubkey).map_err(|_| Error::BadPubkey)?;
-            let key = VerifyingKey::<MlDsa65>::decode(&enc);
-            key.verify(msg, &parsed).map_err(|_| bad)
-        }
+        SCHEME_ML_DSA_65 => verify_ml_dsa(pubkey, sig, msg).map_err(|e| match e {
+            Error::BadComponentLength(_) | Error::BadPubkey => e,
+            _ => Error::BadSignature { scheme },
+        }),
         other => Err(Error::UnsupportedSigScheme(other)),
     }
+}
+
+/// Verify one ML-DSA-65 signature, shared by the bundle path and the
+/// checkpoint-sidecar path so the two cannot disagree on what "valid" means.
+///
+/// FIPS 204 verification over the 32-byte digest as the message. The digest is
+/// already domain-separated upstream, so the ML-DSA context is empty: no
+/// second domain tag inside the primitive. Lengths are refused before any
+/// lattice work, so a truncated component cannot become a resource sink.
+pub fn verify_ml_dsa(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<()> {
+    use ml_dsa::{EncodedVerifyingKey, MlDsa65, Signature, Verifier as _, VerifyingKey};
+    if sig.len() != ML_DSA_65_SIGNATURE_BYTES {
+        return Err(Error::BadComponentLength(sig.len()));
+    }
+    if pubkey.len() != ML_DSA_65_PUBLIC_KEY_BYTES {
+        return Err(Error::BadComponentLength(pubkey.len()));
+    }
+    let parsed =
+        Signature::<MlDsa65>::try_from(sig).map_err(|_| Error::BadSignature {
+            scheme: SCHEME_ML_DSA_65,
+        })?;
+    let enc = EncodedVerifyingKey::<MlDsa65>::try_from(pubkey).map_err(|_| Error::BadPubkey)?;
+    let key = VerifyingKey::<MlDsa65>::decode(&enc);
+    key.verify(msg, &parsed).map_err(|_| Error::BadSignature {
+        scheme: SCHEME_ML_DSA_65,
+    })
 }
 
 #[cfg(test)]

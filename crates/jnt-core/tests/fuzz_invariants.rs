@@ -371,6 +371,7 @@ fn candidate_set(n: u8, epoch: u64) -> jnt_core::validators::EpochSet {
                 stake_address: [i; 20],
                 bls_pk: sk.public_key(),
                 stake_sat: u64::from(i) * 100,
+                mldsa_pk: None,
             }
         })
         .collect();

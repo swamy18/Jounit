@@ -69,6 +69,12 @@ pub struct ValidatorRecord {
     /// carrying it here means the set derivation is a pure function of the
     /// candidate list.
     pub stake_sat: u64,
+    /// Lattice key this validator registered for checkpoint sidecars, if any.
+    /// Never the committee identity and never part of the record order (that
+    /// stays `(bls_pk, stake_address)`, so registering a key cannot reshuffle
+    /// bitmap bit assignments). `None` for genesis committees and for bonds
+    /// written before lattice registration existed.
+    pub mldsa_pk: Option<[u8; 1952]>,
 }
 
 impl PartialOrd for ValidatorRecord {
@@ -110,6 +116,11 @@ pub enum ValidatorError {
     DuplicateAddress {
         address: Address,
     },
+    /// A candidate list contained one lattice key under two BLS identities.
+    /// One holder signing for two stakes would make the sidecar ambiguous
+    /// about whose stake each lattice signature backs, so it is refused like
+    /// a duplicate BLS key.
+    DuplicateMldsaKey,
     /// A key failed validation (zero, not in G1, not a point).
     BadKey {
         address: Address,
@@ -142,6 +153,11 @@ pub enum ValidatorError {
         need: usize,
     },
     CheckpointBadSignature,
+    /// Clause 7: the lattice sidecar is missing, malformed, or fails. The
+    /// detail names which signer and which rule, like the bitmap clause does.
+    CheckpointBadSidecar {
+        detail: String,
+    },
     CheckpointNotBeyondFinalized {
         height: u64,
         finalized: u64,
@@ -154,6 +170,9 @@ impl std::fmt::Display for ValidatorError {
             ValidatorError::DuplicateKey { .. } => write!(f, "duplicate bls key in candidate list"),
             ValidatorError::DuplicateAddress { .. } => {
                 write!(f, "duplicate stake address in candidate list")
+            }
+            ValidatorError::DuplicateMldsaKey => {
+                write!(f, "duplicate lattice key in candidate list")
             }
             ValidatorError::BadKey { .. } => write!(f, "candidate has an invalid bls key"),
             ValidatorError::NoCandidates { epoch } => {
@@ -189,6 +208,9 @@ impl std::fmt::Display for ValidatorError {
             }
             ValidatorError::CheckpointBadSignature => {
                 write!(f, "aggregate signature failed verification")
+            }
+            ValidatorError::CheckpointBadSidecar { detail } => {
+                write!(f, "bad lattice sidecar: {detail}")
             }
             ValidatorError::CheckpointNotBeyondFinalized { height, finalized } => {
                 write!(
@@ -249,6 +271,7 @@ pub fn genesis_epoch_set(keys: &[BlsPublicKey]) -> Result<EpochSet, ValidatorErr
             stake_address: Address::default(),
             bls_pk: *k,
             stake_sat: 0,
+            mldsa_pk: None,
         });
     }
     records.sort();
@@ -297,6 +320,7 @@ pub fn derive_set(
     // across addresses, addresses must be unique.
     let mut seen_keys = std::collections::HashSet::new();
     let mut seen_addrs = std::collections::HashSet::new();
+    let mut seen_mldsa = std::collections::HashSet::new();
     for c in candidates {
         if seen_keys.contains(&c.bls_pk) {
             return Err(ValidatorError::DuplicateKey { key: c.bls_pk });
@@ -305,6 +329,11 @@ pub fn derive_set(
             return Err(ValidatorError::DuplicateAddress {
                 address: c.stake_address,
             });
+        }
+        if let Some(pk) = c.mldsa_pk {
+            if !seen_mldsa.insert(pk) {
+                return Err(ValidatorError::DuplicateMldsaKey);
+            }
         }
         // blst-side validation: rejects zero/infinity/not-in-G1/parse failures.
         if crate::bls::validate_public_key(&c.bls_pk).is_err() {
@@ -362,6 +391,13 @@ pub fn set_hash(set: &EpochSet) -> Hash {
     for v in &set.validators {
         buf.extend_from_slice(&v.stake_address);
         buf.extend_from_slice(v.bls_pk.as_bytes());
+        // A registered lattice key extends its validator's preimage; a
+        // validator without one contributes nothing further, so a set in
+        // which nobody registered hashes exactly as before.
+        if let Some(pk) = &v.mldsa_pk {
+            buf.push(0x01);
+            buf.extend_from_slice(pk);
+        }
     }
     sha256_dom(&[DOM_EPOCH_SET_HASH], &[&buf])
 }
@@ -566,6 +602,29 @@ pub fn validate_checkpoint_against_set(
         return Err(ValidatorError::CheckpointBadSignature);
     }
 
+    // Clause 7: the lattice sidecar. For every bitmap signer holding a
+    // registered lattice key, exactly one sidecar entry with that bitmap
+    // index must verify over the same signing hash the aggregate covers.
+    // Signers without a registered key pass on BLS alone — that is the
+    // transition, not a hole: a key is registered by a bond transaction no
+    // caller can forge, and unregistering means unbonding.
+    //
+    // What is refused, and why each refusal matters:
+    //
+    // - an entry for a non-signer or an out-of-range index: the index names
+    //   the member, the set names the key, the caller names neither — so an
+    //   entry that points nowhere is not a signature;
+    // - a duplicate index: one member, one lattice voice, like one BLS voice
+    //   in the aggregate;
+    // - an entry for a member with no registered key: there is nothing it
+    //   could honestly verify against, so accepting it would be trusting the
+    //   caller-supplied bytes by another name;
+    // - a missing entry for a keyed signer: accepting it would let a quorum
+    //   quietly drop its quantum half, which is the downgrade this clause
+    //   exists to prevent — including a sidecar stripped off in transit,
+    //   which lands here as "missing", never as "valid without".
+    verify_pq_sidecar(checkpoint, &set, &message)?;
+
     // Clause 6: monotonic finality.
     if height <= finalized_height {
         return Err(ValidatorError::CheckpointNotBeyondFinalized {
@@ -574,6 +633,52 @@ pub fn validate_checkpoint_against_set(
         });
     }
 
+    Ok(())
+}
+
+/// Clause 7 of checkpoint validation: the lattice sidecar. See the call site
+/// for what each refusal means.
+pub fn verify_pq_sidecar(
+    checkpoint: &crate::bls_checkpoint::Checkpoint,
+    set: &EpochSet,
+    message: &crate::hash::Hash,
+) -> Result<(), ValidatorError> {
+    let n = set.validators.len();
+    let is_signer = |idx: usize| {
+        idx < n && (checkpoint.signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1
+    };
+    let mut seen = vec![false; n];
+    for e in &checkpoint.pq_sidecar {
+        let idx = e.signer_index as usize;
+        if idx >= n || !is_signer(idx) {
+            return Err(ValidatorError::CheckpointBadSidecar {
+                detail: format!("sidecar entry for non-signer {idx}"),
+            });
+        }
+        if seen[idx] {
+            return Err(ValidatorError::CheckpointBadSidecar {
+                detail: format!("duplicate sidecar entry for signer {idx}"),
+            });
+        }
+        seen[idx] = true;
+        let key = set.validators[idx].mldsa_pk.ok_or_else(|| {
+            ValidatorError::CheckpointBadSidecar {
+                detail: format!("sidecar entry for keyless member {idx}"),
+            }
+        })?;
+        crate::sig::verify_ml_dsa(&key, &e.signature, message).map_err(|_| {
+            ValidatorError::CheckpointBadSidecar {
+                detail: format!("lattice signature failed for signer {idx}"),
+            }
+        })?;
+    }
+    for (i, v) in set.validators.iter().enumerate() {
+        if is_signer(i) && v.mldsa_pk.is_some() && !seen[i] {
+            return Err(ValidatorError::CheckpointBadSidecar {
+                detail: format!("keyed signer {i} has no sidecar entry"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -625,6 +730,7 @@ mod tests {
             stake_address: [seed; 20],
             bls_pk: sk(seed).public_key(),
             stake_sat: stake,
+            mldsa_pk: None,
         }
     }
 
@@ -672,6 +778,7 @@ mod tests {
             stake_address: [0xEE; 20], // different address...
             bls_pk: cands[0].bls_pk,   // ...same key: two slots, one signer
             stake_sat: 999,
+            mldsa_pk: None,
         };
         cands.push(twin);
         assert!(matches!(
@@ -687,6 +794,7 @@ mod tests {
             stake_address: cands[0].stake_address,
             bls_pk: sk(0x77).public_key(), // different key, same address
             stake_sat: 1,
+            mldsa_pk: None,
         };
         cands.push(twin);
         assert!(matches!(
@@ -702,6 +810,7 @@ mod tests {
             stake_address: [0x88; 20],
             bls_pk: BlsPublicKey([0u8; 48]), // zero key: not a valid G1 point
             stake_sat: 10_000,               // would be top-N by stake
+            mldsa_pk: None,
         });
         assert!(matches!(
             derive_set(1, &cands, SelectionRule::TopN, 21),
@@ -755,6 +864,7 @@ mod tests {
                 stake_address: [i as u8; 20],
                 bls_pk: sk(i as u8).public_key(),
                 stake_sat: i * 100,
+                mldsa_pk: None,
             })
             .collect()
     }

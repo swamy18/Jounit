@@ -860,6 +860,7 @@ impl Chain {
                     BondRecord {
                         bonder: draft.bonder,
                         bls_pk: draft.bls_pk,
+                        mldsa_pk: draft.mldsa_pk,
                         amount_sat: draft.amount_sat,
                         bond_height: height,
                         bond_index: tx_index,
@@ -956,7 +957,8 @@ impl Chain {
     /// Stake-backed validator records for the current epoch's committee
     /// derivation (Item 5). One `ValidatorRecord` per active bond: the bond's
     /// identity address (network-bound, so a mainnet bond cannot masquerade as a
-    /// mini bond), its BLS key, and its locked value as `stake_sat`. `derive_set`
+    /// mini bond), its BLS key, its registered lattice key if any, and its
+    /// locked value as `stake_sat`. `derive_set`
     /// (TopN) consumes these to pick the top 21 by stake and bind the `stake_address`
     /// into the epoch set hash — the bit that turns "a bonded key signs checkpoints"
     /// into "the highest-staked 21 keys form the committee".
@@ -969,6 +971,7 @@ impl Chain {
                 stake_address: bond_identity(&self.params.network_id, &r.bonder, &r.bls_pk),
                 bls_pk: r.bls_pk,
                 stake_sat: r.amount_sat,
+                mldsa_pk: r.mldsa_pk,
             })
             .collect()
     }

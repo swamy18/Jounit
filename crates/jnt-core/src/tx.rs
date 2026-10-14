@@ -184,8 +184,16 @@ pub struct Transaction {
 /// here: the codec stays dumb and total.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StakePayload {
-    /// `TX_BOND`: the BLS key this bond authorizes for checkpoints.
-    Bond { bls_pk: BlsPublicKey },
+    /// `TX_BOND`: the BLS key this bond authorizes for checkpoints, plus the
+    /// validator's lattice key when it registers one (`None` for bonds written
+    /// before lattice registration existed, and for validators that have not
+    /// migrated). The lattice key is looked up by BLS identity — it never
+    /// replaces the BLS key as the committee identity, so bitmap order and
+    /// `bond_identity` are unchanged by its presence.
+    Bond {
+        bls_pk: BlsPublicKey,
+        mldsa_pk: Option<[u8; 1952]>,
+    },
     /// `TX_UNBOND`: the bond being released (the BOND transaction's txid).
     Unbond { bond_id: Hash512 },
     /// `TX_SLASH`: two conflicting checkpoints proving equivocation. Boxed:
@@ -208,11 +216,23 @@ impl StakePayload {
     }
 
     /// Canonical payload bytes (without any tag — `tx_type` says the shape).
+    ///
+    /// A bond is `bls_pk(48)` alone when no lattice key is registered, and
+    /// `bls_pk(48) ‖ 0x01 ‖ mldsa_pk(1952)` when one is. The short shape is
+    /// exactly the pre-registration encoding, so old bonds decode unchanged;
+    /// a `0x00` flag byte is accepted and also means absent, so both spellings
+    /// of "no key" name the same payload.
     pub fn body_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
-            StakePayload::Bond { bls_pk } => {
+            StakePayload::Bond { bls_pk, mldsa_pk } => {
                 w.raw(bls_pk.as_bytes());
+                match mldsa_pk {
+                    Some(pk) => {
+                        w.u8(1).raw(pk);
+                    }
+                    None => {}
+                }
             }
             StakePayload::Unbond { bond_id } => {
                 w.fixed(bond_id);
@@ -233,8 +253,28 @@ impl StakePayload {
         match tx_type {
             TX_BOND => {
                 let raw = r.fixed::<48>().map_err(|_| Error::Malformed("bond key"))?;
+                // Backcompat: a bare 48-byte payload is a bond with no lattice
+                // key. Anything else must be the flag byte plus, for `0x01`,
+                // exactly one 1952-byte key — then end of payload.
+                if r.remaining() == 0 {
+                    return Ok(StakePayload::Bond {
+                        bls_pk: BlsPublicKey(raw),
+                        mldsa_pk: None,
+                    });
+                }
+                let flag = r.u8()?;
+                let mldsa_pk = match flag {
+                    0 => None,
+                    1 => {
+                        let key: [u8; 1952] = r.fixed()?;
+                        Some(key)
+                    }
+                    _ => return Err(Error::Malformed("bond lattice-key flag")),
+                };
+                r.expect_end()?;
                 Ok(StakePayload::Bond {
                     bls_pk: BlsPublicKey(raw),
+                    mldsa_pk,
                 })
             }
             TX_UNBOND => {

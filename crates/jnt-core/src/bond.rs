@@ -73,6 +73,10 @@ pub struct BondRecord {
     pub bonder: Address,
     /// BLS key the bond authorizes for checkpoints.
     pub bls_pk: BlsPublicKey,
+    /// Lattice key the bond registers for checkpoint sidecars, if any. Never
+    /// the committee identity (that stays the BLS key), only the key clause 7
+    /// looks up for this validator's sidecar entry.
+    pub mldsa_pk: Option<[u8; 1952]>,
     /// Locked value, always `>= MIN_VALIDATOR_STAKE_SAT` by construction.
     pub amount_sat: u64,
     /// Height of the block that bonded.
@@ -236,6 +240,7 @@ pub fn bonder_of(tx: &Transaction) -> Result<Address> {
 pub struct BondDraft {
     pub bonder: Address,
     pub bls_pk: BlsPublicKey,
+    pub mldsa_pk: Option<[u8; 1952]>,
     pub amount_sat: u64,
 }
 
@@ -247,12 +252,24 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
     if tx.tx_type != TX_BOND {
         return Err(Error::StakeInvalid("not a bond transaction"));
     }
-    let bls_pk = match &tx.stake {
-        Some(StakePayload::Bond { bls_pk }) => *bls_pk,
+    let (bls_pk, mldsa_pk) = match &tx.stake {
+        Some(StakePayload::Bond { bls_pk, mldsa_pk }) => (*bls_pk, *mldsa_pk),
         _ => return Err(Error::StakeInvalid("bond transaction without bond payload")),
     };
     crate::bls::validate_public_key(&bls_pk)
         .map_err(|_| Error::StakeInvalid("bond BLS key invalid"))?;
+    // The lattice key needs no cryptographic check here: any 1952 bytes decode
+    // structurally (FIPS 204 vkDecode is total), and the check that matters —
+    // that its signatures verify — runs at checkpoint time, not bond time. A
+    // garbage key buys its registrant nothing: their sidecar entries will
+    // simply never verify, and clause 7 will refuse checkpoints that need
+    // them. What *is* refused here is sharing: one lattice key under two BLS
+    // identities would let one holder sign for two stakes.
+    if let Some(pk) = mldsa_pk {
+        if bonds.records().iter().any(|r| r.mldsa_pk == Some(pk)) {
+            return Err(Error::StakeInvalid("lattice key already bonded"));
+        }
+    }
     if bonds.find_by_key(&bls_pk).is_some() {
         return Err(Error::StakeInvalid("BLS key already bonded"));
     }
@@ -274,6 +291,7 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
     Ok(BondDraft {
         bonder,
         bls_pk,
+        mldsa_pk,
         amount_sat: bond_out.value,
     })
 }
@@ -429,6 +447,7 @@ pub fn probe_stake_tx(
                 BondRecord {
                     bonder: draft.bonder,
                     bls_pk: draft.bls_pk,
+                    mldsa_pk: draft.mldsa_pk,
                     amount_sat: draft.amount_sat,
                     bond_height: height,
                     bond_index: tx_index,
@@ -489,6 +508,7 @@ mod tests {
                 BondRecord {
                     bonder: [i; 20],
                     bls_pk: bls_key(i + 1),
+                    mldsa_pk: None,
                     amount_sat: MIN_VALIDATOR_STAKE_SAT,
                     bond_height: height,
                     bond_index: 0,
@@ -531,6 +551,7 @@ mod tests {
         let record = BondRecord {
             bonder: [3u8; 20],
             bls_pk: bls_key(3),
+            mldsa_pk: None,
             amount_sat: MIN_VALIDATOR_STAKE_SAT,
             bond_height: 10,
             bond_index: 1,
