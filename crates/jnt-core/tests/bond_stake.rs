@@ -139,7 +139,10 @@ fn bond_tx_value(
         )
         .unwrap();
     tx.tx_type = TX_BOND;
-    tx.stake = Some(StakePayload::Bond { bls_pk: pk, mldsa_pk: None });
+    tx.stake = Some(StakePayload::Bond {
+        bls_pk: pk,
+        mldsa_pk: None,
+    });
     w.sign(&mut tx).unwrap();
     tx
 }
@@ -355,7 +358,10 @@ fn bond_refusals_name_their_rule_and_record_nothing() {
         )
         .unwrap();
     wrong_addr.tx_type = TX_BOND;
-    wrong_addr.stake = Some(StakePayload::Bond { bls_pk: pk, mldsa_pk: None });
+    wrong_addr.stake = Some(StakePayload::Bond {
+        bls_pk: pk,
+        mldsa_pk: None,
+    });
     w.sign(&mut wrong_addr).unwrap();
     assert_eq!(
         submit_block(&mut chain, bonder, vec![wrong_addr]).unwrap_err(),
@@ -490,7 +496,10 @@ fn mempool_admits_a_valid_bond_and_refuses_a_broken_one() {
         )
         .unwrap();
     small.tx_type = TX_BOND;
-    small.stake = Some(StakePayload::Bond { bls_pk: pk, mldsa_pk: None });
+    small.stake = Some(StakePayload::Bond {
+        bls_pk: pk,
+        mldsa_pk: None,
+    });
     w.sign(&mut small).unwrap();
     let err = pool
         .add(small, chain.utxo(), h, &net, base, chain.bonds())

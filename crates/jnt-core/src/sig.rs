@@ -340,10 +340,9 @@ pub fn verify_ml_dsa(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<()> {
     if pubkey.len() != ML_DSA_65_PUBLIC_KEY_BYTES {
         return Err(Error::BadComponentLength(pubkey.len()));
     }
-    let parsed =
-        Signature::<MlDsa65>::try_from(sig).map_err(|_| Error::BadSignature {
-            scheme: SCHEME_ML_DSA_65,
-        })?;
+    let parsed = Signature::<MlDsa65>::try_from(sig).map_err(|_| Error::BadSignature {
+        scheme: SCHEME_ML_DSA_65,
+    })?;
     let enc = EncodedVerifyingKey::<MlDsa65>::try_from(pubkey).map_err(|_| Error::BadPubkey)?;
     let key = VerifyingKey::<MlDsa65>::decode(&enc);
     key.verify(msg, &parsed).map_err(|_| Error::BadSignature {

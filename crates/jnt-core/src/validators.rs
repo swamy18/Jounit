@@ -644,9 +644,8 @@ pub fn verify_pq_sidecar(
     message: &crate::hash::Hash,
 ) -> Result<(), ValidatorError> {
     let n = set.validators.len();
-    let is_signer = |idx: usize| {
-        idx < n && (checkpoint.signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1
-    };
+    let is_signer =
+        |idx: usize| idx < n && (checkpoint.signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1;
     let mut seen = vec![false; n];
     for e in &checkpoint.pq_sidecar {
         let idx = e.signer_index as usize;
@@ -661,11 +660,12 @@ pub fn verify_pq_sidecar(
             });
         }
         seen[idx] = true;
-        let key = set.validators[idx].mldsa_pk.ok_or_else(|| {
-            ValidatorError::CheckpointBadSidecar {
-                detail: format!("sidecar entry for keyless member {idx}"),
-            }
-        })?;
+        let key =
+            set.validators[idx]
+                .mldsa_pk
+                .ok_or_else(|| ValidatorError::CheckpointBadSidecar {
+                    detail: format!("sidecar entry for keyless member {idx}"),
+                })?;
         crate::sig::verify_ml_dsa(&key, &e.signature, message).map_err(|_| {
             ValidatorError::CheckpointBadSidecar {
                 detail: format!("lattice signature failed for signer {idx}"),

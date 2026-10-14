@@ -1365,20 +1365,22 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                     && !signed_epochs.contains(&boundary_height)
                 {
                     // The set a verifier will use for this epoch: the chain's own
-                    // committee keys for that height, in the sorted order
-                    // `EpochSet` uses.
+                    // committee records for that height, in the sorted order
+                    // `EpochSet` uses — records, not bare keys, so members
+                    // holding registered lattice keys get their sidecar entry
+                    // and the certificate stays valid past the migration.
                     let epoch = boundary_height / epoch_blocks;
-                    let committee_keys = sh.chain.committee_keys();
-                    if !committee_keys.is_empty() {
+                    let records = sh.chain.committee_signing_records();
+                    if !records.is_empty() {
                         let signer = jnt_core::signing::CheckpointSigner::new(
                             &sh.chain.params().network_id,
                             epoch_blocks,
                         );
-                        if let Some(Ok(cp)) = signer.sign_for_set(
+                        if let Some(Ok(cp)) = signer.sign_for_set_with_records(
                             boundary_height,
                             sh.chain.tip_hash(),
                             committee,
-                            &committee_keys,
+                            &records,
                         ) {
                             debug_assert_eq!(cp.payload.epoch, epoch);
                             if let Ok(()) = sh.chain.apply_checkpoint(&cp, &jnt_core::bls::RealBls)

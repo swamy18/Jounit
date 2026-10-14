@@ -174,6 +174,34 @@ impl ValidatorKey {
         self.key.sign(message)
     }
 
+    /// The validator's lattice signing key, derived from the same scalar as
+    /// the BLS key — one secret, two primitives, no second file and no second
+    /// backup for the operator to lose. The derivation is domain-separated
+    /// from everything the BLS key itself signs, so the two key pairs are
+    /// independent even though they share a seed.
+    fn mldsa_signing_key(&self) -> ml_dsa::SigningKey<ml_dsa::MlDsa65> {
+        use crate::hash::sha256_dom;
+        let seed = sha256_dom(b"jounit/validator-mldsa/v1", &[&self.key.scalar()]);
+        ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&seed.into())
+    }
+
+    /// The lattice public key this validator registers in its bond, encoded.
+    pub fn mldsa_pubkey(&self) -> [u8; 1952] {
+        use ml_dsa::Keypair as _;
+        self.mldsa_signing_key().verifying_key().encode().into()
+    }
+
+    /// Sign a checkpoint decision for the lattice sidecar: the same signing
+    /// hash the BLS aggregate covers, deterministic, empty ML-DSA context.
+    pub fn sign_pq(&self, message: &Hash) -> Result<[u8; 3309], Error> {
+        let sig = self
+            .mldsa_signing_key()
+            .expanded_key()
+            .sign_deterministic(message, &[])
+            .map_err(|_| Error::Malformed("lattice signing failed"))?;
+        Ok(sig.encode().into())
+    }
+
     /// Serialize to the key-file format. The caller writes the bytes; this
     /// module does no I/O, so no path here can be tricked into writing a key
     /// somewhere the operator did not choose.
@@ -320,12 +348,79 @@ impl Committee {
                 "a committee key is not a member of the validator set it signs against",
             )));
         }
+        // BLS half only: without the epoch records this path cannot know which
+        // members hold registered lattice keys, and emitting sidecar entries
+        // for keyless members would produce a certificate clause 7 refuses.
+        // Callers signing for a committee with registered keys must use
+        // `sign_in_set_with_records`.
         Some(Ok(Checkpoint {
             payload: payload.clone(),
             aggregate_sig: aggregate,
             signer_bitmap: bitmap,
             signer_count: signed as u32,
             pq_sidecar: Vec::new(),
+        }))
+    }
+
+    /// Sign against validator *records*: the committee a peer verifies
+    /// against, with each member's registered lattice key if any.
+    ///
+    /// Same bitmap discipline as [`Committee::sign_in_set`], plus one sidecar
+    /// entry per held key whose record carries a lattice key — over the same
+    /// message the aggregate covers, at the member's bitmap index. Members
+    /// without a registered key are covered by the aggregate alone, exactly
+    /// what clause 7 accepts. The result is a dual-signed certificate when
+    /// the committee has migrated keys, and a plain one otherwise: the same
+    /// call signs correctly on both sides of the migration.
+    pub fn sign_in_set_with_records(
+        &self,
+        payload: &CheckpointPayload,
+        records: &[crate::validators::ValidatorRecord],
+    ) -> Option<Result<Checkpoint, Error>> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let msg = payload.signing_hash();
+        let sigs: Vec<BlsSignature> = self.keys.iter().map(|k| k.sign_hash(&msg)).collect();
+        let aggregate = match RealBls::aggregate(&sigs) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        // The verifier's order: BLS keys unique per set, so sorting records by
+        // key bytes indexes identically to the epoch set's canonical order.
+        let mut sorted: Vec<&crate::validators::ValidatorRecord> = records.iter().collect();
+        sorted.sort_by(|a, b| a.bls_pk.0.cmp(&b.bls_pk.0));
+        let mut bitmap = vec![0u8; sorted.len().div_ceil(8)];
+        let mut signed = 0usize;
+        let mut pq_sidecar = Vec::new();
+        for (i, rec) in sorted.iter().enumerate() {
+            if let Some(held) = self.keys.iter().find(|k| k.public_key() == rec.bls_pk) {
+                bitmap[i / 8] |= 1 << (i % 8);
+                signed += 1;
+                if rec.mldsa_pk.is_some() {
+                    let signature = match held.sign_pq(&msg) {
+                        Ok(s) => s,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    pq_sidecar.push(crate::bls_checkpoint::PqSidecarEntry {
+                        signer_index: i as u32,
+                        signature,
+                    });
+                }
+            }
+        }
+        if signed != self.keys.len() {
+            return Some(Err(Error::Malformed(
+                "a committee key is not a member of the validator set it signs against",
+            )));
+        }
+        Some(Ok(Checkpoint {
+            payload: payload.clone(),
+            aggregate_sig: aggregate,
+            signer_bitmap: bitmap,
+            signer_count: signed as u32,
+            pq_sidecar,
         }))
     }
 }
@@ -395,6 +490,21 @@ impl CheckpointSigner {
     ) -> Option<Result<Checkpoint, Error>> {
         let payload = self.payload(height, block_hash);
         committee.sign_in_set(&payload, set_keys)
+    }
+
+    /// Sign against validator records: same as [`CheckpointSigner::sign_for_set`],
+    /// plus the lattice sidecar for members holding registered keys. This is
+    /// the call a production loop uses — the BLS-only call is for committees
+    /// known to carry no lattice keys (tests, genesis bootstraps).
+    pub fn sign_for_set_with_records(
+        &self,
+        height: u64,
+        block_hash: Hash512,
+        committee: &Committee,
+        records: &[crate::validators::ValidatorRecord],
+    ) -> Option<Result<Checkpoint, Error>> {
+        let payload = self.payload(height, block_hash);
+        committee.sign_in_set_with_records(&payload, records)
     }
 }
 

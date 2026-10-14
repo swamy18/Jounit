@@ -94,7 +94,10 @@ fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash512) {
         )
         .unwrap();
     tx.tx_type = TX_BOND;
-    tx.stake = Some(StakePayload::Bond { bls_pk: pk, mldsa_pk: None });
+    tx.stake = Some(StakePayload::Bond {
+        bls_pk: pk,
+        mldsa_pk: None,
+    });
     w.sign(&mut tx).unwrap();
     let bond_id = tx.txid();
 

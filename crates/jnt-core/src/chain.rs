@@ -954,6 +954,37 @@ impl Chain {
         }
     }
 
+    /// The same membership as [`Chain::committee_keys`], as full records: each
+    /// member's registered lattice key rides along, so the signing loop can
+    /// produce dual-signed certificates. Genesis fallback members carry no
+    /// lattice key, exactly like the genesis epoch set the verifier derives.
+    pub fn committee_signing_records(&self) -> Vec<crate::validators::ValidatorRecord> {
+        use crate::bond::bond_identity;
+        let bonded = self.bonds.committee();
+        if bonded.is_empty() {
+            self.params
+                .genesis_validators
+                .iter()
+                .map(|k| crate::validators::ValidatorRecord {
+                    stake_address: crate::hash::Address::default(),
+                    bls_pk: *k,
+                    stake_sat: 0,
+                    mldsa_pk: None,
+                })
+                .collect()
+        } else {
+            bonded
+                .into_iter()
+                .map(|r| crate::validators::ValidatorRecord {
+                    stake_address: bond_identity(&self.params.network_id, &r.bonder, &r.bls_pk),
+                    bls_pk: r.bls_pk,
+                    stake_sat: r.amount_sat,
+                    mldsa_pk: r.mldsa_pk,
+                })
+                .collect()
+        }
+    }
+
     /// Stake-backed validator records for the current epoch's committee
     /// derivation (Item 5). One `ValidatorRecord` per active bond: the bond's
     /// identity address (network-bound, so a mainnet bond cannot masquerade as a
