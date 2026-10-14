@@ -1717,6 +1717,21 @@ signer with a registered key and no valid sidecar entry is refused by name
 message is the domain-separated hash of `(task_id, verdict, vwc_hash)`, so a
 settle decision cannot be replayed against another task or another verdict.
 
+Wire form of the settle payload (the sidecar rides last; a payload written
+before it existed ends after `signer_count` and decodes to an empty sidecar):
+
+```
+fixed  task_id        (32)
+u8     verdict
+fixed  vwc_hash       (32)
+raw    bls_sig        (96)
+u32le  bitmap_len     (<= 64)
+raw    signer_bitmap
+u32le  signer_count
+u32le  sidecar_count  (<= 64)       // absent in pre-sidecar encodings
+sidecar_count × (u32le signer_index ‖ raw sig (3309))
+```
+
 Every payload is canonically encodable: `serialize` and `from_reader` are exact
 inverses, and every length prefix (signature bundle components, attestation
 signatures, signer bitmap) is bounded **before** it drives an allocation.
