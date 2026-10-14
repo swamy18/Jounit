@@ -115,10 +115,22 @@ pub fn sign_vote(
         height,
         signer: key.public_key(),
         signature: jnt_core::bls_checkpoint::BlsSignature([0u8; 96]),
+        pq_sig: None,
     };
     let msg = base.signing_hash();
+    // A vote carries a lattice signature exactly when its signer holds a
+    // registered lattice key in the bond ledger. Attaching one for a keyless
+    // member would build a settle the chain must refuse ("entry for keyless
+    // member"), turning every vote this node casts into a stuck settlement —
+    // so the bond registry, not the key file, decides.
+    let pq_sig = chain
+        .bonds()
+        .find_by_key(&key.public_key())
+        .filter(|(_, r)| r.mldsa_pk.is_some())
+        .and_then(|_| key.sign_pq(&msg).ok());
     Some(ArbitrationVote {
         signature: key.sign_hash(&msg),
+        pq_sig,
         ..base
     })
 }

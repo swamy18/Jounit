@@ -146,6 +146,7 @@ impl DisputeVerdict {
         bls_sig: [u8; 96],
         signer_bitmap: Vec<u8>,
         signer_count: u32,
+        pq_sidecar: Vec<jnt_core::bls_checkpoint::PqSidecarEntry>,
     ) -> L2Result<SettlePayload> {
         let verdict = self.verdict().ok_or(L2Error::InconclusiveDispute)?;
         Ok(SettlePayload {
@@ -155,6 +156,7 @@ impl DisputeVerdict {
             bls_sig,
             signer_bitmap,
             signer_count,
+            pq_sidecar,
         })
     }
 }
@@ -304,7 +306,7 @@ mod tests {
         assert_eq!(v.verdict(), None);
         assert_eq!(v.vwc_hash(), None);
         assert_eq!(
-            v.settle_payload([0u8; 96], vec![0xFF], 1),
+            v.settle_payload([0u8; 96], vec![0xFF], 1, Vec::new()),
             Err(L2Error::InconclusiveDispute)
         );
     }
@@ -327,7 +329,7 @@ mod tests {
     fn a_verdict_builds_the_settle_payload_the_existing_path_applies() {
         let v = DisputeEngine::arbitrate(&evidence(), COUNTER).unwrap();
         let p = v
-            .settle_payload([0x7Fu8; 96], vec![0b0000_0111], 3)
+            .settle_payload([0x7Fu8; 96], vec![0b0000_0111], 3, Vec::new())
             .unwrap();
         assert_eq!(p.task_id, TASK);
         assert_eq!(p.verdict, Verdict::Fraudulent);

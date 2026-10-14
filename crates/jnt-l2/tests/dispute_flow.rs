@@ -203,6 +203,7 @@ impl World {
             [0xAAu8; 96],
             quorum_bitmap(self.validators.len(), quorum),
             quorum as u32,
+            Vec::new(),
         )?;
         self.apply(&L2Transaction::new(L2Payload::Settle(payload)), height)
     }
@@ -466,6 +467,7 @@ fn a_payment_equal_to_the_settle_fee_settles_with_a_zero_payout() {
                 bls_sig: [0xAAu8; 96],
                 signer_bitmap: quorum_bitmap(4, 3),
                 signer_count: 3,
+                pq_sidecar: Vec::new(),
             })),
             9,
         )
@@ -511,6 +513,7 @@ fn a_payment_below_the_settle_fee_is_refused_and_not_settled() {
             bls_sig: [0xAAu8; 96],
             signer_bitmap: quorum_bitmap(4, 3),
             signer_count: 3,
+            pq_sidecar: Vec::new(),
         })),
         9,
     );
@@ -673,6 +676,7 @@ fn a_settle_hash_that_does_not_match_the_verdict_is_refused() {
         bls_sig: [0xAAu8; 96],
         signer_bitmap: quorum_bitmap(4, 3),
         signer_count: 3,
+        pq_sidecar: Vec::new(),
     };
     assert_eq!(
         w.apply(&L2Transaction::new(L2Payload::Settle(payload)), 5),
@@ -703,6 +707,7 @@ fn a_task_cannot_be_settled_twice_or_slashed_twice() {
         bls_sig: [0xAAu8; 96],
         signer_bitmap: quorum_bitmap(4, 3),
         signer_count: 3,
+        pq_sidecar: Vec::new(),
     };
     assert!(matches!(
         w.apply(&L2Transaction::new(L2Payload::Settle(again)), 6),
@@ -805,7 +810,7 @@ fn a_dispute_verdict_still_needs_a_validator_quorum_to_settle() {
 
     // A payload the *engine* produced, but with too few signers.
     let payload = v
-        .settle_payload([0xAAu8; 96], quorum_bitmap(4, 2), 2)
+        .settle_payload([0xAAu8; 96], quorum_bitmap(4, 2), 2, Vec::new())
         .unwrap();
     assert_eq!(
         w.apply(&L2Transaction::new(L2Payload::Settle(payload)), 5),

@@ -137,6 +137,7 @@ fn vote(
         height,
         signer: sk.public_key(),
         signature: BlsSignature([0u8; 96]),
+        pq_sig: None,
     };
     ArbitrationVote {
         signature: sk.sign(&base.signing_hash()),
@@ -395,9 +396,12 @@ fn conflicting_votes_are_refused_not_merged() {
     );
 }
 
-/// **Malformed payloads do not panic or count.** Every truncation of a valid
-/// vote is refused by name, and a peer cannot make a node reserve for a
-/// declared length it never sent.
+/// **Malformed payloads do not panic or count.** Every prefix of a valid vote
+/// is refused by name — except the one that ends exactly at the BLS
+/// signature, which is the pre-lattice encoding a legacy peer still sends
+/// (`pq_sig: None`). The lattice flag byte riding last is what makes that
+/// prefix *shape*-valid rather than truncated: the same tolerance the
+/// checkpoint, settle and VWC codecs give their trailing sidecar.
 #[test]
 fn every_truncation_of_a_vote_is_refused_not_panicked() {
     let any = SecretKey::derive(&[1u8; 32]).unwrap();
@@ -410,16 +414,26 @@ fn every_truncation_of_a_vote_is_refused_not_panicked() {
         &any,
     );
     let wire = v.serialize();
+    // This helper's vote has no lattice signature, so its wire form ends with
+    // the `present = 0` flag byte and the pre-lattice shape is one byte
+    // shorter: exactly `body ‖ signature`.
+    let legacy_len = wire.len() - 1;
     let mut refused = 0;
+    let mut legacy_decoded = false;
     for n in 0..wire.len() {
-        if ArbitrationVote::deserialize(&wire[..n]).is_err() {
-            refused += 1;
+        match ArbitrationVote::deserialize(&wire[..n]) {
+            Err(_) => refused += 1,
+            Ok(back) => {
+                assert_eq!(back.signature, v.signature, "only the legacy shape decodes");
+                assert_eq!(n, legacy_len, "and only at the signature boundary");
+                assert!(back.pq_sig.is_none());
+                legacy_decoded = true;
+            }
         }
     }
-    assert_eq!(
-        refused,
-        wire.len(),
-        "every prefix must be refused; an empty prefix is the only edge case"
+    assert!(
+        refused + usize::from(legacy_decoded) == wire.len(),
+        "every prefix is refused, the legacy one decodes"
     );
     assert!(
         ArbitrationVote::deserialize(&wire).is_ok(),

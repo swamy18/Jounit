@@ -159,6 +159,7 @@ fn settle_payload(
         bls_sig: [0xAAu8; 96],
         signer_bitmap: bitmap,
         signer_count: signed as u32,
+        pq_sidecar: Vec::new(),
     }
 }
 

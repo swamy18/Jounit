@@ -75,6 +75,7 @@ fn signed_settle(
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
+        pq_sidecar: Vec::new(),
     };
     let msg = payload.signing_hash();
     let quorum = validators.quorum_size();
@@ -95,6 +96,7 @@ fn signed_settle(
         bls_sig: *jnt_core::bls::RealBls::aggregate(&sigs).unwrap().as_bytes(),
         signer_bitmap: bitmap,
         signer_count: quorum as u32,
+        pq_sidecar: Vec::new(),
         ..payload
     };
     L2Transaction::new(L2Payload::Settle(payload))

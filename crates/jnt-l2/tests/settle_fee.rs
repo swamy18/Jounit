@@ -124,6 +124,7 @@ impl World {
                     bls_sig: [0xAAu8; 96],
                     signer_bitmap: quorum_bitmap(),
                     signer_count: 3,
+                    pq_sidecar: Vec::new(),
                 })),
                 height + 8,
             )
@@ -176,6 +177,7 @@ fn fee_boundary_exact_from_dust_to_whale() {
                 bls_sig: [0xAAu8; 96],
                 signer_bitmap: quorum_bitmap(),
                 signer_count: 3,
+                pq_sidecar: Vec::new(),
             })),
             9,
         ),
@@ -281,6 +283,7 @@ fn fraud_fee_comes_from_task_value_not_deposit_size() {
                 bls_sig: [0xAAu8; 96],
                 signer_bitmap: quorum_bitmap(),
                 signer_count: 3,
+                pq_sidecar: Vec::new(),
             })),
             5,
         )

@@ -149,6 +149,7 @@ fn signed_settle(
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
+        pq_sidecar: Vec::new(),
     };
     let msg = payload.signing_hash();
     let quorum = set.quorum_size();
@@ -167,6 +168,7 @@ fn signed_settle(
         bls_sig,
         signer_bitmap: bitmap,
         signer_count: quorum as u32,
+        pq_sidecar: Vec::new(),
         task_id,
         verdict: Verdict::Correct,
         vwc_hash: RESULT,
@@ -325,6 +327,7 @@ fn a_profile_without_a_committee_fails_closed_on_settlements() {
         bls_sig: [0x01; 96],
         signer_bitmap: vec![0b0000_0111],
         signer_count: 3,
+        pq_sidecar: Vec::new(),
     };
     mine_and_submit(
         &mut chain,

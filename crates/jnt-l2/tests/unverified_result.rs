@@ -327,6 +327,7 @@ fn a_challenged_and_arbitrated_result_is_accepted_as_verified() {
             [0xAAu8; 96],
             bitmap(w.validators.len(), quorum),
             quorum as u32,
+            Vec::new(),
         )
         .expect("a decisive verdict has a settle payload");
     w.apply(&L2Transaction::new(L2Payload::Settle(payload)), 5)

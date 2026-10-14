@@ -158,6 +158,7 @@ impl World {
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
+            pq_sidecar: Vec::new(),
         };
         let msg = payload.signing_hash();
         let quorum = self.validators.quorum_size();
@@ -180,6 +181,7 @@ impl World {
             bls_sig: *RealBls::aggregate(&sigs).unwrap().as_bytes(),
             signer_bitmap: self.validators.bitmap_from_indices(&indices),
             signer_count: quorum as u32,
+            pq_sidecar: Vec::new(),
             ..payload
         }
     }

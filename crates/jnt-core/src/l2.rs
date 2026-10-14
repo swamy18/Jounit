@@ -666,6 +666,13 @@ pub struct SettlePayload {
     pub signer_bitmap: Vec<u8>,
     /// Number of validators that signed. Must agree with the bitmap.
     pub signer_count: u32,
+    /// Lattice sidecar: one ML-DSA-65 signature per bitmap signer that voted
+    /// with a lattice signature, over the same signing hash the aggregate
+    /// covers. Collected, not verified, at tally time — the tally is not a
+    /// trust boundary (consensus re-verifies at apply) — and verified at
+    /// `apply_settle` against the epoch set's registered keys, exactly like
+    /// checkpoint clause 7. Empty while no voter carries a lattice signature.
+    pub pq_sidecar: Vec<crate::bls_checkpoint::PqSidecarEntry>,
 }
 
 impl SettlePayload {
@@ -688,6 +695,11 @@ impl SettlePayload {
         w.u32le(self.signer_bitmap.len() as u32)
             .raw(&self.signer_bitmap)
             .u32le(self.signer_count);
+        // The sidecar rides last, length-prefixed like every repeated field.
+        w.u32le(self.pq_sidecar.len() as u32);
+        for e in &self.pq_sidecar {
+            w.u32le(e.signer_index).raw(&e.signature);
+        }
         w.into_vec()
     }
 
@@ -705,6 +717,26 @@ impl SettlePayload {
         }
         let signer_bitmap = r.fixed_slice(n)?.to_vec();
         let signer_count = r.u32le()?;
+        // Tolerant: payloads written before the sidecar end here and decode
+        // to an empty one. Stripping is not a downgrade: apply refuses a
+        // keyed signer with no entry.
+        let mut pq_sidecar = Vec::new();
+        if r.remaining() > 0 {
+            let m = r.u32le()? as usize;
+            if m > crate::bls_checkpoint::MAX_PQ_SIDECAR_ENTRIES {
+                return Err(Error::Malformed("settle pq sidecar too large"));
+            }
+            pq_sidecar.reserve(m.min(8));
+            for _ in 0..m {
+                let signer_index = r.u32le()?;
+                let signature: [u8; crate::bls_checkpoint::PQ_SIDECAR_SIGNATURE_BYTES] =
+                    r.fixed()?;
+                pq_sidecar.push(crate::bls_checkpoint::PqSidecarEntry {
+                    signer_index,
+                    signature,
+                });
+            }
+        }
         Ok(SettlePayload {
             task_id,
             verdict,
@@ -712,6 +744,7 @@ impl SettlePayload {
             bls_sig,
             signer_bitmap,
             signer_count,
+            pq_sidecar,
         })
     }
 }
@@ -1164,6 +1197,7 @@ mod tests {
                 bls_sig: [0x7Fu8; 96],
                 signer_bitmap: vec![0b0000_0111],
                 signer_count: 3,
+                pq_sidecar: Vec::new(),
             }),
             L2Payload::ExitQueue(
                 ExitQueuePayload::build(&w, 1, 50_000, [0xCCu8; 20], 1_000).unwrap(),
@@ -1206,6 +1240,7 @@ mod tests {
             bls_sig: [0u8; 96],
             signer_bitmap: vec![],
             signer_count: 0,
+            pq_sidecar: Vec::new(),
         };
         let mut other_verdict = base.clone();
         other_verdict.verdict = Verdict::Fraudulent;

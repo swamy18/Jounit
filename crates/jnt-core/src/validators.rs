@@ -647,36 +647,65 @@ pub fn verify_pq_sidecar(
     let is_signer =
         |idx: usize| idx < n && (checkpoint.signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1;
     let mut seen = vec![false; n];
-    for e in &checkpoint.pq_sidecar {
+    check_sidecar(
+        &checkpoint.pq_sidecar,
+        n,
+        is_signer,
+        |idx| set.validators[idx].mldsa_pk,
+        message,
+        &mut seen,
+    )
+    .map_err(|r| ValidatorError::CheckpointBadSidecar { detail: r.detail })
+}
+
+/// A sidecar refusal, described rather than enumerated: the detail names the
+/// signer index and the rule, the caller decides the error type. One
+/// implementation serves checkpoint clause 7, settle application and VWC
+/// validation, so the three cannot disagree on what "valid" means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarRefusal {
+    pub detail: String,
+}
+
+impl std::fmt::Display for SidecarRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bad lattice sidecar: {}", self.detail)
+    }
+}
+
+impl std::error::Error for SidecarRefusal {}
+
+/// Check lattice sidecar entries against a membership: `is_signer` answers
+/// the bitmap, `key_of` answers the registry, and every bitmap signer holding
+/// a registered key must have exactly one entry. Every rule from clause 7, in
+/// one place; `seen` is filled for the caller to inspect.
+#[allow(clippy::too_many_arguments)]
+pub fn check_sidecar(
+    entries: &[crate::bls_checkpoint::PqSidecarEntry],
+    member_count: usize,
+    is_signer: impl Fn(usize) -> bool,
+    key_of: impl Fn(usize) -> Option<[u8; 1952]>,
+    message: &crate::hash::Hash,
+    seen: &mut [bool],
+) -> Result<(), SidecarRefusal> {
+    let refuse = |detail: String| SidecarRefusal { detail };
+    for e in entries {
         let idx = e.signer_index as usize;
-        if idx >= n || !is_signer(idx) {
-            return Err(ValidatorError::CheckpointBadSidecar {
-                detail: format!("sidecar entry for non-signer {idx}"),
-            });
+        if idx >= member_count || !is_signer(idx) {
+            return Err(refuse(format!("sidecar entry for non-signer {idx}")));
         }
         if seen[idx] {
-            return Err(ValidatorError::CheckpointBadSidecar {
-                detail: format!("duplicate sidecar entry for signer {idx}"),
-            });
+            return Err(refuse(format!("duplicate sidecar entry for signer {idx}")));
         }
         seen[idx] = true;
         let key =
-            set.validators[idx]
-                .mldsa_pk
-                .ok_or_else(|| ValidatorError::CheckpointBadSidecar {
-                    detail: format!("sidecar entry for keyless member {idx}"),
-                })?;
-        crate::sig::verify_ml_dsa(&key, &e.signature, message).map_err(|_| {
-            ValidatorError::CheckpointBadSidecar {
-                detail: format!("lattice signature failed for signer {idx}"),
-            }
-        })?;
+            key_of(idx).ok_or_else(|| refuse(format!("sidecar entry for keyless member {idx}")))?;
+        crate::sig::verify_ml_dsa(&key, &e.signature, message)
+            .map_err(|_| refuse(format!("lattice signature failed for signer {idx}")))?;
     }
-    for (i, v) in set.validators.iter().enumerate() {
-        if is_signer(i) && v.mldsa_pk.is_some() && !seen[i] {
-            return Err(ValidatorError::CheckpointBadSidecar {
-                detail: format!("keyed signer {i} has no sidecar entry"),
-            });
+    for (i, covered) in seen.iter().enumerate().take(member_count) {
+        if is_signer(i) && key_of(i).is_some() && !covered {
+            return Err(refuse(format!("keyed signer {i} has no sidecar entry")));
         }
     }
     Ok(())

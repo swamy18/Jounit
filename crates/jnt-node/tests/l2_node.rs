@@ -103,6 +103,7 @@ fn settle_no_quorum() -> L2Transaction {
         bls_sig: [0x01u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
+        pq_sidecar: Vec::new(),
     }))
 }
 

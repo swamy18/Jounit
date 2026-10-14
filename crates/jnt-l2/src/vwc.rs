@@ -68,6 +68,10 @@ pub enum VwcVerification {
         bls_sig: [u8; 96],
         signer_bitmap: Vec<u8>,
         signer_count: u32,
+        /// Lattice sidecar carried over from the settlement, verified like
+        /// checkpoint clause 7. Empty while no quorum member voted with a
+        /// lattice signature.
+        pq_sidecar: Vec<jnt_core::bls_checkpoint::PqSidecarEntry>,
     },
     /// An implicit settlement (auto-settle or dispute lapse, §15.7): no
     /// aggregate exists for a transition no one transacted.
@@ -142,6 +146,7 @@ impl VerifiedWorkCertificate {
         if let VwcVerification::Quorum {
             signer_bitmap,
             signer_count,
+            pq_sidecar,
             ..
         } = &verification
         {
@@ -154,6 +159,9 @@ impl VerifiedWorkCertificate {
             }
             if *signer_count == 0 {
                 return Err(L2Error::VwcInvalid("quorum certificate with no signers"));
+            }
+            if pq_sidecar.len() > jnt_core::bls_checkpoint::MAX_PQ_SIDECAR_ENTRIES {
+                return Err(L2Error::VwcInvalid("lattice sidecar over cap"));
             }
         }
         let mut cert = VerifiedWorkCertificate {
@@ -183,12 +191,18 @@ impl VerifiedWorkCertificate {
             bls_sig,
             signer_bitmap,
             signer_count,
+            pq_sidecar,
         } = &self.verification
         {
             w.raw(bls_sig)
                 .u32le(signer_bitmap.len() as u32)
                 .raw(signer_bitmap)
                 .u32le(*signer_count);
+            // The sidecar rides last, length-prefixed like every repeated field.
+            w.u32le(pq_sidecar.len() as u32);
+            for e in pq_sidecar {
+                w.u32le(e.signer_index).raw(&e.signature);
+            }
         }
         w.into_vec()
     }
@@ -230,10 +244,29 @@ impl VerifiedWorkCertificate {
                 }
                 let signer_bitmap = r.fixed_slice(n)?.to_vec();
                 let signer_count = r.u32le()?;
+                // Tolerant: certificates written before the sidecar end here.
+                let mut pq_sidecar = Vec::new();
+                if r.remaining() > 0 {
+                    let m = r.u32le()? as usize;
+                    if m > jnt_core::bls_checkpoint::MAX_PQ_SIDECAR_ENTRIES {
+                        return Err(L2Error::VwcInvalid("lattice sidecar over cap"));
+                    }
+                    pq_sidecar.reserve(m.min(8));
+                    for _ in 0..m {
+                        let signer_index = r.u32le()?;
+                        let signature: [u8; jnt_core::bls_checkpoint::PQ_SIDECAR_SIGNATURE_BYTES] =
+                            r.fixed()?;
+                        pq_sidecar.push(jnt_core::bls_checkpoint::PqSidecarEntry {
+                            signer_index,
+                            signature,
+                        });
+                    }
+                }
                 VwcVerification::Quorum {
                     bls_sig,
                     signer_bitmap,
                     signer_count,
+                    pq_sidecar,
                 }
             }
             KIND_WINDOW_ELAPSED => VwcVerification::WindowElapsed,
@@ -297,6 +330,7 @@ impl VerifiedWorkCertificate {
                 bls_sig,
                 signer_bitmap,
                 signer_count,
+                pq_sidecar,
             } => {
                 // The same three checks the settle path applies, over the same
                 // message the settle path signed: rebuild the *decision* (not
@@ -315,10 +349,27 @@ impl VerifiedWorkCertificate {
                     bls_sig: [0u8; 96],
                     signer_bitmap: Vec::new(),
                     signer_count: 0,
+                    pq_sidecar: Vec::new(),
                 };
                 let msg = decision.signing_hash();
                 if !verifier.verify_aggregate(&signers, &msg, &BlsSignature(*bls_sig)) {
                     return Err(L2Error::VwcInvalid("quorum aggregate did not verify"));
+                }
+                // Lattice sidecar, clause-7 shape: a relying party that stops
+                // at the aggregate accepts a decision whose quantum half is
+                // missing, so the sidecar is verified here, not merely carried.
+                {
+                    let n = validators.keys.len();
+                    let mut seen = vec![false; n];
+                    jnt_core::validators::check_sidecar(
+                        pq_sidecar,
+                        n,
+                        |idx| idx < n && (signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1,
+                        |idx| validators.mldsa_key(idx).copied(),
+                        &msg,
+                        &mut seen,
+                    )
+                    .map_err(|_| L2Error::VwcInvalid("lattice sidecar did not verify"))?;
                 }
             }
         }
@@ -376,6 +427,27 @@ impl VerifiedWorkCertificate {
             && payload.verdict == Verdict::Correct
             && payload.vwc_hash == self.result_hash
     }
+
+    /// Lattice sidecar entries this certificate carries (0 for `WindowElapsed`
+    /// and for quorums nobody voted lattice on).
+    pub fn pq_sidecar_len(&self) -> usize {
+        match &self.verification {
+            VwcVerification::Quorum { pq_sidecar, .. } => pq_sidecar.len(),
+            VwcVerification::WindowElapsed => 0,
+        }
+    }
+
+    /// Drop the lattice sidecar and re-derive the id. Test-only: it exists so
+    /// the downgrade attack (a valid BLS aggregate with the quantum half
+    /// stripped in transit) can be staged against an *honestly issued*
+    /// certificate — the registry copy keeps the real evidence.
+    #[doc(hidden)]
+    pub fn strip_pq_sidecar_for_test(&mut self) {
+        if let VwcVerification::Quorum { pq_sidecar, .. } = &mut self.verification {
+            pq_sidecar.clear();
+        }
+        self.id = self.id();
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +483,7 @@ mod tests {
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
+            pq_sidecar: Vec::new(),
         };
         let msg = payload.signing_hash();
         let indices = [0usize, 1, 2];
@@ -434,6 +507,7 @@ mod tests {
                 bls_sig: *aggregate.as_bytes(),
                 signer_bitmap: bitmap,
                 signer_count: 3,
+                pq_sidecar: Vec::new(),
             },
         )
     }
@@ -744,6 +818,7 @@ mod tests {
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
+            pq_sidecar: Vec::new(),
         };
         assert!(cert.matches_settle(&payload));
 

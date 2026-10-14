@@ -496,6 +496,7 @@ fn a_non_validator_cannot_settle_or_certify() {
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
+        pq_sidecar: Vec::new(),
     };
     let res = {
         let mut c = core.borrow_mut();

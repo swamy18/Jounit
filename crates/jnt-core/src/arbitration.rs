@@ -97,6 +97,12 @@ pub struct ArbitrationVote {
     pub signer: BlsPublicKey,
     /// The signer's signature over [`Self::signing_hash`].
     pub signature: BlsSignature,
+    /// The signer's lattice signature over the same [`Self::signing_hash`],
+    /// when the signer holds a registered lattice key. `None` for keyless
+    /// voters and for votes written before lattice voting existed. Collected
+    /// into the settle sidecar by the tally; verified at apply, never trusted
+    /// from the wire alone.
+    pub pq_sig: Option<[u8; 3309]>,
 }
 
 impl ArbitrationVote {
@@ -176,9 +182,21 @@ impl ArbitrationVote {
     }
 
     /// Canonical wire form.
+    ///
+    /// A vote written before lattice voting ends after the BLS signature and
+    /// decodes to `pq_sig: None`. The lattice signature rides last as
+    /// `present(u8) ‖ sig(3309)`, so its absence costs one zero byte.
     pub fn serialize(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.raw(&self.body()).raw(self.signature.as_bytes());
+        match &self.pq_sig {
+            Some(sig) => {
+                w.u8(1).raw(sig);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
         w.into_vec()
     }
 
@@ -206,6 +224,20 @@ impl ArbitrationVote {
         let height = r.u64le()?;
         let signer = BlsPublicKey(r.fixed()?);
         let signature = BlsSignature(r.fixed()?);
+        // Tolerant: votes written before lattice voting end here.
+        let mut pq_sig = None;
+        if r.remaining() > 0 {
+            let present = r.u8()?;
+            match present {
+                0 => {}
+                1 => {
+                    pq_sig = Some(r.fixed()?);
+                }
+                _ => {
+                    return Err(Error::Malformed("arbitration vote lattice flag"));
+                }
+            }
+        }
         r.expect_end()?;
         Ok(ArbitrationVote {
             version,
@@ -216,6 +248,7 @@ impl ArbitrationVote {
             height,
             signer,
             signature,
+            pq_sig,
         })
     }
 }
@@ -409,6 +442,28 @@ impl VoteTally {
         // so arrival order cannot change the bytes.
         let sigs: Vec<BlsSignature> = self.votes.iter().map(|v| v.signature).collect();
         let aggregate = crate::bls::RealBls::aggregate(&sigs).ok()?;
+        // The lattice sidecar, one entry per counted vote that carried a
+        // lattice signature, at the vote's bitmap index. Collected, not
+        // verified: the tally is not a trust boundary (a proposer gains
+        // nothing from garbage it cannot get applied), and verification needs
+        // the epoch set's registered keys, which live at apply time, not here.
+        // Sorted by index so two nodes holding the same votes build the same
+        // bytes regardless of arrival order.
+        let mut sorted_committee = committee.to_vec();
+        sorted_committee.sort_by_key(|k| k.0);
+        let mut pq_sidecar = Vec::new();
+        for v in &self.votes {
+            let Some(sig) = v.pq_sig else { continue };
+            // A counted vote is always a committee member (record checked it),
+            // so a miss here is impossible — but the `?` keeps it honest rather
+            // than indexing blindly.
+            let idx = sorted_committee.iter().position(|k| *k == v.signer)?;
+            pq_sidecar.push(crate::bls_checkpoint::PqSidecarEntry {
+                signer_index: idx as u32,
+                signature: sig,
+            });
+        }
+        pq_sidecar.sort_by_key(|e| e.signer_index);
         let payload = SettlePayload {
             task_id,
             verdict,
@@ -418,6 +473,7 @@ impl VoteTally {
             // against the sorted committee rather than arrival order.
             signer_bitmap: bitmap_for(&signers, committee),
             signer_count: signers.len() as u32,
+            pq_sidecar,
         };
         // The check that matters: the aggregate must verify over the settle
         // decision hash under the committee, exactly as `apply_settle` will.
@@ -556,6 +612,7 @@ mod tests {
             height,
             signer: sk.public_key(),
             signature: BlsSignature([0u8; 96]),
+            pq_sig: None,
         };
         ArbitrationVote {
             signature: sk.sign(&base.signing_hash()),
@@ -587,6 +644,7 @@ mod tests {
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
+            pq_sidecar: Vec::new(),
         };
         assert_eq!(v.signing_hash(), payload.signing_hash());
     }
@@ -772,6 +830,7 @@ mod tests {
             height: 0,
             signer: stranger.public_key(),
             signature: BlsSignature([0u8; 96]),
+            pq_sig: None,
         };
         let v = ArbitrationVote {
             signature: stranger.sign(&base.signing_hash()),

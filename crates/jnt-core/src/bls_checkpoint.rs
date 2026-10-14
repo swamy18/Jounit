@@ -191,12 +191,42 @@ impl CheckpointPayload {
 pub struct ValidatorSet {
     /// Keys in deterministic order (sorted by key bytes for reproducibility).
     pub keys: Vec<BlsPublicKey>,
+    /// Registered lattice key per member, aligned with `keys` by index:
+    /// `mldsa_keys[i]` is member `i`'s ML-DSA-65 key, or `None` when that
+    /// member registered none. The alignment is the whole point — a bitmap
+    /// index resolves to a lattice key with no second lookup — so every
+    /// constructor that reorders `keys` must carry this vector along, and any
+    /// two `ValidatorSet`s compared for equality compare both halves.
+    pub mldsa_keys: Vec<Option<[u8; 1952]>>,
 }
 
 impl ValidatorSet {
     pub fn new(mut keys: Vec<BlsPublicKey>) -> Self {
         keys.sort_by_key(|a| a.0);
-        ValidatorSet { keys }
+        let n = keys.len();
+        ValidatorSet {
+            keys,
+            mldsa_keys: vec![None; n],
+        }
+    }
+
+    /// Build from validator records: same sorted order as [`ValidatorSet::new`]
+    /// (BLS keys are unique per set, so sorting records by key bytes indexes
+    /// identically), with each member's registered lattice key aligned beside
+    /// its BLS key. This is the constructor settle and VWC verification use —
+    /// the one that knows about lattice keys at all.
+    pub fn from_records(records: &[crate::validators::ValidatorRecord]) -> Self {
+        let mut sorted: Vec<&crate::validators::ValidatorRecord> = records.iter().collect();
+        sorted.sort_by_key(|r| r.bls_pk.0);
+        ValidatorSet {
+            keys: sorted.iter().map(|r| r.bls_pk).collect(),
+            mldsa_keys: sorted.iter().map(|r| r.mldsa_pk).collect(),
+        }
+    }
+
+    /// Member `i`'s registered lattice key, if any.
+    pub fn mldsa_key(&self, idx: usize) -> Option<&[u8; 1952]> {
+        self.mldsa_keys.get(idx).and_then(|k| k.as_ref())
     }
 
     pub fn len(&self) -> usize {

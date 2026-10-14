@@ -134,6 +134,7 @@ fn fully_populated_state() -> (L2State, Vec<Hash512>) {
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
+            pq_sidecar: Vec::new(),
         };
         let msg = draft.signing_hash();
         let bitmap = vs.bitmap_from_indices(&(0..vs.quorum_size()).collect::<Vec<_>>());
@@ -152,6 +153,7 @@ fn fully_populated_state() -> (L2State, Vec<Hash512>) {
             bls_sig: *RealBls::aggregate(&sigs).unwrap().as_bytes(),
             signer_bitmap: bitmap,
             signer_count: vs.quorum_size() as u32,
+            pq_sidecar: Vec::new(),
             ..draft
         };
         L2Transaction::new(L2Payload::Settle(payload))

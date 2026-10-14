@@ -1703,12 +1703,17 @@ change the message and swapping keys does. This is the same discipline as the L1
 
 `Settle` has no single signer. Its authorization is a validator-quorum
 BLS12-381 aggregate (the M5 structure: bitmap + signer count + 96-byte
-aggregate), verified through the existing `BlsVerifier` trait **against the
+aggregate) **plus the lattice sidecar**: one ML-DSA-65 signature per bitmap
+signer holding a registered lattice key, over the same decision hash, carried
+in the payload and in the issued VWC. Both halves verify through the existing
+`BlsVerifier` trait and the epoch set's registered keys **against the
 profile's declared active committee** — the same `genesis_validators` list the
 L1 finality layer verifies checkpoints against (§14.8), never keys pulled from
 finality machinery by convenience. A profile with an intentionally empty
 committee (mainnet) verifies against nothing and therefore refuses every
-settlement by name (`BadQuorum`) — fail closed, never fail open. The aggregate
+settlement by name (`BadQuorum`) — fail closed, never fail open. A bitmap
+signer with a registered key and no valid sidecar entry is refused by name
+(`BadPqSidecar`) — fail closed, never silently downgraded. The aggregate
 message is the domain-separated hash of `(task_id, verdict, vwc_hash)`, so a
 settle decision cannot be replayed against another task or another verdict.
 
@@ -2002,6 +2007,8 @@ if Quorum:
   u32le  bitmap_len     (<= 64)
   raw    signer_bitmap
   u32le  signer_count
+  u32le  sidecar_count  (<= 64)      // lattice entries, absent in pre-sidecar encodings
+  sidecar_count × (u32le signer_index ‖ raw sig (3309))
 ```
 
 The certificate id is *not* stored in the encoding — it is derived (§17.3), so a
@@ -2049,11 +2056,12 @@ but never sufficient.
 
 | Kind | Value | Evidence carried | Offline-verifiable | Strength |
 |---|---|---|---|---|
-| `Quorum` | 1 | BLS aggregate + signer bitmap + count | Yes, given the validator set | A quorum signed this exact decision |
+| `Quorum` | 1 | BLS aggregate + signer bitmap + count + lattice sidecar | Yes, given the validator set | A quorum signed this exact decision, under both primitives |
 | `WindowElapsed` | 2 | none | No | The on-chain record; unchallenged for one full window |
 
 An explicit `Settle` transaction always yields `Quorum` — its payload already
-carries the aggregate, and the certificate reuses it rather than re-signing.
+carries the aggregate and the sidecar, and the certificate reuses both rather
+than re-signing.
 An implicit settlement (auto-settle or dispute lapse, §15.7) yields
 `WindowElapsed`, because no aggregate exists for a transition no one transacted.
 
@@ -2069,7 +2077,10 @@ An implicit settlement (auto-settle or dispute lapse, §15.7) yields
 3. **Kind-specific.** For `Quorum`: bitmap and count agree; count ≥ quorum
    threshold; the aggregate verifies over
    `SettlePayload { task_id, Correct, result_hash }.signing_hash()` with the
-   *same* verifier the settlement path uses. For `WindowElapsed`: nothing
+   *same* verifier the settlement path uses; then the lattice sidecar verifies
+   clause-7-shape against the set's registered keys (every bitmap signer
+   holding one needs a valid entry — a relying party that stops at the
+   aggregate accepts a decision whose quantum half is missing). For `WindowElapsed`: nothing
    further — its strength is the on-chain record (§17.5).
 4. **Presence.** When checked against live state, the certificate MUST be in the
    registry under its own `task_id`, byte-identical. A certificate that is not

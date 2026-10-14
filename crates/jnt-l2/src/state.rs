@@ -797,6 +797,23 @@ impl L2State {
         if !verifier.verify_aggregate(&signers, &msg, &BlsSignature(p.bls_sig)) {
             return Err(L2Error::BadBlsSignature);
         }
+        // Lattice sidecar, clause-7 shape: every bitmap signer holding a
+        // registered lattice key in this set needs a valid entry over the
+        // same decision hash. Sets without registered keys verify BLS-only,
+        // exactly as before — the rule tightens only where keys exist.
+        {
+            let n = validators.keys.len();
+            let mut seen = vec![false; n];
+            jnt_core::validators::check_sidecar(
+                &p.pq_sidecar,
+                n,
+                |idx| idx < n && (p.signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1,
+                |idx| validators.mldsa_key(idx).copied(),
+                &msg,
+                &mut seen,
+            )
+            .map_err(|r| L2Error::BadPqSidecar(r.detail))?;
+        }
         let (submitter, worker, challenger, outcome) = {
             let contract = self.tasks.get_mut(&p.task_id).ok_or(L2Error::UnknownTask)?;
             // Decision 23 (P5): the settle fee is proportional to the task's
@@ -834,6 +851,7 @@ impl L2State {
                     bls_sig: p.bls_sig,
                     signer_bitmap: p.signer_bitmap.clone(),
                     signer_count: p.signer_count,
+                    pq_sidecar: p.pq_sidecar.clone(),
                 },
             )?;
             Some(self.issue_vwc(cert)?)

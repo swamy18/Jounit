@@ -172,6 +172,7 @@ fn a_settle_without_quorum_is_refused() {
         bls_sig: [0x01u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
+        pq_sidecar: Vec::new(),
     }));
     let txid = settle.txid();
     mine_and_submit(&mut chain, &mut view, vec![settle]);
