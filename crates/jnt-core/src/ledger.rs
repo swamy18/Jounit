@@ -238,10 +238,7 @@ pub fn check_tx(
         if pq_epoch != 0
             && height >= pq_epoch
             && held.height >= pq_epoch
-            && !input
-                .sigs
-                .schemes()
-                .contains(&crate::sig::SCHEME_ML_DSA_65)
+            && !input.sigs.schemes().contains(&crate::sig::SCHEME_ML_DSA_65)
         {
             return Err(Error::PostQuantumRequired);
         }

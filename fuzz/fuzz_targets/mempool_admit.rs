@@ -25,11 +25,17 @@ fuzz_target!(|data: &[u8]| {
     // Deterministic funding UTXO: one output the fuzzer's transaction may or
     // may not spend.
     let mut utxo = jnt_core::ledger::UtxoSet::default();
-    let funding_txid = [7u8; 32];
+    let funding_txid = [7u8; 64];
     utxo.insert(
-        OutPoint { txid: funding_txid, index: 0 },
+        OutPoint {
+            txid: funding_txid,
+            index: 0,
+        },
         jnt_core::ledger::Utxo {
-            out: Output { value: 1_000_000_000, address: [3u8; 20] },
+            out: Output {
+                value: 1_000_000_000,
+                address: [3u8; 20],
+            },
             height: 0,
         },
     );
@@ -52,9 +58,15 @@ fuzz_target!(|data: &[u8]| {
         input.sigs = jnt_core::sig::Bundle::single(1, vec![0u8; 64]);
     }
     utxo.insert(
-        jnt_core::tx::OutPoint { txid: funding_txid, index: 1 },
+        jnt_core::tx::OutPoint {
+            txid: funding_txid,
+            index: 1,
+        },
         jnt_core::ledger::Utxo {
-            out: Output { value: 500_000_000, address: [4u8; 20] },
+            out: Output {
+                value: 500_000_000,
+                address: [4u8; 20],
+            },
             height: 0,
         },
     );

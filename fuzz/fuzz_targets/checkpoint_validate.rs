@@ -55,7 +55,7 @@ fn run_checkpoint_validation(data: &[u8]) {
 
     let payload = CheckpointPayload {
         height,
-        block_hash: jnt_core::hash::sha256(&[b"fuzz", &height.to_le_bytes()]),
+        block_hash: jnt_core::hash::sha512(&[b"fuzz", &height.to_le_bytes()]),
         network_id: "jounit/mini".into(),
         epoch,
     };
@@ -129,7 +129,7 @@ fn run_finality_state(data: &[u8]) {
     let params = NetworkParams::testnet(); // deterministic committee, activation 20
     let mut fm = FinalityManager::new(&params);
     // Local model of what accept() has actually returned Ok for.
-    let mut accepted: HashMap<u64, jnt_core::Hash> = HashMap::new();
+    let mut accepted: HashMap<u64, jnt_core::hash::Hash512> = HashMap::new();
 
     let mut off = 0usize;
     while off + 12 <= data.len() {
@@ -141,7 +141,7 @@ fn run_finality_state(data: &[u8]) {
         let canonical_mode = data[off + 5] % 3; // 0 = exact, 1 = other hash, 2 = absent
         let count = data[off + 6];
 
-        let block_hash = jnt_core::hash::sha256(&[&[variant], &height.to_le_bytes()]);
+        let block_hash = jnt_core::hash::sha512(&[&[variant], &height.to_le_bytes()]);
         let payload = CheckpointPayload {
             height,
             block_hash,
@@ -160,7 +160,7 @@ fn run_finality_state(data: &[u8]) {
         };
         let canonical = match canonical_mode {
             0 => Some(block_hash),
-            1 => Some(jnt_core::hash::sha256(&[b"other", &height.to_le_bytes()])),
+            1 => Some(jnt_core::hash::sha512(&[b"other", &height.to_le_bytes()])),
             _ => None,
         };
 
@@ -212,7 +212,7 @@ fn run_finality_state(data: &[u8]) {
         let cp2 = Checkpoint {
             payload: CheckpointPayload {
                 height,
-                block_hash: jnt_core::hash::sha256(&[&[variant ^ 0xFF], &height.to_le_bytes()]),
+                block_hash: jnt_core::hash::sha512(&[&[variant ^ 0xFF], &height.to_le_bytes()]),
                 network_id: "jounit/testnet".into(),
                 epoch: height / params.checkpoint_interval_blocks,
             },

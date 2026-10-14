@@ -63,7 +63,7 @@ def reference_header(height: int, nonce: int, epoch_id: int):
         + bytes([1])  # tx_type = coinbase
         + u64le(0)  # lock_time
         + u32le(1)  # input_count
-        + (b"\x00" * 32)  # prevout_hash
+        + (b"\x00" * 64)  # prevout_hash
         + (0).to_bytes(4, "little")  # prevout_index
         # SPEC.md 3.5: signature and key bundles. A coinbase spends
         # nothing, so both are empty -- two zero counts. These replaced

@@ -30,9 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
-use jnt_core::hash::{
-    address_from_hex, address_to_hex, hash512_to_hex, hash_to_hex, Hash512,
-};
+use jnt_core::hash::{address_from_hex, address_to_hex, hash512_to_hex, hash_to_hex, Hash512};
 use jnt_core::params::{NetworkParams, SAT_PER_JNT};
 use jnt_core::supply::{block_reward_sat, cumulative_supply_sat, halvings, max_issuance_sat};
 use jnt_core::tx::{OutPoint, Output, Transaction};

@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::bls_checkpoint::{BlsPublicKey, Checkpoint};
 use crate::error::{Error, Result};
-use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512, DOM_SIG, DOM_TXBODY, DOM_TX512};
+use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512, DOM_SIG, DOM_TX512, DOM_TXBODY};
 use crate::hexserde;
 use crate::ser::{Reader, Writer};
 

@@ -52,10 +52,6 @@
 //! state. Recording the list rather than ignoring it is what makes that visible:
 //! a node can report which payloads in a block it refused, and why.
 
-use jnt_core::bls_checkpoint::{BlsVerifier, ValidatorSet};
-use jnt_core::chain::Chain;
-use jnt_core::hash::{Address, Hash512};
-use jnt_core::state_root::InclusionProof;
 use crate::deposits::{
     scan_block, DepositIgnoreReason, DepositParams, DetectedDeposit, IgnoredDeposit, PendingDeposit,
 };
@@ -63,6 +59,10 @@ use crate::error::L2Error;
 use crate::genesis::L2Genesis;
 use crate::state::{ExitRecord, L2State};
 use crate::task_contract::L2Config;
+use jnt_core::bls_checkpoint::{BlsVerifier, ValidatorSet};
+use jnt_core::chain::Chain;
+use jnt_core::hash::{Address, Hash512};
+use jnt_core::state_root::InclusionProof;
 
 /// An L2 transaction that a canonical block carried but that did not apply.
 ///

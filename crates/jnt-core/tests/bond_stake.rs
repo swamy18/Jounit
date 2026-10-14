@@ -208,7 +208,12 @@ fn slash_tx(
     tx
 }
 
-fn unbond_tx(chain: &Chain, w: &Wallet, ops: &[OutPoint], bond_id: jnt_core::hash::Hash512) -> Transaction {
+fn unbond_tx(
+    chain: &Chain,
+    w: &Wallet,
+    ops: &[OutPoint],
+    bond_id: jnt_core::hash::Hash512,
+) -> Transaction {
     let total = utxo_total(chain, ops);
     let fee = fee_for(chain, ops.len(), 1);
     let to = w.address().unwrap();

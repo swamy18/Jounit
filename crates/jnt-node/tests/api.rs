@@ -34,7 +34,7 @@ use jnt_core::agent::{
 use jnt_core::block::GENESIS_TIMESTAMP_MS;
 use jnt_core::chain::Chain;
 use jnt_core::compute_ir::{ComputeBackend, ComputeTask};
-use jnt_core::hash::{address_to_hex, hash_to_hex, hash512_to_hex};
+use jnt_core::hash::{address_to_hex, hash512_to_hex, hash_to_hex};
 use jnt_core::l2::{Auth, L2Payload, L2Transaction, PostTaskPayload};
 use jnt_core::params::NetworkParams;
 use jnt_core::payment::{build_signed_payment, MachinePayment};

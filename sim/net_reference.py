@@ -125,8 +125,8 @@ def version_payload(
         raise ValueError("network_id does not fit a 1-byte length prefix")
     if len(user_agent) > 255:
         raise ValueError("user_agent does not fit a 1-byte length prefix")
-    if len(tip_hash) != 32:
-        raise ValueError("tip_hash must be 32 bytes")
+    if len(tip_hash) != 64:
+        raise ValueError("tip_hash must be 64 bytes")
     out = NETWORK_MAGIC[network]
     out += bytes([len(network_id)]) + network_id
     out += u32le(PROTOCOL_VERSION)
@@ -144,23 +144,23 @@ def nonce_payload(nonce: int) -> bytes:
 
 
 def inv_payload(entries: list[tuple[int, bytes]]) -> bytes:
-    """INV / GETDATA: count(2 LE) | count x (kind(1) | hash(32))."""
+    """INV / GETDATA: count(2 LE) | count x (kind(1) | hash(64))."""
     if len(entries) > MAX_INV_PER_MSG:
         raise ValueError(f"inv count {len(entries)} exceeds max_inv_per_msg")
     out = u16le(len(entries))
     for kind, h in entries:
-        if len(h) != 32:
-            raise ValueError("inv hash must be 32 bytes")
+        if len(h) != 64:
+            raise ValueError("inv hash must be 64 bytes")
         out += bytes([kind]) + h
     return out
 
 
 def getblocks_payload(locator: list[bytes], stop: bytes) -> bytes:
-    """GETBLOCKS: count(2 LE) | count x locator(32) | stop_hash(32)."""
+    """GETBLOCKS: count(2 LE) | count x locator(64) | stop_hash(64)."""
     if len(locator) > MAX_LOCATOR_LEN:
         raise ValueError(f"locator count {len(locator)} exceeds max_locator_len")
-    if len(stop) != 32:
-        raise ValueError("stop_hash must be 32 bytes")
+    if len(stop) != 64:
+        raise ValueError("stop_hash must be 64 bytes")
     return u16le(len(locator)) + b"".join(locator) + stop
 
 
@@ -212,14 +212,14 @@ def tx_payload(
     """Transaction -- SPEC.md section 3.3.
 
     version(4 LE) | tx_type(1) | lock_time(8 LE) |
-    input_count(4 LE)  | inputs  (32 | index(4 LE) | sigs | keys)
+    input_count(4 LE)  | inputs  (64 | index(4 LE) | sigs | keys)
     output_count(4 LE) | outputs (value(8 LE) | address(20))
     """
     out = u32le(version) + bytes([tx_type]) + u64le(lock_time)
     out += u32le(len(inputs))
     for prev_hash, prev_index, sigs, keys in inputs:
-        if len(prev_hash) != 32:
-            raise ValueError("prevout hash must be 32 bytes")
+        if len(prev_hash) != 64:
+            raise ValueError("prevout hash must be 64 bytes")
         out += prev_hash + u32le(prev_index) + bundle(sigs) + bundle(keys)
     out += u32le(len(outputs))
     for value, address in outputs:
@@ -234,10 +234,10 @@ def checkpoint_payload(
 ) -> bytes:
     """CheckpointPayload -- SPEC.md section 14 / M5.
 
-    height(8 LE) | block_hash(32) | id_len(4 LE) | network_id | epoch(8 LE)
+    height(8 LE) | block_hash(64) | id_len(4 LE) | network_id | epoch(8 LE)
     """
-    if len(block_hash) != 32:
-        raise ValueError("block_hash must be 32 bytes")
+    if len(block_hash) != 64:
+        raise ValueError("block_hash must be 64 bytes")
     return (
         u64le(height)
         + block_hash
@@ -269,7 +269,7 @@ def checkpoint_payload_wire(
 
 # --- the values net_vectors.json pins -------------------------------------
 
-TIP = bytes([0x5A]) * 32
+TIP = bytes([0x5A]) * 64
 
 
 def derived_items() -> dict[str, str]:
@@ -282,18 +282,18 @@ def derived_items() -> dict[str, str]:
     items["msg_ping"] = nonce_payload(0xBEEF).hex()
     items["msg_pong"] = nonce_payload(0xFEED).hex()
     items["msg_inv"] = inv_payload(
-        [(INV_TYPE_BLOCK, bytes([0x11]) * 32), (INV_TYPE_BLOCK, bytes([0x22]) * 32)]
+        [(INV_TYPE_BLOCK, bytes([0x11]) * 64), (INV_TYPE_BLOCK, bytes([0x22]) * 64)]
     ).hex()
-    items["msg_getdata"] = inv_payload([(INV_TYPE_BLOCK, bytes([0x33]) * 32)]).hex()
+    items["msg_getdata"] = inv_payload([(INV_TYPE_BLOCK, bytes([0x33]) * 64)]).hex()
     items["msg_getblocks"] = getblocks_payload(
-        [bytes([0x44]) * 32, bytes([0x55]) * 32], bytes([0x66]) * 32
+        [bytes([0x44]) * 64, bytes([0x55]) * 64], bytes([0x66]) * 64
     ).hex()
     items["msg_addr"] = addr_payload([(ipv4_mapped(127, 0, 0, 1), 8333)]).hex()
     # section 13.14: an unsigned transaction, so the payload follows from section
     # 3 prose alone -- both bundles are `count = 0` and no key material is needed.
-    items["msg_inv_tx"] = inv_payload([(INV_TYPE_TX, bytes([0x99]) * 32)]).hex()
+    items["msg_inv_tx"] = inv_payload([(INV_TYPE_TX, bytes([0x99]) * 64)]).hex()
     items["msg_tx"] = tx_payload(
-        inputs=[(bytes([0x77]) * 32, 1, [], [])],
+        inputs=[(bytes([0x77]) * 64, 1, [], [])],
         outputs=[(12_345, bytes([0x88]) * 20)],
     ).hex()
     # section 13.5 msg_type = 11 (M4). A structural certificate: the payload is
@@ -301,7 +301,7 @@ def derived_items() -> dict[str, str]:
     # byte patterns so a second encoder can rebuild the whole message without a
     # pairing library. Real BLS aggregation is pinned by the Rust M4 tests.
     cp_payload = checkpoint_payload(
-        100, bytes([0x21]) * 32, NETWORK_ID["mini"], 10
+        100, bytes([0x21]) * 64, NETWORK_ID["mini"], 10
     )
     items["msg_checkpoint"] = checkpoint_payload_wire(
         cp_payload, bytes([0x37]) * 96, bytes([0b0000_0111]), 3
@@ -318,20 +318,20 @@ def derived_facts() -> dict[str, int]:
         "ping_len": len(nonce_payload(0xBEEF)),
         "pong_len": len(nonce_payload(0xFEED)),
         "inv_len": len(
-            inv_payload([(INV_TYPE_BLOCK, bytes([0x11]) * 32), (INV_TYPE_BLOCK, bytes([0x22]) * 32)])
+            inv_payload([(INV_TYPE_BLOCK, bytes([0x11]) * 64), (INV_TYPE_BLOCK, bytes([0x22]) * 64)])
         ),
-        "getdata_len": len(inv_payload([(INV_TYPE_BLOCK, bytes([0x33]) * 32)])),
+        "getdata_len": len(inv_payload([(INV_TYPE_BLOCK, bytes([0x33]) * 64)])),
         "getblocks_len": len(
-            getblocks_payload([bytes([0x44]) * 32, bytes([0x55]) * 32], bytes([0x66]) * 32)
+            getblocks_payload([bytes([0x44]) * 64, bytes([0x55]) * 64], bytes([0x66]) * 64)
         ),
         "addr_len": len(addr_payload([(ipv4_mapped(127, 0, 0, 1), 8333)])),
-        "inv_tx_len": len(inv_payload([(INV_TYPE_TX, bytes([0x99]) * 32)])),
+        "inv_tx_len": len(inv_payload([(INV_TYPE_TX, bytes([0x99]) * 64)])),
         "tx_len": len(
-            tx_payload(inputs=[(bytes([0x77]) * 32, 1, [], [])], outputs=[(12_345, bytes([0x88]) * 20)])
+            tx_payload(inputs=[(bytes([0x77]) * 64, 1, [], [])], outputs=[(12_345, bytes([0x88]) * 20)])
         ),
         "checkpoint_len": len(
             checkpoint_payload_wire(
-                checkpoint_payload(100, bytes([0x21]) * 32, NETWORK_ID["mini"], 10),
+                checkpoint_payload(100, bytes([0x21]) * 64, NETWORK_ID["mini"], 10),
                 bytes([0x37]) * 96,
                 bytes([0b0000_0111]),
                 3,

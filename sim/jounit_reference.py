@@ -19,9 +19,11 @@ from dataclasses import dataclass
 # --- Domain tags (SPEC.md section 0) ---------------------------------------
 DOM_BLOCK = b"jounit/blockhash/v1"
 DOM_TX = b"jounit/txid/v1"
+DOM_BLOCK512 = b"jounit/blockhash512/v1"
+DOM_TX512 = b"jounit/txid512/v1"
 DOM_TXBODY = b"jounit/txbody/v1"
 DOM_SIG = b"jounit/sig/v1"
-DOM_ADDR = b"jounit/addr/v1"
+DOM_ADDR = b"jounit/addr/v2"
 DOM_S1 = b"jounit/puzzle/stage1/v1"
 DOM_S2 = b"jounit/puzzle/stage2/v1"
 DOM_S3 = b"jounit/puzzle/stage3/v1"
@@ -29,7 +31,7 @@ DOM_W = b"jounit/puzzle/weights/v1"
 
 SIG_SCHEME_SECP256K1_ECDSA = 1
 
-HEADER_LEN = 145
+HEADER_LEN = 177
 BIAS_INDEX_OFFSET = 1_000_000
 ACTIVATION_SHIFT = 2
 
@@ -43,6 +45,17 @@ def sha(*parts: bytes) -> bytes:
 
 def sha_dom(dom: bytes, *parts: bytes) -> bytes:
     return sha(dom, *parts)
+
+
+def sha512(*parts: bytes) -> bytes:
+    h = hashlib.sha512()
+    for p in parts:
+        h.update(p)
+    return h.digest()
+
+
+def sha512_dom(dom: bytes, *parts: bytes) -> bytes:
+    return sha512(dom, *parts)
 
 
 def i32le(value: int) -> bytes:
@@ -94,14 +107,14 @@ class Header:
         )
 
     def block_hash(self) -> bytes:
-        return sha_dom(DOM_BLOCK, self.serialize())
+        return sha512_dom(DOM_BLOCK512, self.serialize())
 
 
 def genesis_header(merkle_root: bytes, difficulty: int) -> Header:
     return Header(
         version=1,
         height=0,
-        prev_hash=b"\x00" * 32,
+        prev_hash=b"\x00" * 64,
         merkle_root=merkle_root,
         timestamp_ms=1_767_225_600_000,  # 2026-01-01T00:00:00Z
         base_fee_sat=0,

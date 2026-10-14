@@ -697,7 +697,9 @@ async fn block_by_hash(State(state): State<ApiState>, Path(hash): Path<String>) 
             .ok_or_else(|| not_found("unknown block"))?;
         let value = serde_json::to_value(block)
             .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
-        Ok(Json(json!({ "hash": hash512_to_hex(&hash), "block": value })))
+        Ok(Json(
+            json!({ "hash": hash512_to_hex(&hash), "block": value }),
+        ))
     })?
 }
 
@@ -1192,7 +1194,9 @@ async fn l2_broadcast(State(state): State<ApiState>, Json(req): Json<L2Broadcast
             .check(&tx, sh.chain.height() + 1)
             .map_err(|e| fail(StatusCode::CONFLICT, "l2_refused", format!("{e}")))?;
         sh.l2_to_include.push(tx);
-        Ok(Json(json!({ "txid": hash512_to_hex(&txid), "queued": true })))
+        Ok(Json(
+            json!({ "txid": hash512_to_hex(&txid), "queued": true }),
+        ))
     })?
 }
 

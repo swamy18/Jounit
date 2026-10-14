@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::exit::{ExitClaim, EXIT_CLAIM_MIN_ENCODED_LEN};
 use crate::hash::{sha256, sha512_dom, Hash, Hash512, DOM_BLOCK512, ZERO_HASH512};
 #[cfg(test)]
-use crate::hash::{DOM_BLOCK, sha256_dom};
+use crate::hash::{sha256_dom, DOM_BLOCK};
 use crate::l2::L2Transaction;
 use crate::ser::{Reader, Writer};
 use crate::tx::{Output, Transaction, TX_COINBASE};

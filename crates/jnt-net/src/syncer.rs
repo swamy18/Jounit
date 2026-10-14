@@ -86,7 +86,11 @@ pub fn create_locator(chain: &Chain) -> Vec<Hash512> {
 
 /// Find the highest common canonical block from the locator and return an INV
 /// batch of up to 500 subsequent blocks along the canonical chain. SPEC.md §13.7.
-pub fn find_fork_and_collect_inv(chain: &Chain, locator: &[Hash512], stop: &Hash512) -> Vec<InvEntry> {
+pub fn find_fork_and_collect_inv(
+    chain: &Chain,
+    locator: &[Hash512],
+    stop: &Hash512,
+) -> Vec<InvEntry> {
     let mut fork_height = 0;
     let mut found = false;
 

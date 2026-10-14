@@ -33,12 +33,12 @@ fuzz_target!(|data: &[u8]| {
             // zero pair).
             if meta.finalized_height == 0 {
                 assert_eq!(
-                    meta.finalized_hash, [0u8; 32],
+                    meta.finalized_hash, [0u8; 64],
                     "no finalized height must mean no finalized hash"
                 );
             } else {
                 assert_ne!(
-                    meta.finalized_hash, [0u8; 32],
+                    meta.finalized_hash, [0u8; 64],
                     "a finalized height must carry its hash"
                 );
                 assert!(
