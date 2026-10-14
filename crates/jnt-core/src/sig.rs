@@ -126,6 +126,13 @@ impl Bundle {
         self.components.iter().map(|c| c.scheme).collect()
     }
 
+    /// True when one component declares `scheme`. The migration rule
+    /// (`Transaction::verify_input_pq`) is a one-line question over this:
+    /// does the bundle carry a lattice component, yes or no.
+    pub fn has_scheme(&self, scheme: u8) -> bool {
+        self.components.iter().any(|c| c.scheme == scheme)
+    }
+
     /// Validate the structural rules every bundle must satisfy, independent of
     /// any signature checking: non-empty, within the component and total-size
     /// caps, no repeated scheme (a duplicate adds bytes without adding

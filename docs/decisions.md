@@ -1340,3 +1340,70 @@ exactly once each. The batch test caught a real crank bug (two claims funded
 from the same sink output — the crank now retires assigned inputs per exit).
 Full loop, refusals, unwinds and conservation remain green; the height still
 does not flip on this evidence alone.
+
+## Decision 24 — Post-quantum succession: BLS design + migration rule (RECORDED, partly implemented)
+
+Steps 1 and 2 of the PQ plan are live (scheme 3 = ML-DSA-65 in the spend
+bundle; 64-byte txid and block hash). Two halves remain, and they are not the
+same kind of work: the BLS half is a design (no code yet), the migration half
+is a small enforcement primitive plus a rule that stays off until it is
+explicitly flipped.
+
+### Step 3 — BLS succession (design only, no code)
+
+Shor breaks BLS12-381 exactly as it breaks secp256k1, so the lattice half of a
+spend bundle does not save anything BLS signs. Two surfaces:
+
+- **Checkpoint certificates** (short-lived, per-epoch): a forged quorum moves
+  binding finality and freezes honest history.
+- **VWC `Quorum` certificates** (long-lived evidence): a forged aggregate
+  manufactures "verified work" that never happened, and the forgery is
+  checkable offline forever.
+
+Options considered and rejected:
+
+- **Swap BLS for ML-DSA multisig.** ML-DSA has no pairing-based aggregation,
+  so a "quorum aggregate" becomes a list of 3 309-byte signatures. Certificate
+  size explodes and every verifier changes shape. Rejected as a flag day.
+- **SPHINCS+ (stateless hash-based).** No lattice assumptions at all, but
+  signatures are 8–30 KB each — unrelayable inside the current checkpoint
+  envelope. Rejected for the transport, kept in mind for cold, rarely-checked
+  evidence.
+
+**Chosen direction: dual-signature checkpoints.** BLS stays exactly where it
+is (compatibility: old verifiers keep reading the BLS half), and an ML-DSA-65
+sidecar carries the same decision under each signer's lattice key. A
+checkpoint is binding only when *both* halves verify against the same
+committee. VWC `Quorum` keeps its BLS evidence and records the sidecar when
+present. No new curve, no trusted setup, and it reuses the scheme-3 key
+material the staking path already knows how to hold.
+
+Open wiring, stated up front: validators today hold BLS keys, not lattice
+keys, so the sidecar needs a per-validator ML-DSA key registered beside the
+bond — that registration is the code half of this decision and is **not**
+built here. Nothing in this decision changes a runtime rule.
+
+### Step 4 — Migration rule (primitive implemented, activation NOT set)
+
+Moving funds to a PQ address is an ordinary spend (`classical_addr` →
+`pq_address`): no new transaction type, no committee, no ceremony. What the
+chain needs is the *deadline* that makes the move happen before a CRQC, not
+after. That deadline has two parts:
+
+1. **The enforcement primitive — implemented now.** `Transaction::verify_input_pq`
+   verifies exactly like `verify_input` and additionally refuses any bundle
+   that does not carry scheme 3. Structural check first (the scheme id is
+   absent), cryptography never runs for a bundle that cannot satisfy the rule.
+   Pinned by `tests/pq_migrate.rs` (3 tests).
+2. **The activation — NOT set.** Flipping consensus to `verify_input_pq`
+   happens through an explicit `pq_activation_height` change, `0` meaning
+   *never* like every other activation in this codebase. That wiring (height
+   plumbing through the check path, per-profile heights, a rehearsal on
+   testnet first) is a separate, reviewable change and is not smuggled in
+   here.
+
+The honest tradeoff, in one sentence: after activation, classical-only outputs
+do not move — they are frozen, not confiscated, and they stay in the UTXO set
+where a later rule can only ever thaw them, never invent them. That is why
+the grace period between announcing the height and flipping it must be long,
+and why the flip waits for a testnet rehearsal like every other activation.

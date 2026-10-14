@@ -529,6 +529,23 @@ impl Transaction {
     pub fn verify_input_any(&self, k: usize, owner: &Address) -> Result<()> {
         self.verify_input(k, owner, false)
     }
+
+    /// The migration-rule verifier (Decision 24, step 4): exactly
+    /// [`Transaction::verify_input`] with hybrid required, plus a refusal for
+    /// any bundle that does not carry scheme 3 (ML-DSA-65).
+    ///
+    /// The scheme check runs *before* any cryptography: a bundle that cannot
+    /// satisfy the rule is a structural refusal, not a verification failure.
+    /// Consensus does not call this yet — flipping to it happens through an
+    /// explicit `pq_activation_height`, `0` meaning never like every other
+    /// activation, and that wiring is a separate change.
+    pub fn verify_input_pq(&self, k: usize, owner: &Address) -> Result<()> {
+        let input = &self.inputs[k];
+        if !input.sigs.has_scheme(crate::sig::SCHEME_ML_DSA_65) {
+            return Err(Error::HybridRequired);
+        }
+        self.verify_input(k, owner, true)
+    }
 }
 
 #[cfg(test)]
