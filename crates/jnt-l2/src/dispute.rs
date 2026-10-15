@@ -141,8 +141,13 @@ impl DisputeVerdict {
     /// and the existing `Settle` path applies. An inconclusive arbitration has
     /// no payload to vote on, and asking for one is an error rather than an
     /// empty transaction.
+    ///
+    /// The caller names the chain and height the quorum signed for, because the
+    /// aggregate binds both: a payload without them would verify on any chain.
     pub fn settle_payload(
         &self,
+        network_id: &str,
+        height: u64,
         bls_sig: [u8; 96],
         signer_bitmap: Vec<u8>,
         signer_count: u32,
@@ -153,6 +158,8 @@ impl DisputeVerdict {
             task_id: self.task_id,
             verdict,
             vwc_hash: self.re_execution_result,
+            network_id: network_id.to_string(),
+            height,
             bls_sig,
             signer_bitmap,
             signer_count,
@@ -306,7 +313,7 @@ mod tests {
         assert_eq!(v.verdict(), None);
         assert_eq!(v.vwc_hash(), None);
         assert_eq!(
-            v.settle_payload([0u8; 96], vec![0xFF], 1, Vec::new()),
+            v.settle_payload("jounit/mini", 4, [0u8; 96], vec![0xFF], 1, Vec::new()),
             Err(L2Error::InconclusiveDispute)
         );
     }
@@ -329,7 +336,14 @@ mod tests {
     fn a_verdict_builds_the_settle_payload_the_existing_path_applies() {
         let v = DisputeEngine::arbitrate(&evidence(), COUNTER).unwrap();
         let p = v
-            .settle_payload([0x7Fu8; 96], vec![0b0000_0111], 3, Vec::new())
+            .settle_payload(
+                "jounit/mini",
+                4,
+                [0x7Fu8; 96],
+                vec![0b0000_0111],
+                3,
+                Vec::new(),
+            )
             .unwrap();
         assert_eq!(p.task_id, TASK);
         assert_eq!(p.verdict, Verdict::Fraudulent);
@@ -337,6 +351,8 @@ mod tests {
             p.vwc_hash, COUNTER,
             "the settle hash is the reference result"
         );
+        assert_eq!(p.network_id, "jounit/mini");
+        assert_eq!(p.height, 4);
         assert_eq!(p.signer_count, 3);
     }
 }

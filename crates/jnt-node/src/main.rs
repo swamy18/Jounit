@@ -87,8 +87,10 @@ SERVE OPTIONS:
   --api-listen <host:port>   Start the opt-in REST service API (disabled by
                              default; loopback expected — see SPEC.md §19.2)
   --api-token <token>        Bearer token the API requires. A non-loopback
-                             --api-listen is refused without one; absent, the
-                             JNT_API_TOKEN environment variable is used
+                              --api-listen is refused without one; absent, the
+                              JNT_API_TOKEN environment variable is used.
+                              Prefer the environment variable: --api-token is
+                              visible in `ps` to other local users
   --connect <host:port>      Dial an outbound peer (repeatable via CSV)
   --peers <n>                Max total peers (default: 125)
   --interval <ms>            Serve loop period (default: 250)
@@ -383,7 +385,8 @@ impl Store {
                 )
             })?;
             let plain = wallet_store::decrypt(&passphrase, &bytes)?;
-            String::from_utf8(plain).map_err(|_| "wallet file is not UTF-8".to_string())?
+            String::from_utf8((*plain).clone())
+                .map_err(|_| "wallet file is not UTF-8".to_string())?
         } else {
             // One note, not a refusal: refusing to *read* an existing plaintext
             // file would lock the operator out of their own keys. The refusal
@@ -570,7 +573,7 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
     // as blocks are mined below. Genesis-funded accounts apply; genuinely
     // unfunded payloads are expected `InsufficientBalance` skips, not errors
     // — the view still advances and still names what it refused.
-    let mut l2 = NodeL2::replay_from(&chain, &store.params);
+    let mut l2 = NodeL2::replay_from(&chain, &store.params).map_err(|e| e.to_string())?;
     let wallets = store.load_wallets()?;
     if wallets.is_empty() {
         return Err("no wallet in this data dir".into());
@@ -597,7 +600,7 @@ fn cmd_mine(args: &Args) -> Result<(), String> {
         // L1 layer rejects never moves the tip and therefore never reaches the
         // view — that ordering is what keeps rejected blocks from mutating L2
         // state.
-        l2.sync(&chain);
+        l2.sync(&chain).map_err(|e| e.to_string())?;
         println!(
             "height {:>6}  diff {:>10}  reward {:>12} JNT  {}",
             height,
@@ -735,7 +738,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     let height = block.header.height;
     let burned = block.header.base_fee_sat * block.txs[1].gas_used();
     chain.submit(block).map_err(|e| e.to_string())?;
-    let l2 = NodeL2::replay_from(&chain, &store.params);
+    let l2 = NodeL2::replay_from(&chain, &store.params).map_err(|e| e.to_string())?;
     store.save_chain(&chain)?;
     store.write_meta(&chain)?;
 
@@ -848,7 +851,7 @@ fn cmd_status(args: &Args) -> Result<(), String> {
 
     // L2 is derived from the stored chain, so `status` reconstructs it the
     // same way a restart does: replay, no persisted L2 state to go stale.
-    let l2 = NodeL2::replay_from(&chain, &store.params);
+    let l2 = NodeL2::replay_from(&chain, &store.params).map_err(|e| e.to_string())?;
     let ls = l2.status(chain.height());
     println!();
     println!(
@@ -908,13 +911,13 @@ fn cmd_verify(args: &Args) -> Result<(), String> {
     // with full replay. Equality is total (`L2State` derives `PartialEq` over
     // all fields), so this is agreement on every L2 fact, not a summary.
     let params = store.params.clone();
-    let a = NodeL2::replay_from(&chain, &params);
-    let b = NodeL2::replay_from(&chain, &params);
+    let a = NodeL2::replay_from(&chain, &params).map_err(|e| e.to_string())?;
+    let b = NodeL2::replay_from(&chain, &params).map_err(|e| e.to_string())?;
     if a.state() != b.state() || a.skipped() != b.skipped() {
         return Err("l2 replay diverged: two replays of the same chain disagree".into());
     }
-    let mut inc = NodeL2::fresh(&params);
-    inc.sync(&chain);
+    let mut inc = NodeL2::fresh(&params).map_err(|e| e.to_string())?;
+    inc.sync(&chain).map_err(|e| e.to_string())?;
     if inc.state() != a.state()
         || inc.applied_count() != a.applied_count()
         || inc.skipped() != a.skipped()
@@ -1073,6 +1076,26 @@ fn load_validator_committee(
             continue;
         }
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let bytes = if wallet_store::is_encrypted(&bytes) {
+            let passphrase = wallet_store::passphrase_from_env().ok_or_else(|| {
+                format!(
+                    "{} is encrypted; set {} to read it",
+                    path.display(),
+                    wallet_store::PASSPHRASE_ENV
+                )
+            })?;
+            wallet_store::decrypt(&passphrase, &bytes)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+        } else {
+            // Loud on every load, not just the first: a plaintext key file
+            // is the exposure `validator add` now refuses to create.
+            eprintln!(
+                "warning: {} holds an unencrypted validator key; set {} and re-add it to encrypt it",
+                path.display(),
+                wallet_store::PASSPHRASE_ENV
+            );
+            zeroize::Zeroizing::new(bytes)
+        };
         let key = jnt_core::signing::ValidatorKey::from_bytes(&bytes, &params.network_id)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         committee.add(key).map_err(|e| e.to_string())?;
@@ -1090,8 +1113,10 @@ fn load_validator_committee(
 /// a validator key signs consensus messages. Mixing them would make a wallet
 /// backup a validator key backup, which is a different risk entirely.
 ///
-/// The scalar is written with mode 0600 where the platform supports it, because
-/// the file *is* the key. `validator list` prints public keys only.
+/// A new key is written encrypted under `JNT_WALLET_PASSPHRASE` (Argon2id +
+/// ChaCha20-Poly1305, mode 0600 where the platform supports it), because the
+/// file *is* the key — creation without a passphrase is refused rather than
+/// writing plaintext. `validator list` prints public keys only.
 fn cmd_validator(args: &Args) -> Result<(), String> {
     let store = Store::open(args)?;
     let params = store.params.clone();
@@ -1124,6 +1149,19 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
     let key = jnt_core::signing::ValidatorKey::new(sk, params.network_id.clone());
     let file = key.to_file();
     let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+    // New keys are never written plaintext: without a passphrase there is no
+    // key to encrypt under, so creation is refused rather than writing a
+    // 0600 JSON scalar. Existing plaintext keys still load (with a loud
+    // warning at load time), so this refuses new exposure without locking
+    // operators out of keys they already hold.
+    let Some(passphrase) = wallet_store::passphrase_from_env() else {
+        return Err(format!(
+            "refusing to write an unencrypted validator key: set {} and retry",
+            wallet_store::PASSPHRASE_ENV
+        ));
+    };
+    let bytes = wallet_store::encrypt(&passphrase, &bytes)
+        .map_err(|e| format!("validator key encryption: {e}"))?;
 
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{label}.json"));
@@ -1242,8 +1280,10 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         .map(|s| s.parse().map_err(|e| format!("--api-listen: {e}")))
         .transpose()?;
     // A non-loopback API bind requires auth (§19.2). The token comes from
-    // `--api-token` or, failing that, the `JNT_API_TOKEN` env var; either is
-    // left unset for a loopback bind, which stays unauthenticated by design.
+    // `--api-token` or, failing that, the `JNT_API_TOKEN` env var; prefer the
+    // env var, because a flag value is visible to other local users in `ps`.
+    // Either is left unset for a loopback bind, which stays unauthenticated
+    // by design.
     let api_token: Option<String> = args
         .str("api-token")
         .map(str::to_owned)
@@ -1271,7 +1311,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // ability to *propose*, never the ability to verify or relay.
     let mut votes = jnt_core::arbitration::VoteBook::new();
     // L2 follows the tip by replay; nothing L2 is persisted.
-    let l2 = NodeL2::replay_from(&chain, &store.params);
+    let l2 = NodeL2::replay_from(&chain, &store.params).map_err(|e| e.to_string())?;
     let mut l2_skipped_seen = l2.skipped().len();
 
     println!("network        {}", store.params.name);
@@ -1489,8 +1529,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         );
 
         // Keep the L2 view on the tip after both paths above. A reorg that
-        // rewrote history takes the full-replay arm inside `sync`.
-        let report = sh.l2.sync(&sh.chain);
+        // rewrote history takes the full-replay arm inside `sync`. A genesis
+        // refusal here is unreachable (same inputs as startup, which
+        // succeeded) — but the loop fails closed and loud rather than
+        // serving on a view it cannot rebuild.
+        let report = sh.l2.sync(&sh.chain).map_err(|e| format!("l2 sync: {e}"))?;
         match report.outcome {
             jnt_node::l2::SyncOutcome::FullReplay { .. }
                 if report.to_height != report.from_height =>

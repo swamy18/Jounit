@@ -19,6 +19,7 @@ rand.workspace = true
 argon2.workspace = true
 chacha20poly1305.workspace = true
 zeroize.workspace = true
+subtle = "2.6"
 axum = "0.8"
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 # DoS guards on the service API: a per-request deadline, a cap on the number

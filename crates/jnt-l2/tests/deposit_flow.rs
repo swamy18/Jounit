@@ -310,7 +310,7 @@ fn deposits_mature_at_final_depth_and_replay_agrees_incrementally() {
             jnt_core::bls_checkpoint::ValidatorSet::new(vec![]),
             jnt_core::bls_checkpoint::MockBls,
         );
-        ChainL2::replay(c, L2Config::mini(), &g, d, &set, &v)
+        ChainL2::replay(c, L2Config::mini(), &g, d, &set, &v).unwrap()
     };
 
     // Just before maturity: detected, pending, uncredited.
@@ -341,7 +341,7 @@ fn deposits_mature_at_final_depth_and_replay_agrees_incrementally() {
         jnt_core::bls_checkpoint::ValidatorSet::new(vec![]),
         jnt_core::bls_checkpoint::MockBls,
     );
-    let mut inc = ChainL2::empty(L2Config::mini(), &g, d);
+    let mut inc = ChainL2::empty(L2Config::mini(), &g, d).unwrap();
     let tip = chain.height();
     let binding = chain.finality().binding_finalized_height();
     for h in 1..=tip {
@@ -403,7 +403,7 @@ fn absorbing_the_same_block_twice_credits_once() {
     );
     let tip = chain.height();
     let binding = chain.finality().binding_finalized_height();
-    let mut view = ChainL2::empty(L2Config::mini(), &g, d);
+    let mut view = ChainL2::empty(L2Config::mini(), &g, d).unwrap();
     view.apply_block(&b, tip, binding, &set, &v);
     assert_eq!(view.deposits_applied_count(), 1);
     assert_eq!(view.state().balance(&miner_addr), to_sink);

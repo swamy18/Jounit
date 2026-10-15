@@ -134,6 +134,7 @@ fn replay(chain: &Chain) -> ChainL2 {
         &set,
         &verifier,
     )
+    .unwrap()
 }
 
 #[test]
@@ -159,7 +160,7 @@ fn full_replay_equals_incremental_application() {
 
     let (set, verifier) = empty_set();
     let deposits = DepositParams::for_params(&NetworkParams::mini());
-    let mut incremental = ChainL2::empty(L2Config::mini(), &L2Genesis::empty(), deposits);
+    let mut incremental = ChainL2::empty(L2Config::mini(), &L2Genesis::empty(), deposits).unwrap();
     // Evaluated at the final tip, exactly as full replay evaluates every
     // block: with no sink outputs present the tip value is moot, but the call
     // must still name the tip maturity is measured against.

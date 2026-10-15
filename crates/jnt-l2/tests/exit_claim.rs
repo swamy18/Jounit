@@ -61,6 +61,7 @@ fn l2view(chain: &Chain) -> ChainL2 {
         &ValidatorSet::new(vec![]),
         &MockBls,
     )
+    .unwrap()
 }
 
 fn mine_empty_to(chain: &mut Chain, miner: Address, to: u64) {

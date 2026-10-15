@@ -83,7 +83,7 @@ fn a_matured_exit_is_settled_without_anyone_hand_building_the_claim() {
     mine_empty_to(&mut chain, me, 12);
     deposit(&mut chain, &miner);
 
-    let mut view = NodeL2::replay_from(&chain, &params);
+    let mut view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(
         view.state().balance(&me),
         SINK_VALUE,
@@ -112,7 +112,7 @@ fn a_matured_exit_is_settled_without_anyone_hand_building_the_claim() {
         )
         .unwrap();
     chain.submit(block).unwrap();
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     // Queued but not yet final: the crank must not touch it.
     assert!(
@@ -123,7 +123,7 @@ fn a_matured_exit_is_settled_without_anyone_hand_building_the_claim() {
 
     // Final over the queue block.
     mine_empty_to(&mut chain, me, q + params.finality_depth);
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     let claims = view.crank_claims(&chain, me);
     assert_eq!(claims.len(), 1, "exactly the matured exit is claimable");
@@ -158,7 +158,7 @@ fn a_matured_exit_is_settled_without_anyone_hand_building_the_claim() {
 
     // L2 absorbs: the record is gone, the value left L2, and the crank offers
     // nothing further.
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert!(
         view.state().exit(&me, 1).is_none(),
         "a released exit cannot be proven again"
@@ -196,7 +196,7 @@ fn a_matured_exit_is_settled_without_anyone_hand_building_the_claim() {
 fn a_profile_that_never_activates_cranks_nothing() {
     let params = NetworkParams::mainnet();
     let chain = Chain::new(params.clone()).unwrap();
-    let view = NodeL2::fresh(&params);
+    let view = NodeL2::fresh(&params).unwrap();
     assert!(
         !chain.exit_active_at(1),
         "mainnet has chosen no activation height, so exits are off"
@@ -228,11 +228,11 @@ fn build_to_maturity(
     amounts: &[u64],
 ) -> (NodeL2, u64) {
     // Funded already (see `fund`): queue, mature, sync.
-    let mut view = NodeL2::replay_from(chain, chain.params());
+    let mut view = NodeL2::replay_from(chain, chain.params()).unwrap();
     let q = submit_queue_block(chain, &mut view, miner, me, dest, amounts);
     let depth = chain.params().finality_depth;
     mine_empty_to(chain, me, q + depth);
-    view.sync(chain);
+    view.sync(chain).unwrap();
     (view, q)
 }
 
@@ -269,7 +269,7 @@ fn submit_queue_block(
         )
         .unwrap();
     chain.submit(block).unwrap();
-    view.sync(chain);
+    view.sync(chain).unwrap();
     q
 }
 
@@ -326,7 +326,7 @@ fn settle_claims(s: &mut QueuedSetup) {
             None,
         )
         .unwrap();
-    s.view.sync(&s.chain);
+    s.view.sync(&s.chain).unwrap();
 }
 
 /// A reorg that takes the claim block away must not take the exit away: the
@@ -365,7 +365,7 @@ fn a_claim_block_reorged_away_is_re_cranked_and_settles_again() {
 
     // The exit is still queued canonically, so the crank re-offers it and
     // settling again conserves exactly as the first time.
-    s.view.sync(&s.chain);
+    s.view.sync(&s.chain).unwrap();
     assert_eq!(s.view.pending_exits().len(), 1);
     settle_claims(&mut s);
     assert!(s.chain.exit_released(&s.me, 1));
@@ -389,12 +389,12 @@ fn a_queue_block_reorged_away_leaves_no_phantom_exit() {
     let dest = addr(&wallet(8));
     let mut main = Chain::new(params.clone()).unwrap();
     fund(&mut main, &miner, me, 1);
-    let mut view = NodeL2::replay_from(&main, &params);
+    let mut view = NodeL2::replay_from(&main, &params).unwrap();
     let gas = 16_000u64 + 1_000 + 2 * 250;
     let l1_fee = main.expected_base_fee_for_next_block() * gas;
     let amounts = vec![SINK_VALUE - EXIT_FEE - l1_fee];
     let q = submit_queue_block(&mut main, &mut view, &miner, me, dest, &amounts);
-    view.sync(&main);
+    view.sync(&main).unwrap();
     assert_eq!(view.pending_exits().len(), 1);
 
     // Rival shares history through the queue block's parent, then out-works
@@ -408,7 +408,7 @@ fn a_queue_block_reorged_away_leaves_no_phantom_exit() {
         main.submit(b).unwrap();
     }
     assert_eq!(main.height(), q + 1);
-    view.sync(&main);
+    view.sync(&main).unwrap();
     assert!(
         view.pending_exits().is_empty(),
         "a reorged queue must drop its watch"
@@ -419,7 +419,7 @@ fn a_queue_block_reorged_away_leaves_no_phantom_exit() {
     );
     // Far past finality: still nothing, ever.
     mine_empty_to(&mut main, me, q + 200);
-    view.sync(&main);
+    view.sync(&main).unwrap();
     assert!(view.crank_claims(&main, me).is_empty());
 }
 

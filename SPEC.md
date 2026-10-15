@@ -1719,16 +1719,27 @@ committee (mainnet) verifies against nothing and therefore refuses every
 settlement by name (`BadQuorum`) — fail closed, never fail open. A bitmap
 signer with a registered key and no valid sidecar entry is refused by name
 (`BadPqSidecar`) — fail closed, never silently downgraded. The aggregate
-message is the domain-separated hash of `(task_id, verdict, vwc_hash)`, so a
-settle decision cannot be replayed against another task or another verdict.
+message is the domain-separated hash of
+`(task_id, verdict, vwc_hash, network_id, height)`, so a settle decision
+cannot be replayed against another task, another verdict, another chain, or —
+from the future — another height. `apply` refuses a payload naming another
+network than the state's own config, and a vote height above the applying
+height. A quorum formed at `H` may still settle at `H+1`: votes are signed as
+the chain moves, so the height rule is "not from the future", with the
+dispute lifecycle (a task settles once) closing the replay window.
 
 Wire form of the settle payload (the sidecar rides last; a payload written
-before it existed ends after `signer_count` and decodes to an empty sidecar):
+before it existed ends after `signer_count` and decodes to an empty sidecar —
+but any payload written before the network/height binding is refused outright,
+because its signature covers the decision alone and must no longer verify):
 
 ```
 fixed  task_id        (32)
 u8     verdict
 fixed  vwc_hash       (32)
+u32le  id_len         (<= 64)
+raw    network_id                   // chain the quorum signed for
+u64le  height                       // height the quorum signed at
 raw    bls_sig        (96)
 u32le  bitmap_len     (<= 64)
 raw    signer_bitmap
@@ -2015,7 +2026,7 @@ path accepted a result.
 Canonical, little-endian, exact-inverse encoding (the same codec rules as §15.1):
 
 ```
-u32le  version                      // 1; unknown versions are refused
+u32le  version                      // 2; unknown versions are refused
 fixed  task_id        (32)
 fixed  worker         (20)
 fixed  result_hash    (32)
@@ -2029,6 +2040,9 @@ if Quorum:
   u32le  signer_count
   u32le  sidecar_count  (<= 64)      // lattice entries, absent in pre-sidecar encodings
   sidecar_count × (u32le signer_index ‖ raw sig (3309))
+  u32le  id_len         (<= 64)
+  raw    network_id                   // chain the quorum signed for
+  u64le  vote_height                  // height the quorum signed at
 ```
 
 The certificate id is *not* stored in the encoding — it is derived (§17.3), so a
@@ -2096,7 +2110,8 @@ An implicit settlement (auto-settle or dispute lapse, §15.7) yields
    verified and still certifies.
 3. **Kind-specific.** For `Quorum`: bitmap and count agree; count ≥ quorum
    threshold; the aggregate verifies over
-   `SettlePayload { task_id, Correct, result_hash }.signing_hash()` with the
+   `SettlePayload { task_id, Correct, result_hash, network_id, vote_height }.signing_hash()`
+   — rebuilt with the chain context the certificate carries — with the
    *same* verifier the settlement path uses; then the lattice sidecar verifies
    clause-7-shape against the set's registered keys (every bitmap signer
    holding one needs a valid entry — a relying party that stops at the
@@ -2590,7 +2605,13 @@ needs, so §13 itself is not edited.
   (§13's broadcast is L1-shaped).
 - Authentication, replay protection, malformed-message rejection and
   idempotent retry are required (§18.9, §18.10, §18.11 apply to the transport
-  exactly as they apply to the SDK's own state machines).
+  exactly as they apply to the SDK's own state machines). Authentication is
+  implemented as: Host-header validation on **every** bind (loopback
+  included), bearer-token authentication (constant-time compare) with a
+  per-IP token bucket on exposed binds, and a per-request deadline plus a
+  global in-flight cap on every bind. The bearer token SHOULD come from the
+  `JNT_API_TOKEN` environment variable rather than `--api-token`, because
+  command-line flags are visible in `ps`.
 - Binding is loopback by default; exposing it beyond that is an operator
   decision, and the API is not a consensus surface: nothing it accepts may
   reach `Chain::submit` except a signed transaction, which is validated as
@@ -2619,13 +2640,13 @@ Client-side bounds are one response cap (16 MiB default), one header cap
 (16 KiB), a connect timeout and a read timeout; plain `http://` only, with
 HTTPS refused by name rather than downgraded.
 
-**Not implemented.** Transport authentication. The API is an *unauthenticated*
-loopback surface: binding to a non-loopback address prints a warning and is
-left to the operator, and replay/idempotence for writes rests on the node's
-existing L2 dedup and mempool rules rather than on a transport nonce or
-credential. This bullet of §19.2 is therefore satisfied by the operator's
-binding choice alone, and a non-loopback deployment is not authenticated by
-this specification.
+**Implemented (measured).** Transport authentication. A non-loopback bind is
+*refused* without a bearer token; loopback binds stay unauthenticated by
+design. Host-header validation runs on every bind, bearer authentication
+(constant-time compare) and a bounded per-IP token bucket run on exposed
+binds, and a per-request deadline plus a global in-flight cap run on every
+bind. Replay/idempotence for writes rests on the node's existing L2 dedup
+and mempool rules rather than on a transport nonce or credential.
 
 ### 19.3 Superseded — genesis validator committee and checkpoints (Decisions 11–14)
 

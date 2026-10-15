@@ -58,6 +58,7 @@ fn settle_payload(
     vwc_hash: Hash,
     signed: usize,
     total: usize,
+    height: u64,
 ) -> SettlePayload {
     let n_bytes = total.div_ceil(8).max(1);
     let mut bitmap = vec![0u8; n_bytes];
@@ -68,6 +69,8 @@ fn settle_payload(
         task_id,
         verdict,
         vwc_hash,
+        network_id: "jounit/mini".to_string(),
+        height,
         bls_sig: [0xAAu8; 96],
         signer_bitmap: bitmap,
         signer_count: signed as u32,
@@ -175,6 +178,7 @@ impl World {
             vwc_hash,
             signed,
             self.validators.len(),
+            height,
         )));
         self.apply(&tx, height)
     }
@@ -418,7 +422,7 @@ fn a_settle_with_a_zero_aggregate_is_refused() {
     let id = w.post(1);
     w.claim(id, 2, 50_000);
     w.submit(id, [0xAAu8; 32], 3);
-    let mut payload = settle_payload(id, Verdict::Correct, [0xAAu8; 32], 3, 4);
+    let mut payload = settle_payload(id, Verdict::Correct, [0xAAu8; 32], 3, 4, 9);
     payload.bls_sig = [0u8; 96];
     let tx = L2Transaction::new(L2Payload::Settle(payload));
     assert_eq!(w.apply(&tx, 9), Err(L2Error::BadBlsSignature));
@@ -430,7 +434,7 @@ fn a_settle_whose_bitmap_disagrees_with_the_count_is_refused() {
     let id = w.post(1);
     w.claim(id, 2, 50_000);
     w.submit(id, [0xAAu8; 32], 3);
-    let mut payload = settle_payload(id, Verdict::Correct, [0xAAu8; 32], 3, 4);
+    let mut payload = settle_payload(id, Verdict::Correct, [0xAAu8; 32], 3, 4, 9);
     payload.signer_count = 4; // bitmap still has 3 bits
     let tx = L2Transaction::new(L2Payload::Settle(payload));
     assert_eq!(w.apply(&tx, 9), Err(L2Error::BadQuorum));
@@ -565,6 +569,7 @@ fn a_rejecting_verifier_blocks_settlement() {
         [0xAAu8; 32],
         3,
         4,
+        9,
     )));
     assert_eq!(
         w.state.apply(&tx, 9, &w.validators, &RejectAll),

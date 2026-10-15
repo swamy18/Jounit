@@ -146,6 +146,7 @@ fn settle_payload(
     vwc_hash: Hash,
     signed: usize,
     total: usize,
+    height: u64,
 ) -> SettlePayload {
     let n_bytes = total.div_ceil(8).max(1);
     let mut bitmap = vec![0u8; n_bytes];
@@ -156,6 +157,8 @@ fn settle_payload(
         task_id,
         verdict,
         vwc_hash,
+        network_id: "jounit/mini".to_string(),
+        height,
         bls_sig: [0xAAu8; 96],
         signer_bitmap: bitmap,
         signer_count: signed as u32,
@@ -444,8 +447,8 @@ fn replay_rebuilds_identical_exit_state() {
     config.exit_activation_height = params.exit_activation_height;
     let genesis = L2Genesis::for_params(&params);
     let deposits = DepositParams::for_params(&params);
-    let mut first = ChainL2::empty(config, &genesis, deposits);
-    let mut second = ChainL2::empty(config, &genesis, deposits);
+    let mut first = ChainL2::empty(config.clone(), &genesis, deposits).unwrap();
+    let mut second = ChainL2::empty(config, &genesis, deposits).unwrap();
     // Fund both identically outside genesis (unit-test seam, like `world`).
     for l2 in [&mut first, &mut second] {
         l2.state_mut().credit(addr(&wallet(1)), 10_000_000).unwrap();
@@ -489,7 +492,7 @@ fn value_stays_in_l2_across_a_full_settlement_lifecycle() {
         SubmitResultPayload::build(&w.worker, id, attestation(&w.worker, id, result)).unwrap();
     w.apply(&L2Transaction::new(L2Payload::Submit(submit)), 3);
 
-    let settle = settle_payload(id, Verdict::Correct, result, 3, w.validators.len());
+    let settle = settle_payload(id, Verdict::Correct, result, 3, w.validators.len(), 9);
     w.apply(&L2Transaction::new(L2Payload::Settle(settle)), 9);
 
     assert_eq!(w.state.funded_total(), funded);

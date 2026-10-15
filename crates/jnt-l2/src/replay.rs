@@ -55,7 +55,7 @@
 use crate::deposits::{
     scan_block, DepositIgnoreReason, DepositParams, DetectedDeposit, IgnoredDeposit, PendingDeposit,
 };
-use crate::error::L2Error;
+use crate::error::{L2Error, L2Result};
 use crate::genesis::L2Genesis;
 use crate::state::{ExitRecord, L2State};
 use crate::task_contract::L2Config;
@@ -149,12 +149,16 @@ impl ChainL2 {
     /// This is also the second half of the recovery story: `replay` and
     /// "start empty, then apply each block" must reach the same state, and a
     /// test asserts exactly that.
-    pub fn empty(config: L2Config, genesis: &L2Genesis, deposits: DepositParams) -> Self {
+    ///
+    /// Returns the genesis refusal instead of panicking on it: the caller
+    /// that built this genesis (usually `L2Genesis::for_params` of a
+    /// validated profile) names the failure, and a library constructor has
+    /// no business aborting the process — with `panic = "abort"` that would
+    /// take down every peer connection and request.
+    pub fn empty(config: L2Config, genesis: &L2Genesis, deposits: DepositParams) -> L2Result<Self> {
         let mut state = L2State::new(config);
-        state
-            .apply_genesis(genesis)
-            .expect("genesis validated by NetworkParams::validate");
-        ChainL2 {
+        state.apply_genesis(genesis)?;
+        Ok(ChainL2 {
             state,
             height: 0,
             applied: 0,
@@ -165,7 +169,7 @@ impl ChainL2 {
             deposits_applied: 0,
             watches: Vec::new(),
             unbacked: Vec::new(),
-        }
+        })
     }
 
     /// Replay a whole chain from genesis to its tip.
@@ -181,7 +185,7 @@ impl ChainL2 {
         deposits: DepositParams,
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
-    ) -> Self {
+    ) -> L2Result<Self> {
         Self::replay_to(
             chain,
             config,
@@ -207,13 +211,13 @@ impl ChainL2 {
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
         upto: u64,
-    ) -> Self {
+    ) -> L2Result<Self> {
         let tip = chain.height().min(upto);
         // The one binding-finality floor for this replay: a pure read of the L1
         // chain's finality layer, fixed for the whole pass so every deposit is
         // judged against the same consensus answer (Decision 15).
         let binding = chain.finality().binding_finalized_height();
-        let mut l2 = ChainL2::empty(config, genesis, deposits);
+        let mut l2 = ChainL2::empty(config, genesis, deposits)?;
         for height in 1..=tip {
             // `block_at` is total over 1..=tip on a canonical chain: `canon`
             // indexes every canonical height and `Chain::prune_side_branches`
@@ -230,7 +234,7 @@ impl ChainL2 {
             };
             l2.absorb(height, block, tip, binding, validators, verifier);
         }
-        l2
+        Ok(l2)
     }
 
     /// Apply one newly accepted block. The incremental twin of [`Self::replay`],

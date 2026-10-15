@@ -86,7 +86,7 @@ fn chain_with_a_matured_deposit() -> (Chain, NodeL2, Address, u64) {
     // Mature it: depth >= finality_depth (mini: 20) so L2 credits it.
     mine(&mut chain, depositor_addr, params.finality_depth + 1);
 
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(
         view.state().balance(&depositor_addr),
         to_sink,
@@ -153,7 +153,7 @@ fn verify_conservation_passes_with_a_real_deposit_and_reports_headroom() {
 fn verify_conservation_passes_on_an_empty_chain() {
     let params = NetworkParams::mini();
     let chain = Chain::new(params.clone()).unwrap();
-    let view = NodeL2::fresh(&params);
+    let view = NodeL2::fresh(&params).unwrap();
     let s = verify_conservation(&chain, &view).expect("genesis-only state must conserve");
     assert_eq!(s.sink_held_sat, 0, "no deposits yet");
     assert_eq!(s.l2_held_sat, params.l2_genesis_escrow_sat);
@@ -166,7 +166,7 @@ fn verify_conservation_passes_on_an_empty_chain() {
 fn l2_funding_from_an_unauthorized_path_is_refused_by_name() {
     let params = NetworkParams::mini();
     let chain = Chain::new(params.clone()).unwrap();
-    let mut view = NodeL2::fresh(&params);
+    let mut view = NodeL2::fresh(&params).unwrap();
     let before = view.state().funded_total();
     assert_eq!(before, params.l2_genesis_escrow_sat);
 
@@ -211,7 +211,8 @@ fn a_deposit_is_counted_once_while_pending_and_cancelled_once_matured() {
     let depositor_addr = depositor.address().unwrap();
     mine(&mut chain, depositor_addr, 11);
 
-    let before = verify_conservation(&chain, &NodeL2::replay_from(&chain, &params)).unwrap();
+    let before =
+        verify_conservation(&chain, &NodeL2::replay_from(&chain, &params).unwrap()).unwrap();
 
     let op = OutPoint {
         txid: chain.block_at(1).unwrap().txs[0].txid(),
@@ -244,7 +245,7 @@ fn a_deposit_is_counted_once_while_pending_and_cancelled_once_matured() {
 
     // Phase 1 — pending: the sink holds the value, L2 has not credited it yet,
     // so the value is counted exactly once.
-    let pending_view = NodeL2::replay_from(&chain, &params);
+    let pending_view = NodeL2::replay_from(&chain, &params).unwrap();
     let pending = verify_conservation(&chain, &pending_view).unwrap();
     assert_eq!(
         pending.sink_held_sat, to_sink,
@@ -267,7 +268,7 @@ fn a_deposit_is_counted_once_while_pending_and_cancelled_once_matured() {
     // Phase 2 — matured: the L2 twin now exists, so the same satoshis are
     // present on both sides until the sink term removes one copy.
     mine(&mut chain, depositor_addr, params.finality_depth + 1);
-    let matured_view = NodeL2::replay_from(&chain, &params);
+    let matured_view = NodeL2::replay_from(&chain, &params).unwrap();
     let matured = verify_conservation(&chain, &matured_view).unwrap();
     assert_eq!(matured.sink_held_sat, to_sink);
     assert_eq!(

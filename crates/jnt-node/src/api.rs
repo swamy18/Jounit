@@ -20,9 +20,12 @@
 //! - **Bounded everything.** One body-size cap for all inputs; the receipt
 //!   book, payment store and policy book are cap-with-refusal, so a flood
 //!   cannot grow node memory without bound.
-//! - **State it holds is non-consensus**: receipts, payment ids and policy
-//!   accounting are this node's view for lookup/authorization convenience.
-//!   Losing them (restart) changes no coin.
+//! - **State it holds is non-consensus and node-local**: receipts, payment
+//!   ids, policy accounting and the credit book (`CreditBook`: free balances,
+//!   bonds, positions) are this node's view for lookup/authorization
+//!   convenience. They are not persisted and a restart loses them — losing
+//!   them changes no coin, but a credit position open at shutdown does not
+//!   come back.
 //!
 //! Endpoints (§13 for L1, §19.2 for the L2 additions, plus the payment/
 //! receipt surface items 16–17 require):
@@ -70,15 +73,21 @@
 //! Loopback is the default binding and is unauthenticated by design: every test
 //! drives a socket on `127.0.0.1:0` with no token. A **non-loopback bind is
 //! refused** unless a bearer token is supplied, because exposing this surface is
-//! an operator decision the node will not make silently (SPEC.md §19.2). On an
-//! exposed bind the stack additionally enforces:
+//! an operator decision the node will not make silently (SPEC.md §19.2).
 //!
-//! - **Host-header validation** — the request's `Host` must name the bound
-//!   address (or a loopback alias), which is what stops a DNS-rebound name from
-//!   reaching a peer machine that can answer for it.
-//! - **Bearer authentication** — every request carries
-//!   `Authorization: Bearer <token>`.
-//! - **A per-IP token bucket** — a flood is shed to the server.
+//! - **Host-header validation runs on *every* bind**, loopback included — the
+//!   request's `Host` must name the bound address (or a loopback alias), which
+//!   is what stops a DNS-rebound name from reaching a peer machine that can
+//!   answer for it. Loopback is no longer exempt: that was where the rebinding
+//!   risk was highest.
+//! - **Bearer authentication on an exposed bind** — every request carries
+//!   `Authorization: Bearer <token>`, compared in constant time. Supply the
+//!   token through the `JNT_API_TOKEN` environment variable, not
+//!   `--api-token`: command-line flags are visible to other users in `ps`,
+//!   while the environment of a started process is not.
+//! - **A per-IP token bucket on an exposed bind** — a flood is shed to the
+//!   server. The table is bounded (idle entries are evicted), so a spray of
+//!   source addresses cannot grow it without limit.
 //! - **A per-request deadline and a global in-flight cap** — these apply on
 //!   *every* binding, loopback included, because they bound the hold time on
 //!   the shared-state `Mutex` rather than defending against a remote attacker.
@@ -1166,36 +1175,49 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
     let bytes = decode_hex_bytes(&req.signed_tx_hex, "signed_tx")?;
     let tx = Transaction::deserialize(&bytes).map_err(|e| bad(format!("tx decode: {e}")))?;
     let txid = tx.txid();
-    with_shared(&state, |sh| {
-        // Only a deposit is funding-shaped. An ordinary payment still relays:
-        // freezing all of L1 would stop the chain without fixing the number.
-        // Checked after decode so a malformed transaction stays a client error
-        // (`bad_request`) rather than being reported as a breach refusal.
-        let sink = sh.chain.params().l2_deposit_sink();
-        if tx.outputs.iter().any(|o| o.address == sink) {
-            refuse_funding_if_breached(sh, FundingPath::Deposit)?;
-        }
-        let outcome = sh.pool.add(
-            tx,
-            sh.chain.utxo(),
-            sh.chain.height() + 1,
-            sh.chain.params(),
-            sh.chain.expected_base_fee_for_next_block(),
-            sh.chain.bonds(),
-        );
-        match outcome {
-            Ok(txid) => {
-                sh.tx_to_relay.push(txid);
-                Ok(Json(json!({ "tx_hash": hash512_to_hex(&txid) })))
+    // Signature verification and admission (BLS/ML-DSA/ECDSA) happen on a
+    // blocking thread, so the async runtime is never stalled by crypto and
+    // the request timeout and concurrency cap stay effective: the timeout
+    // races the `spawn_blocking` await, and the in-flight cap bounds how many
+    // such tasks can exist at once.
+    //
+    // Stated plainly: verification still runs under the shared-state lock —
+    // only off the async thread, not outside the lock. Moving it fully
+    // outside would need `Mempool` split into validate-then-commit, which
+    // re-opens fee/height races between the two phases; that split is deferred
+    // until admission is reworked, and this keeps the current exactness.
+    let state_for_task = state.clone();
+    let tx_for_task = tx;
+    let txid_for_result = txid;
+    let result = tokio::task::spawn_blocking(move || {
+        with_shared(&state_for_task, |sh| {
+            let sink = sh.chain.params().l2_deposit_sink();
+            if tx_for_task.outputs.iter().any(|o| o.address == sink) {
+                refuse_funding_if_breached(sh, FundingPath::Deposit)?;
             }
-            // Idempotent: the same signed transaction arriving twice is the
-            // same request, not an error — dedup is by txid.
-            Err(jnt_core::mempool::MempoolError::AlreadyKnown) => Ok(Json(
-                json!({ "tx_hash": hash512_to_hex(&txid), "already_known": true }),
-            )),
-            Err(e) => Err(fail(StatusCode::BAD_REQUEST, "tx_refused", e.to_string())),
-        }
-    })?
+            let outcome = sh.pool.add(
+                tx_for_task,
+                sh.chain.utxo(),
+                sh.chain.height() + 1,
+                sh.chain.params(),
+                sh.chain.expected_base_fee_for_next_block(),
+                sh.chain.bonds(),
+            );
+            match outcome {
+                Ok(txid) => {
+                    sh.tx_to_relay.push(txid);
+                    Ok(Json(json!({ "tx_hash": hash512_to_hex(&txid) })))
+                }
+                Err(jnt_core::mempool::MempoolError::AlreadyKnown) => Ok(Json(
+                    json!({ "tx_hash": hash512_to_hex(&txid_for_result), "already_known": true }),
+                )),
+                Err(e) => Err(fail(StatusCode::BAD_REQUEST, "tx_refused", e.to_string())),
+            }
+        })
+    })
+    .await
+    .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal", "task join"))??;
+    result
 }
 
 #[derive(Deserialize)]
@@ -2298,10 +2320,17 @@ impl ApiConfig {
         }
     }
 
+    /// Snapshot the host-validation configuration for `from_fn_with_state`.
+    /// Runs on every bind, loopback included.
+    fn host(&self) -> HostConfig {
+        HostConfig {
+            bind_host: self.bind_host.clone(),
+        }
+    }
+
     /// Snapshot the auth/rate-limit configuration for `from_fn_with_state`.
     fn auth(&self) -> AuthConfig {
         AuthConfig {
-            bind_host: self.bind_host.clone(),
             token: self.token.clone(),
             limiter: self.limiter.clone(),
         }
@@ -2316,10 +2345,15 @@ struct DosConfig {
     concurrency: Arc<tokio::sync::Semaphore>,
 }
 
+/// Host-header validation config, applied on every bind.
+#[derive(Clone)]
+struct HostConfig {
+    bind_host: String,
+}
+
 /// Auth + rate-limit config, only applied on an exposed bind.
 #[derive(Clone)]
 struct AuthConfig {
-    bind_host: String,
     token: Option<String>,
     limiter: RateLimiter,
 }
@@ -2350,6 +2384,9 @@ const RATE_LIMIT_RATE: u64 = 60;
 const RATE_LIMIT_CAPACITY: u64 = 120;
 const TOKEN_SCALE: u64 = 1_000;
 const CAP: u64 = RATE_LIMIT_CAPACITY * TOKEN_SCALE;
+/// Upper bound on the number of distinct IPs tracked by the rate limiter, so
+/// memory cannot grow without limit under a spray of IPv6 sources.
+const MAX_RATE_TRACKED: usize = 8192;
 
 impl Default for RateLimiter {
     fn default() -> Self {
@@ -2366,7 +2403,20 @@ impl RateLimiter {
     /// the hot path.
     fn check(&self, peer: IpAddr) -> bool {
         let now = Instant::now();
-        let mut map = self.inner.lock().expect("rate table lock poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Bound the table: drop idle buckets first, then the stalest single
+        // entry, so a spray of sources cannot grow memory without limit.
+        if map.len() >= MAX_RATE_TRACKED {
+            map.retain(|_, b| now.duration_since(b.last) < Duration::from_secs(300));
+            if map.len() >= MAX_RATE_TRACKED {
+                if let Some(oldest) = map.iter().min_by_key(|(_, b)| b.last).map(|(ip, _)| *ip) {
+                    map.remove(&oldest);
+                }
+            }
+        }
         let bucket = map.entry(peer).or_insert(Bucket {
             tokens: CAP,
             last: now,
@@ -2445,10 +2495,13 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
     // runtime even on a loopback bind.
     app = app.layer(from_fn_with_state(cfg.dos(), dos_guard));
 
+    // Host-header validation runs on every bind (DNS-rebinding defense), including
+    // loopback; loopback binds are no longer exempt.
+    app = app.layer(from_fn_with_state(cfg.host(), host_check));
+
     if cfg.is_exposed() {
-        // Host-header validation, bearer auth and per-IP rate limiting all
-        // require the API to be exposed. Loopback-only binds (the default, and
-        // what every test uses) stay open by design.
+        // Bearer auth and per-IP rate limiting require the API to be exposed.
+        // Loopback-only binds stay open for those by design.
         app = app.layer(from_fn_with_state(cfg.auth(), exposed_auth));
     }
     app.with_state(state)
@@ -2482,6 +2535,42 @@ async fn dos_guard(State(cfg): State<DosConfig>, req: Request, next: Next) -> Re
 /// Host-header + bearer-token gate + per-IP rate limit, applied only on an
 /// exposed bind. Returns a plain `Response` so the layer stays `Infallible` for
 /// `Router::layer`.
+async fn host_check(State(cfg): State<HostConfig>, req: Request, next: Next) -> Response {
+    // Host-header validation runs on every bind. The request's `Host` must name
+    // the address this server bound to, or a loopback alias. Guards against any
+    // bind being reached via a DNS-rebound Host whose name resolves back to a
+    // peer (including loopback binds, where exposure was previously open).
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    let host_part = if let Some(rest) = host.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            &rest[..end]
+        } else {
+            host
+        }
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let host_ok = host_part == cfg.bind_host.as_str()
+        || host_part == "localhost"
+        || host_part == "127.0.0.1"
+        || host_part == "::1"
+        || host_part
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if !host_ok {
+        let mut resp = axum::response::Response::new(axum::body::Body::from("forbidden"));
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        return resp;
+    }
+    next.run(req).await
+}
+
 async fn exposed_auth(
     State(cfg): State<AuthConfig>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -2495,26 +2584,6 @@ async fn exposed_auth(
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         return resp;
     }
-    // Host-header validation: the request's `Host` must name the address this
-    // server bound to (or a loopback alias). Guards against a non-loopback bind
-    // being reached via a DNS-rebound Host whose name resolves back to a peer.
-    let host = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim();
-    let host_part = host.split(':').next().unwrap_or("");
-    let host_ok = host_part == cfg.bind_host.as_str()
-        || host_part
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false);
-    if !host_ok {
-        let mut resp = axum::response::Response::new(axum::body::Body::from("forbidden"));
-        *resp.status_mut() = StatusCode::FORBIDDEN;
-        return resp;
-    }
     if let Some(token) = &cfg.token {
         let bearer = req
             .headers()
@@ -2522,7 +2591,9 @@ async fn exposed_auth(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
             .map(|s| s.trim());
-        if bearer != Some(token.as_str()) {
+        use subtle::ConstantTimeEq;
+        let provided = bearer.unwrap_or("");
+        if !bool::from(provided.as_bytes().ct_eq(token.as_bytes())) {
             let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
             *resp.status_mut() = StatusCode::UNAUTHORIZED;
             return resp;

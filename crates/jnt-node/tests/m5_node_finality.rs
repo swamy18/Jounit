@@ -141,11 +141,15 @@ fn signed_settle(
     set: &ValidatorSet,
     signers_secrets: &[(SecretKey, BlsPublicKey)],
     task_id: Hash,
+    network_id: &str,
+    vote_height: u64,
 ) -> L2Transaction {
     let payload = SettlePayload {
         task_id,
         verdict: Verdict::Correct,
         vwc_hash: RESULT,
+        network_id: network_id.to_string(),
+        height: vote_height,
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
@@ -172,6 +176,8 @@ fn signed_settle(
         task_id,
         verdict: Verdict::Correct,
         vwc_hash: RESULT,
+        network_id: network_id.to_string(),
+        height: vote_height,
     }))
 }
 
@@ -200,7 +206,9 @@ fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) {
     let block = if l2.is_empty() {
         chain.mine_block([1u8; 20], Vec::new(), ts(h))
     } else if chain.exit_active_at(h) {
-        let root = NodeL2::replay_from(chain, chain.params()).simulate_root(h, &l2);
+        let root = NodeL2::replay_from(chain, chain.params())
+            .unwrap()
+            .simulate_root(h, &l2);
         chain.mine_block_with_l2_root([1u8; 20], Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
     } else {
         // Pre-activation profile: the trailer rides without a root.
@@ -259,9 +267,19 @@ fn a_settlement_applies_under_the_declared_committee() {
     mine_and_submit(&mut chain, vec![claim(3, task_id)]);
     mine_and_submit(&mut chain, vec![submit_result(3, task_id)]);
     mine_and_submit(&mut chain, vec![dispute(1, task_id)]);
-    mine_and_submit(&mut chain, vec![signed_settle(&set, &committee, task_id)]);
+    let vote_height = chain.height();
+    mine_and_submit(
+        &mut chain,
+        vec![signed_settle(
+            &set,
+            &committee,
+            task_id,
+            &params.network_id,
+            vote_height,
+        )],
+    );
 
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert!(
         view.skipped().is_empty(),
         "the lifecycle must apply cleanly: {:?}",
@@ -293,9 +311,19 @@ fn a_settlement_signed_by_a_foreign_committee_is_refused() {
     mine_and_submit(&mut chain, vec![claim(3, task_id)]);
     mine_and_submit(&mut chain, vec![submit_result(3, task_id)]);
     mine_and_submit(&mut chain, vec![dispute(1, task_id)]);
-    mine_and_submit(&mut chain, vec![signed_settle(&set, &foreign, task_id)]);
+    let vote_height = chain.height();
+    mine_and_submit(
+        &mut chain,
+        vec![signed_settle(
+            &set,
+            &foreign,
+            task_id,
+            &params.network_id,
+            vote_height,
+        )],
+    );
 
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.applied_count(), 4, "the first four payloads applied");
     assert_eq!(view.skipped().len(), 1);
     assert!(
@@ -322,6 +350,8 @@ fn a_profile_without_a_committee_fails_closed_on_settlements() {
         task_id: [0x77; 32],
         verdict: Verdict::Correct,
         vwc_hash: RESULT,
+        network_id: "jounit/mainnet".to_string(),
+        height: 0,
         // Signs over nothing: on a profile with a committee this would fail
         // at the aggregate; with no committee it must not even get there.
         bls_sig: [0x01; 96],
@@ -334,7 +364,7 @@ fn a_profile_without_a_committee_fails_closed_on_settlements() {
         vec![L2Transaction::new(L2Payload::Settle(fake))],
     );
 
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.applied_count(), 0);
     assert_eq!(view.skipped().len(), 1);
     assert!(
@@ -444,8 +474,8 @@ fn a_checkpoint_without_a_tip_move_matures_a_pending_deposit() {
     let params = NetworkParams::testnet();
 
     // Depth is satisfied; binding finality is live but below the deposit.
-    let mut view = NodeL2::fresh(&params);
-    let report = view.sync(&chain);
+    let mut view = NodeL2::fresh(&params).unwrap();
+    let report = view.sync(&chain).unwrap();
     assert!(matches!(report.outcome, SyncOutcome::FullReplay { .. }));
     assert_eq!(
         view.pending_deposits().len(),
@@ -460,7 +490,7 @@ fn a_checkpoint_without_a_tip_move_matures_a_pending_deposit() {
     // forever until some unrelated block arrived.
     checkpoint_at(&mut chain, 30);
     assert_eq!(chain.height(), 42, "the tip did not move");
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert_eq!(
         report.outcome,
         SyncOutcome::FullReplay { blocks: 42 },
@@ -475,7 +505,7 @@ fn a_checkpoint_without_a_tip_move_matures_a_pending_deposit() {
     assert_eq!(view.state().balance(&addr_of(&wallet(81))), SINK_VALUE);
 
     // Nothing left to do: the next sync is a no-op.
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert_eq!(report.outcome, SyncOutcome::Unchanged);
     assert_eq!(view.deposits_applied_count(), 1, "credited exactly once");
 }
@@ -531,7 +561,7 @@ fn finality_and_l2_state_survive_a_restart_identically() {
     let chain = case_a_chain();
     let point = chain.finalized_point().unwrap();
 
-    let live = NodeL2::replay_from(&chain, &params);
+    let live = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(live.pending_deposits().len(), 1, "Case A before restart");
 
     persist(&chain, &dir);
@@ -546,17 +576,17 @@ fn finality_and_l2_state_survive_a_restart_identically() {
         "finalized height/hash before restart == after restart"
     );
 
-    let recovered = NodeL2::replay_from(&reborn, &params);
+    let recovered = NodeL2::replay_from(&reborn, &params).unwrap();
     assert_eq!(recovered.pending_deposits().len(), 1);
     assert_eq!(recovered.deposits_applied_count(), 0);
 
     // Fresh replay == the view a node builds by following the tip from
     // scratch (incremental) == a second fresh replay.
-    let mut incremental = NodeL2::fresh(&params);
-    incremental.sync(&reborn);
-    let again = NodeL2::replay_from(&reborn, &params);
+    let mut incremental = NodeL2::fresh(&params).unwrap();
+    incremental.sync(&reborn).unwrap();
+    let again = NodeL2::replay_from(&reborn, &params).unwrap();
 
-    let third = NodeL2::replay_from(&reborn, &params); // third derivation
+    let third = NodeL2::replay_from(&reborn, &params).unwrap(); // third derivation
     for (name, view) in [
         ("recovered", &recovered),
         ("incremental", &incremental),

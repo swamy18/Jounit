@@ -150,11 +150,19 @@ impl World {
         id
     }
 
-    fn signed_settle(&self, id: Hash, verdict: Verdict, vwc_hash: Hash) -> SettlePayload {
+    fn signed_settle(
+        &self,
+        id: Hash,
+        verdict: Verdict,
+        vwc_hash: Hash,
+        height: u64,
+    ) -> SettlePayload {
         let payload = SettlePayload {
             task_id: id,
             verdict,
             vwc_hash,
+            network_id: "jounit/mini".to_string(),
+            height,
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
@@ -187,7 +195,7 @@ impl World {
     }
 
     fn settle(&mut self, id: Hash, verdict: Verdict, vwc_hash: Hash, height: u64) {
-        let payload = self.signed_settle(id, verdict, vwc_hash);
+        let payload = self.signed_settle(id, verdict, vwc_hash, height);
         self.apply(&L2Transaction::new(L2Payload::Settle(payload)), height)
             .unwrap();
     }

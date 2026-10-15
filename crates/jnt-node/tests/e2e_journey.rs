@@ -148,8 +148,8 @@ struct Node {
 impl Node {
     fn new(params: NetworkParams) -> Self {
         let chain = Chain::new(params.clone()).unwrap();
-        let mut view = NodeL2::fresh(&params);
-        view.sync(&chain);
+        let mut view = NodeL2::fresh(&params).unwrap();
+        view.sync(&chain).unwrap();
         Node {
             chain,
             view,
@@ -200,7 +200,7 @@ impl Node {
         self.chain
             .submit(block.clone())
             .expect("it must be accepted");
-        self.view.sync(&self.chain);
+        self.view.sync(&self.chain).unwrap();
         block
     }
 
@@ -248,13 +248,20 @@ fn mini_validators() -> ValidatorSet {
 /// A quorum settle transaction signed by the profile's real committee, i.e.
 /// what the arbitrator set would broadcast. The validators are the node's own,
 /// so the aggregate verifies inside `NodeL2::sync`.
-fn quorum_settle(task_id: Hash, verdict: Verdict, vwc_hash: Hash) -> L2Transaction {
+fn quorum_settle(
+    task_id: Hash,
+    verdict: Verdict,
+    vwc_hash: Hash,
+    vote_height: u64,
+) -> L2Transaction {
     let validators = mini_validators();
     let secrets = mini_committee_secrets();
     let payload = SettlePayload {
         task_id,
         verdict,
         vwc_hash,
+        network_id: "jounit/mini".to_string(),
+        height: vote_height,
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
@@ -524,8 +531,16 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
     ));
 
     // --- 10. the arbitrator settles, and the VWC it issues -----------------
-    node.borrow_mut()
-        .mine_l2(vec![quorum_settle(task_id, Verdict::Correct, result_hash)]);
+    // The quorum signed at the current tip and settles in the next block —
+    // the honest vote-height pattern the apply rule ("not from the future")
+    // admits.
+    let vote_height = node.borrow().height();
+    node.borrow_mut().mine_l2(vec![quorum_settle(
+        task_id,
+        Verdict::Correct,
+        result_hash,
+        vote_height,
+    )]);
     let settled_at = node.borrow().height();
     assert!(settled_at > disputed_at);
 
@@ -691,7 +706,7 @@ fn the_full_journey_agent_to_settlement_vwc_receipt_reputation_finality() {
     drop(node);
 
     let reloaded = reload(&dir, &params);
-    let recovered = NodeL2::replay_from(&reloaded, &params);
+    let recovered = NodeL2::replay_from(&reloaded, &params).unwrap();
 
     assert_eq!(
         recovered.state(),
@@ -836,7 +851,12 @@ static STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_store_dir() -> PathBuf {
     let id = STORE_COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("jnt-e2e-journey-{}-{id}", std::process::id()))
+    let dir = std::env::temp_dir().join(format!("jnt-e2e-journey-{}-{id}", std::process::id()));
+    // Process ids are reused, and a crashed run can leave its directory
+    // behind: opening a stale store reads another run's meta and fails for
+    // unrelated reasons. Start from an empty directory every time.
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 /// Persist every canonical block, plus the finalized point, the way a node does.

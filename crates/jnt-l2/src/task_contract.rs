@@ -44,8 +44,13 @@ use crate::error::{L2Error, L2Result};
 /// `jnt_core::slash` so L2 slashing and M2 cannot drift apart;
 /// `whistleblower_bounty_percent` is the share of a slashed deposit paid to a
 /// successful challenger out of the PSCB reserve (SPEC.md §15.8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct L2Config {
+    /// Chain this config (and the state built from it) belongs to. The
+    /// expected network for `Settle` verification: a settle aggregate signs
+    /// its network, and `apply` refuses one naming another. Wired from
+    /// `NetworkParams::network_id` by the node, like the exit height below.
+    pub network_id: String,
     pub dispute_window: u64,
     pub vesting_period: u64,
     /// Whole percent, 0..=100. Not a basis-point value because the bounty is a
@@ -64,6 +69,7 @@ impl L2Config {
     /// one-year M2 vesting period.
     pub fn mainnet() -> Self {
         L2Config {
+            network_id: "jounit/mainnet".to_string(),
             dispute_window: 100,
             vesting_period: VESTING_BLOCKS_MAINNET,
             whistleblower_bounty_percent: 25,
@@ -77,6 +83,7 @@ impl L2Config {
     /// testing a different rule.
     pub fn mini() -> Self {
         L2Config {
+            network_id: "jounit/mini".to_string(),
             dispute_window: 5,
             vesting_period: jnt_core::slash::VESTING_BLOCKS_MINI,
             whistleblower_bounty_percent: 25,

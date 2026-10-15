@@ -74,7 +74,9 @@ fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) -> Block {
     let block = if l2.is_empty() {
         chain.mine_block(addr(1), Vec::new(), ts(h))
     } else if chain.exit_active_at(h) {
-        let root = NodeL2::replay_from(chain, chain.params()).simulate_root(h, &l2);
+        let root = NodeL2::replay_from(chain, chain.params())
+            .unwrap()
+            .simulate_root(h, &l2);
         chain.mine_block_with_l2_root(addr(1), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
     } else {
         chain.mine_block_with_l2(addr(1), Vec::new(), l2, ts(h), None, MAX_ATTEMPTS)
@@ -97,8 +99,8 @@ fn funded_post_flows_through_the_node_end_to_end() {
     let params = NetworkParams::mini();
     let mut chain = Chain::new(params.clone()).unwrap();
     // 3. Replay the node. 4. Verify the funded balance.
-    let mut view = NodeL2::fresh(&params);
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(&params).unwrap();
+    view.sync(&chain).unwrap();
     let submitter = wallet(1).address().unwrap();
     assert_eq!(view.state().balance(&submitter), GRANT_SAT);
     assert_eq!(view.state().funded_total(), escrow_total(&params));
@@ -107,7 +109,7 @@ fn funded_post_flows_through_the_node_end_to_end() {
     let tx = post(1, 7, 200);
     mine_and_submit(&mut chain, vec![tx.clone()]);
     // 7. NodeL2 syncs. 8. The task exists.
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert_eq!(report.outcome, SyncOutcome::Incremental { blocks: 1 });
     assert_eq!(view.applied_count(), 1);
     assert!(view.is_clean());
@@ -121,7 +123,7 @@ fn funded_post_flows_through_the_node_end_to_end() {
     assert_eq!(view.state().funded_total(), escrow_total(&params));
 
     // 10–11. Replay from scratch: identical final state.
-    let again = NodeL2::replay_from(&chain, &params);
+    let again = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(again.state(), view.state());
     assert_eq!(again.skipped(), view.skipped());
     assert_eq!(again.applied_count(), view.applied_count());
@@ -133,8 +135,8 @@ fn unfunded_account_fails_closed_beside_funded_ones() {
     let mut chain = Chain::new(params.clone()).unwrap();
     // Seed 9 holds no grant; seed 1 does. Both posts ride one block.
     mine_and_submit(&mut chain, vec![post(9, 1, 200), post(1, 2, 200)]);
-    let mut view = NodeL2::fresh(&params);
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(&params).unwrap();
+    view.sync(&chain).unwrap();
 
     assert_eq!(view.applied_count(), 1);
     assert_eq!(view.skipped().len(), 1);
@@ -159,8 +161,8 @@ fn same_bytes_in_two_blocks_apply_once_then_replay_refuse() {
     let tx = post(1, 21, 200);
     mine_and_submit(&mut chain, vec![tx.clone()]);
     mine_and_submit(&mut chain, vec![tx.clone()]);
-    let mut view = NodeL2::fresh(&params);
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(&params).unwrap();
+    view.sync(&chain).unwrap();
 
     assert_eq!(view.applied_count(), 1);
     assert_eq!(view.skipped().len(), 1);
@@ -177,12 +179,12 @@ fn restart_keeps_funding_exactly_once() {
     let mut chain = Chain::new(params.clone()).unwrap();
     mine_and_submit(&mut chain, vec![post(1, 1, 200)]);
     mine_and_submit(&mut chain, vec![post(2, 2, 200)]);
-    let live = NodeL2::replay_from(&chain, &params);
+    let live = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(live.applied_count(), 2);
 
     // Shutdown drops everything; restart replays the same blocks. Funding is
     // re-derived from params, not re-added per block, so it appears once.
-    let recovered = NodeL2::replay_from(&chain, &params);
+    let recovered = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(recovered.state(), live.state());
     assert_eq!(
         recovered.state().funded_total(),
@@ -196,8 +198,8 @@ fn restart_keeps_funding_exactly_once() {
     assert!(recovered.state().check_conservation());
 
     // Incremental-from-scratch converges to the same state (STEP 7).
-    let mut inc = NodeL2::fresh(&params);
-    inc.sync(&chain);
+    let mut inc = NodeL2::fresh(&params).unwrap();
+    inc.sync(&chain).unwrap();
     assert_eq!(inc.state(), live.state());
 }
 
@@ -211,7 +213,7 @@ fn reorg_does_not_duplicate_funding_or_keep_losing_tasks() {
     for h in 1..=2u64 {
         mine_and_submit(&mut chain, vec![post(1, h, 200)]);
     }
-    let mut view = NodeL2::replay_from(&chain, &params);
+    let mut view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.applied_count(), 2);
     let main_task = task_id_of(&post(1, 1, 200));
 
@@ -227,7 +229,9 @@ fn reorg_does_not_duplicate_funding_or_keep_losing_tasks() {
         let rb = if l2.is_empty() {
             rival.mine_block(addr(2), Vec::new(), ts(h)).unwrap()
         } else if rival.exit_active_at(h) {
-            let root = NodeL2::replay_from(&rival, rival.params()).simulate_root(h, &l2);
+            let root = NodeL2::replay_from(&rival, rival.params())
+                .unwrap()
+                .simulate_root(h, &l2);
             rival
                 .mine_block_with_l2_root(addr(2), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
                 .unwrap()
@@ -245,7 +249,7 @@ fn reorg_does_not_duplicate_funding_or_keep_losing_tasks() {
     }
     assert_eq!(chain.height(), 3);
 
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert!(matches!(report.outcome, SyncOutcome::FullReplay { .. }));
     // The winner's post applied; the loser's tasks are gone; the funding was
     // neither duplicated nor lost.
@@ -254,7 +258,7 @@ fn reorg_does_not_duplicate_funding_or_keep_losing_tasks() {
     assert!(view.state().task(&task_id_of(&post(2, 42, 200))).is_some());
     assert_eq!(view.state().funded_total(), escrow_total(&params));
     assert!(view.state().check_conservation());
-    let fresh = NodeL2::replay_from(&chain, &params);
+    let fresh = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.state(), fresh.state());
 }
 
@@ -269,9 +273,9 @@ fn two_independent_nodes_agree_on_everything() {
     mine_and_submit(&mut chain, vec![post(2, 3, 200)]);
 
     // Node A replays whole; node B follows incrementally from empty.
-    let a = NodeL2::replay_from(&chain, &params);
-    let mut b = NodeL2::fresh(&params);
-    b.sync(&chain);
+    let a = NodeL2::replay_from(&chain, &params).unwrap();
+    let mut b = NodeL2::fresh(&params).unwrap();
+    b.sync(&chain).unwrap();
     assert_eq!(a.state(), b.state());
     assert_eq!(a.skipped(), b.skipped());
     assert_eq!(a.applied_count(), b.applied_count());
@@ -299,7 +303,7 @@ fn joint_l1_plus_l2_supply_stays_under_the_joint_bound() {
     for h in [1u64, 2, 3] {
         mine_and_submit(&mut chain, vec![post(1, h, 200)]);
     }
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.applied_count(), 3);
 
     let joint = chain

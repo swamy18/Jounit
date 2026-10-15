@@ -200,6 +200,8 @@ impl World {
     fn settle_verdict(&mut self, v: &DisputeVerdict, height: u64) -> Result<L2Effect, L2Error> {
         let quorum = self.validators.quorum_size();
         let payload = v.settle_payload(
+            "jounit/mini",
+            height,
             [0xAAu8; 96],
             quorum_bitmap(self.validators.len(), quorum),
             quorum as u32,
@@ -464,6 +466,8 @@ fn a_payment_equal_to_the_settle_fee_settles_with_a_zero_payout() {
                 task_id: id,
                 verdict: Verdict::Correct,
                 vwc_hash: SUBMITTED,
+                network_id: "jounit/mini".to_string(),
+                height: 9,
                 bls_sig: [0xAAu8; 96],
                 signer_bitmap: quorum_bitmap(4, 3),
                 signer_count: 3,
@@ -510,6 +514,8 @@ fn a_payment_below_the_settle_fee_is_refused_and_not_settled() {
             task_id: id,
             verdict: Verdict::Correct,
             vwc_hash: SUBMITTED,
+            network_id: "jounit/mini".to_string(),
+            height: 9,
             bls_sig: [0xAAu8; 96],
             signer_bitmap: quorum_bitmap(4, 3),
             signer_count: 3,
@@ -673,6 +679,8 @@ fn a_settle_hash_that_does_not_match_the_verdict_is_refused() {
         task_id: id,
         verdict: Verdict::Fraudulent,
         vwc_hash: SUBMITTED,
+        network_id: "jounit/mini".to_string(),
+        height: 5,
         bls_sig: [0xAAu8; 96],
         signer_bitmap: quorum_bitmap(4, 3),
         signer_count: 3,
@@ -704,6 +712,8 @@ fn a_task_cannot_be_settled_twice_or_slashed_twice() {
         task_id: id,
         verdict: Verdict::Correct,
         vwc_hash: SUBMITTED,
+        network_id: "jounit/mini".to_string(),
+        height: 6,
         bls_sig: [0xAAu8; 96],
         signer_bitmap: quorum_bitmap(4, 3),
         signer_count: 3,
@@ -810,7 +820,14 @@ fn a_dispute_verdict_still_needs_a_validator_quorum_to_settle() {
 
     // A payload the *engine* produced, but with too few signers.
     let payload = v
-        .settle_payload([0xAAu8; 96], quorum_bitmap(4, 2), 2, Vec::new())
+        .settle_payload(
+            "jounit/mini",
+            5,
+            [0xAAu8; 96],
+            quorum_bitmap(4, 2),
+            2,
+            Vec::new(),
+        )
         .unwrap();
     assert_eq!(
         w.apply(&L2Transaction::new(L2Payload::Settle(payload)), 5),

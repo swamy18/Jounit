@@ -61,7 +61,8 @@ use jnt_core::hash::{Hash, Hash512};
 use jnt_core::params::NetworkParams;
 use jnt_core::tx::{GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 use jnt_l2::{
-    ChainL2, DepositParams, IgnoredDeposit, L2Config, L2Genesis, L2State, PendingDeposit, SkippedL2,
+    ChainL2, DepositParams, IgnoredDeposit, L2Config, L2Error, L2Genesis, L2State, PendingDeposit,
+    SkippedL2,
 };
 
 /// Gas an exit claim consumes for `inputs` sink outputs. Mirrors
@@ -125,6 +126,10 @@ pub fn config_for(params: &NetworkParams) -> L2Config {
     } else {
         L2Config::mainnet()
     };
+    // The expected network for settle verification always comes from the
+    // profile, so a config built for one chain can never verify another's
+    // settlements — including `testnet`, which shares `mainnet()` timings.
+    config.network_id = params.network_id.clone();
     config.exit_activation_height = params.exit_activation_height;
     config
 }
@@ -205,20 +210,20 @@ impl NodeL2 {
     /// synced anything. Genesis funding is already applied (L2 height 0 holds
     /// the allocation), so the first `sync` against a non-empty chain takes
     /// the full-replay arm and converges by construction.
-    pub fn fresh(params: &NetworkParams) -> Self {
+    pub fn fresh(params: &NetworkParams) -> Result<Self, L2Error> {
         let config = config_for(params);
         let genesis = L2Genesis::for_params(params);
         let deposits = DepositParams::for_params(params);
         let validators = validator_set(params);
-        NodeL2 {
-            inner: ChainL2::empty(config, &genesis, deposits),
+        Ok(NodeL2 {
+            inner: ChainL2::empty(config.clone(), &genesis, deposits)?,
             config,
             genesis,
             deposits,
             validators,
             synced_tip: None,
             synced_height: 0,
-        }
+        })
     }
 
     /// Rebuild the view from the whole chain — the restart path. Nothing about
@@ -227,15 +232,22 @@ impl NodeL2 {
     /// reaches exactly the state its pre-shutdown self held. Funding exists
     /// exactly once because genesis is applied once per construction, never
     /// replayed from blocks.
-    pub fn replay_from(chain: &Chain, params: &NetworkParams) -> Self {
+    pub fn replay_from(chain: &Chain, params: &NetworkParams) -> Result<Self, L2Error> {
         let config = config_for(params);
         let genesis = L2Genesis::for_params(params);
         let deposits = DepositParams::for_params(params);
         let validators = validator_set(params);
-        let inner = ChainL2::replay(chain, config, &genesis, deposits, &validators, &RealBls);
+        let inner = ChainL2::replay(
+            chain,
+            config.clone(),
+            &genesis,
+            deposits,
+            &validators,
+            &RealBls,
+        )?;
         let synced_height = inner.height();
         let synced_tip = Some(chain.tip_hash());
-        NodeL2 {
+        Ok(NodeL2 {
             inner,
             config,
             genesis,
@@ -243,7 +255,7 @@ impl NodeL2 {
             validators,
             synced_tip,
             synced_height,
-        }
+        })
     }
 
     /// Bring the view up to `chain`'s tip. See the module docs for the rule.
@@ -252,7 +264,7 @@ impl NodeL2 {
     /// received, both move the same tip — and only then: it reads the tip, it
     /// does not validate blocks, so calling it cannot admit anything `Chain`
     /// did not already accept.
-    pub fn sync(&mut self, chain: &Chain) -> SyncReport {
+    pub fn sync(&mut self, chain: &Chain) -> Result<SyncReport, L2Error> {
         let tip = chain.tip_hash();
         let tip_height = chain.height();
         // Both Decision 15 inputs come off the same chain the tip came from:
@@ -270,7 +282,7 @@ impl NodeL2 {
         // when a certificate arrives, tip untouched — without this second
         // condition the view would sit on a spendable deposit forever.
         if self.synced_tip == Some(tip) && !self.inner.has_pending_matured(tip_height, binding) {
-            return SyncReport {
+            return Ok(SyncReport {
                 outcome: SyncOutcome::Unchanged,
                 from_height,
                 to_height: self.synced_height,
@@ -278,7 +290,7 @@ impl NodeL2 {
                 skipped_new: 0,
                 applied_total: self.inner.applied_count(),
                 skipped_total: self.inner.skipped().len(),
-            };
+            });
         }
 
         // Incremental only when the chain still contains the block we synced
@@ -315,12 +327,12 @@ impl NodeL2 {
                 // loudly on the same inconsistency instead of papering over it.
                 self.inner = ChainL2::replay(
                     chain,
-                    self.config,
+                    self.config.clone(),
                     &genesis,
                     deposits,
                     &validators,
                     &RealBls,
-                );
+                )?;
                 SyncOutcome::FullReplay { blocks: tip_height }
             } else if self.inner.has_pending_matured(tip_height, binding) {
                 // A deposit detected in an old block just became spendable —
@@ -332,12 +344,12 @@ impl NodeL2 {
                 // binding floor.
                 self.inner = ChainL2::replay(
                     chain,
-                    self.config,
+                    self.config.clone(),
                     &genesis,
                     deposits,
                     &validators,
                     &RealBls,
-                );
+                )?;
                 SyncOutcome::FullReplay { blocks: tip_height }
             } else {
                 SyncOutcome::Incremental {
@@ -347,18 +359,18 @@ impl NodeL2 {
         } else {
             self.inner = ChainL2::replay(
                 chain,
-                self.config,
+                self.config.clone(),
                 &genesis,
                 deposits,
                 &validators,
                 &RealBls,
-            );
+            )?;
             SyncOutcome::FullReplay { blocks: tip_height }
         };
 
         self.synced_tip = Some(tip);
         self.synced_height = self.inner.height();
-        SyncReport {
+        Ok(SyncReport {
             outcome,
             from_height,
             to_height: self.synced_height,
@@ -366,7 +378,7 @@ impl NodeL2 {
             skipped_new: self.inner.skipped().len().saturating_sub(skipped_before),
             applied_total: self.inner.applied_count(),
             skipped_total: self.inner.skipped().len(),
-        }
+        })
     }
 
     /// The replayed L2 state. Equal states on two nodes mean they agree on

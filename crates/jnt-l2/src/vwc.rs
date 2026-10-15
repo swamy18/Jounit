@@ -43,7 +43,11 @@ use crate::error::{L2Error, L2Result};
 
 /// The only certificate format version this build understands. A decoded
 /// certificate claiming another version is refused, never guessed at.
-pub const VWC_VERSION: u32 = 1;
+///
+/// Version 2 carries the quorum's signed chain context (`network_id` and
+/// `vote_height`) in `Quorum` evidence: version-1 certificates cannot
+/// re-verify their aggregate now that settlements bind network and height.
+pub const VWC_VERSION: u32 = 2;
 
 const KIND_QUORUM: u8 = 1;
 const KIND_WINDOW_ELAPSED: u8 = 2;
@@ -63,7 +67,10 @@ const KIND_WINDOW_ELAPSED: u8 = 2;
 pub enum VwcVerification {
     /// An explicit `Settle` transaction: the payload's quorum aggregate, reused
     /// rather than re-signed. It signs exactly
-    /// `SettlePayload { task_id, Correct, result_hash }.signing_hash()`.
+    /// `SettlePayload { task_id, Correct, result_hash, network_id, vote_height }.signing_hash()`.
+    /// The signed chain context rides along because the aggregate cannot be
+    /// re-verified without it: a certificate that dropped the network would
+    /// let a quorum aggregate verify anywhere.
     Quorum {
         bls_sig: [u8; 96],
         signer_bitmap: Vec<u8>,
@@ -72,6 +79,10 @@ pub enum VwcVerification {
         /// checkpoint clause 7. Empty while no quorum member voted with a
         /// lattice signature.
         pq_sidecar: Vec<jnt_core::bls_checkpoint::PqSidecarEntry>,
+        /// Chain the quorum signed for, copied from the settle payload.
+        network_id: String,
+        /// Height the quorum signed at, copied from the settle payload.
+        vote_height: u64,
     },
     /// An implicit settlement (auto-settle or dispute lapse, §15.7): no
     /// aggregate exists for a transition no one transacted.
@@ -147,11 +158,16 @@ impl VerifiedWorkCertificate {
             signer_bitmap,
             signer_count,
             pq_sidecar,
+            network_id,
             ..
         } = &verification
         {
             if signer_bitmap.len() > MAX_SIGNER_BITMAP_BYTES {
                 return Err(L2Error::VwcInvalid("signer bitmap over cap"));
+            }
+            if network_id.is_empty() || network_id.len() > jnt_core::l2::MAX_SETTLE_NETWORK_ID_BYTES
+            {
+                return Err(L2Error::VwcInvalid("quorum network id out of range"));
             }
             let pop: usize = signer_bitmap.iter().map(|b| b.count_ones() as usize).sum();
             if pop != *signer_count as usize {
@@ -192,6 +208,8 @@ impl VerifiedWorkCertificate {
             signer_bitmap,
             signer_count,
             pq_sidecar,
+            network_id,
+            vote_height,
         } = &self.verification
         {
             w.raw(bls_sig)
@@ -203,6 +221,11 @@ impl VerifiedWorkCertificate {
             for e in pq_sidecar {
                 w.u32le(e.signer_index).raw(&e.signature);
             }
+            // The signed chain context, so the aggregate stays verifiable —
+            // and bound — after the settle payload is gone.
+            w.u32le(network_id.len() as u32)
+                .raw(network_id.as_bytes())
+                .u64le(*vote_height);
         }
         w.into_vec()
     }
@@ -262,11 +285,30 @@ impl VerifiedWorkCertificate {
                         });
                     }
                 }
+                // Required, not tolerant: a certificate written before the
+                // chain-context binding cannot re-verify its aggregate, so old
+                // bytes fail here rather than decode.
+                let id_len = r.u32le()? as usize;
+                if id_len > jnt_core::l2::MAX_SETTLE_NETWORK_ID_BYTES {
+                    return Err(L2Error::VwcInvalid("network id over cap"));
+                }
+                if id_len > r.remaining() {
+                    return Err(L2Error::VwcInvalid("network id exceeds buffer"));
+                }
+                let network_id = std::str::from_utf8(
+                    r.fixed_slice(id_len)
+                        .map_err(|_| L2Error::VwcInvalid("network id"))?,
+                )
+                .map_err(|_| L2Error::VwcInvalid("network id not utf-8"))?
+                .to_string();
+                let vote_height = r.u64le().map_err(|_| L2Error::VwcInvalid("vote height"))?;
                 VwcVerification::Quorum {
                     bls_sig,
                     signer_bitmap,
                     signer_count,
                     pq_sidecar,
+                    network_id,
+                    vote_height,
                 }
             }
             KIND_WINDOW_ELAPSED => VwcVerification::WindowElapsed,
@@ -331,10 +373,13 @@ impl VerifiedWorkCertificate {
                 signer_bitmap,
                 signer_count,
                 pq_sidecar,
+                network_id,
+                vote_height,
             } => {
-                // The same three checks the settle path applies, over the same
+                // The same checks the settle path applies, over the same
                 // message the settle path signed: rebuild the *decision* (not
-                // the evidence) and verify the aggregate against it.
+                // the evidence) with the carried chain context and verify the
+                // aggregate against it.
                 let signers = validators.signers_from_bitmap(signer_bitmap);
                 if signers.len() != *signer_count as usize {
                     return Err(L2Error::VwcInvalid("signer count disagrees with bitmap"));
@@ -346,6 +391,8 @@ impl VerifiedWorkCertificate {
                     task_id: self.task_id,
                     verdict: Verdict::Correct,
                     vwc_hash: self.result_hash,
+                    network_id: network_id.clone(),
+                    height: *vote_height,
                     bls_sig: [0u8; 96],
                     signer_bitmap: Vec::new(),
                     signer_count: 0,
@@ -457,6 +504,7 @@ mod tests {
 
     const TASK: Hash = [0x11u8; 32];
     const RESULT: Hash = [0xAAu8; 32];
+    const NET: &str = "jounit/mini";
     const WORKER: Address = [0x07u8; 20];
 
     fn validators(n: usize) -> (ValidatorSet, Vec<SecretKey>) {
@@ -480,6 +528,8 @@ mod tests {
             task_id: TASK,
             verdict: Verdict::Correct,
             vwc_hash: RESULT,
+            network_id: NET.to_string(),
+            height: 9,
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
@@ -508,6 +558,8 @@ mod tests {
                 signer_bitmap: bitmap,
                 signer_count: 3,
                 pq_sidecar: Vec::new(),
+                network_id: NET.to_string(),
+                vote_height: 9,
             },
         )
     }
@@ -583,7 +635,7 @@ mod tests {
     fn decoding_refuses_unknown_versions_and_kinds() {
         let (_set, cert) = quorum_cert();
         let mut bytes = cert.encode();
-        bytes[0] = 2; // version
+        bytes[0] = 9; // version
         assert!(matches!(
             VerifiedWorkCertificate::decode(&bytes),
             Err(L2Error::VwcInvalid(_))
@@ -815,6 +867,8 @@ mod tests {
             task_id: TASK,
             verdict: Verdict::Correct,
             vwc_hash: RESULT,
+            network_id: NET.to_string(),
+            height: 9,
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,

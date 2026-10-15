@@ -296,7 +296,7 @@ fn an_inconclusive_dispute_gives_a_committee_nothing_to_vote_on() {
     let verdict = DisputeEngine::resolve(w.state.task(&id).unwrap()).unwrap();
     assert_eq!(verdict.verdict(), None);
     assert_eq!(
-        verdict.settle_payload([0u8; 96], vec![], 0, Vec::new()),
+        verdict.settle_payload(NET, 0, [0u8; 96], vec![], 0, Vec::new()),
         Err(L2Error::InconclusiveDispute)
     );
 }
@@ -324,6 +324,8 @@ fn a_committee_members_vote_signs_the_settle_decision() {
         task_id: id,
         verdict: decision,
         vwc_hash: verdict.re_execution_result,
+        network_id: NET.to_string(),
+        height: 0,
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,

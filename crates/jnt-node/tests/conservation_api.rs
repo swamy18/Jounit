@@ -101,8 +101,8 @@ fn the_endpoint_reports_terms_that_re_add_and_match_status() {
     let params = NetworkParams::mini();
     let miner = wallet(1).address().unwrap();
     let chain = mine_to(&params, &miner, 3);
-    let escrow = NodeL2::fresh(&params).genesis().escrow_total_sat;
-    let node = start(chain, NodeL2::fresh(&params));
+    let escrow = NodeL2::fresh(&params).unwrap().genesis().escrow_total_sat;
+    let node = start(chain, NodeL2::fresh(&params).unwrap());
 
     let (status, body) = get(node.addr, "/v1/conservation");
     assert_eq!(status, 200, "the endpoint must serve: {body}");
@@ -173,7 +173,7 @@ fn metrics_exports_the_same_joint_figure_and_the_ok_flag() {
     let params = NetworkParams::mini();
     let miner = wallet(2).address().unwrap();
     let chain = mine_to(&params, &miner, 5);
-    let node = start(chain, NodeL2::fresh(&params));
+    let node = start(chain, NodeL2::fresh(&params).unwrap());
 
     let (status, body) = get(node.addr, "/v1/conservation");
     assert_eq!(status, 200);
@@ -244,7 +244,7 @@ fn the_sink_term_is_reported_after_a_real_matured_deposit() {
         mine_one(&mut chain, depositor_addr);
     }
 
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(
         view.state().balance(&depositor_addr),
         to_sink,

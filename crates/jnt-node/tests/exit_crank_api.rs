@@ -88,7 +88,7 @@ fn an_idle_profile_reports_nothing_to_crank() {
     let params = NetworkParams::mini();
     let miner = wallet(1).address().unwrap();
     let chain = mine_to(&params, &miner, 3);
-    let node = start(chain, NodeL2::fresh(&params));
+    let node = start(chain, NodeL2::fresh(&params).unwrap());
 
     let (status, body) = get(
         node.addr,
@@ -118,7 +118,7 @@ fn a_profile_with_exits_disabled_refuses_by_name() {
         let b = chain.mine_block(miner, vec![], ts(h)).unwrap();
         chain.submit(b).unwrap();
     }
-    let node = start(chain, NodeL2::fresh(&params));
+    let node = start(chain, NodeL2::fresh(&params).unwrap());
 
     let (status, body) = get(
         node.addr,
@@ -139,7 +139,7 @@ fn a_missing_claimant_is_refused_not_guessed() {
     let params = NetworkParams::mini();
     let miner = wallet(1).address().unwrap();
     let chain = mine_to(&params, &miner, 3);
-    let node = start(chain, NodeL2::fresh(&params));
+    let node = start(chain, NodeL2::fresh(&params).unwrap());
 
     let (status, body) = get(node.addr, "/v1/exit/crankable");
     assert_eq!(
@@ -212,7 +212,7 @@ fn node_with_one_crankable_exit() -> (Node, Address) {
     chain.submit(deposit_block).unwrap();
     mine_empty_to(&mut chain, me, h + 20);
 
-    let mut view = NodeL2::replay_from(&chain, &params);
+    let mut view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.state().balance(&me), SINK_VALUE, "deposit matured");
 
     let gas = 16_000u64 + 1_000 + 2 * 250;
@@ -234,7 +234,7 @@ fn node_with_one_crankable_exit() -> (Node, Address) {
         )
         .unwrap();
     chain.submit(block).unwrap();
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     // Queued but immature: the crank must stay empty, and the route must say so
     // as "nothing yet" rather than as an error.
@@ -251,7 +251,7 @@ fn node_with_one_crankable_exit() -> (Node, Address) {
     );
 
     mine_empty_to(&mut chain, me, q + params.finality_depth);
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert_eq!(view.crank_claims(&chain, me).len(), 1, "now mature");
 
     (node_of(&chain, &view), me)

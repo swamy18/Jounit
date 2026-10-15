@@ -14,6 +14,23 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed (consensus — settle binds network and height)
+
+- **Arbitration signatures now bind the chain and height they were signed
+  for.** `SettlePayload` carries `network_id` and `height`,
+  `SettlePayload::signing_hash` covers both, and `apply` refuses a payload
+  naming another network (`BadSettleNetwork`) or a vote height above the
+  applying height (`BadSettleHeight`). A quorum aggregate over one chain's
+  decision no longer verifies on another chain. The quorum certificate
+  carries the same chain context (`VwcVerification::Quorum` gains
+  `network_id`/`vote_height`) so it stays re-verifiable, and `L2Config`
+  carries the expected `network_id` (wired from the profile by
+  `jnt_node::l2::config_for`).
+- **Wire consequences (pre-mainnet, no migration):** the settle payload
+  encoding requires the new fields (decision-only payloads are refused, not
+  reinterpreted), `VWC_VERSION` moves 1 → 2, and `L2_STATE_WIRE_VERSION`
+  moves 2 → 3 for the config `network_id`. Old bytes fail closed on decode.
+
 ### Added (library)
 
 - **Delegation chains: every level inherits a strict subset of its parent's

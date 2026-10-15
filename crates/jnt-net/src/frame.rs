@@ -92,9 +92,6 @@ pub fn read_frame<R: Read>(r: &mut R, params: &NetworkParams) -> NetResult<(u8, 
     // `chunk_len * max_peers` rather than `MAX_FRAME_PAYLOAD * max_peers`.
     let mut payload = Vec::new();
     if payload_len > 0 {
-        payload
-            .try_reserve(payload_len)
-            .map_err(|_| NetError::Protocol("payload allocation over cap".into()))?;
         let mut buf = [0u8; 64 * 1024];
         let mut remaining = payload_len;
         while remaining > 0 {

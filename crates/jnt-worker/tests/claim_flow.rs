@@ -72,6 +72,8 @@ fn signed_settle(
         task_id: id,
         verdict,
         vwc_hash,
+        network_id: "jounit/mini".to_string(),
+        height: 0,
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,

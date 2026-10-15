@@ -108,8 +108,8 @@ fn fresh_node(params: &NetworkParams) -> (Chain, NodeL2) {
         .mine_block_with_l2(addr(1), Vec::new(), Vec::new(), ts(h), None, MAX_ATTEMPTS)
         .expect("genesis block must build");
     chain.submit(block).expect("genesis must be accepted");
-    let mut view = NodeL2::fresh(params);
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(params).unwrap();
+    view.sync(&chain).unwrap();
     (chain, view)
 }
 
@@ -127,7 +127,7 @@ fn an_invalid_l2_payload_is_skipped_by_name_not_crashed() {
     let bad = bad_auth_post(2, 1, 200);
     let txid = bad.txid();
     mine_and_submit(&mut chain, &mut view, vec![bad]);
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     assert_eq!(
         view.skipped().len(),
@@ -152,7 +152,7 @@ fn an_unknown_task_claim_is_skipped_without_partial_write() {
     let claim = claim_unknown_task(2);
     let txid = claim.txid();
     mine_and_submit(&mut chain, &mut view, vec![claim]);
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     assert_eq!(view.skipped().len(), 1);
     assert_eq!(view.skipped()[0].txid, txid);
@@ -169,6 +169,8 @@ fn a_settle_without_quorum_is_refused() {
         task_id: [0x77u8; 32],
         verdict: Verdict::Correct,
         vwc_hash: [0x99u8; 32],
+        network_id: "jounit/mini".to_string(),
+        height: 0,
         bls_sig: [0x01u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
@@ -176,7 +178,7 @@ fn a_settle_without_quorum_is_refused() {
     }));
     let txid = settle.txid();
     mine_and_submit(&mut chain, &mut view, vec![settle]);
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     assert_eq!(view.skipped().len(), 1);
     assert_eq!(view.skipped()[0].txid, txid);
@@ -211,7 +213,7 @@ fn a_rejected_block_never_mutates_l2_state() {
     );
 
     // NodeL2 never saw the rejected block — sync is a no-op.
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert_eq!(view.state(), &before, "rejected block changed nothing");
 }
 
@@ -225,7 +227,7 @@ fn a_bad_authorization_is_refused_before_balance_check() {
     // refused even on an empty/unfunded ledger.
     let bad = bad_auth_post(2, 1, 200);
     mine_and_submit(&mut chain, &mut view, vec![bad]);
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     assert_eq!(view.skipped()[0].error, L2Error::BadAuthorization);
     assert_eq!(view.applied_count(), 0);
@@ -239,13 +241,13 @@ fn sequential_incremental_sync_matches_full_replay() {
     // Apply blocks one at a time (incremental path).
     for nonce in 1..=3u64 {
         mine_and_submit(&mut chain, &mut view, vec![post(2, nonce, 200)]);
-        view.sync(&chain);
+        view.sync(&chain).unwrap();
     }
     let incremental_skips = view.skipped().len();
     let incremental_applied = view.applied_count();
 
     // Full replay from genesis must agree exactly.
-    let replay = NodeL2::replay_from(&chain, &params);
+    let replay = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(replay.skipped().len(), incremental_skips);
     assert_eq!(replay.applied_count(), incremental_applied);
 }
@@ -260,7 +262,7 @@ fn an_empty_l2_section_is_absent_not_stripped() {
     let (mut chain, mut view) = fresh_node(&params);
 
     mine_and_submit(&mut chain, &mut view, Vec::new());
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert!(view.is_clean(), "empty L2 is clean");
     assert_eq!(view.skipped().len(), 0);
 }
@@ -307,7 +309,7 @@ fn double_spend_is_rejected() {
     );
 
     // L2 replay must not apply the txid twice.
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert_eq!(view.state(), &before);
     assert_eq!(view.applied_count(), 0, "neither unfunded post was applied");
 }
@@ -332,14 +334,14 @@ fn l2_replay_refuses_duplicate_apply() {
     // First appearance: funded => applied, task created.
     let block1 = mine_l2(&mut chain, &view, vec![tx.clone()]);
     chain.submit(block1).unwrap();
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert_eq!(view.applied_count(), 1, "first post was applied");
     assert!(view.state().task(&task_id).is_some(), "task was created");
 
     // Second appearance in the next block: refused as Replay.
     let block2 = mine_l2(&mut chain, &view, vec![tx.clone()]);
     chain.submit(block2).unwrap();
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
 
     let replay_skip = &view.skipped()[view.skipped().len() - 1];
     assert_eq!(
@@ -380,7 +382,7 @@ fn restart_through_block_store_preserves_canonical_chain() {
 
     for nonce in 1..=3u64 {
         mine_and_submit(&mut chain, &mut view, vec![post(2, nonce, 200)]);
-        view.sync(&chain);
+        view.sync(&chain).unwrap();
     }
     let height = chain.height();
     let tip = chain.tip_hash();
@@ -411,7 +413,7 @@ fn restart_through_block_store_preserves_canonical_chain() {
     assert_eq!(reloaded.tip_hash(), tip);
 
     // The L2 view must reconstruct identically by replay.
-    let replay = NodeL2::replay_from(&reloaded, &params);
+    let replay = NodeL2::replay_from(&reloaded, &params).unwrap();
     assert_eq!(replay.applied_count(), applied);
     assert_eq!(replay.skipped().len(), skipped);
 }

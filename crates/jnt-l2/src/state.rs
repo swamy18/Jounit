@@ -314,7 +314,7 @@ impl L2State {
     }
 
     pub fn config(&self) -> L2Config {
-        self.config
+        self.config.clone()
     }
 
     // --- accounts ------------------------------------------------------
@@ -783,9 +783,19 @@ impl L2State {
         validators: &ValidatorSet,
         verifier: &dyn BlsVerifier,
     ) -> L2Result<L2Effect> {
+        // The signed chain context first: a quorum aggregate binds the network
+        // it was signed for and the height it was signed at, so a payload
+        // naming another network — or a vote from the future — is refused by
+        // name before any pairing runs.
+        if p.network_id != self.config.network_id {
+            return Err(L2Error::BadSettleNetwork);
+        }
+        if p.height > height {
+            return Err(L2Error::BadSettleHeight);
+        }
         // Quorum is three checks, in the order the M5 checkpoint validator uses:
         // the bitmap and the declared count must agree, the count must meet the
-        // threshold, and the aggregate must verify over the decision.
+        // threshold, and the aggregate must verify over the bound message.
         let signers = validators.signers_from_bitmap(&p.signer_bitmap);
         if signers.len() != p.signer_count as usize {
             return Err(L2Error::BadQuorum);
@@ -852,6 +862,8 @@ impl L2State {
                     signer_bitmap: p.signer_bitmap.clone(),
                     signer_count: p.signer_count,
                     pq_sidecar: p.pq_sidecar.clone(),
+                    network_id: p.network_id.clone(),
+                    vote_height: p.height,
                 },
             )?;
             Some(self.issue_vwc(cert)?)
@@ -1185,7 +1197,13 @@ impl L2State {
 /// the two exit counters with the other counters. Version-1 blobs are refused
 /// rather than guessed at — a state without exits cannot describe a chain
 /// that queued one.
-pub const L2_STATE_WIRE_VERSION: u8 = 2;
+///
+/// Version 3 adds the config `network_id` to the config area: the state now
+/// names the chain it belongs to, which is what lets `apply` refuse a settle
+/// aggregate signed for another network. Older blobs are refused rather than
+/// guessed at — a state without a network cannot verify a network-bound
+/// settlement.
+pub const L2_STATE_WIRE_VERSION: u8 = 3;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
@@ -1234,6 +1252,8 @@ impl L2State {
             128 + self.accounts.len() * WIRE_ACCOUNT_MIN + self.tasks.len() * 256,
         );
         w.u8(L2_STATE_WIRE_VERSION)
+            .u32le(self.config.network_id.len() as u32)
+            .raw(self.config.network_id.as_bytes())
             .u64le(self.config.dispute_window)
             .u64le(self.config.vesting_period)
             .u64le(self.config.whistleblower_bounty_percent)
@@ -1319,7 +1339,16 @@ impl L2State {
                 _ => "state version not supported",
             })));
         }
+        let id_len = r.u32le().map_err(|_| codec_err("network id length"))? as usize;
+        if id_len > 64 || id_len > r.remaining() {
+            return Err(codec_err("network id over cap"));
+        }
+        let network_id =
+            std::str::from_utf8(r.fixed_slice(id_len).map_err(|_| codec_err("network id"))?)
+                .map_err(|_| codec_err("network id not utf-8"))?
+                .to_string();
         let config = L2Config {
+            network_id,
             dispute_window: r.u64le().map_err(|_| codec_err("dispute window"))?,
             vesting_period: r.u64le().map_err(|_| codec_err("vesting period"))?,
             whistleblower_bounty_percent: r.u64le().map_err(|_| codec_err("bounty percent"))?,

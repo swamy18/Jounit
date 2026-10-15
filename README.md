@@ -574,17 +574,13 @@ recorded as equivocation â€” blaming an honest signer for the committee's
 disagreement is exactly the kind of thing that gets turned into a slash. A genuine
 double-sign is recorded as `ArbitrationEquivocation`.
 
-> **One stated limitation.** A vote signs the settle *decision*, so its signature
-> verifies on any chain carrying that decision. Network and height are checked
-> against the node's own chain at tally time rather than bound into the signature.
-> Binding them into the hash would change `SettlePayload::signing_hash` — a
-> consensus change — so it is documented in
-> [`arbitration.rs`](crates/jnt-core/src/arbitration.rs) rather than made
-> unilaterally. The tally is nonetheless the thing that binds them: `record`
-> refuses a vote that disagrees with the node's own network or height and is the
-> only entry point into a tally, and `settle_payload` re-checks that every
-> counted vote names one network and one height before any aggregate becomes a
-> settle transaction.
+> **Fixed before mainnet.** A vote used to sign the settle *decision* only, so
+> its signature verified on any chain carrying that decision. Network and
+> height are now part of the signed message: `SettlePayload` carries both,
+> `SettlePayload::signing_hash` covers them, and `apply` refuses a payload
+> naming another network or a vote from the future. The tally still re-checks
+> that every counted vote names one network and one height, and the quorum
+> certificate carries the same chain context so it stays re-verifiable.
 
 ### What a fraud verdict does
 
@@ -735,7 +731,7 @@ applies.
 | M3 compute IR | Provides the reference | Envelopes carried, no interpreter |
 | M4 HBM puzzle | **Registered (off on mainnet)** | `hbm_pow.rs` scratchpad PoW is registered as `puzzle_id = 2` (reviewed in `docs/security-review-hbm-2026-10-12.md`); `Chain::pow_satisfies` dispatches by puzzle id. `mini`/`testnet` keep mining `puzzle_id = 1` (hybrid); M4 is recognized but not activated as the mining puzzle |
 | M5 finality | **Off on mainnet** | Both sides built; activation unset |
-| REST API, `/metrics` | **Shipped** | Opt-in (`--api-listen`). **Loopback by default and unauthenticated**; a **non-loopback bind is refused** unless `--api-token`/`JNT_API_TOKEN` supplies a bearer token (§19.2). An exposed bind then enforces Host-header validation (DNS-rebinding), bearer auth on every request, and a per-IP token bucket |
+| REST API, `/metrics` | **Shipped** | Opt-in (`--api-listen`). **Loopback by default and unauthenticated**; a **non-loopback bind is refused** unless `JNT_API_TOKEN` (preferred — `--api-token` leaks via `ps`) supplies a bearer token (§19.2). **Every bind** enforces Host-header validation (DNS-rebinding); an exposed bind adds bearer auth on every request and a per-IP token bucket |
 | API DoS guards | **Shipped** | Always on, on every binding including loopback, because they bound the shared-state `Mutex` rather than defend a remote attacker: a 10-second per-request deadline and a 64-request in-flight cap, so a flood of slow requests cannot wedge block production |
 | Zeroizing wallet keys | **Shipped** | The Argon2id-derived symmetric key is held in a `Zeroizing` wrapper and dropped on release, so a decrypted key is not left in freed memory for the next allocation to expose |
 | Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, keyless cosign/Sigstore bundle wiring — **no signed release published yet**. Every action pinned to a commit SHA; job tokens least-privilege; Dependabot refreshes pins without opening PR branches |
@@ -792,12 +788,12 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **Wallet keys at rest** | `wallets.json` held plain-hex private keys at whatever permissions the umask allowed | **Mode 0600 via temp-file rename and encrypted** under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305); plaintext writes require `--allow-plaintext-wallet` |
 | **Item 10 settlement** | A credit reservation could never settle and a released escrow never committed: the debit and the state change had no landing place | **Non-custodial ledger settlement**: `credit.settle` commits at receipt acceptance behind a `settled_payments` conservation bucket, and `ConditionalEscrow::finalize` commits `Released` → `Finalized` under finality, driven by the serve loop |
 | **Zero-amount credit requests** | A bond, release, repay or open for `0` sat dereferenced a `get_mut()` on an address that had no credit entry — a panic, and with `panic = "abort"` a whole-node crash from one malformed request | **Refused by name** as `Malformed` before any mutation, and the entry is taken with `entry().or_insert(0)` so no code path can panic on a missing row. Pinned by 4 new regressions |
-| **API exposure** | The REST API was unauthenticated on any bind — loopback was the only control — and no request had a deadline or an in-flight cap, so slow requests held the shared-state `Mutex` for as long as they liked | **A non-loopback bind is refused without a token**, and an exposed bind adds Host-header validation (a DNS-rebound name cannot answer for it), bearer auth, and a per-IP token bucket. A 10-second deadline and a 64-request cap apply on *every* binding, loopback included |
+| **API exposure** | The REST API was unauthenticated on any bind — loopback was the only control — and no request had a deadline or an in-flight cap, so slow requests held the shared-state `Mutex` for as long as they liked | **A non-loopback bind is refused without a token**; Host-header validation (a DNS-rebound name cannot answer for it) runs on *every* binding including loopback, and an exposed bind adds bearer auth (constant-time compare, `JNT_API_TOKEN` preferred over `--api-token`) and a bounded per-IP token bucket. A 10-second deadline and a 64-request cap apply on *every* binding, loopback included |
 | **Key material in memory** | The Argon2id-derived wallet key was an ordinary `[u8; 32]`, so it stayed readable in freed memory until something else overwrote it | **`Zeroizing`** wraps the derived key for its whole life and drops it on release, so the decrypt-and-reencrypt path does not leave a key behind |
-| **Net frame allocation** | `read_frame` reserved `vec![0u8; payload_len]` up front, so a peer that declared a near-maximum length got the node to allocate that in one shot before reading a byte of it | **Read incrementally**: reserve with `try_reserve`, then fill in 64 KiB chunks, capping pinned memory at `chunk × max_peers` and refusing an allocation larger than the frame cache |
+| **Net frame allocation** | `read_frame` reserved the full declared length up front, so a peer that declared a near-maximum length got the node to allocate that in one shot before reading a byte of it | **Read incrementally**: no upfront reserve for the declared length — the buffer grows in 64 KiB chunks as bytes actually arrive, capping pinned memory at `chunk × max_peers`, and an over-cap length is refused before anything is read |
 | **Handshake failure handling** | Four `unreachable!()`s sat after `Message::decode` in `peer.rs`, each reachable from a peer's bytes | **`NetError::Protocol`** returns instead, so a malformed handshake costs one connection rather than the process |
 | **HBM scratchpad lane** | The lane was indexed with `state % lanes as u64` **after** the modulo on a `u64` — correct on 64-bit, but it cast the *modulus* to `usize` rather than reducing the state, so it was one edit away from a truncation | **Reduce before the width cast**: `state % lanes as u64` is computed on the same width at both sites, which is identical on 64-bit and correct on 32-bit |
-| **Arbitration tally** | `settle_payload` re-checked committee, quorum and the BLS aggregate, but trusted the accumulator on network and height | **Network and height are re-checked across every counted vote** at the point the aggregate becomes a settle transaction. This is a safety net, not a new rule: `record` refuses a vote that disagrees with the node's own network or height and is the only entry into a tally, but the point that pays out no longer has to trust that invariant |
+| **Arbitration tally** | `settle_payload` re-checked committee, quorum and the BLS aggregate, but the signed message covered the decision only — a quorum aggregate verified on any chain | **Network and height are bound by the signature**: `SettlePayload` carries both, `signing_hash` covers them, and `apply` refuses a foreign network or a vote from the future. The tally still re-checks unanimity across every counted vote, and the quorum certificate carries the same chain context so it stays re-verifiable |
 | **L2 replay failure handling** | `replay_to` *aborted the process* if `block_at` returned `None` for any height up to the tip — and with `panic = "abort"` that took the node down, including every open connection | **Stops the replay** at the first unreadable height and lets the node's `apply_block` catch-up resume from the L2 tip. The case is provably unreachable (`Chain::prune_side_branches` keeps every canonical block), so this removes the abort mode without changing behaviour |
 
 ---
@@ -884,16 +880,20 @@ The API defaults to loopback and needs no credentials. Binding anything
 non-loopback is refused unless a token is supplied:
 
 ```sh
-# Non-loopback: a bearer token is mandatory (§19.2).
-jnt-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080 --api-token "$JNT_API_TOKEN"
+# Non-loopback: a bearer token is mandatory (§19.2). Pass it through the
+# environment, not --api-token: flags are visible in `ps`.
+export JNT_API_TOKEN="..."
+jnt-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080
 
 # Loopback: unchanged, and unauthenticated.
 jnt-node serve --network testnet --data-dir ./chain --api-listen 127.0.0.1:8080
 ```
 
-Every request to an exposed bind must carry `Authorization: Bearer <token>`, and
-a `Host` header that names the bound address. Exposed binds also rate-limit per
-remote address, and every bind caps a request at 10 seconds and 64 in flight.
+Every request to an exposed bind must carry `Authorization: Bearer <token>`
+(compared in constant time). Every bind — loopback included — requires a
+`Host` header naming the bound address (DNS-rebinding defense). Exposed binds
+also rate-limit per remote address, and every bind caps a request at 10 seconds
+and 64 in flight.
 figures are in JNT.
 
 ---
@@ -901,7 +901,7 @@ figures are in JNT.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1160 tests, 0 failures
+cargo test --workspace                                   # 1159 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -964,7 +964,7 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1160 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1159 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnodes, no log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |

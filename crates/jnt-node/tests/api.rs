@@ -74,7 +74,7 @@ fn start() -> Node {
 /// Start a server over a chain the caller has already mined.
 fn start_with(chain: Chain) -> Node {
     let params = NetworkParams::mini();
-    let l2 = NodeL2::fresh(&params);
+    let l2 = NodeL2::fresh(&params).unwrap();
     let shared = Arc::new(Mutex::new(SharedNode::new(chain, l2)));
     let peers = Arc::new(AtomicUsize::new(0));
     let addr = spawn(
@@ -223,7 +223,7 @@ fn metrics_endpoint_serves_prometheus_gauges_in_the_exposition_format() {
         .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
     stream
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .expect("write request");
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);

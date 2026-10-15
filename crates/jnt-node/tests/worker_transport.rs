@@ -70,8 +70,8 @@ fn compute_task() -> ComputeTask {
 fn start_with_task() -> (SocketAddr, Arc<Mutex<SharedNode>>, Hash) {
     let params = NetworkParams::mini();
     let mut chain = Chain::new(params.clone()).unwrap();
-    let mut l2 = NodeL2::fresh(&params);
-    l2.sync(&chain);
+    let mut l2 = NodeL2::fresh(&params).unwrap();
+    l2.sync(&chain).unwrap();
 
     let post = PostTaskPayload::build(
         &wallet(1, "transport-poster"),
@@ -98,7 +98,7 @@ fn start_with_task() -> (SocketAddr, Arc<Mutex<SharedNode>>, Hash) {
         )
         .expect("a block we just mined must build");
     chain.submit(block).expect("it must be accepted");
-    l2.sync(&chain);
+    l2.sync(&chain).unwrap();
     assert!(l2.state().task(&task_id).is_some(), "the fixture posted");
 
     let shared = Arc::new(Mutex::new(SharedNode::new(chain, l2)));

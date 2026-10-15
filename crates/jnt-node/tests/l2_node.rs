@@ -100,6 +100,8 @@ fn settle_no_quorum() -> L2Transaction {
         task_id: [0x77u8; 32],
         verdict: Verdict::Correct,
         vwc_hash: [0x99u8; 32],
+        network_id: "jounit/mini".to_string(),
+        height: 0,
         bls_sig: [0x01u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,
@@ -118,7 +120,9 @@ fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) -> Block {
     } else if chain.exit_active_at(h) {
         // An L2-bearing block commits the root replay derives (approved P1);
         // the view is rebuilt from the chain so far, as `replay_from` would.
-        let root = NodeL2::replay_from(chain, chain.params()).simulate_root(h, &l2);
+        let root = NodeL2::replay_from(chain, chain.params())
+            .unwrap()
+            .simulate_root(h, &l2);
         chain.mine_block_with_l2_root(addr(1), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
     } else {
         // Pre-activation profile: a root would be a second encoding rule the
@@ -142,11 +146,11 @@ fn is_insufficient(e: &L2Error) -> bool {
 #[test]
 fn block_with_no_l2_syncs_clean() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
-    let mut view = NodeL2::fresh(chain.params());
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
     mine_and_submit(&mut chain, Vec::new());
     mine_and_submit(&mut chain, Vec::new());
 
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert!(matches!(
         report.outcome,
         SyncOutcome::FullReplay { blocks: 2 }
@@ -174,6 +178,7 @@ fn block_with_valid_l2_is_carried_committed_and_skipped_by_name() {
             Vec::new(),
             vec![expected.clone()],
             NodeL2::replay_from(&chain, chain.params())
+                .unwrap()
                 .simulate_root(h, std::slice::from_ref(&expected)),
             ts(h),
             None,
@@ -185,8 +190,8 @@ fn block_with_valid_l2_is_carried_committed_and_skipped_by_name() {
     assert_eq!(block.header.merkle_root, block.merkle_root());
     chain.submit(block).unwrap();
 
-    let mut view = NodeL2::fresh(chain.params());
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    view.sync(&chain).unwrap();
     // Accepted by L1, refused by L2 for the documented reason: no funding.
     assert_eq!(view.height(), 1);
     assert_eq!(view.applied_count(), 0);
@@ -205,8 +210,8 @@ fn block_with_multiple_l2_transactions_skips_each_by_name() {
     let b = post(9, 11, 200);
     mine_and_submit(&mut chain, vec![a.clone(), b.clone()]);
 
-    let mut view = NodeL2::fresh(chain.params());
-    let report = view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    let report = view.sync(&chain).unwrap();
     assert_eq!(report.skipped_new, 2);
     assert_eq!(report.applied_new, 0);
     assert_eq!(view.skipped().len(), 2);
@@ -226,8 +231,8 @@ fn invalid_l2_payload_is_skipped_and_the_block_is_still_accepted() {
     let block = mine_and_submit(&mut chain, vec![bad.clone()]);
     assert_eq!(block.l2_count(), 1, "miner carries what it is given");
 
-    let mut view = NodeL2::fresh(chain.params());
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    view.sync(&chain).unwrap();
     assert_eq!(chain.height(), 1);
     assert_eq!(view.applied_count(), 0);
     assert_eq!(view.skipped().len(), 1);
@@ -245,8 +250,8 @@ fn settle_without_quorum_is_skipped_and_never_applied() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, vec![settle_no_quorum()]);
 
-    let mut view = NodeL2::fresh(chain.params());
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    view.sync(&chain).unwrap();
     assert_eq!(chain.height(), 1);
     assert_eq!(view.applied_count(), 0);
     assert_eq!(view.skipped().len(), 1);
@@ -284,7 +289,7 @@ fn stripped_l2_trailer_is_rejected_and_l2_state_is_untouched() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     let carried = post(1, 2, 200);
     mine_and_submit(&mut chain, vec![carried]);
-    let before = NodeL2::replay_from(&chain, chain.params());
+    let before = NodeL2::replay_from(&chain, chain.params()).unwrap();
 
     // Strip the trailer but keep the header: the committed root no longer
     // matches, so the existing L1 rule refuses it — no new consensus code.
@@ -298,8 +303,8 @@ fn stripped_l2_trailer_is_rejected_and_l2_state_is_untouched() {
     assert!(chain.submit(stripped).is_err());
 
     // The failed submit moved no tip, so a sync is a no-op by construction.
-    let mut view = NodeL2::replay_from(&chain, chain.params());
-    let report = view.sync(&chain);
+    let mut view = NodeL2::replay_from(&chain, chain.params()).unwrap();
+    let report = view.sync(&chain).unwrap();
     assert_eq!(report.outcome, SyncOutcome::Unchanged);
     assert_eq!(view.state(), before.state());
     assert_eq!(view.skipped(), before.skipped());
@@ -309,7 +314,7 @@ fn stripped_l2_trailer_is_rejected_and_l2_state_is_untouched() {
 fn modified_l2_payload_is_rejected_and_l2_state_is_untouched() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, vec![post(1, 2, 200)]);
-    let skipped_before = NodeL2::replay_from(&chain, chain.params());
+    let skipped_before = NodeL2::replay_from(&chain, chain.params()).unwrap();
 
     let mut tampered = chain.block_at(1).unwrap().clone();
     let L2Payload::Post(ref mut p) = tampered.l2_txs[0].payload else {
@@ -318,8 +323,8 @@ fn modified_l2_payload_is_rejected_and_l2_state_is_untouched() {
     p.payment_sat += 1;
     assert!(chain.submit(tampered).is_err());
 
-    let mut view = NodeL2::replay_from(&chain, chain.params());
-    assert_eq!(view.sync(&chain).outcome, SyncOutcome::Unchanged);
+    let mut view = NodeL2::replay_from(&chain, chain.params()).unwrap();
+    assert_eq!(view.sync(&chain).unwrap().outcome, SyncOutcome::Unchanged);
     assert_eq!(view.state(), skipped_before.state());
 }
 
@@ -329,15 +334,15 @@ fn modified_l2_payload_is_rejected_and_l2_state_is_untouched() {
 fn replaying_the_same_tip_is_a_noop() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, vec![post(9, 2, 200)]);
-    let mut view = NodeL2::fresh(chain.params());
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    view.sync(&chain).unwrap();
     let applied = view.applied_count();
     let skipped = view.skipped().len();
 
     // `ChainL2::apply_block` itself is not idempotent — the wrapper's tip
     // cursor is what makes re-sync safe. Call it twice more.
-    assert_eq!(view.sync(&chain).outcome, SyncOutcome::Unchanged);
-    assert_eq!(view.sync(&chain).outcome, SyncOutcome::Unchanged);
+    assert_eq!(view.sync(&chain).unwrap().outcome, SyncOutcome::Unchanged);
+    assert_eq!(view.sync(&chain).unwrap().outcome, SyncOutcome::Unchanged);
     assert_eq!(view.applied_count(), applied);
     assert_eq!(view.skipped().len(), skipped);
     assert_eq!(view.height(), 1);
@@ -346,14 +351,14 @@ fn replaying_the_same_tip_is_a_noop() {
 #[test]
 fn sequential_blocks_advance_incrementally() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
-    let mut view = NodeL2::fresh(chain.params());
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
     mine_and_submit(&mut chain, vec![post(1, 1, 200)]);
-    let first = view.sync(&chain);
+    let first = view.sync(&chain).unwrap();
     assert!(matches!(first.outcome, SyncOutcome::FullReplay { .. }));
 
     mine_and_submit(&mut chain, vec![post(1, 2, 200)]);
     mine_and_submit(&mut chain, Vec::new());
-    let second = view.sync(&chain);
+    let second = view.sync(&chain).unwrap();
     assert_eq!(second.outcome, SyncOutcome::Incremental { blocks: 2 });
     assert_eq!(second.from_height, 1);
     assert_eq!(second.to_height, 3);
@@ -363,7 +368,7 @@ fn sequential_blocks_advance_incrementally() {
     assert!(view.is_clean());
     // Incremental and full replay are the same state machine: assert it here,
     // at the node level, not just in `jnt-l2`.
-    let full = NodeL2::replay_from(&chain, chain.params());
+    let full = NodeL2::replay_from(&chain, chain.params()).unwrap();
     assert_eq!(view.state(), full.state());
     assert_eq!(view.skipped(), full.skipped());
 }
@@ -379,14 +384,14 @@ fn deterministic_reconstruction_two_views_agree_exactly() {
         };
         mine_and_submit(&mut chain, l2);
     }
-    let a = NodeL2::replay_from(&chain, chain.params());
-    let b = NodeL2::replay_from(&chain, chain.params());
+    let a = NodeL2::replay_from(&chain, chain.params()).unwrap();
+    let b = NodeL2::replay_from(&chain, chain.params()).unwrap();
     assert_eq!(a.state(), b.state());
     assert_eq!(a.skipped(), b.skipped());
     assert_eq!(a.applied_count(), b.applied_count());
 
-    let mut inc = NodeL2::fresh(chain.params());
-    inc.sync(&chain);
+    let mut inc = NodeL2::fresh(chain.params()).unwrap();
+    inc.sync(&chain).unwrap();
     assert_eq!(inc.state(), a.state());
 }
 
@@ -433,17 +438,17 @@ fn restart_reconstructs_identical_l2_state_from_persisted_blocks() {
     mine_and_submit(&mut chain, vec![post(1, 1, 200)]);
     mine_and_submit(&mut chain, Vec::new());
     mine_and_submit(&mut chain, vec![post(1, 3, 200), bad_auth_post(1, 4, 200)]);
-    let live = NodeL2::replay_from(&chain, &params);
+    let live = NodeL2::replay_from(&chain, &params).unwrap();
     persist_chain(&chain, &dir);
 
     // Shutdown: drop chain and view. Restart: rebuild from the store only.
     drop(chain);
     drop(live);
     let chain2 = reload_chain(&dir, &params);
-    let recovered = NodeL2::replay_from(&chain2, &params);
+    let recovered = NodeL2::replay_from(&chain2, &params).unwrap();
 
     let chain3 = reload_chain(&dir, &params);
-    let live_again = NodeL2::replay_from(&chain3, &params);
+    let live_again = NodeL2::replay_from(&chain3, &params).unwrap();
     assert_eq!(recovered.state(), live_again.state());
     assert_eq!(recovered.skipped(), live_again.skipped());
     assert_eq!(recovered.applied_count(), live_again.applied_count());
@@ -463,7 +468,7 @@ fn restart_reconstructs_identical_l2_state_from_persisted_blocks() {
 fn l1_invalid_block_does_not_mutate_l2_state() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, vec![post(1, 1, 200)]);
-    let mut view = NodeL2::replay_from(&chain, chain.params());
+    let mut view = NodeL2::replay_from(&chain, chain.params()).unwrap();
 
     // A duplicate is already known: rejected before any state moves.
     let dup = chain.block_at(1).unwrap().clone();
@@ -473,7 +478,7 @@ fn l1_invalid_block_does_not_mutate_l2_state() {
     orphan.header.prev_hash = [0xEEu8; 64];
     assert!(chain.submit(orphan).is_err());
 
-    assert_eq!(view.sync(&chain).outcome, SyncOutcome::Unchanged);
+    assert_eq!(view.sync(&chain).unwrap().outcome, SyncOutcome::Unchanged);
     assert_eq!(view.height(), 1);
     // The one carried post applied (seed 1 is funded); the rejections above
     // added nothing and removed nothing.
@@ -496,8 +501,8 @@ fn l2_failure_leaves_no_partial_state_behind() {
     mine_and_submit(&mut plain, Vec::new());
     assert_ne!(plain.tip_hash(), chain.tip_hash());
 
-    let view = NodeL2::replay_from(&chain, chain.params());
-    let clean = NodeL2::replay_from(&plain, plain.params());
+    let view = NodeL2::replay_from(&chain, chain.params()).unwrap();
+    let clean = NodeL2::replay_from(&plain, plain.params()).unwrap();
     assert_eq!(view.applied_count(), 0);
     assert_eq!(view.skipped().len(), 2);
     assert_eq!(
@@ -528,7 +533,7 @@ fn reorg_replays_the_winning_chain_with_no_silent_divergence() {
     for h in 1..=3u64 {
         mine_and_submit(&mut chain, vec![post(1, h, 200)]);
     }
-    let mut view = NodeL2::replay_from(&chain, chain.params());
+    let mut view = NodeL2::replay_from(&chain, chain.params()).unwrap();
     // Seed 1 is funded: all three main-branch posts apply.
     assert_eq!(view.applied_count(), 3);
     assert!(view.is_clean());
@@ -548,7 +553,9 @@ fn reorg_replays_the_winning_chain_with_no_silent_divergence() {
         let rb = if l2.is_empty() {
             rival.mine_block(addr(2), Vec::new(), ts(h)).unwrap()
         } else if rival.exit_active_at(h) {
-            let root = NodeL2::replay_from(&rival, rival.params()).simulate_root(h, &l2);
+            let root = NodeL2::replay_from(&rival, rival.params())
+                .unwrap()
+                .simulate_root(h, &l2);
             rival
                 .mine_block_with_l2_root(addr(2), Vec::new(), l2, root, ts(h), None, MAX_ATTEMPTS)
                 .unwrap()
@@ -575,7 +582,7 @@ fn reorg_replays_the_winning_chain_with_no_silent_divergence() {
 
     assert_eq!(chain.height(), 4);
     assert_eq!(chain.tip_hash(), rival_blocks[3].block_hash());
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert!(
         matches!(report.outcome, SyncOutcome::FullReplay { .. }),
         "a rewritten prefix must replay, never extend, got {:?}",
@@ -583,7 +590,7 @@ fn reorg_replays_the_winning_chain_with_no_silent_divergence() {
     );
     // The view is exactly the winning chain's replay — nothing of the old
     // branch survives, nothing is silently kept.
-    let fresh = NodeL2::replay_from(&chain, chain.params());
+    let fresh = NodeL2::replay_from(&chain, chain.params()).unwrap();
     assert_eq!(view.state(), fresh.state());
     assert_eq!(view.skipped(), fresh.skipped());
     assert_eq!(report.skipped_total, 1);
@@ -608,8 +615,8 @@ fn adhoc_credit_does_not_survive_replay() {
     // proving replay never consults ambient state.
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, vec![post(3, 1, 200)]);
-    let mut view = NodeL2::fresh(chain.params());
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    view.sync(&chain).unwrap();
     // Seed 3 is genesis-funded: the post applies with no seam involved.
     assert_eq!(view.applied_count(), 1);
     assert!(view.is_clean());
@@ -619,7 +626,7 @@ fn adhoc_credit_does_not_survive_replay() {
 
     // Restart: replay derives from blocks plus genesis only, so the ad-hoc
     // credit is gone and funding is exactly the escrow total again.
-    let again = NodeL2::replay_from(&chain, chain.params());
+    let again = NodeL2::replay_from(&chain, chain.params()).unwrap();
     assert_eq!(again.applied_count(), 1);
     assert!(again.is_clean());
     assert_eq!(
@@ -642,8 +649,8 @@ fn funded_claim_for_unknown_task_is_skipped_without_partial_write() {
     // Seed 2 holds a genesis grant — no seam involved.
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, Vec::new());
-    let mut view = NodeL2::fresh(chain.params());
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    view.sync(&chain).unwrap();
 
     let claim = claim_unknown_task(2);
     let h = chain.height() + 1;
@@ -659,7 +666,7 @@ fn funded_claim_for_unknown_task_is_skipped_without_partial_write() {
         )
         .unwrap();
     chain.submit(block).unwrap();
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert_eq!(report.outcome, SyncOutcome::Incremental { blocks: 1 });
     assert_eq!(view.skipped().len(), 1);
     assert_eq!(view.skipped()[0].error, L2Error::UnknownTask);
@@ -673,8 +680,8 @@ fn funded_post_applies_through_incremental_sync() {
     // posts, the block is mined and accepted, incremental sync applies it.
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, Vec::new());
-    let mut view = NodeL2::fresh(chain.params());
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(chain.params()).unwrap();
+    view.sync(&chain).unwrap();
 
     let tx = post(2, 1, 200);
     let h = chain.height() + 1;
@@ -690,7 +697,7 @@ fn funded_post_applies_through_incremental_sync() {
         )
         .unwrap();
     chain.submit(block).unwrap();
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert_eq!(report.outcome, SyncOutcome::Incremental { blocks: 1 });
     assert_eq!(report.applied_new, 1);
     assert_eq!(view.applied_count(), 1);
@@ -723,7 +730,7 @@ fn node_reports_enough_to_verify_processing_happened() {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     mine_and_submit(&mut chain, vec![post(9, 1, 200)]);
     mine_and_submit(&mut chain, Vec::new());
-    let view = NodeL2::replay_from(&chain, chain.params());
+    let view = NodeL2::replay_from(&chain, chain.params()).unwrap();
     let s = view.status(chain.height());
     assert_eq!(s.chain_height, 2);
     assert_eq!(s.l2_height, 2);

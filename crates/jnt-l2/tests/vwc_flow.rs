@@ -143,11 +143,19 @@ impl World {
 
     /// A genuine quorum aggregate over the given settle decision, from the
     /// world's validators — the same bytes a real committee would produce.
-    fn signed_settle(&self, id: Hash, verdict: Verdict, vwc_hash: Hash) -> SettlePayload {
+    fn signed_settle(
+        &self,
+        id: Hash,
+        verdict: Verdict,
+        vwc_hash: Hash,
+        height: u64,
+    ) -> SettlePayload {
         let payload = SettlePayload {
             task_id: id,
             verdict,
             vwc_hash,
+            network_id: "jounit/mini".to_string(),
+            height,
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
@@ -186,7 +194,7 @@ impl World {
         vwc_hash: Hash,
         height: u64,
     ) -> Result<L2Effect, L2Error> {
-        let payload = self.signed_settle(id, verdict, vwc_hash);
+        let payload = self.signed_settle(id, verdict, vwc_hash, height);
         self.apply(&L2Transaction::new(L2Payload::Settle(payload)), height)
     }
 }
@@ -248,23 +256,27 @@ fn the_certificate_carries_the_aggregate_that_signed_its_own_decision() {
 
     // Rebuild the decision from the certificate's own fields and check the
     // stored aggregate verifies over exactly that message.
-    let decision = SettlePayload {
-        task_id: cert.task_id,
-        verdict: Verdict::Correct,
-        vwc_hash: cert.result_hash,
-        bls_sig: [0u8; 96],
-        signer_bitmap: Vec::new(),
-        signer_count: 0,
-        pq_sidecar: Vec::new(),
-    };
     let VwcVerification::Quorum {
         bls_sig,
         signer_bitmap,
         signer_count,
         pq_sidecar: _,
+        network_id,
+        vote_height,
     } = &cert.verification
     else {
         panic!("expected quorum verification");
+    };
+    let decision = SettlePayload {
+        task_id: cert.task_id,
+        verdict: Verdict::Correct,
+        vwc_hash: cert.result_hash,
+        network_id: network_id.clone(),
+        height: *vote_height,
+        bls_sig: [0u8; 96],
+        signer_bitmap: Vec::new(),
+        signer_count: 0,
+        pq_sidecar: Vec::new(),
     };
     let signers = w.validators.signers_from_bitmap(signer_bitmap);
     assert_eq!(signers.len(), *signer_count as usize);
@@ -465,11 +477,13 @@ fn a_settled_task_cannot_be_disputed_or_certified_twice() {
         Err(L2Error::IllegalTransition { .. })
     ));
 
-    // Re-settling is equally impossible. The byte-identical decision reproduces
-    // the first settlement's txid, so the refusal here is `Replay` (the same
-    // aggregate signs the same message); either way nothing re-certifies.
+    // Re-settling is equally impossible. Replaying the byte-identical decision
+    // (same vote height, hence the same txid) is refused as `Replay` — the
+    // height binding is what makes "byte-identical" meaningful here; either
+    // way nothing re-certifies.
+    let replay = w.signed_settle(id, Verdict::Correct, RESULT, 9);
     assert_eq!(
-        w.settle(id, Verdict::Correct, RESULT, 11),
+        w.apply(&L2Transaction::new(L2Payload::Settle(replay)), 11),
         Err(L2Error::Replay)
     );
     assert_eq!(w.state.vwc_count(), 1);

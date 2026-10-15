@@ -15,29 +15,26 @@
 //! one dispute. It carries the decision (`task_id`, `verdict`, `vwc_hash`), the
 //! network it was signed for, the height it was signed at, and one BLS signature.
 //!
-//! # Why it signs the settle decision hash, and nothing else
+//! # Why it signs the settle decision hash, network and height included
 //!
 //! [`ArbitrationVote::signing_hash`] is byte-identical to
-//! `SettlePayload::signing_hash` for the same decision — the same three fields,
-//! the same domain tag. That is deliberate and load-bearing: `apply_settle`
-//! verifies `bls_sig` against `SettlePayload::signing_hash()`, so a vote's
-//! signature must be over exactly those bytes for a quorum of votes to aggregate
-//! into the aggregate that transaction carries. Signing anything else would
-//! produce a beautiful protocol that settles nothing.
+//! `SettlePayload::signing_hash` for the same decision on the same network at
+//! the same height — the same fields, the same domain tag. That is deliberate
+//! and load-bearing: `apply_settle` verifies `bls_sig` against
+//! `SettlePayload::signing_hash()`, so a vote's signature must be over exactly
+//! those bytes for a quorum of votes to aggregate into the aggregate that
+//! transaction carries. Signing anything else would produce a beautiful
+//! protocol that settles nothing.
 //!
-//! The consequence, stated plainly rather than buried: **network and height are
-//! authenticated by the vote's fields and by the tally, not by the signature.**
-//! Each vote carries `network_id` and `height`, a tallying node requires every
-//! vote to agree with its own chain before accepting it, and signers must be in
-//! the committee the chain derives. Cross-network replay of a settle decision is
-//! additionally bounded by task ids being network-scoped and by the `Settle`
-//! riding inside an L1 block of that chain — but a signature over the decision
-//! alone would verify on any chain, so the guarantee is structural rather than
-//! cryptographic. [`MAX_NETWORK_ID_BYTES`] bounds the string that makes it
-//! checkable.
-//!
-//! This module adds no consensus rule. `apply_settle` is unchanged, so the
-//! threshold, the checks and the pairing verification are exactly what they were.
+//! The consequence, stated plainly rather than buried: **network and height
+//! are bound by the signature, not just by the tally.** Each vote carries
+//! `network_id` and `height` inside the signed message, a tallying node
+//! requires every vote to agree with its own chain before accepting it, and
+//! signers must be in the committee the chain derives. A quorum's aggregate
+//! over one chain's decision does not verify on another chain, and a vote
+//! from the future is refused at apply — so cross-network vote replay is
+//! closed cryptographically, not just structurally.
+//! [`MAX_NETWORK_ID_BYTES`] bounds the string that makes it checkable.
 
 use crate::bls_checkpoint::{BlsPublicKey, BlsSignature};
 use crate::error::Error;
@@ -107,16 +104,16 @@ pub struct ArbitrationVote {
 
 impl ArbitrationVote {
     /// The exact bytes a signer signs, which is byte-identical to the settle
-    /// decision hash. See the module docs.
+    /// decision hash for the same network and height. See the module docs.
     pub fn signing_hash(&self) -> Hash {
-        sha256_dom(
-            DOM_ARBITRATION_VOTE,
-            &[
-                &self.task_id,
-                &self.verdict.to_wire().to_le_bytes(),
-                &self.vwc_hash,
-            ],
-        )
+        let mut w = Writer::new();
+        w.fixed(&self.task_id)
+            .u8(self.verdict.to_wire())
+            .fixed(&self.vwc_hash)
+            .u32le(self.network_id.len() as u32)
+            .raw(self.network_id.as_bytes())
+            .u64le(self.height);
+        sha256_dom(DOM_ARBITRATION_VOTE, &[w.as_slice()])
     }
 
     /// The decision this vote attests to, as the fields `SettlePayload` carries.
@@ -427,19 +424,19 @@ impl VoteTally {
     /// Re-checks everything from the votes themselves rather than trusting the
     /// accumulator: a decision exists, quorum is met, every counted signer is in
     /// the committee, every counted vote names the same network and height, and
-    /// the aggregate verifies over the settle decision hash with real pairings.
-    /// Returns `None` on any doubt, which is the fail-closed direction — a node
-    /// that cannot produce a payload simply does not propose.
+    /// the aggregate verifies over the settle message — decision plus network
+    /// plus height — with real pairings. Returns `None` on any doubt, which is
+    /// the fail-closed direction — a node that cannot produce a payload simply
+    /// does not propose.
     ///
-    /// The network/height check is a *safety net*, not a new rule: the signed
-    /// message covers the decision only, so network and height cannot be bound
-    /// by the signature without changing `SettlePayload::signing_hash`, which
-    /// `apply_settle` verifies against. That leaves them authenticated by the
-    /// tally: [`Self::record`] refuses a vote whose `network_id` or `height`
-    /// disagrees with the node's own, and it is the only way a vote enters a
-    /// tally. Re-checking here means the point where an aggregate becomes a
-    /// settle transaction does not have to trust that invariant, because
-    /// [`VoteBook`] carries no deserialization path that could bypass it.
+    /// The unanimous network and height are carried into the payload, so the
+    /// aggregate `apply_settle` verifies is over the same bytes every counted
+    /// vote signed. [`Self::record`] refuses a vote whose `network_id` or
+    /// `height` disagrees with the node's own, and it is the only way a vote
+    /// enters a tally; re-checking here means the point where an aggregate
+    /// becomes a settle transaction does not have to trust that invariant,
+    /// because [`VoteBook`] carries no deserialization path that could bypass
+    /// it.
     pub fn settle_payload(&self, committee: &[BlsPublicKey]) -> Option<SettlePayload> {
         let (task_id, verdict, vwc_hash) = self.decision?;
         if self.votes.len() < self.quorum {
@@ -493,6 +490,8 @@ impl VoteTally {
             task_id,
             verdict,
             vwc_hash,
+            network_id: network.to_string(),
+            height,
             bls_sig: aggregate.0,
             // The bitmap is an index into the verifier's key order, so build it
             // against the sorted committee rather than arrival order.
@@ -501,7 +500,8 @@ impl VoteTally {
             pq_sidecar,
         };
         // The check that matters: the aggregate must verify over the settle
-        // decision hash under the committee, exactly as `apply_settle` will.
+        // message — decision plus the unanimous network and height — under the
+        // committee, exactly as `apply_settle` will.
         let msg = payload.signing_hash();
         if !crate::bls::RealBls::verify_aggregate(&signers, &msg, &aggregate) {
             return None;
@@ -656,7 +656,7 @@ mod tests {
     // --- what a vote is ------------------------------------------------
 
     #[test]
-    fn a_vote_signs_the_settle_decision_hash_exactly() {
+    fn a_vote_signs_the_settle_message_exactly() {
         // Load-bearing: `apply_settle` verifies the aggregate over
         // `SettlePayload::signing_hash`, so a vote must sign those exact bytes or
         // a quorum of them cannot compose into anything the chain accepts.
@@ -666,6 +666,8 @@ mod tests {
             task_id: TASK,
             verdict: Verdict::Fraudulent,
             vwc_hash: RESULT,
+            network_id: NET.to_string(),
+            height: 0,
             bls_sig: [0u8; 96],
             signer_bitmap: Vec::new(),
             signer_count: 0,
@@ -799,17 +801,42 @@ mod tests {
         assert_eq!(payload.task_id, TASK);
         assert_eq!(payload.verdict, Verdict::Fraudulent);
         assert_eq!(payload.vwc_hash, RESULT);
+        assert_eq!(payload.network_id, NET);
+        assert_eq!(payload.height, 0);
         assert_eq!(payload.signer_count, q as u32);
 
         // And the aggregate must verify the way `apply_settle` verifies it:
-        // over the settle decision hash, against the signers the bitmap names.
+        // over the settle message, against the signers the bitmap names.
         let signers = crate::bls_checkpoint::ValidatorSet::new(committee.clone())
             .signers_from_bitmap(&payload.signer_bitmap);
         assert_eq!(signers.len(), q);
         let msg = payload.signing_hash();
         assert!(
             crate::bls::RealBls::verify_aggregate(&signers, &msg, &BlsSignature(payload.bls_sig)),
-            "the aggregate must verify over the settle decision"
+            "the aggregate must verify over the settle message"
+        );
+
+        // The same aggregate does not verify for another network or height:
+        // cross-chain replay of the decision is closed by the signature.
+        let mut replayed = payload.clone();
+        replayed.network_id = "jounit/other".to_string();
+        assert!(
+            !crate::bls::RealBls::verify_aggregate(
+                &signers,
+                &replayed.signing_hash(),
+                &BlsSignature(payload.bls_sig)
+            ),
+            "a quorum aggregate must not verify on another network"
+        );
+        replayed.network_id = NET.to_string();
+        replayed.height += 1;
+        assert!(
+            !crate::bls::RealBls::verify_aggregate(
+                &signers,
+                &replayed.signing_hash(),
+                &BlsSignature(payload.bls_sig)
+            ),
+            "a quorum aggregate must not verify at another height"
         );
     }
 
@@ -828,13 +855,12 @@ mod tests {
 
     #[test]
     fn a_payload_is_refused_when_counted_votes_name_different_networks_or_heights() {
-        // The safety net in `settle_payload`. The signature cannot bind network
-        // or height without changing `SettlePayload::signing_hash` (which
-        // `apply_settle` verifies), so the tally is the only thing that binds
-        // them — `record` refuses a mismatched vote, and this re-check means the
-        // point that turns an aggregate into a settle transaction does not have
-        // to trust that. Reaching it requires a broken invariant, so the case is
-        // built by hand rather than through `record`.
+        // The unanimity re-check in `settle_payload`. The signature binds
+        // network and height, so mixed votes could never aggregate into one
+        // verifiable message — but the payload carries a single pair, and
+        // refusing here keeps a broken tally from proposing at all. Reaching it
+        // requires a broken invariant, so the case is built by hand rather
+        // than through `record`.
         let committee = keys(4);
         let q = quorum(&committee);
 

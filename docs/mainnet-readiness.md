@@ -53,7 +53,7 @@ also exists now, with a conservation gate before its first pass.)
   |---|---|---|
   | 1 | `cargo fmt --all --check` | clean |
   | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
-  | 3 | `cargo test --workspace` | 773 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
+  | 3 | `cargo test --workspace` | 1159 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
   | 4 | `cargo build --workspace --release` | succeeds |
   | 5 | vector cross-check: `python sim/verify_vectors.py --check` | see `docs/status.md` |
   | 6 | confirm the only `#[ignore]`d test is the manual `vwc_perf_probe` | confirmed |
@@ -88,9 +88,11 @@ counters that need per-request bookkeeping in the consensus loop, and no key
 material or per-user data — see the handler in `crates/jnt-node/src/api.rs`.
 It carries the same loopback-by-default exposure as every other route: a
 loopback bind is unauthenticated, and a non-loopback bind is refused unless
-`--api-token`/`JNT_API_TOKEN` supplies a bearer token, which the exposed stack
-then enforces on every request alongside Host-header validation, a per-request
-deadline, a global in-flight cap and a per-IP rate limit.
+`JNT_API_TOKEN` (preferred over `--api-token`, which is visible in `ps`)
+supplies a bearer token, which the exposed stack then enforces on every
+request alongside a per-request deadline, a global in-flight cap and a
+bounded per-IP rate limit. Host-header validation runs on every bind,
+loopback included.
 
 The `/health` path in an earlier revision is wrong twice over: the route is
 `/v1/health` and it returns only `{"status":"ok"}`. The rich JSON observables
@@ -227,7 +229,7 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 916 passed, 0 failed |
+| `cargo test --workspace` passes | ✅ 1159 passed, 0 failed, 1 ignored |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
 | Fuzz: 14 targets executed, real campaigns | ✅ see `docs/fuzz.md` |

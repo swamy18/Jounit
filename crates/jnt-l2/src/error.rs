@@ -42,6 +42,13 @@ pub enum L2Error {
     BadQuorum,
     /// The settle BLS aggregate did not verify.
     BadBlsSignature,
+    /// The settle payload names a network this state does not belong to. The
+    /// aggregate is bound to its network, so a cross-chain replay fails here
+    /// by name rather than by a pairing mismatch.
+    BadSettleNetwork,
+    /// The settle payload claims a vote height above the applying height. A
+    /// quorum formed at `H` may settle at `H+1`, but never from the future.
+    BadSettleHeight,
     /// The settle lattice sidecar failed clause-7-shape verification: the
     /// detail names the signer index and the rule. See `validators::check_sidecar`.
     BadPqSidecar(String),
@@ -118,6 +125,12 @@ impl fmt::Display for L2Error {
             L2Error::BadAttestation(w) => write!(f, "bad attestation: {w}"),
             L2Error::BadQuorum => write!(f, "settle evidence does not meet quorum"),
             L2Error::BadBlsSignature => write!(f, "settle BLS aggregate did not verify"),
+            L2Error::BadSettleNetwork => {
+                write!(f, "settle payload is for another network")
+            }
+            L2Error::BadSettleHeight => {
+                write!(f, "settle vote height is above the applying height")
+            }
             L2Error::BadPqSidecar(why) => write!(f, "settle lattice sidecar refused: {why}"),
             L2Error::BadVwcHash => write!(f, "settle hash does not match the verdict"),
             L2Error::EvidenceIncomplete => write!(f, "dispute evidence is incomplete"),

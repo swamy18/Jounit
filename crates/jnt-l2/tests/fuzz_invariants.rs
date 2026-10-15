@@ -171,6 +171,8 @@ fn l2_decode_survives_truncation_and_bitflips_of_real_transactions() {
             task_id: id,
             verdict: Verdict::Correct,
             vwc_hash: [0xAAu8; 32],
+            network_id: "jounit/mini".to_string(),
+            height: 5,
             bls_sig: [0x7Fu8; 96],
             signer_bitmap: validators(4).bitmap_from_indices(&[0, 1, 2]),
             signer_count: 3,
@@ -395,7 +397,7 @@ fn arbitration_is_a_total_deterministic_function_of_the_reference() {
         assert_eq!(a.vwc_hash(), expected.map(|_| reference));
         // An inconclusive arbitration has no payload to vote on — and asking for
         // one is an error, never an empty transaction.
-        match a.settle_payload([0u8; 96], vec![0xFF], 1, Vec::new()) {
+        match a.settle_payload("jounit/mini", 0, [0u8; 96], vec![0xFF], 1, Vec::new()) {
             Ok(p) => {
                 assert_eq!(expected, Some(p.verdict));
                 assert_eq!(p.vwc_hash, reference);
@@ -579,6 +581,8 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
                                 state.task(&id).and_then(|t| DisputeEngine::resolve(t).ok());
                             if let Some(v) = verdict {
                                 if let Ok(payload) = v.settle_payload(
+                                    "jounit/mini",
+                                    height,
                                     [0xAAu8; 96],
                                     bitmap.clone(),
                                     quorum as u32,
@@ -613,6 +617,8 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
                     if disputed {
                         if let Ok(v) = DisputeEngine::resolve(state.task(&id).unwrap()) {
                             if let Ok(payload) = v.settle_payload(
+                                "jounit/mini",
+                                height,
                                 [0xAAu8; 96],
                                 bitmap.clone(),
                                 quorum as u32,
@@ -683,6 +689,8 @@ fn l2_value_conservation_holds_across_an_adversarial_program() {
         task_id: [0x11u8; 32],
         verdict: Verdict::Correct,
         vwc_hash: [0xAAu8; 32],
+        network_id: "jounit/mini".to_string(),
+        height,
         bls_sig: [0u8; 96],
         signer_bitmap: bitmap,
         signer_count: 99,

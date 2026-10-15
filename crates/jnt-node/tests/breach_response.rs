@@ -162,7 +162,7 @@ fn funded_chain() -> (NetworkParams, Chain, Wallet) {
 }
 
 fn breached_view(params: &NetworkParams) -> NodeL2 {
-    let mut l2 = NodeL2::fresh(params);
+    let mut l2 = NodeL2::fresh(params).unwrap();
     // Satoshis that genesis and deposits never released: exactly the L2
     // funding anomaly `ConservationReport::l2_funding_ok` is there to catch.
     l2.state_mut()
@@ -312,7 +312,7 @@ fn a_breached_node_still_serves_every_read() {
 #[test]
 fn a_healthy_node_is_completely_unaffected() {
     let (params, chain, _) = funded_chain();
-    let addr = start(chain, NodeL2::fresh(&params));
+    let addr = start(chain, NodeL2::fresh(&params).unwrap());
 
     // The same request that is refused above: on a healthy node it reaches the
     // normal path, so a malformed payload is a client error, not a breach.

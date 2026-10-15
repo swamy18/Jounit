@@ -41,8 +41,9 @@
 //! # Why this reuses ArbitrationVote
 //!
 //! [`crate::arbitration::ArbitrationVote::signing_hash`] is byte-identical to
-//! `SettlePayload::signing_hash` (same domain tag `DOM_L2_SETTLE`, same three
-//! fields). By deriving the arbitrator's decision hash the same way, a single
+//! `SettlePayload::signing_hash` (same domain tag `DOM_L2_SETTLE`, same
+//! decision-plus-network-plus-height fields). By deriving the arbitrator's
+//! decision hash the same way, a single
 //! BLS key can serve both fraud-arbitration and conditional-payment arbitration
 //! with no second signing scheme, and a quorum of one is a valid quorum by the
 //! chain's existing BLS checks.

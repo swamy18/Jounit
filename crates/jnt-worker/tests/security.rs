@@ -493,6 +493,8 @@ fn a_non_validator_cannot_settle_or_certify() {
         task_id: id,
         verdict: jnt_core::l2::Verdict::Correct,
         vwc_hash: submitted,
+        network_id: "jounit/mini".to_string(),
+        height: 0,
         bls_sig: [0u8; 96],
         signer_bitmap: Vec::new(),
         signer_count: 0,

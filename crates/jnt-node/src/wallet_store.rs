@@ -94,7 +94,7 @@ pub fn encrypt(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
 /// Open a blob produced by [`encrypt`]. Refuses a wrong passphrase, a
 /// truncated file and a tampered file by name — all three surface as a MAC
 /// failure, and the caller's message must not pretend to know which.
-pub fn decrypt(passphrase: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
+pub fn decrypt(passphrase: &str, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     let header = MAGIC.len() + SALT_LEN + NONCE_LEN;
     if blob.len() < header + TAG_LEN {
         return Err("wallet file is truncated".to_string());
@@ -112,6 +112,7 @@ pub fn decrypt(passphrase: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|_| "wallet cipher setup failed".to_string())?;
     cipher
         .decrypt(&Nonce::from(nonce_bytes), ct)
+        .map(Zeroizing::new)
         .map_err(|_| "wrong passphrase, or the wallet file was modified".to_string())
 }
 
@@ -159,7 +160,7 @@ mod tests {
         let blob = encrypt("correct horse", plain).unwrap();
         assert!(is_encrypted(&blob));
         assert!(!is_encrypted(plain), "JSON is not mistaken for ciphertext");
-        assert_eq!(decrypt("correct horse", &blob).unwrap(), plain);
+        assert_eq!(decrypt("correct horse", &blob).unwrap().as_slice(), plain);
     }
 
     #[test]

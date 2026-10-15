@@ -142,14 +142,19 @@ fn checkpoint(chain: &mut Chain, height: u64) {
 /// the mainnet config, exactly as `jnt_node::l2::config_for` does).
 fn replay(chain: &Chain) -> ChainL2 {
     let params = net();
+    // Mainnet timings with the testnet chain identity, exactly as
+    // `jnt_node::l2::config_for` maps this profile.
+    let mut config = L2Config::mainnet();
+    config.network_id = params.network_id.clone();
     ChainL2::replay(
         chain,
-        L2Config::mainnet(),
+        config,
         &L2Genesis::for_params(&params),
         DepositParams::for_params(&params),
         &ValidatorSet::new(params.genesis_validators.clone()),
         &RealBls,
     )
+    .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -275,11 +280,14 @@ fn case_b_binding_satisfied_but_depth_not_is_not_spendable() {
 
     // Fresh replay == incremental application, binding floor included.
     let params = net();
+    let mut config = L2Config::mainnet();
+    config.network_id = params.network_id.clone();
     let mut inc = ChainL2::empty(
-        L2Config::mainnet(),
+        config,
         &L2Genesis::for_params(&params),
         DepositParams::for_params(&params),
-    );
+    )
+    .unwrap();
     let tip = chain.height();
     let binding = chain.finality().binding_finalized_height();
     let validators = ValidatorSet::new(params.genesis_validators.clone());

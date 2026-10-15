@@ -324,6 +324,8 @@ fn a_challenged_and_arbitrated_result_is_accepted_as_verified() {
     let quorum = w.validators.quorum_size();
     let payload = verdict
         .settle_payload(
+            "jounit/mini",
+            5,
             [0xAAu8; 96],
             bitmap(w.validators.len(), quorum),
             quorum as u32,

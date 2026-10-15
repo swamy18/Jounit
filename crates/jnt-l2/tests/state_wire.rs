@@ -126,38 +126,41 @@ fn fully_populated_state() -> (L2State, Vec<Hash512>) {
             .unwrap(),
         ))
     };
-    let quorum_settle = |task: Hash, verdict: Verdict, vwc_hash: Hash| -> L2Transaction {
-        let draft = SettlePayload {
-            task_id: task,
-            verdict,
-            vwc_hash,
-            bls_sig: [0u8; 96],
-            signer_bitmap: Vec::new(),
-            signer_count: 0,
-            pq_sidecar: Vec::new(),
+    let quorum_settle =
+        |task: Hash, verdict: Verdict, vwc_hash: Hash, height: u64| -> L2Transaction {
+            let draft = SettlePayload {
+                task_id: task,
+                verdict,
+                vwc_hash,
+                network_id: "jounit/mini".to_string(),
+                height,
+                bls_sig: [0u8; 96],
+                signer_bitmap: Vec::new(),
+                signer_count: 0,
+                pq_sidecar: Vec::new(),
+            };
+            let msg = draft.signing_hash();
+            let bitmap = vs.bitmap_from_indices(&(0..vs.quorum_size()).collect::<Vec<_>>());
+            let signers = vs.signers_from_bitmap(&bitmap);
+            let sigs: Vec<_> = signers
+                .iter()
+                .map(|pk| {
+                    secrets
+                        .iter()
+                        .find(|sk| sk.public_key().0 == pk.0)
+                        .expect("committee keys come from the secrets")
+                        .sign(&msg)
+                })
+                .collect();
+            let payload = SettlePayload {
+                bls_sig: *RealBls::aggregate(&sigs).unwrap().as_bytes(),
+                signer_bitmap: bitmap,
+                signer_count: vs.quorum_size() as u32,
+                pq_sidecar: Vec::new(),
+                ..draft
+            };
+            L2Transaction::new(L2Payload::Settle(payload))
         };
-        let msg = draft.signing_hash();
-        let bitmap = vs.bitmap_from_indices(&(0..vs.quorum_size()).collect::<Vec<_>>());
-        let signers = vs.signers_from_bitmap(&bitmap);
-        let sigs: Vec<_> = signers
-            .iter()
-            .map(|pk| {
-                secrets
-                    .iter()
-                    .find(|sk| sk.public_key().0 == pk.0)
-                    .expect("committee keys come from the secrets")
-                    .sign(&msg)
-            })
-            .collect();
-        let payload = SettlePayload {
-            bls_sig: *RealBls::aggregate(&sigs).unwrap().as_bytes(),
-            signer_bitmap: bitmap,
-            signer_count: vs.quorum_size() as u32,
-            pq_sidecar: Vec::new(),
-            ..draft
-        };
-        L2Transaction::new(L2Payload::Settle(payload))
-    };
     let apply = |state: &mut L2State, tx: &L2Transaction, h: u64| {
         state.apply(tx, h, &vs, &RealBls).unwrap();
     };
@@ -206,7 +209,7 @@ fn fully_populated_state() -> (L2State, Vec<Hash512>) {
     apply(&mut state, &dispute(task_f, counter), 8);
     apply(
         &mut state,
-        &quorum_settle(task_f, Verdict::Fraudulent, counter),
+        &quorum_settle(task_f, Verdict::Fraudulent, counter, 9),
         9,
     );
     assert!(
@@ -413,9 +416,10 @@ fn an_inflated_account_count_is_refused_before_it_allocates() {
     let (state, _) = fully_populated_state();
     let mut bytes = state.encode();
     // The account count sits right after the fixed header:
-    // version(1) + 4·u64 config (including `exit_activation_height`)
-    // + flag(1) + 5·u64 counters (including `exited_total`) = 74 bytes.
-    let count_at = 74;
+    // version(1) + id_len(4) + network_id(11, "jounit/mini")
+    // + 4·u64 config (including `exit_activation_height`)
+    // + flag(1) + 5·u64 counters (including `exited_total`) = 89 bytes.
+    let count_at = 89;
     bytes[count_at..count_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(L2State::decode(&bytes).is_err());
 }
@@ -424,9 +428,9 @@ fn an_inflated_account_count_is_refused_before_it_allocates() {
 fn a_tampered_counter_that_breaks_conservation_is_refused() {
     let (state, _) = fully_populated_state();
     let mut bytes = state.encode();
-    // The funded_total field sits after version + config + flag:
-    // 1 + 32 + 1 = 34.
-    let funded_at = 34;
+    // The funded_total field sits after version + network + config + flag:
+    // 1 + 4 + 11 + 32 + 1 = 49.
+    let funded_at = 49;
     let current = u64::from_le_bytes(bytes[funded_at..funded_at + 8].try_into().unwrap());
     bytes[funded_at..funded_at + 8].copy_from_slice(&(current + 1).to_le_bytes());
     let err = L2State::decode(&bytes).expect_err("inflated funding must be refused");

@@ -180,8 +180,8 @@ fn deposit_end_to_end_funds_posttask_and_survives_restart() {
     mine_with_body(&mut chain, user_addr, vec![tx.clone()]);
 
     // 5. Replay detects it — pending, not credited, before maturity.
-    let mut view = NodeL2::fresh(&params);
-    view.sync(&chain);
+    let mut view = NodeL2::fresh(&params).unwrap();
+    view.sync(&chain).unwrap();
     assert_eq!(view.pending_deposits().len(), 1);
     assert_eq!(view.deposits_applied_count(), 0);
     assert_eq!(view.state().balance(&user_addr), 0);
@@ -195,7 +195,7 @@ fn deposit_end_to_end_funds_posttask_and_survives_restart() {
     while chain.height() < deposit_height + depth {
         mine_empty_to(&mut chain, user_addr, 1);
     }
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert!(matches!(report.outcome, SyncOutcome::FullReplay { .. }));
     // 7. Exact credit, conservation closed, funding provenance exact.
     assert!(view.pending_deposits().is_empty());
@@ -225,7 +225,7 @@ fn deposit_end_to_end_funds_posttask_and_survives_restart() {
         )
         .unwrap();
     chain.submit(b).unwrap();
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert!(view.state().task(&task_id_of(&post)).is_some());
     // 10. Balance = deposit − payment − fee, to the satoshi.
     assert_eq!(
@@ -238,7 +238,7 @@ fn deposit_end_to_end_funds_posttask_and_survives_restart() {
     let dir = temp_store_dir();
     persist_chain(&chain, &dir);
     let chain2 = reload_chain(&dir, &params);
-    let again = NodeL2::replay_from(&chain2, &params);
+    let again = NodeL2::replay_from(&chain2, &params).unwrap();
     assert_eq!(again.state(), view.state());
     assert_eq!(again.pending_deposits(), view.pending_deposits());
     assert_eq!(again.ignored_deposits(), view.ignored_deposits());
@@ -337,7 +337,7 @@ fn mixed_owner_sink_output_is_burn_without_credit() {
     mine_with_body(&mut chain, aa, vec![mixed.clone()]);
     // ...but credited to nobody.
     mine_empty_to(&mut chain, aa, params.finality_depth);
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 0);
     assert_eq!(view.ignored_deposits().len(), 1);
     assert_eq!(
@@ -387,7 +387,7 @@ fn zero_amount_output_rejected_by_l1_before_l2_sees_it() {
     // refuse — either L1 gate failing keeps L2 untouched.)
     let h = chain.height() + 1;
     assert!(chain.mine_block(user_addr, vec![tx], ts(h)).is_err());
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 0);
     assert!(view.pending_deposits().is_empty());
     assert!(view.ignored_deposits().is_empty());
@@ -405,7 +405,7 @@ fn below_minimum_sink_output_is_valid_l1_but_no_credit() {
     let tx = deposit_tx(&chain, &user, op, op_value, dust);
     mine_with_body(&mut chain, user_addr, vec![tx]);
     mine_empty_to(&mut chain, user_addr, params.finality_depth);
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 0);
     assert_eq!(view.ignored_deposits().len(), 1);
     assert_eq!(
@@ -448,7 +448,7 @@ fn wrong_sink_addresses_are_silent() {
         .unwrap();
     mine_with_body(&mut chain, user_addr, vec![tx]);
     mine_empty_to(&mut chain, user_addr, params.finality_depth);
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 0);
     assert!(view.pending_deposits().is_empty());
     assert!(view.ignored_deposits().is_empty());
@@ -495,7 +495,7 @@ fn same_deposit_on_competing_branches_credits_once() {
     }
     // Winner holds the bytes once: mature them out and expect one credit.
     mine_empty_to(&mut chain, user_addr, params.finality_depth);
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 1);
     assert_eq!(view.state().balance(&user_addr), DEPOSIT_SAT);
     assert_eq!(view.state().deposited_total(), DEPOSIT_SAT);
@@ -519,7 +519,7 @@ fn mutated_transaction_rejected_by_l1() {
     // refuses the block, so the mutated bytes never become canonical.
     let h = chain.height() + 1;
     assert!(chain.mine_block(user_addr, vec![tx], ts(h)).is_err());
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 0);
     assert!(view.pending_deposits().is_empty());
 }
@@ -556,7 +556,7 @@ fn two_sink_outputs_credit_independently() {
         .unwrap();
     mine_with_body(&mut chain, user_addr, vec![tx.clone()]);
     mine_empty_to(&mut chain, user_addr, params.finality_depth);
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 2);
     assert_eq!(view.state().balance(&user_addr), v1 + v2);
     assert_eq!(view.state().deposited_total(), v1 + v2);
@@ -573,7 +573,7 @@ fn unfunded_l2_account_still_closed() {
     let h = chain.height() + 1;
     // Unfunded post: replay skips it, so the committed root is the skipped one.
     let root = {
-        let empty = NodeL2::fresh(&params);
+        let empty = NodeL2::fresh(&params).unwrap();
         empty.simulate_root(h, std::slice::from_ref(&post))
     };
     let b = chain
@@ -588,7 +588,7 @@ fn unfunded_l2_account_still_closed() {
         )
         .unwrap();
     chain.submit(b).unwrap();
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.applied_count(), 0);
     assert_eq!(view.skipped().len(), 1);
     assert!(matches!(
@@ -618,7 +618,7 @@ fn reorg_removes_deposit_and_winner_recredits_exactly_once() {
     mine_with_body(&mut chain, user_addr, vec![tx.clone()]);
     mine_empty_to(&mut chain, user_addr, 3);
     assert_eq!(chain.height(), 15);
-    let mut view = NodeL2::replay_from(&chain, &params);
+    let mut view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.pending_deposits().len(), 1);
     assert_eq!(view.deposits_applied_count(), 0);
 
@@ -647,7 +647,7 @@ fn reorg_removes_deposit_and_winner_recredits_exactly_once() {
     }
     // The deposit vanished with its block: no credit, no pending, no record —
     // and funding is exactly the escrow again.
-    let report = view.sync(&chain);
+    let report = view.sync(&chain).unwrap();
     assert!(matches!(report.outcome, SyncOutcome::FullReplay { .. }));
     assert_eq!(view.deposits_applied_count(), 0);
     assert!(view.pending_deposits().is_empty());
@@ -665,7 +665,7 @@ fn reorg_removes_deposit_and_winner_recredits_exactly_once() {
         .unwrap();
     chain.submit(b).unwrap();
     mine_empty_to(&mut chain, [0xFu8; 20], depth);
-    view.sync(&chain);
+    view.sync(&chain).unwrap();
     assert_eq!(view.deposits_applied_count(), 1);
     assert_eq!(view.state().balance(&user_addr), DEPOSIT_SAT);
     assert_eq!(view.state().deposited_total(), DEPOSIT_SAT);
@@ -674,7 +674,7 @@ fn reorg_removes_deposit_and_winner_recredits_exactly_once() {
         escrow_of(&params) + DEPOSIT_SAT
     );
     assert!(view.state().check_conservation());
-    let fresh = NodeL2::replay_from(&chain, &params);
+    let fresh = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.state(), fresh.state());
 }
 
@@ -694,19 +694,19 @@ fn ab_replay_agrees_on_deposits_pending_and_ignored() {
     // Node B follows incrementally: full replay to the deposit block, then an
     // incremental extension over the dust block. Both paths must agree on the
     // pending deposit and the named refusal.
-    let mut b = NodeL2::fresh(&params);
-    b.sync(&chain);
+    let mut b = NodeL2::fresh(&params).unwrap();
+    b.sync(&chain).unwrap();
     mine_empty_to(&mut chain, user_addr, 5);
     let funding2: Vec<_> = mature_outpoints(&chain, user_addr);
     let dust_tx = deposit_tx(&chain, &user, funding2[0].0, funding2[0].1, 500_000);
     mine_with_body(&mut chain, user_addr, vec![dust_tx]);
-    let inc_report = b.sync(&chain);
+    let inc_report = b.sync(&chain).unwrap();
     assert!(matches!(
         inc_report.outcome,
         SyncOutcome::Incremental { .. }
     ));
 
-    let a = NodeL2::replay_from(&chain, &params);
+    let a = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(a.state(), b.state());
     assert_eq!(a.pending_deposits(), b.pending_deposits());
     assert_eq!(a.ignored_deposits(), b.ignored_deposits());
@@ -733,7 +733,7 @@ fn joint_supply_holds_with_live_deposits() {
     let tx = deposit_tx(&chain, &user, op, op_value, DEPOSIT_SAT);
     mine_with_body(&mut chain, user_addr, vec![tx]);
     mine_empty_to(&mut chain, user_addr, params.finality_depth);
-    let view = NodeL2::replay_from(&chain, &params);
+    let view = NodeL2::replay_from(&chain, &params).unwrap();
     assert_eq!(view.deposits_applied_count(), 1);
 
     let sink_held: u64 = chain

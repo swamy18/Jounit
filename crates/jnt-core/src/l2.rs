@@ -651,6 +651,10 @@ impl DisputePayload {
 // Settle
 // ---------------------------------------------------------------------------
 
+/// Longest `network_id` a settle payload may name, matching the arbitration
+/// vote bound so the two encodings agree on what fits.
+pub const MAX_SETTLE_NETWORK_ID_BYTES: usize = 64;
+
 /// The validator quorum's settlement decision. Not user-facing: it is produced
 /// by the arbitrator set (the M5 committee) and authorized by its BLS aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,6 +664,17 @@ pub struct SettlePayload {
     /// The hash the verdict settles on — see [`VWC_HASH_EXPIRED`] for the
     /// pre-VWC convention.
     pub vwc_hash: Hash,
+    /// Chain the quorum signed for. Part of the signed message, and `apply`
+    /// refuses a payload naming another network: without this, a quorum's
+    /// aggregate over the decision alone would verify on any chain whose
+    /// committee overlaps.
+    pub network_id: String,
+    /// Height the quorum signed at. Part of the signed message; `apply`
+    /// refuses a vote from the future (`height` above the applying height).
+    /// A quorum formed at `H` may still settle at `H+1` — votes are signed as
+    /// the chain moves — so the rule is "not from the future", with the
+    /// dispute lifecycle (a task settles once) closing the replay window.
+    pub height: u64,
     /// BLS12-381 G2 aggregate signature over [`SettlePayload::signing_hash`].
     pub bls_sig: [u8; 96],
     /// One bit per validator (LSB = index 0) in the epoch's sorted set.
@@ -677,12 +692,16 @@ pub struct SettlePayload {
 
 impl SettlePayload {
     pub fn signing_hash(&self) -> Hash {
-        // Covers the decision only: not the signature, not the bitmap, not the
-        // count. Those are evidence *of* the decision.
+        // Covers the decision plus the chain it was signed for: not the
+        // signature, not the bitmap, not the count. Those are evidence *of*
+        // the decision.
         let mut w = Writer::new();
         w.fixed(&self.task_id)
             .u8(self.verdict.to_wire())
-            .fixed(&self.vwc_hash);
+            .fixed(&self.vwc_hash)
+            .u32le(self.network_id.len() as u32)
+            .raw(self.network_id.as_bytes())
+            .u64le(self.height);
         sha256_dom(DOM_L2_SETTLE, &[w.as_slice()])
     }
 
@@ -691,6 +710,9 @@ impl SettlePayload {
         w.fixed(&self.task_id)
             .u8(self.verdict.to_wire())
             .fixed(&self.vwc_hash)
+            .u32le(self.network_id.len() as u32)
+            .raw(self.network_id.as_bytes())
+            .u64le(self.height)
             .raw(&self.bls_sig);
         w.u32le(self.signer_bitmap.len() as u32)
             .raw(&self.signer_bitmap)
@@ -707,6 +729,20 @@ impl SettlePayload {
         let task_id = r.fixed()?;
         let verdict = Verdict::from_wire(r.u8()?)?;
         let vwc_hash = r.fixed()?;
+        // Required, not tolerant: a payload written before network/height
+        // binding carries a signature over the decision alone, which must no
+        // longer verify. Old bytes fail here rather than decode.
+        let id_len = r.u32le()? as usize;
+        if id_len > MAX_SETTLE_NETWORK_ID_BYTES {
+            return Err(Error::Malformed("settle network_id over cap"));
+        }
+        if id_len > r.remaining() {
+            return Err(Error::Malformed("settle network_id exceeds buffer"));
+        }
+        let network_id = std::str::from_utf8(r.fixed_slice(id_len)?)
+            .map_err(|_| Error::Malformed("settle network_id not utf-8"))?
+            .to_string();
+        let height = r.u64le()?;
         let bls_sig: [u8; 96] = r.fixed()?;
         let n = r.u32le()? as usize;
         if n > MAX_SIGNER_BITMAP_BYTES {
@@ -741,6 +777,8 @@ impl SettlePayload {
             task_id,
             verdict,
             vwc_hash,
+            network_id,
+            height,
             bls_sig,
             signer_bitmap,
             signer_count,
@@ -1194,6 +1232,8 @@ mod tests {
                 task_id: t,
                 verdict: Verdict::Correct,
                 vwc_hash: result,
+                network_id: "jounit/mini".to_string(),
+                height: 9,
                 bls_sig: [0x7Fu8; 96],
                 signer_bitmap: vec![0b0000_0111],
                 signer_count: 3,
@@ -1232,11 +1272,13 @@ mod tests {
     }
 
     #[test]
-    fn settle_hash_covers_the_verdict_and_task_not_the_evidence() {
+    fn settle_hash_covers_the_verdict_task_network_and_height_not_the_evidence() {
         let base = SettlePayload {
             task_id: [1u8; 32],
             verdict: Verdict::Correct,
             vwc_hash: [2u8; 32],
+            network_id: "jounit/mini".to_string(),
+            height: 7,
             bls_sig: [0u8; 96],
             signer_bitmap: vec![],
             signer_count: 0,
@@ -1249,6 +1291,14 @@ mod tests {
         let mut other_task = base.clone();
         other_task.task_id = [3u8; 32];
         assert_ne!(base.signing_hash(), other_task.signing_hash());
+
+        let mut other_network = base.clone();
+        other_network.network_id = "jounit/other".to_string();
+        assert_ne!(base.signing_hash(), other_network.signing_hash());
+
+        let mut other_height = base.clone();
+        other_height.height = 8;
+        assert_ne!(base.signing_hash(), other_height.signing_hash());
 
         // Evidence fields are not part of the signed decision.
         let mut other_sig = base.clone();
