@@ -1,15 +1,13 @@
 # Keeps dependencies current without turning the branch list into noise.
 #
-# Two rules shape this file, both learned from what an earlier revision did:
-# it set `open-pull-requests-limit: 5` per ecosystem with no grouping, which
-# produced eleven simultaneous PRs (five crate bumps and six action bumps) the
-# day it landed. Dependabot opens one branch per *dependency*, so the limit has
-# to be near zero and the updates have to be grouped, or a repo that wants a
-# single branch gets a spray of them.
+# Two rules shape this file, both learned from what earlier revisions did:
+# the first set `open-pull-requests-limit: 5` per ecosystem with no grouping,
+# which produced eleven simultaneous PRs (five crate bumps and six action bumps)
+# the day it landed. Dependabot opens one branch per *dependency*, so a repo
+# that wants a single `main` branch must not let it open any at all.
 version: 2
 updates:
-  # Rust crates. One grouped PR per week instead of one per crate, so a CVE has
-  # a reviewed path to a bump without eleven branches to manage.
+  # Rust crates. Grouped, then capped at zero open PRs.
   - package-ecosystem: cargo
     directory: "/"
     schedule:
@@ -17,13 +15,17 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
-    # Every crate into a single PR. A transitive bump still lands, but as one
-    # reviewable diff rather than five branches that fight each other.
+    # Every crate into a single PR (if any PR were allowed at all).
     groups:
       rust-crates:
         patterns:
           - "*"
-    # At most one open PR across the whole workspace.
+    # Zero, deliberately: this repo keeps `main` as its only branch, and every
+    # Dependabot version PR *is* a branch. Security visibility is not disabled
+    # by this — GitHub's Dependabot alerts in the Security tab are driven by the
+    # advisory database and `Cargo.lock`, not by these PRs — but the automated
+    # bump is, so applying one becomes `cargo update -p <crate>` plus `cargo
+    # audit` as an owner step (see `docs/mainnet-readiness.md` §1).
     open-pull-requests-limit: 0\n    # A semver-major bump of these is a *protocol* decision, not a bot's.
     # `sha2` is the domain separator every hash on the chain flows through,
     # `k256` is the curve every signature is verified on, and `argon2` /
@@ -42,9 +44,14 @@ updates:
       - dependency-name: "chacha20poly1305"
         update-types: ["version-update:semver-major"]
 
-  # GitHub Actions. Needed for supply-chain hygiene: the workflows pin every
-  # action to a commit SHA, and something has to notice when a pinned action
-  # falls behind (a compromised or outdated action is a real supply-chain risk).
+  # GitHub Actions. Zero-PR and zero-branch for the same reason *plus* a
+  # correctness one: `dtolnay/rust-toolchain` is pinned to the moving `stable`
+  # and `nightly` branches by SHA, and the updater resolves both to the same
+  # latest tip and then rewrites one with the other's SHA — it opened a PR
+  # proposing to change the `# nightly` pin to `stable`'s SHA. No pin it writes
+  # for that action can be trusted. Every action pin is a manual
+  # release-checklist step: resolve the SHA back to its tag and check it against
+  # the branch it was cut from (`docs/mainnet-readiness.md` §1).
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -56,7 +63,8 @@ updates:
       actions:
         patterns:
           - "*"
-    open-pull-requests-limit: 0\n    # `dtolnay/rust-toolchain` is the one action Dependabot cannot help with.
+    open-pull-requests-limit: 0
+    # `dtolnay/rust-toolchain` is the one action Dependabot cannot help with.
     # The workflows pin `stable` and `nightly` — moving *branches*, not tags —
     # by SHA. The updater resolves both pins to the same latest tip and then
     # rewrites one of them with the other's SHA: it opened a PR proposing to
