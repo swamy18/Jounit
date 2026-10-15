@@ -891,9 +891,12 @@ jnt-node serve --network testnet --data-dir ./chain --api-listen 127.0.0.1:8080
 
 Every request to an exposed bind must carry `Authorization: Bearer <token>`
 (compared in constant time). Every bind — loopback included — requires a
-`Host` header naming the bound address (DNS-rebinding defense). Exposed binds
-also rate-limit per remote address, and every bind caps a request at 10 seconds
-and 64 in flight.
+`Host` header (DNS-rebinding defense): a loopback bind accepts loopback names
+only, while a non-loopback bind additionally accepts any IP literal, the bound
+address, and hostnames listed via `--api-allowed-host` (comma-separated) or
+`JNT_API_ALLOWED_HOSTS`. A missing, unknown, or bracket-malformed `Host` is
+403. Exposed binds also rate-limit per remote address, and every bind caps a
+request at 10 seconds and 64 in flight.
 figures are in JNT.
 
 ---

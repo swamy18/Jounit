@@ -91,6 +91,11 @@ SERVE OPTIONS:
                               JNT_API_TOKEN environment variable is used.
                               Prefer the environment variable: --api-token is
                               visible in `ps` to other local users
+  --api-allowed-host <names> Extra hostnames accepted in the HTTP `Host`
+                              header on a non-loopback API bind,
+                              comma-separated. Merged with
+                              JNT_API_ALLOWED_HOSTS. IP literals need no
+                              allowlisting; unknown names get 403
   --connect <host:port>      Dial an outbound peer (repeatable via CSV)
   --peers <n>                Max total peers (default: 125)
   --interval <ms>            Serve loop period (default: 250)
@@ -155,6 +160,7 @@ impl Args {
                         | "listen"
                         | "api-listen"
                         | "api-token"
+                        | "api-allowed-host"
                         | "connect"
                         | "peers"
                         | "relay"
@@ -1289,6 +1295,21 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         .map(str::to_owned)
         .or_else(|| std::env::var("JNT_API_TOKEN").ok())
         .filter(|t| !t.is_empty());
+    // Hostnames the Host-header check accepts on a non-loopback bind, beyond
+    // the bound address and any IP literal. Comma-separated in both places;
+    // flag and env merge, so one cannot silently clear the other.
+    fn split_hosts(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+    let mut api_allowed_hosts: Vec<String> = std::env::var("JNT_API_ALLOWED_HOSTS")
+        .map(|s| split_hosts(&s))
+        .unwrap_or_default();
+    if let Some(flag) = args.str("api-allowed-host") {
+        api_allowed_hosts.extend(split_hosts(flag));
+    }
 
     let node =
         P2pNode::start(config, chain.height(), chain.tip_hash()).map_err(|e| e.to_string())?;
@@ -1329,11 +1350,12 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let peers = Arc::new(AtomicUsize::new(0));
     let shared = Arc::new(Mutex::new(jnt_node::api::SharedNode::new(chain, l2)));
     if let Some(api_addr) = api_listen {
-        let bound = jnt_node::api::spawn(
+        let bound = jnt_node::api::spawn_with_options(
             Arc::clone(&shared),
             Arc::clone(&peers),
             api_addr,
             api_token.clone(),
+            api_allowed_hosts,
         )?;
         println!("api            {bound}");
     }

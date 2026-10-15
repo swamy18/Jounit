@@ -75,11 +75,13 @@
 //! refused** unless a bearer token is supplied, because exposing this surface is
 //! an operator decision the node will not make silently (SPEC.md §19.2).
 //!
-//! - **Host-header validation runs on *every* bind**, loopback included — the
-//!   request's `Host` must name the bound address (or a loopback alias), which
-//!   is what stops a DNS-rebound name from reaching a peer machine that can
-//!   answer for it. Loopback is no longer exempt: that was where the rebinding
-//!   risk was highest.
+//! - **Host-header validation runs on *every* bind**, loopback included.
+//!   On a loopback bind only loopback names pass (`localhost`, `127.0.0.1`,
+//!   `::1`, any loopback IP literal). On a non-loopback bind any IP literal
+//!   passes too — DNS rebinding cannot use an IP literal — plus the bound
+//!   address and the operator's allowlisted names (`--api-allowed-host` /
+//!   `JNT_API_ALLOWED_HOSTS`). Anything else, including a missing or
+//!   bracket-malformed `Host`, is 403.
 //! - **Bearer authentication on an exposed bind** — every request carries
 //!   `Authorization: Bearer <token>`, compared in constant time. Supply the
 //!   token through the `JNT_API_TOKEN` environment variable, not
@@ -2291,15 +2293,22 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENCY: usize = 64;
 
 /// Opt-in service API configuration. Carries the bearer token an exposed bind
-/// requires, the host the bound address is checked against for Host-header
-/// validation (DNS-rebinding defense), the in-flight request budget for the
-/// always-on DoS guard, and the per-IP rate limiter.
+/// requires, the bound address plus the hostname allowlist checked by
+/// Host-header validation (DNS-rebinding defense), the in-flight request
+/// budget for the always-on DoS guard, and the per-IP rate limiter.
 #[derive(Clone)]
 pub struct ApiConfig {
     /// Bearer token required on every request when this node is exposed.
     pub token: Option<String>,
     /// The host portion of the bound address, for Host-header validation.
     pub bind_host: String,
+    /// Whether the bound address is loopback. Decides how strict the Host
+    /// check is: a loopback bind accepts loopback names only, while a
+    /// non-loopback bind additionally accepts any IP literal.
+    bind_loopback: bool,
+    /// Lowercased hostnames (no ports) accepted in `Host` on a non-loopback
+    /// bind, from `--api-allowed-host` / `JNT_API_ALLOWED_HOSTS`.
+    allowed_hosts: Vec<String>,
     /// In-flight request budget shared across the always-on guard.
     concurrency: Arc<tokio::sync::Semaphore>,
     /// Per-IP token bucket, only consulted on an exposed bind.
@@ -2325,6 +2334,8 @@ impl ApiConfig {
     fn host(&self) -> HostConfig {
         HostConfig {
             bind_host: self.bind_host.clone(),
+            bind_loopback: self.bind_loopback,
+            allowed_hosts: self.allowed_hosts.clone(),
         }
     }
 
@@ -2349,6 +2360,76 @@ struct DosConfig {
 #[derive(Clone)]
 struct HostConfig {
     bind_host: String,
+    bind_loopback: bool,
+    allowed_hosts: Vec<String>,
+}
+
+/// Split a `Host` header value into its host part: strip one optional
+/// `:port`, unwrapping one layer of `[` `]` around IPv6 literals. Returns
+/// `None` for a missing, empty, or bracket-malformed value — the caller
+/// refuses those rather than guessing at them.
+///
+/// `None` here can never panic: it is all slicing on `find`/`split` results,
+/// so hostile bytes cost a rejection, not the process.
+fn host_part(header: &str) -> Option<&str> {
+    let header = header.trim();
+    if header.is_empty() {
+        return None;
+    }
+    if let Some(rest) = header.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let tail = &rest[end + 1..];
+        // After `]` only `:port` (or nothing) may follow. Anything else —
+        // `[::1]evil`, a missing `]` — is malformed.
+        if !tail.is_empty()
+            && !(tail.starts_with(':') && tail[1..].chars().all(|c| c.is_ascii_digit()))
+        {
+            return None;
+        }
+        return Some(&rest[..end]);
+    }
+    // No brackets: strip one `:port`. A bare multi-colon value (`::1`) is not
+    // a valid Host header; treating it whole lets the IP parse decide rather
+    // than a guess at where a port starts.
+    if header.chars().filter(|&c| c == ':').count() == 1 {
+        Some(header.split(':').next().unwrap_or(header))
+    } else {
+        Some(header)
+    }
+}
+
+/// Normalize a hostname for the allowlist and for comparison: lowercase,
+/// no port, no brackets. `None` for values `host_part` refuses.
+fn normalize_host(value: &str) -> Option<String> {
+    host_part(value).map(|h| h.to_lowercase())
+}
+
+/// Whether a `Host` header value is accepted on this bind.
+///
+/// - IP literals that parse as loopback are always accepted.
+/// - On a loopback bind nothing else is: the threat is a page reaching
+///   127.0.0.1 under an attacker's name, so only loopback names pass.
+/// - On a non-loopback bind any other IP literal is accepted too — DNS
+///   rebinding cannot use an IP literal, so there is nothing to spoof — plus
+///   the bound address itself and the operator's allowlisted names.
+///   Comparison is case-insensitive; a missing or malformed header is refused.
+fn host_allowed(cfg: &HostConfig, header: Option<&str>) -> bool {
+    let part = match header.and_then(normalize_host) {
+        Some(p) => p,
+        None => return false,
+    };
+    // The one loopback name that is not an IP literal. Allowed on every bind:
+    // it can only ever name the local machine.
+    if part == "localhost" {
+        return true;
+    }
+    if let Ok(ip) = part.parse::<IpAddr>() {
+        if ip.is_loopback() {
+            return true;
+        }
+        return !cfg.bind_loopback;
+    }
+    part == cfg.bind_host.to_lowercase() || cfg.allowed_hosts.iter().any(|a| a == &part)
 }
 
 /// Auth + rate-limit config, only applied on an exposed bind.
@@ -2532,38 +2613,16 @@ async fn dos_guard(State(cfg): State<DosConfig>, req: Request, next: Next) -> Re
     }
 }
 
-/// Host-header + bearer-token gate + per-IP rate limit, applied only on an
-/// exposed bind. Returns a plain `Response` so the layer stays `Infallible` for
-/// `Router::layer`.
+/// Host-header gate, applied on every bind including loopback. Returns a
+/// plain `Response` so the layer stays `Infallible` for `Router::layer`.
 async fn host_check(State(cfg): State<HostConfig>, req: Request, next: Next) -> Response {
-    // Host-header validation runs on every bind. The request's `Host` must name
-    // the address this server bound to, or a loopback alias. Guards against any
-    // bind being reached via a DNS-rebound Host whose name resolves back to a
-    // peer (including loopback binds, where exposure was previously open).
+    // The exact rule lives in `host_allowed` so it is unit-testable without a
+    // socket. A refused Host is 403, never a guess.
     let host = req
         .headers()
         .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim();
-    let host_part = if let Some(rest) = host.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            &rest[..end]
-        } else {
-            host
-        }
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    let host_ok = host_part == cfg.bind_host.as_str()
-        || host_part == "localhost"
-        || host_part == "127.0.0.1"
-        || host_part == "::1"
-        || host_part
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false);
-    if !host_ok {
+        .and_then(|v| v.to_str().ok());
+    if !host_allowed(&cfg, host) {
         let mut resp = axum::response::Response::new(axum::body::Body::from("forbidden"));
         *resp.status_mut() = StatusCode::FORBIDDEN;
         return resp;
@@ -2618,6 +2677,20 @@ pub fn spawn(
     listen: SocketAddr,
     token: Option<String>,
 ) -> Result<SocketAddr, String> {
+    spawn_with_options(shared, peers, listen, token, Vec::new())
+}
+
+/// Start the API like [`spawn`], additionally allowlisting hostnames for the
+/// Host-header check on a non-loopback bind (`--api-allowed-host` /
+/// `JNT_API_ALLOWED_HOSTS`). Entries are normalized (lowercased, port
+/// stripped); empties are dropped.
+pub fn spawn_with_options(
+    shared: Arc<Mutex<SharedNode>>,
+    peers: Arc<AtomicUsize>,
+    listen: SocketAddr,
+    token: Option<String>,
+    allowed_hosts: Vec<String>,
+) -> Result<SocketAddr, String> {
     if !listen.ip().is_loopback() && token.is_none() {
         return Err(format!(
             "refusing non-loopback API bind {listen} without a bearer token: \
@@ -2636,6 +2709,12 @@ pub fn spawn(
     let cfg = ApiConfig {
         token: token.filter(|t| !t.is_empty()),
         bind_host: listen.ip().to_string(),
+        bind_loopback: listen.ip().is_loopback(),
+        allowed_hosts: allowed_hosts
+            .iter()
+            .filter_map(|h| normalize_host(h))
+            .filter(|h| !h.is_empty())
+            .collect(),
         concurrency: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY)),
         limiter: RateLimiter::default(),
     };
@@ -2659,7 +2738,12 @@ pub fn spawn(
                 // with the reactor: `from_std` must run where a reactor exists.
                 let listener = tokio::net::TcpListener::from_std(std_listener)
                     .expect("api listener conversion");
-                if let Err(e) = axum::serve(listener, app).await {
+                // `into_make_service_with_connect_info`: without it the
+                // `ConnectInfo` extractor in `exposed_auth` finds nothing and
+                // every request on an exposed bind fails 500 — the peer's
+                // address is what the per-IP rate limiter keys on.
+                let svc = app.into_make_service_with_connect_info::<SocketAddr>();
+                if let Err(e) = axum::serve(listener, svc).await {
                     eprintln!("api: serve error: {e}");
                 }
             });

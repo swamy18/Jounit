@@ -14,6 +14,18 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed (API exposure)
+
+- **Exposed/wildcard binds no longer 403 every IP literal.** The Host check
+  now allows any IP literal on a non-loopback bind (DNS rebinding cannot use
+  one), loopback names only on a loopback bind, and operator-allowlisted
+  hostnames via `--api-allowed-host` / `JNT_API_ALLOWED_HOSTS`
+  (comma-separated, case-insensitive, ports and brackets handled). A missing
+  or malformed `Host` is 403, never a guess.
+- **Exposed binds no longer 500 every request.** `spawn` serves with
+  `into_make_service_with_connect_info`, so the `ConnectInfo` extractor the
+  per-IP rate limiter depends on is actually present.
+
 ### Changed (consensus — settle binds network and height)
 
 - **Arbitration signatures now bind the chain and height they were signed
