@@ -108,8 +108,14 @@ fn build_scratchpad(seed: &Hash, lanes: usize) -> Vec<Hash> {
 fn mix_accesses(pad: &[Hash], seed: &Hash, lanes: usize, accesses: usize) -> Hash {
     let mut state = *seed;
     for _ in 0..accesses {
-        // Derive access index from current state (sequential dependency)
-        let idx = u64::from_le_bytes(state[..8].try_into().unwrap()) as usize % lanes;
+        // Derive access index from current state (sequential dependency).
+        //
+        // The reduction is done in u64 on purpose: `u64 as usize` truncates the
+        // high bits on a 32-bit target, so reducing *after* the cast would pick
+        // a different lane for the same state than a 64-bit node does — a
+        // consensus split rather than a curiosity. `lanes` is validated > 0 by
+        // `HbmConfig`, so the u64 divisor is never zero.
+        let idx = (u64::from_le_bytes(state[..8].try_into().unwrap()) % lanes as u64) as usize;
         let lane = &pad[idx];
         // XOR state with the lane, then SHA-256 to mix
         let mut mixed = [0u8; 64];
