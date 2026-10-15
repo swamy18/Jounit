@@ -426,9 +426,20 @@ impl VoteTally {
     ///
     /// Re-checks everything from the votes themselves rather than trusting the
     /// accumulator: a decision exists, quorum is met, every counted signer is in
-    /// the committee, and the aggregate verifies over the settle decision hash
-    /// with real pairings. Returns `None` on any doubt, which is the fail-closed
-    /// direction — a node that cannot produce a payload simply does not propose.
+    /// the committee, every counted vote names the same network and height, and
+    /// the aggregate verifies over the settle decision hash with real pairings.
+    /// Returns `None` on any doubt, which is the fail-closed direction — a node
+    /// that cannot produce a payload simply does not propose.
+    ///
+    /// The network/height check is a *safety net*, not a new rule: the signed
+    /// message covers the decision only, so network and height cannot be bound
+    /// by the signature without changing `SettlePayload::signing_hash`, which
+    /// `apply_settle` verifies against. That leaves them authenticated by the
+    /// tally: [`Self::record`] refuses a vote whose `network_id` or `height`
+    /// disagrees with the node's own, and it is the only way a vote enters a
+    /// tally. Re-checking here means the point where an aggregate becomes a
+    /// settle transaction does not have to trust that invariant, because
+    /// [`VoteBook`] carries no deserialization path that could bypass it.
     pub fn settle_payload(&self, committee: &[BlsPublicKey]) -> Option<SettlePayload> {
         let (task_id, verdict, vwc_hash) = self.decision?;
         if self.votes.len() < self.quorum {
@@ -436,6 +447,20 @@ impl VoteTally {
         }
         let signers: Vec<BlsPublicKey> = self.votes.iter().map(|v| v.signer).collect();
         if !signers.iter().all(|k| committee.contains(k)) {
+            return None;
+        }
+        // One network and one height across every counted vote. Homogeneous by
+        // `record`'s contract, so this only ever fires on a broken invariant —
+        // and if it does, refusing to propose is the direction that keeps two
+        // honest nodes agreeing.
+        let mut networks = self.votes.iter().map(|v| v.network_id.as_str());
+        let network = networks.next()?;
+        if !networks.all(|n| n == network) {
+            return None;
+        }
+        let mut heights = self.votes.iter().map(|v| v.height);
+        let height = heights.next()?;
+        if !heights.all(|h| h == height) {
             return None;
         }
         // Aggregate the counted signatures. BLS aggregation is order-independent,
@@ -799,6 +824,55 @@ mod tests {
         }
         assert!(!tally.has_quorum());
         assert!(tally.settle_payload(&committee).is_none());
+    }
+
+    #[test]
+    fn a_payload_is_refused_when_counted_votes_name_different_networks_or_heights() {
+        // The safety net in `settle_payload`. The signature cannot bind network
+        // or height without changing `SettlePayload::signing_hash` (which
+        // `apply_settle` verifies), so the tally is the only thing that binds
+        // them — `record` refuses a mismatched vote, and this re-check means the
+        // point that turns an aggregate into a settle transaction does not have
+        // to trust that. Reaching it requires a broken invariant, so the case is
+        // built by hand rather than through `record`.
+        let committee = keys(4);
+        let q = quorum(&committee);
+
+        // Same decision, same signers, different `network_id` / `height`.
+        for mutate in 0..2 {
+            let mut votes = Vec::new();
+            for idx in 0..q {
+                let mut v = vote(&committee, idx, TASK, Verdict::Fraudulent, RESULT, NET, 0);
+                if idx == q - 1 && mutate == 0 {
+                    v.network_id = "jounit-other".to_string();
+                }
+                if idx == q - 1 && mutate == 1 {
+                    v.height = 1;
+                }
+                votes.push(v);
+            }
+
+            let mut tally = VoteBook::new();
+            for v in &votes {
+                tally
+                    .entry(TASK, q)
+                    // `record` itself would refuse both of these; the point is
+                    // what `settle_payload` does when they are already inside.
+                    .record(v, NET, 0, &committee)
+                    .ok();
+            }
+            // Force the votes in past `record`, then confirm the payload is
+            // still refused rather than built.
+            tally.tallies.get_mut(&TASK).unwrap().votes = votes;
+            assert!(
+                tally
+                    .tally(&TASK)
+                    .unwrap()
+                    .settle_payload(&committee)
+                    .is_none(),
+                "counted votes that disagree on network or height must not aggregate"
+            );
+        }
     }
 
     #[test]
