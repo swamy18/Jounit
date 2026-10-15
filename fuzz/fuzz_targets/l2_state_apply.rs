@@ -158,9 +158,14 @@ fuzz_target!(|data: &[u8]| {
                     );
                     if disputed {
                         if let Ok(v) = DisputeEngine::resolve(state.task(&id).unwrap()) {
-                            if let Ok(payload) =
-                                v.settle_payload([0xAAu8; 96], vec![0b0000_0111], 3, Vec::new())
-                            {
+                            if let Ok(payload) = v.settle_payload(
+                                "jounit/mini",
+                                height,
+                                [0xAAu8; 96],
+                                vec![0b0000_0111],
+                                3,
+                                Vec::new(),
+                            ) {
                                 let _ = state.apply(
                                     &L2Transaction::new(L2Payload::Settle(payload)),
                                     height,
