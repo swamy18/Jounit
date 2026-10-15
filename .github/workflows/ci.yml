@@ -85,7 +85,7 @@ jobs:
       # on Linux the ASan runtime ships with the toolchain, so no extra setup.
       # This is a moving ref pinned by Dependabot (`.github/dependabot.yml`);
       # refresh the SHA from the branch tip when it is bumped.
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # nightly
         with:
           components: llvm-tools-preview
 
