@@ -24,8 +24,7 @@ updates:
         patterns:
           - "*"
     # At most one open PR across the whole workspace.
-    open-pull-requests-limit: 1
-    # A semver-major bump of these is a *protocol* decision, not a bot's.
+    open-pull-requests-limit: 0\n    # A semver-major bump of these is a *protocol* decision, not a bot's.
     # `sha2` is the domain separator every hash on the chain flows through,
     # `k256` is the curve every signature is verified on, and `argon2` /
     # `chacha20poly1305` are the wallet's KDF and cipher. Swapping any of them
@@ -57,8 +56,7 @@ updates:
       actions:
         patterns:
           - "*"
-    open-pull-requests-limit: 1
-    # `dtolnay/rust-toolchain` is the one action Dependabot cannot help with.
+    open-pull-requests-limit: 0\n    # `dtolnay/rust-toolchain` is the one action Dependabot cannot help with.
     # The workflows pin `stable` and `nightly` — moving *branches*, not tags —
     # by SHA. The updater resolves both pins to the same latest tip and then
     # rewrites one of them with the other's SHA: it opened a PR proposing to
