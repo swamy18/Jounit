@@ -18,8 +18,14 @@ hex.workspace = true
 rand.workspace = true
 argon2.workspace = true
 chacha20poly1305.workspace = true
+zeroize.workspace = true
 axum = "0.8"
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+# DoS guards on the service API: a per-request deadline, a cap on the number
+# of requests admitted concurrently, and a per-IP rate limiter. §19.2 notes
+# the API is non-consensus and opt-in; these keep it from being a
+# self-inflicted DoS against the shared-state lock.
+tower = { version = "0.5", features = ["limit", "timeout", "make", "util"] }
 
 [dev-dependencies]
 # The worker SDK, so the end-to-end journey can drive the real worker client
