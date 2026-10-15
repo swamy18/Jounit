@@ -35,7 +35,7 @@ struct Node {
 fn start(chain: Chain, l2: NodeL2) -> Node {
     let shared = Arc::new(Mutex::new(SharedNode::new(chain, l2)));
     let peers = Arc::new(AtomicUsize::new(0));
-    let addr = spawn(shared, peers, "127.0.0.1:0".parse().unwrap())
+    let addr = spawn(shared, peers, "127.0.0.1:0".parse().unwrap(), None)
         .expect("the API must bind its loopback socket");
     Node { addr }
 }

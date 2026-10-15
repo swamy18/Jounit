@@ -57,7 +57,31 @@
 //! POST /v1/escrow/open         open a conditional escrow with a chosen arbitrator
 //! POST /v1/escrow/{id}/release arbiter- or mutual-release a live escrow (non-consensus)
 //! GET  /v1/escrow/{id}         escrow state
+//! POST /v1/credit/deposit      fund an address's credit line (non-consensus book)
+//! POST /v1/credit/bond         move free credit into a posted bond, or release it
+//! POST /v1/credit/open         open a credit position under a lender's terms
+//! POST /v1/credit/repay        repay against a position, interest first
+//! POST /v1/credit/default      settle an unpaid position at or after its deadline
+//! GET  /v1/credit/balance/{address} free balance + bond + live positions
 //! ```
+//!
+//! # Exposure and its guards
+//!
+//! Loopback is the default binding and is unauthenticated by design: every test
+//! drives a socket on `127.0.0.1:0` with no token. A **non-loopback bind is
+//! refused** unless a bearer token is supplied, because exposing this surface is
+//! an operator decision the node will not make silently (SPEC.md §19.2). On an
+//! exposed bind the stack additionally enforces:
+//!
+//! - **Host-header validation** — the request's `Host` must name the bound
+//!   address (or a loopback alias), which is what stops a DNS-rebound name from
+//!   reaching a peer machine that can answer for it.
+//! - **Bearer authentication** — every request carries
+//!   `Authorization: Bearer <token>`.
+//! - **A per-IP token bucket** — a flood is shed to the server.
+//! - **A per-request deadline and a global in-flight cap** — these apply on
+//!   *every* binding, loopback included, because they bound the hold time on
+//!   the shared-state `Mutex` rather than defending against a remote attacker.
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -1898,6 +1922,11 @@ struct CreditBondReq {
 
 async fn credit_bond(State(state): State<ApiState>, Json(req): Json<CreditBondReq>) -> ApiResult {
     let addr = decode_address(&req.address_hex)?;
+    if req.amount_sat == 0 {
+        return Err(bad(
+            "amount_sat must be positive; a zero bond moves nothing",
+        ));
+    }
     with_shared(&state, |sh| {
         match req.action.as_str() {
             "post" => {
@@ -1960,6 +1989,11 @@ struct CreditRepayReq {
 
 async fn credit_repay(State(state): State<ApiState>, Json(req): Json<CreditRepayReq>) -> ApiResult {
     let id = decode_hash(&req.position_id)?;
+    if req.amount_sat == 0 {
+        return Err(bad(
+            "amount_sat must be positive; a zero repayment pays nothing",
+        ));
+    }
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let repayment = sh
@@ -2213,10 +2247,156 @@ async fn escrow_release(
 }
 
 // ---------------------------------------------------------------------------
-// Server
+// Server and DoS guards (SPEC.md §19.2: opt-in, loopback by default)
 // ---------------------------------------------------------------------------
-pub fn router(state: ApiState) -> Router {
-    Router::new()
+
+use axum::extract::connect_info::ConnectInfo;
+use axum::extract::Request;
+use axum::middleware::{from_fn_with_state, Next};
+use axum::response::Response;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
+
+/// Hard ceiling on how long a single request may run before the server drops
+/// it. Bounds the hold time on the shared-state `Mutex`, so a flood of slow
+/// requests cannot wedge block production.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many requests the API admits at once. With a current-threaded runtime
+/// this is an in-flight cap, not a thread count; it is what stops a flood of
+/// long-held requests from exhausting the runtime's readiness to accept new
+/// connections.
+const MAX_CONCURRENCY: usize = 64;
+
+/// Opt-in service API configuration. Carries the bearer token an exposed bind
+/// requires, the host the bound address is checked against for Host-header
+/// validation (DNS-rebinding defense), the in-flight request budget for the
+/// always-on DoS guard, and the per-IP rate limiter.
+#[derive(Clone)]
+pub struct ApiConfig {
+    /// Bearer token required on every request when this node is exposed.
+    pub token: Option<String>,
+    /// The host portion of the bound address, for Host-header validation.
+    pub bind_host: String,
+    /// In-flight request budget shared across the always-on guard.
+    concurrency: Arc<tokio::sync::Semaphore>,
+    /// Per-IP token bucket, only consulted on an exposed bind.
+    limiter: RateLimiter,
+}
+
+impl ApiConfig {
+    /// Whether the API is in exposed (authenticated) mode.
+    pub fn is_exposed(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// Snapshot the DoS guard configuration for `from_fn_with_state`.
+    fn dos(&self) -> DosConfig {
+        DosConfig {
+            timeout: REQUEST_TIMEOUT,
+            concurrency: Arc::clone(&self.concurrency),
+        }
+    }
+
+    /// Snapshot the auth/rate-limit configuration for `from_fn_with_state`.
+    fn auth(&self) -> AuthConfig {
+        AuthConfig {
+            bind_host: self.bind_host.clone(),
+            token: self.token.clone(),
+            limiter: self.limiter.clone(),
+        }
+    }
+}
+
+/// Always-on DoS guard config: a request deadline and a per-node in-flight cap.
+/// These protect the shared-state lock even on a loopback bind (§19.2).
+#[derive(Clone)]
+struct DosConfig {
+    timeout: Duration,
+    concurrency: Arc<tokio::sync::Semaphore>,
+}
+
+/// Auth + rate-limit config, only applied on an exposed bind.
+#[derive(Clone)]
+struct AuthConfig {
+    bind_host: String,
+    token: Option<String>,
+    limiter: RateLimiter,
+}
+
+// ---------------------------------------------------------------------------
+// Per-IP rate limiting (only active when the API is exposed)
+// ---------------------------------------------------------------------------
+
+/// Per-IP token bucket. Refills at `RATE_LIMIT_RATE` tokens/sec up to
+/// `RATE_LIMIT_CAPACITY`, so a client that bursts can proceed but a flood is
+/// shed to the server rather than through it. Holds only counters keyed by IP.
+#[derive(Clone)]
+struct RateLimiter {
+    inner: Arc<Mutex<HashMap<IpAddr, Bucket>>>,
+}
+
+#[derive(Debug)]
+struct Bucket {
+    /// Tokens remaining, scaled by `TOKEN_SCALE` for sub-request resolution.
+    tokens: u64,
+    /// Last refill instant.
+    last: Instant,
+}
+
+/// Refill rate and burst ceiling, in requests per second; and the fixed-point
+/// scale used for sub-request token accounting.
+const RATE_LIMIT_RATE: u64 = 60;
+const RATE_LIMIT_CAPACITY: u64 = 120;
+const TOKEN_SCALE: u64 = 1_000;
+const CAP: u64 = RATE_LIMIT_CAPACITY * TOKEN_SCALE;
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl RateLimiter {
+    /// Refuse a request when the bucket for `peer` is empty. Uses a blocking
+    /// lock because the API runtime is current-threaded and the critical
+    /// section is a few integer ops — an async lock would needlessly yield on
+    /// the hot path.
+    fn check(&self, peer: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut map = self.inner.lock().expect("rate table lock poisoned");
+        let bucket = map.entry(peer).or_insert(Bucket {
+            tokens: CAP,
+            last: now,
+        });
+        let elapsed = now.duration_since(bucket.last).as_secs_f64();
+        let refill = (elapsed * RATE_LIMIT_RATE as f64 * TOKEN_SCALE as f64).floor() as u64;
+        if refill > 0 {
+            bucket.tokens = (bucket.tokens + refill).min(CAP);
+            bucket.last = now;
+        }
+        if bucket.tokens >= TOKEN_SCALE {
+            bucket.tokens -= TOKEN_SCALE;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Always-on + exposed middleware (SPEC.md §19.2: opt-in, loopback by default)
+// ---------------------------------------------------------------------------
+// `dos_guard` always runs (timeout + in-flight cap, on every bind including
+// loopback). `exposed_auth` (Host check + bearer + per-IP rate limit) runs only
+// when the API is bound non-loopback with a token. Loopback-only binds, which
+// every test uses, stay unauthenticated by design.
+
+pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
+    let mut app = Router::new();
+    app = app
         .route("/v1/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/status", get(status))
@@ -2253,9 +2433,102 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/escrow/open", post(escrow_open))
         .route("/v1/escrow/{id}/release", post(escrow_release))
         .route("/v1/escrow/{id}", get(escrow_get))
-        .route("/v1/exit/crankable", get(exit_crankable))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
+        .route("/v1/exit/crankable", get(exit_crankable));
+    // The stack stays `Router<ApiState>` (no state yet) until the end, where a
+    // single `with_state` resolves it to the servable `Router<()>`.
+    let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
+
+    // Always-on DoS guard: a per-request deadline and a cap on how many
+    // requests are in flight at once. Implemented as a `from_fn_with_state`
+    // middleware so it produces a `Response` (never a service error) and
+    // satisfies `Router::layer`'s `Into<Infallible>` bound. This protects the
+    // runtime even on a loopback bind.
+    app = app.layer(from_fn_with_state(cfg.dos(), dos_guard));
+
+    if cfg.is_exposed() {
+        // Host-header validation, bearer auth and per-IP rate limiting all
+        // require the API to be exposed. Loopback-only binds (the default, and
+        // what every test uses) stay open by design.
+        app = app.layer(from_fn_with_state(cfg.auth(), exposed_auth));
+    }
+    app.with_state(state)
+}
+
+/// Always-on guard: bound the in-flight request count, then run the request
+/// with a deadline. A peer that can't acquire a permit gets 429; a peer whose
+/// request overruns the deadline gets 504. Either way the response is produced
+/// here, so the downstream service error stays `Infallible`.
+async fn dos_guard(State(cfg): State<DosConfig>, req: Request, next: Next) -> Response {
+    let permit = match cfg.concurrency.try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let mut resp =
+                axum::response::Response::new(axum::body::Body::from("too many requests"));
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            return resp;
+        }
+    };
+    match tokio::time::timeout(cfg.timeout, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            drop(permit);
+            let mut resp = axum::response::Response::new(axum::body::Body::from("gateway timeout"));
+            *resp.status_mut() = StatusCode::GATEWAY_TIMEOUT;
+            resp
+        }
+    }
+}
+
+/// Host-header + bearer-token gate + per-IP rate limit, applied only on an
+/// exposed bind. Returns a plain `Response` so the layer stays `Infallible` for
+/// `Router::layer`.
+async fn exposed_auth(
+    State(cfg): State<AuthConfig>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Per-IP token bucket: shed floods before doing any auth work.
+    if !cfg.limiter.check(addr.ip()) {
+        let mut resp =
+            axum::response::Response::new(axum::body::Body::from("request rate exceeded"));
+        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        return resp;
+    }
+    // Host-header validation: the request's `Host` must name the address this
+    // server bound to (or a loopback alias). Guards against a non-loopback bind
+    // being reached via a DNS-rebound Host whose name resolves back to a peer.
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    let host_part = host.split(':').next().unwrap_or("");
+    let host_ok = host_part == cfg.bind_host.as_str()
+        || host_part
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if !host_ok {
+        let mut resp = axum::response::Response::new(axum::body::Body::from("forbidden"));
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        return resp;
+    }
+    if let Some(token) = &cfg.token {
+        let bearer = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|s| s.trim());
+        if bearer != Some(token.as_str()) {
+            let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
+            *resp.status_mut() = StatusCode::UNAUTHORIZED;
+            return resp;
+        }
+    }
+    next.run(req).await
 }
 
 /// Start the API on a background thread and return the bound address.
@@ -2264,17 +2537,22 @@ pub fn router(state: ApiState) -> Router {
 /// real address even when it asked for port 0 — that is how tests get a free
 /// port without racing. The runtime lives entirely inside the thread: it
 /// exists to accept connections and parse HTTP, nothing else.
+///
+/// A non-loopback bind is refused unless `token` is set, because exposing this
+/// surface without authentication is an operator decision the node will not
+/// make silently.
 pub fn spawn(
     shared: Arc<Mutex<SharedNode>>,
     peers: Arc<AtomicUsize>,
     listen: SocketAddr,
+    token: Option<String>,
 ) -> Result<SocketAddr, String> {
-    if !listen.ip().is_loopback() {
-        eprintln!(
-            "warning: API binding {listen} is not loopback — the API is an \
-             unauthenticated service surface; exposing it is an operator decision \
+    if !listen.ip().is_loopback() && token.is_none() {
+        return Err(format!(
+            "refusing non-loopback API bind {listen} without a bearer token: \
+             set JNT_API_TOKEN and supply --api-listen, or bind loopback \
              (SPEC.md §19.2)"
-        );
+        ));
     }
     let std_listener =
         std::net::TcpListener::bind(listen).map_err(|e| format!("api bind {listen}: {e}"))?;
@@ -2284,7 +2562,13 @@ pub fn spawn(
     let addr = std_listener
         .local_addr()
         .map_err(|e| format!("api listener: {e}"))?;
-    let app = router(ApiState { shared, peers });
+    let cfg = ApiConfig {
+        token: token.filter(|t| !t.is_empty()),
+        bind_host: listen.ip().to_string(),
+        concurrency: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY)),
+        limiter: RateLimiter::default(),
+    };
+    let app = router(ApiState { shared, peers }, &cfg);
 
     std::thread::Builder::new()
         .name("jnt-api".into())

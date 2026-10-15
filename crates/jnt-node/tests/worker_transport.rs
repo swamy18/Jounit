@@ -103,8 +103,13 @@ fn start_with_task() -> (SocketAddr, Arc<Mutex<SharedNode>>, Hash) {
 
     let shared = Arc::new(Mutex::new(SharedNode::new(chain, l2)));
     let peers = Arc::new(AtomicUsize::new(0));
-    let addr = spawn(Arc::clone(&shared), peers, "127.0.0.1:0".parse().unwrap())
-        .expect("the API must bind its loopback socket");
+    let addr = spawn(
+        Arc::clone(&shared),
+        peers,
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+    )
+    .expect("the API must bind its loopback socket");
     (addr, shared, task_id)
 }
 

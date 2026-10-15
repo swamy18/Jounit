@@ -1237,6 +1237,14 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         .str("api-listen")
         .map(|s| s.parse().map_err(|e| format!("--api-listen: {e}")))
         .transpose()?;
+    // A non-loopback API bind requires auth (§19.2). The token comes from
+    // `--api-token` or, failing that, the `JNT_API_TOKEN` env var; either is
+    // left unset for a loopback bind, which stays unauthenticated by design.
+    let api_token: Option<String> = args
+        .str("api-token")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("JNT_API_TOKEN").ok())
+        .filter(|t| !t.is_empty());
 
     let node =
         P2pNode::start(config, chain.height(), chain.tip_hash()).map_err(|e| e.to_string())?;
@@ -1277,7 +1285,12 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let peers = Arc::new(AtomicUsize::new(0));
     let shared = Arc::new(Mutex::new(jnt_node::api::SharedNode::new(chain, l2)));
     if let Some(api_addr) = api_listen {
-        let bound = jnt_node::api::spawn(Arc::clone(&shared), Arc::clone(&peers), api_addr)?;
+        let bound = jnt_node::api::spawn(
+            Arc::clone(&shared),
+            Arc::clone(&peers),
+            api_addr,
+            api_token.clone(),
+        )?;
         println!("api            {bound}");
     }
 
