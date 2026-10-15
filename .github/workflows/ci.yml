@@ -83,8 +83,9 @@ jobs:
 
       # Nightly with llvm-tools/clang runtime is what cargo-fuzz builds with;
       # on Linux the ASan runtime ships with the toolchain, so no extra setup.
-      # This is a moving ref pinned by Dependabot (`.github/dependabot.yml`);
-      # refresh the SHA from the branch tip when it is bumped.
+      # Pinned by SHA from the branch tip, and deliberately NOT maintained by
+      # Dependabot (its github-actions updater resolves moving branches to the
+      # wrong SHA — see `.github/dependabot.yml`). Refreshed by hand.
       - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
         with:
           components: llvm-tools-preview

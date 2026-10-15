@@ -1,25 +1,15 @@
-# Keeps the SHA-pinned actions in `.github/workflows` current. Without this the
-# pins are a leaky bucket: nothing bumps a pinned SHA, so `stable` and `nightly`
-# would silently freeze at whatever tip they were pinned at (see the comment in
-# `ci.yml`'s fuzz-smoke job).
+# Keeps dependencies current without turning the branch list into noise.
+#
+# Two rules shape this file, both learned from what an earlier revision did:
+# it set `open-pull-requests-limit: 5` per ecosystem with no grouping, which
+# produced eleven simultaneous PRs (five crate bumps and six action bumps) the
+# day it landed. Dependabot opens one branch per *dependency*, so the limit has
+# to be near zero and the updates have to be grouped, or a repo that wants a
+# single branch gets a spray of them.
 version: 2
 updates:
-  - package-ecosystem: github-actions
-    directory: "/"
-    schedule:
-      # Weekly is enough for action pins: they change rarely, and a new SHA must
-      # not land mid-review of a release tag.
-      interval: weekly
-    commit-message:
-      prefix: "ci"
-      include: "scope"
-    # Never let a bot move the pipeline underneath a pull request that is
-    # already under review.
-    open-pull-requests-limit: 5
-
-  # The workspace `Cargo.toml` dependencies, so `cargo audit`-relevant CVEs have a
-  # path to a reviewed bump. Update policy is conservative on purpose: a
-  # transitive bump that changes consensus encoding must be a human decision.
+  # Rust crates. One grouped PR per week instead of one per crate, so a CVE has
+  # a reviewed path to a bump without eleven branches to manage.
   - package-ecosystem: cargo
     directory: "/"
     schedule:
@@ -27,4 +17,54 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
-    open-pull-requests-limit: 5
+    # Every crate into a single PR. A transitive bump still lands, but as one
+    # reviewable diff rather than five branches that fight each other.
+    groups:
+      rust-crates:
+        patterns:
+          - "*"
+    # At most one open PR across the whole workspace.
+    open-pull-requests-limit: 1
+    # A semver-major bump of these is a *protocol* decision, not a bot's.
+    # `sha2` is the domain separator every hash on the chain flows through,
+    # `k256` is the curve every signature is verified on, and `argon2` /
+    # `chacha20poly1305` are the wallet's KDF and cipher. Swapping any of them
+    # on a major can change encoded forms or verification behaviour, so it must
+    # be a deliberate, tested release. Ignoring them here blocks the *major*
+    # only: patch and minor security releases still arrive, which is what keeps
+    # a CVE in, say, `sha2 0.10.x` moving.
+    ignore:
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "k256"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "argon2"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "chacha20poly1305"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions. Needed for supply-chain hygiene: the workflows pin every
+  # action to a commit SHA, and something has to notice when a pinned action
+  # falls behind (a compromised or outdated action is a real supply-chain risk).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 1
+    # `dtolnay/rust-toolchain` is the one action Dependabot cannot help with.
+    # The workflows pin `stable` and `nightly` — moving *branches*, not tags —
+    # by SHA. The updater resolves both pins to the same latest tip and then
+    # rewrites one of them with the other's SHA: it opened a PR proposing to
+    # change the `# nightly` pin to the SHA that is `stable`'s tip. No pin it
+    # writes for this action can be trusted, so it is ignored and the toolchain
+    # pins are refreshed by hand as part of the release checklist
+    # (`docs/mainnet-readiness.md` §1).
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"

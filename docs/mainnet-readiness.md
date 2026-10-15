@@ -69,8 +69,15 @@ also exists now, with a conservation gate before its first pass.)
   for the keyless signing identity, and only `publish` takes `contents: write`).
   To audit a release, resolve each SHA back to its tag and confirm the pinned
   `dtolnay/rust-toolchain@stable` commit is still the branch tip it claims to be
-  — `stable` is a moving ref, so its SHA can only be checked against the branch
-  it was cut from, and a stale pin is what Dependabot is there to prevent.
+  — `stable` and `nightly` are moving refs, and Dependabot is configured to
+  *ignore* that action because its updater resolves both moving pins to the same
+  tip and rewrites one with the other's SHA. They are therefore a manual step,
+  not a bot's, and `.github/dependabot.yml` groups every other dependency
+  update into at most one PR per ecosystem (`open-pull-requests-limit: 1`) so the
+  branch list stays at `main`. A semver-major bump of `sha2`, `k256`, `argon2`
+  or `chacha20poly1305` is likewise ignored by Dependabot: swapping the domain
+  separator, the curve, the wallet KDF or the wallet cipher on a major is a
+  protocol decision. Their patch and minor security releases still arrive.
 
 ## 2. Monitoring & observability
 
