@@ -25,6 +25,7 @@ use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 /// File magic: `JNTWLT` plus the format version `01`. Present only on
 /// encrypted files, so plaintext JSON is still recognized by shape.
@@ -50,13 +51,16 @@ pub fn is_encrypted(blob: &[u8]) -> bool {
     blob.starts_with(MAGIC)
 }
 
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
-    let mut key = [0u8; 32];
+/// Derive the ChaCha20-Poly1305 key from the passphrase, returned in a
+/// `Zeroizing` buffer so the in-memory key is overwritten when it goes out of
+/// scope rather than sitting in a freed allocation for the next taker.
+fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
+    let mut key = Zeroizing::new([0u8; 32]);
     // Argon2id at the crate's defaults (RFC 9106 second recommended option):
     // memory-hard on purpose, so an attacker with the file cannot brute-force
     // a human passphrase at the speed of a GPU hash.
     Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key[..])
         .map_err(|e| format!("key derivation failed: {e}"))?;
     Ok(key)
 }
@@ -73,7 +77,7 @@ pub fn encrypt(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let key = derive_key(passphrase, &salt)?;
     // `new_from_slice`/`Nonce::from` rather than the deprecated `from_slice`
     // constructors, which generic-array 0.14 warns on.
-    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+    let cipher = ChaCha20Poly1305::new_from_slice(&key[..])
         .map_err(|_| "wallet cipher setup failed".to_string())?;
     let ct = cipher
         .encrypt(&Nonce::from(nonce), plaintext)
@@ -104,7 +108,7 @@ pub fn decrypt(passphrase: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
     nonce_bytes.copy_from_slice(nonce);
     let key = derive_key(passphrase, salt)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+    let cipher = ChaCha20Poly1305::new_from_slice(&key[..])
         .map_err(|_| "wallet cipher setup failed".to_string())?;
     cipher
         .decrypt(&Nonce::from(nonce_bytes), ct)
