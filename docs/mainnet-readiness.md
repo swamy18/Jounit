@@ -60,6 +60,18 @@ also exists now, with a conservation gate before its first pass.)
   | 7 | update `CHANGELOG.md` | **no CHANGELOG exists yet** |
   | 8 | tag `vMAJOR.MINOR.PATCH`, publish to GitHub Releases | **not yet done** |
 
+- **Supply-chain verification (release build):** every action in
+  `.github/workflows/{ci,release}.yml` is pinned to a commit SHA with the tag
+  it came from in a trailing comment, `.github/dependabot.yml` refreshes those
+  pins weekly, and the cosign installer is pinned to both a SHA and an explicit
+  `cosign-version` rather than `@main` / `latest`. Job tokens are least-
+  privilege (`contents: read` by default; only `build` takes `id-token: write`
+  for the keyless signing identity, and only `publish` takes `contents: write`).
+  To audit a release, resolve each SHA back to its tag and confirm the pinned
+  `dtolnay/rust-toolchain@stable` commit is still the branch tip it claims to be
+  — `stable` is a moving ref, so its SHA can only be checked against the branch
+  it was cut from, and a stale pin is what Dependabot is there to prevent.
+
 ## 2. Monitoring & observability
 
 **A Prometheus text endpoint exists: `GET /metrics`.** It serves
@@ -67,7 +79,11 @@ also exists now, with a conservation gate before its first pass.)
 plus the two relay-queue depths. Gauges only, one static `network` label, no
 counters that need per-request bookkeeping in the consensus loop, and no key
 material or per-user data — see the handler in `crates/jnt-node/src/api.rs`.
-It carries the same loopback-by-default exposure as every other route.
+It carries the same loopback-by-default exposure as every other route: a
+loopback bind is unauthenticated, and a non-loopback bind is refused unless
+`--api-token`/`JNT_API_TOKEN` supplies a bearer token, which the exposed stack
+then enforces on every request alongside Host-header validation, a per-request
+deadline, a global in-flight cap and a per-IP rate limit.
 
 The `/health` path in an earlier revision is wrong twice over: the route is
 `/v1/health` and it returns only `{"status":"ok"}`. The rich JSON observables

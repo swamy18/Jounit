@@ -165,11 +165,17 @@ blocker 1 alone (no exits) prevents a functional economy.
 - Reputation scores are derived in `jnt-l2` but are **not exposed** over the
   node API or MCP yet (a `GET /v1/reputation/{id}` would be the natural next
   step).
-- The worker↔node transport has **no authentication**: the API is an
+- ~~The worker↔node transport has **no authentication**: the API is an
   unauthenticated service surface, loopback binding is the only control, and a
-  non-loopback bind prints a warning rather than enforcing a credential. §19.2's
-  authentication bullet is therefore satisfied by the operator's binding choice
-  alone, and this is stated in `SPEC.md §19.2` rather than papered over.
+  non-loopback bind prints a warning rather than enforcing a credential~~
+  — **resolved since:** a non-loopback bind is now *refused* without a bearer
+  token (`--api-token` or `JNT_API_TOKEN`), and an exposed bind additionally
+  enforces Host-header validation (DNS-rebinding), a per-request deadline, a
+  global in-flight cap and a per-IP rate limit, all in `jnt-node/src/api.rs`.
+  Loopback remains unauthenticated by design — it is the default and what every
+  test drives. What is still true: the API is a service surface and not a
+  consensus surface, and the rate limiter is a token bucket per remote address,
+  not a per-account quota.
 - The transport is also **unexercised against a real remote node process**: the
   tests drive a live socket against an in-process server, which is a genuine
   transport test but not a two-process deployment test.
