@@ -1,0 +1,30 @@
+# Keeps the SHA-pinned actions in `.github/workflows` current. Without this the
+# pins are a leaky bucket: nothing bumps a pinned SHA, so `stable` and `nightly`
+# would silently freeze at whatever tip they were pinned at (see the comment in
+# `ci.yml`'s fuzz-smoke job).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      # Weekly is enough for action pins: they change rarely, and a new SHA must
+      # not land mid-review of a release tag.
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    # Never let a bot move the pipeline underneath a pull request that is
+    # already under review.
+    open-pull-requests-limit: 5
+
+  # The workspace `Cargo.toml` dependencies, so `cargo audit`-relevant CVEs have a
+  # path to a reviewed bump. Update policy is conservative on purpose: a
+  # transitive bump that changes consensus encoding must be a human decision.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    open-pull-requests-limit: 5

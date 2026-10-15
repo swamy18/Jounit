@@ -10,10 +10,13 @@ on:
         required: true
         type: string
 
+# Least privilege by default: every job starts read-only and each takes only the
+# extra scope it needs. `gate` verifies the tree and needs nothing beyond read;
+# `build` needs `id-token: write` for the keyless cosign OIDC identity; `publish`
+# needs `contents: write` to create the release. No job pushes to GHCR, so
+# `packages: write` is deliberately absent.
 permissions:
   contents: read
-  id-token: write
-  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,15 +30,15 @@ jobs:
     name: verify the tagged tree
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Format
         run: cargo fmt --all --check
@@ -55,6 +58,11 @@ jobs:
     name: build ${{ matrix.target }}
     needs: gate
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # Keyless signing below mints an ephemeral cosign key pair from the run's
+      # OIDC identity, so the job must be able to request one.
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -69,15 +77,15 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: jnt-node.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p jnt-node
@@ -100,9 +108,9 @@ jobs:
       # transparency log. `mainnet-readiness.md` §7: operators verify against
       # the SHA256SUMS + the Sigstore bundle, not a Jounit-held signing key.
       - name: Install cosign
-        uses: sigstore/cosign-installer@main
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-version: "latest"
+          cosign-version: '3.1.3'
 
       - name: Sign binary
         shell: bash
@@ -111,7 +119,7 @@ jobs:
           cosign sign-blob --bundle "${{ matrix.artifact }}.sig" \
             --yes "${{ matrix.artifact }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jnt-node-${{ matrix.target }}
           path: |
@@ -120,19 +128,19 @@ jobs:
             target/${{ matrix.target }}/release/${{ matrix.artifact }}.sig
           if-no-files-found: error
 
-publish:
-  name: publish
-  needs: build
-  runs-on: ubuntu-latest
-  permissions:
-    contents: write
-    id-token: write
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the GitHub release is the only write this job performs.
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -158,7 +166,7 @@ publish:
             cat dist/SHA256SUMS
           } > dist/VERIFICATION.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
