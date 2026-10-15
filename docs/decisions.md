@@ -1406,3 +1406,47 @@ do not move — they are frozen, not confiscated, and they stay in the UTXO set
 where a later rule can only ever thaw them, never invent them. That is why
 the grace period between announcing the height and flipping it must be long,
 and why the flip waits for a testnet rehearsal like every other activation.
+
+## Settle-vote age — analysed, no maximum needed
+
+**Status: ANALYSED 2026-10-15, no change.**
+
+A settle vote now binds network and height inside its signed hash, so an
+aggregate over one chain's decision does not verify on another chain, and a
+vote from the future is refused at apply. What is still absent is a maximum
+vote *age*, so the question was asked directly: can an old aggregate change
+state it was not intended to change?
+
+`crates/jnt-l2/tests/settle_stale_quorum.rs` tries the three shapes that
+could matter, each against a real quorum aggregate over a disputed task:
+
+1. **The same task and the same decision, again.** Identical bytes are
+   `Replay` (a task settles once, so the txid is already applied). The same
+   decision *signed afresh* at a later height produces a different payload
+   and is refused by the state machine as `IllegalTransition` — the task is
+   already settled. No second certificate, no value moved.
+2. **The same decision pointed at another task.** The id is refused as
+   `UnknownTask` when the state does not hold it, and `IllegalTransition`
+   when it holds a task that was never disputed. A vote's referent is
+   `task_id`, which is derived from the post payload, so there is no way to
+   name another task without naming another task.
+3. **The same task after its state machine moved on.** Applied after the
+   dispute window lapsed, the explicit settlement is refused
+   (`IllegalTransition` / `TaskExpired`) and only the implicit clock outcome
+   stands. Independently, the honest aggregate for the *next* task still
+   works while a stale one for a previous task is in flight, so staleness
+   does not leak between disputes.
+
+The reason no exploit exists is the same in every case and it is structural:
+**the referent of a vote is the task id, and a task settles at most once.**
+The vote's height changes which message the signatures cover; it cannot
+change which task the decision is about, and the state machine enforces
+single use of that task. An age limit would therefore refuse only
+transactions the state machine already refuses.
+
+An age parameter was considered and rejected: it would need a new field in
+the signed payload (another consensus change) to refuse, by replay, a
+decision the state machine already refuses by transition — paying a wire
+change for a refusal that already exists. What *is* load-bearing, and now
+covered by tests, is that a stale aggregate never blocks or corrupts the
+honest work around it.
