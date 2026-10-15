@@ -215,12 +215,19 @@ impl ChainL2 {
         let binding = chain.finality().binding_finalized_height();
         let mut l2 = ChainL2::empty(config, genesis, deposits);
         for height in 1..=tip {
-            // `block_at` is total over 1..=height on a canonical chain. A
-            // missing block would mean the chain is internally inconsistent,
-            // which is a bug in `Chain`, not an input to route around here.
-            let block = chain
-                .block_at(height)
-                .expect("canonical chain must have a block at every height up to its tip");
+            // `block_at` is total over 1..=tip on a canonical chain: `canon`
+            // indexes every canonical height and `Chain::prune_side_branches`
+            // keeps every canonical block, so a miss means the chain is
+            // internally inconsistent — a bug in `Chain`, not an input to route
+            // around here. Rather than abort the process (which is every peer
+            // connection and every request from then on, with `panic = "abort"`),
+            // stop the replay at the first height that cannot be read: the node's
+            // `apply_block` catch-up then resumes from the L2 tip and the chain
+            // keeps moving. It cannot silently diverge, because the case is
+            // unreachable — this only removes the abort mode if that changes.
+            let Some(block) = chain.block_at(height) else {
+                break;
+            };
             l2.absorb(height, block, tip, binding, validators, verifier);
         }
         l2

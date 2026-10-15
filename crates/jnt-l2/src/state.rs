@@ -962,6 +962,11 @@ impl L2State {
             // resolution. Both settle as `Correct` with no fee; the difference
             // is which deposits move, and `settle_inner` accounts for that.
             let settled = {
+                // `ids` was collected from these keys, and `tasks` is insert-only
+                // (`tasks.insert` at 714 and 1375 are the only writers here), so
+                // the entry cannot be gone: a miss means the map lost a row it
+                // never removed, which is a bug in this module rather than an
+                // input to route around.
                 let t = self.tasks.get_mut(&id).expect("id came from the map");
                 let attrs = (t.submitter, t.worker, t.challenger());
                 // The certificate binds to the result the settlement names, so
@@ -1029,14 +1034,14 @@ impl L2State {
             let expired = self
                 .tasks
                 .get_mut(&id)
-                .expect("id came from the map")
+                .expect("id came from the map; tasks is insert-only")
                 .try_expire(height);
             if let Some(o) = expired {
                 let submitter = self
                     .tasks
                     .get(&id)
                     .map(|t| t.submitter)
-                    .expect("expired task still exists");
+                    .expect("expired task still exists; tasks is insert-only");
                 let _ = self.pay(&submitter, o.submitter_refunded);
                 self.burned = self.burned.saturating_add(o.worker_deposit_burned);
                 effects.push(L2Effect::Expired {
