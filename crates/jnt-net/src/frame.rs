@@ -84,9 +84,26 @@ pub fn read_frame<R: Read>(r: &mut R, params: &NetworkParams) -> NetResult<(u8, 
         return Err(NetError::OversizedFrame { len: payload_len });
     }
 
-    let mut payload = vec![0u8; payload_len as usize];
+    let payload_len = payload_len as usize;
+    // Read incrementally in bounded chunks rather than `vec![0; payload_len]`,
+    // so a peer that declares a large length but sends only a trickle of bytes
+    // holds roughly the bytes it actually delivered, not the whole lie. With
+    // `max_peers` inbound readers this caps the pinned memory at
+    // `chunk_len * max_peers` rather than `MAX_FRAME_PAYLOAD * max_peers`.
+    let mut payload = Vec::new();
     if payload_len > 0 {
-        r.read_exact(&mut payload).map_err(truncated("payload"))?;
+        payload
+            .try_reserve(payload_len)
+            .map_err(|_| NetError::Protocol("payload allocation over cap".into()))?;
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = payload_len;
+        while remaining > 0 {
+            let want = remaining.min(buf.len());
+            r.read_exact(&mut buf[..want])
+                .map_err(truncated("payload"))?;
+            payload.extend_from_slice(&buf[..want]);
+            remaining -= want;
+        }
     }
 
     Ok((msg_type, payload))

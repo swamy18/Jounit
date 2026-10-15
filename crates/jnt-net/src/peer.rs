@@ -219,7 +219,15 @@ pub fn perform_handshake(
         }
         let ver = match Message::decode(ty, &payload)? {
             Message::Version(v) => v,
-            _ => unreachable!(),
+            // `decode` dispatches on the type byte, so this arm is unreachable
+            // as long as the two stay in lockstep. Refusing by name rather than
+            // `unreachable!()` keeps a future decode change a protocol error
+            // instead of a panic on network-controlled bytes.
+            _ => {
+                return Err(NetError::Protocol(
+                    "VERSION frame did not decode to a VERSION message".into(),
+                ))
+            }
         };
 
         validate_peer_version(&ver, &config.params, &genesis_hash)?;
@@ -248,7 +256,13 @@ pub fn perform_handshake(
                     )));
                 }
             }
-            _ => unreachable!(),
+            // See the VERSION arm above: an error return, never a panic on
+            // network-controlled bytes.
+            _ => {
+                return Err(NetError::Protocol(
+                    "VERACK frame did not decode to a VERACK message".into(),
+                ))
+            }
         }
 
         ver
@@ -262,7 +276,13 @@ pub fn perform_handshake(
         }
         let ver = match Message::decode(ty, &payload)? {
             Message::Version(v) => v,
-            _ => unreachable!(),
+            // See the initiator's VERSION arm: an error return, never a panic on
+            // network-controlled bytes.
+            _ => {
+                return Err(NetError::Protocol(
+                    "VERSION frame did not decode to a VERSION message".into(),
+                ))
+            }
         };
 
         validate_peer_version(&ver, &config.params, &genesis_hash)?;
@@ -300,7 +320,11 @@ pub fn perform_handshake(
                     )));
                 }
             }
-            _ => unreachable!(),
+            _ => {
+                return Err(NetError::Protocol(
+                    "VERACK frame did not decode to a VERACK message".into(),
+                ))
+            }
         }
 
         ver
