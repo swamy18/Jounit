@@ -577,10 +577,14 @@ double-sign is recorded as `ArbitrationEquivocation`.
 > **One stated limitation.** A vote signs the settle *decision*, so its signature
 > verifies on any chain carrying that decision. Network and height are checked
 > against the node's own chain at tally time rather than bound into the signature.
-> Binding them into the hash would change `SettlePayload::signing_hash` â€” a
-> consensus change â€” so it is documented in
+> Binding them into the hash would change `SettlePayload::signing_hash` — a
+> consensus change — so it is documented in
 > [`arbitration.rs`](crates/jnt-core/src/arbitration.rs) rather than made
-> unilaterally.
+> unilaterally. The tally is nonetheless the thing that binds them: `record`
+> refuses a vote that disagrees with the node's own network or height and is the
+> only entry point into a tally, and `settle_payload` re-checks that every
+> counted vote names one network and one height before any aggregate becomes a
+> settle transaction.
 
 ### What a fraud verdict does
 
@@ -731,9 +735,13 @@ applies.
 | M3 compute IR | Provides the reference | Envelopes carried, no interpreter |
 | M4 HBM puzzle | **Registered (off on mainnet)** | `hbm_pow.rs` scratchpad PoW is registered as `puzzle_id = 2` (reviewed in `docs/security-review-hbm-2026-10-12.md`); `Chain::pow_satisfies` dispatches by puzzle id. `mini`/`testnet` keep mining `puzzle_id = 1` (hybrid); M4 is recognized but not activated as the mining puzzle |
 | M5 finality | **Off on mainnet** | Both sides built; activation unset |
-| REST API, `/metrics` | **Shipped** | Opt-in, loopback, unauthenticated |
-| Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, keyless cosign/Sigstore bundle wiring — **no signed release published yet** |
-| **Independent security review** | **In progress** | A focused self-review of the HBM permutation gates M4 registration (`docs/security-review-hbm-2026-10-12.md`); a third-party audit is still required before mainnet |
+| REST API, `/metrics` | **Shipped** | Opt-in (`--api-listen`). **Loopback by default and unauthenticated**; a **non-loopback bind is refused** unless `--api-token`/`JNT_API_TOKEN` supplies a bearer token (§19.2). An exposed bind then enforces Host-header validation (DNS-rebinding), bearer auth on every request, and a per-IP token bucket |
+| API DoS guards | **Shipped** | Always on, on every binding including loopback, because they bound the shared-state `Mutex` rather than defend a remote attacker: a 10-second per-request deadline and a 64-request in-flight cap, so a flood of slow requests cannot wedge block production |
+| Zeroizing wallet keys | **Shipped** | The Argon2id-derived symmetric key is held in a `Zeroizing` wrapper and dropped on release, so a decrypted key is not left in freed memory for the next allocation to expose |
+| Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, keyless cosign/Sigstore bundle wiring — **no signed release published yet**. Every action pinned to a commit SHA; job tokens least-privilege; Dependabot refreshes pins without opening PR branches |
+| Net frame reads | **Shipped** | A frame body is read incrementally into a reserved buffer in 64 KiB chunks, so a peer cannot ask for one allocation larger than the whole frame cache |
+| Per-request panic discipline | **Shipped** | No `unwrap`/`expect`/`unreachable!` is reachable from a request or a peer frame on the audited paths. With `panic = "abort"` in the release profile, one panic is a whole-node crash, so each is either made an error return or proved an unreachable invariant |
+| **Independent security review** | **In progress** | A focused self-review of the HBM permutation gates M4 registration (`docs/security-review-hbm-2026-10-12.md`); a focused internal pass over request-path panics, exposure controls and CI supply-chain hygiene closed 15 items on Oct 15. **A third-party audit is still required before mainnet** — neither self-review substitutes for one |
 
 ### Why M4 is registered but not activated
 
@@ -774,7 +782,7 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **Unchallenged results** | A wrong unchallenged result produced a certificate that `validate()` accepted with no signal | **`asserts_correctness()` / `validate_verified`** make the weak basis unmissable |
 | **HBM** | Registered but not the active mining puzzle | Registered as `puzzle_id = 2` with a security review; `mini`/`testnet`/mainnet still mine `puzzle_id = 1` (hybrid), so registration is an open item made safe, not a mainnet-readiness change |
 | **Escrow identity** | Two escrows with the same parties and amount under different conditions shared one id, so the second open silently replaced the first | **The condition is part of the escrow id**, so different contracts are different escrows |
-| **Credit reservation accounting** | A position-backed reservation left free balance spendable (double-admit), recorded one position of a multi-position spread, and interest overflow wrapped or capped silently | **Free is swept at admission, draws are tracked per position, refused admissions leave the book untouched, and interest overflow is refused**; pinned by 3 new `redteam_round2` regressions |
+| **Credit reservation accounting** | A position-backed reservation left free balance spendable (double-admit), recorded one position of a multi-position spread, and interest overflow wrapped or capped silently | **Free is swept at admission, draws are tracked per position, refused admissions leave the book untouched, and interest overflow is refused**; and `POST /v1/payment/submit` **fails fast** on a position-backed admission it cannot service instead of locking that capacity forever; pinned by 3 new `redteam_round2` regressions |
 | **Chain identity hashes** | `txid` and `block_hash` were 32-byte SHA-256: ~128-bit preimage and ~85-bit collision resistance against a quantum attacker | **Widened to 64-byte SHA-512** under new domain tags (`DOM_TX512`, `DOM_BLOCK512`), as a separate `Hash512` type. PoW target math, Merkle nodes and addresses keep their widths; vectors regenerated |
 | **Quantum succession** | A CRQC breaks secp256k1 and BLS12-381, so spends, checkpoints and VWCs were all classically signed | **Three dual-signature paths**: spends accept an ML-DSA-65 component (scheme 3) inside the hybrid bundle, checkpoints carry a lattice sidecar verified as clause 7, and settlements and their VWCs carry one their votes sign. Validators register lattice keys in their bonds. Every rule is accepted-not-required: `pq_activation_height` is `0` on every profile until a rehearsal flips it |
 | **Bond admission** | Anyone could hand the chain a published public key they do not own: squatting a validator out of their own key, or registering a rogue key chosen to cancel another key inside an aggregate | **Proof of possession is mandatory**: `TX_BOND` carries a 96-byte signature over network + bonder + key, checked by `check_bond_tx`, and a payload without one does not decode |
@@ -783,6 +791,14 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | **Escrow timeouts** | No expiry and no refund: a lost key or a silent arbitrator held the value forever, and an oracle escrow could be opened although nothing could ever release it | **A 7-day expiry refunds the payer** (`opened_height` + `ESCROW_EXPIRY_BLOCKS`), a release past the timeout is refused, and oracle conditions are refused at open |
 | **Wallet keys at rest** | `wallets.json` held plain-hex private keys at whatever permissions the umask allowed | **Mode 0600 via temp-file rename and encrypted** under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305); plaintext writes require `--allow-plaintext-wallet` |
 | **Item 10 settlement** | A credit reservation could never settle and a released escrow never committed: the debit and the state change had no landing place | **Non-custodial ledger settlement**: `credit.settle` commits at receipt acceptance behind a `settled_payments` conservation bucket, and `ConditionalEscrow::finalize` commits `Released` → `Finalized` under finality, driven by the serve loop |
+| **Zero-amount credit requests** | A bond, release, repay or open for `0` sat dereferenced a `get_mut()` on an address that had no credit entry — a panic, and with `panic = "abort"` a whole-node crash from one malformed request | **Refused by name** as `Malformed` before any mutation, and the entry is taken with `entry().or_insert(0)` so no code path can panic on a missing row. Pinned by 4 new regressions |
+| **API exposure** | The REST API was unauthenticated on any bind — loopback was the only control — and no request had a deadline or an in-flight cap, so slow requests held the shared-state `Mutex` for as long as they liked | **A non-loopback bind is refused without a token**, and an exposed bind adds Host-header validation (a DNS-rebound name cannot answer for it), bearer auth, and a per-IP token bucket. A 10-second deadline and a 64-request cap apply on *every* binding, loopback included |
+| **Key material in memory** | The Argon2id-derived wallet key was an ordinary `[u8; 32]`, so it stayed readable in freed memory until something else overwrote it | **`Zeroizing`** wraps the derived key for its whole life and drops it on release, so the decrypt-and-reencrypt path does not leave a key behind |
+| **Net frame allocation** | `read_frame` reserved `vec![0u8; payload_len]` up front, so a peer that declared a near-maximum length got the node to allocate that in one shot before reading a byte of it | **Read incrementally**: reserve with `try_reserve`, then fill in 64 KiB chunks, capping pinned memory at `chunk × max_peers` and refusing an allocation larger than the frame cache |
+| **Handshake failure handling** | Four `unreachable!()`s sat after `Message::decode` in `peer.rs`, each reachable from a peer's bytes | **`NetError::Protocol`** returns instead, so a malformed handshake costs one connection rather than the process |
+| **HBM scratchpad lane** | The lane was indexed with `state % lanes as u64` **after** the modulo on a `u64` — correct on 64-bit, but it cast the *modulus* to `usize` rather than reducing the state, so it was one edit away from a truncation | **Reduce before the width cast**: `state % lanes as u64` is computed on the same width at both sites, which is identical on 64-bit and correct on 32-bit |
+| **Arbitration tally** | `settle_payload` re-checked committee, quorum and the BLS aggregate, but trusted the accumulator on network and height | **Network and height are re-checked across every counted vote** at the point the aggregate becomes a settle transaction. This is a safety net, not a new rule: `record` refuses a vote that disagrees with the node's own network or height and is the only entry into a tally, but the point that pays out no longer has to trust that invariant |
+| **L2 replay failure handling** | `replay_to` *aborted the process* if `block_at` returned `None` for any height up to the tip — and with `panic = "abort"` that took the node down, including every open connection | **Stops the replay** at the first unreadable height and lets the node's `apply_block` catch-up resume from the L2 tip. The case is provably unreachable (`Chain::prune_side_branches` keeps every canonical block), so this removes the abort mode without changing behaviour |
 
 ---
 
@@ -863,6 +879,21 @@ Common options: `--network <mainnet|testnet|mini>` (default `mini`) and
 
 `serve` also takes `--listen`, `--connect`, `--peers`, `--interval`,
 `--api-listen` and `--no-mine`. `send --amount` is in satoshis while printed
+
+The API defaults to loopback and needs no credentials. Binding anything
+non-loopback is refused unless a token is supplied:
+
+```sh
+# Non-loopback: a bearer token is mandatory (§19.2).
+jnt-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080 --api-token "$JNT_API_TOKEN"
+
+# Loopback: unchanged, and unauthenticated.
+jnt-node serve --network testnet --data-dir ./chain --api-listen 127.0.0.1:8080
+```
+
+Every request to an exposed bind must carry `Authorization: Bearer <token>`, and
+a `Host` header that names the bound address. Exposed binds also rate-limit per
+remote address, and every bind caps a request at 10 seconds and 64 in flight.
 figures are in JNT.
 
 ---
@@ -870,7 +901,7 @@ figures are in JNT.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1154 tests, 0 failures
+cargo test --workspace                                   # 1160 tests, 0 failures
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -894,7 +925,18 @@ cargo test -p jnt-core --test pq_signature     # post-quantum bundle attacks
 CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release
 build, the vector cross-checks, attack simulations, and all fourteen fuzz targets
 on nightly with ASan. `.github/workflows/release.yml` re-runs the same gate on a
-tagged tree before publishing artifacts with checksums.
+tagged tree before publishing artifacts with checksums and a keyless
+cosign/Sigstore bundle.
+
+**Every action is pinned to a commit SHA**, with the tag it came from in a
+trailing comment, so a compromised or retagged action cannot silently change
+what CI runs. Job tokens are least-privilege: `contents: read` by default, and
+only the two jobs that genuinely write (the signing job's `id-token: write` for
+the OIDC identity, the publish job's `contents: write`) take more. Dependabot
+keeps the pins honest but opens **no pull requests** — every update PR is a
+branch, and this repository keeps `main` as its only branch, so applying a bump
+is an owner step (`cargo update -p <crate>` plus `cargo audit`). Security
+*alerts* are unaffected: those come from the advisory database, not from PRs.
 
 **Vectors.** `tests/vectors/` holds the consensus byte layouts, generated only
 from the implementation. `sim/jounit_reference.py` is a second PoW implementation
@@ -922,7 +964,7 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1154 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1160 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnodes, no log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |

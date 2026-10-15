@@ -86,6 +86,9 @@ SERVE OPTIONS:
   --listen <host:port>       TCP address to accept inbound peers (optional)
   --api-listen <host:port>   Start the opt-in REST service API (disabled by
                              default; loopback expected — see SPEC.md §19.2)
+  --api-token <token>        Bearer token the API requires. A non-loopback
+                             --api-listen is refused without one; absent, the
+                             JNT_API_TOKEN environment variable is used
   --connect <host:port>      Dial an outbound peer (repeatable via CSV)
   --peers <n>                Max total peers (default: 125)
   --interval <ms>            Serve loop period (default: 250)
@@ -149,6 +152,7 @@ impl Args {
                         | "fee"
                         | "listen"
                         | "api-listen"
+                        | "api-token"
                         | "connect"
                         | "peers"
                         | "relay"
