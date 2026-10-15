@@ -7,3 +7,28 @@ __pycache__/
 *.pyc
 chain/
 .freebuff/
+
+# Node data and key material. `wallets.json` (and its `--wallet-file`
+# equivalents) holds encrypted keys; the `.tmp` companion is what
+# `wallet_store::write_private` builds before the atomic rename, so a crash can
+# leave one behind holding plaintext key bytes. Neither belongs in git.
+*.tmp
+*.temp
+wallets.json
+*.json.tmp
+*.pem
+*.pkcs12
+
+# Rust profiling / coverage artifacts from `-C instrument-coverage` and the
+# ASan fuzz campaign.
+*.profraw
+*.profdata
+.lcov.info
+coverage/
+tarpaulin-report.html
+
+# Editor and OS cruft.
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
