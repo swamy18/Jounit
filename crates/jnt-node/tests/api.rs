@@ -77,8 +77,13 @@ fn start_with(chain: Chain) -> Node {
     let l2 = NodeL2::fresh(&params);
     let shared = Arc::new(Mutex::new(SharedNode::new(chain, l2)));
     let peers = Arc::new(AtomicUsize::new(0));
-    let addr = spawn(Arc::clone(&shared), peers, "127.0.0.1:0".parse().unwrap())
-        .expect("the API must bind its loopback socket");
+    let addr = spawn(
+        Arc::clone(&shared),
+        peers,
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+    )
+    .expect("the API must bind its loopback socket");
     Node { addr, shared }
 }
 
@@ -1204,6 +1209,41 @@ fn the_credit_lifecycle_runs_through_the_node() {
         json!({ "spec_hex": hex::encode(third.encode()) }),
     );
     assert_eq!(s, 200, "the bond is free again");
+}
+
+#[test]
+fn zero_amount_credit_requests_are_refused_not_a_node_kill() {
+    // The whole-node crash, pinned end to end: a zero-amount bond request for
+    // an address the book has never seen used to walk past both guards (a
+    // missing entry reads as `0`) and panic on a `get_mut` unwrap — which, with
+    // `panic = "abort"`, is every API request from then on failing to connect.
+    let node = start();
+    let stranger = wallet(93, "stranger").address().unwrap();
+    let addr_hex = address_to_hex(&stranger);
+
+    for action in ["post", "release"] {
+        let (s, b) = post(
+            &node,
+            "/v1/credit/bond",
+            &json!({ "address_hex": addr_hex, "action": action, "amount_sat": 0u64 }),
+        );
+        assert_eq!(s, 400, "{action} of zero must be a client error: {b}");
+        assert_eq!(b["error"], "bad_request");
+    }
+
+    // The node is still serving after each refusal.
+    let (s, _b) = get(&node, "/v1/health");
+    assert_eq!(s, 200, "a refused request must not take the node down");
+
+    // A zero repayment is refused by the same rule.
+    let (s, b) = post(
+        &node,
+        "/v1/credit/repay",
+        &json!({ "position_id": hash_to_hex(&[0u8; 32]), "amount_sat": 0u64 }),
+    );
+    assert_eq!(s, 400, "{b}");
+    let (s, _b) = get(&node, "/v1/health");
+    assert_eq!(s, 200);
 }
 
 // ---------------------------------------------------------------------------

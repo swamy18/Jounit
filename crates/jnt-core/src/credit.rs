@@ -408,12 +408,21 @@ impl CreditBook {
     /// nothing. That is also what stops a borrower from uncollateralizing by
     /// moving value into a bond and out of reach of the position.
     pub fn post_bond(&mut self, agent: Address, amount_sat: u64) -> Result<()> {
+        if amount_sat == 0 {
+            return Err(Error::Malformed(
+                "a bond posts a positive amount; zero is a client error, not a no-op",
+            ));
+        }
         if self.free(&agent) < amount_sat {
             return Err(Error::Malformed(
                 "free balance cannot cover the bond being posted",
             ));
         }
-        let f = self.free.get_mut(&agent).unwrap();
+        // `entry().or_insert(0)` rather than `get_mut().unwrap()`: a missing
+        // entry is a borrower this book has never seen, and an unwrap there is
+        // a panic reachable from the API's JSON surface. The balance check
+        // above already guarantees the subtraction cannot underflow.
+        let f = self.free.entry(agent).or_insert(0);
         *f -= amount_sat;
         let b = self.bonds.entry(agent).or_insert(0);
         *b = b.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
@@ -427,6 +436,11 @@ impl CreditBook {
     /// leave the position's discount unbacked — the exact defect the pledge
     /// accounting exists to prevent.
     pub fn release_bond(&mut self, agent: Address, amount_sat: u64) -> Result<()> {
+        if amount_sat == 0 {
+            return Err(Error::Malformed(
+                "a bond release moves a positive amount; zero is a client error, not a no-op",
+            ));
+        }
         if self.bond(&agent) < amount_sat {
             return Err(Error::Malformed(
                 "no posted bond covers the release requested",
@@ -437,7 +451,10 @@ impl CreditBook {
                 "bond pledged to a live position cannot be released",
             ));
         }
-        let b = self.bonds.get_mut(&agent).unwrap();
+        // `entry().or_insert(0)` rather than `get_mut().unwrap()`: with the
+        // checks above the entry is guaranteed to exist, but reaching for the
+        // key makes the failure mode a panic instead of an unreachable branch.
+        let b = self.bonds.entry(agent).or_insert(0);
         *b -= amount_sat;
         let f = self.free.entry(agent).or_insert(0);
         *f = f.checked_add(amount_sat).ok_or(Error::ValueOverflow)?;
@@ -477,7 +494,7 @@ impl CreditBook {
                 "free balance cannot cover the collateral required",
             ));
         }
-        let f = self.free.get_mut(&spec.borrower).unwrap();
+        let f = self.free.entry(spec.borrower).or_insert(0);
         *f -= position.collateral_sat;
         // Pledge the bond: it is at risk for this position until the position
         // settles, and no second position may price against the same satoshis.
@@ -542,7 +559,11 @@ impl CreditBook {
                 .ok_or(Error::Malformed("no such position"))?;
             position.repay(payment_sat, height)?
         };
-        let f = self.free.get_mut(&borrower).unwrap();
+        // `entry().or_insert(0)` rather than `get_mut().unwrap()`: a zero
+        // payment against a borrower whose free balance is already fully
+        // encumbered reaches here with no `free` entry at all, and the check
+        // above guarantees the subtraction cannot underflow.
+        let f = self.free.entry(borrower).or_insert(0);
         *f -= payment_sat;
 
         // The lender is paid: the value left the borrower and it went somewhere,
@@ -2519,6 +2540,79 @@ mod tests {
         book.release(&res).unwrap();
         assert_eq!(book.total_reserved(), 0);
         assert_eq!(book.positions.get(&id).unwrap(), &before);
+        book.check_conservation().unwrap();
+    }
+
+    // -- remote-crash regressions (routed from the unauthenticated API) ------
+
+    #[test]
+    fn a_zero_amount_bond_operation_is_refused_not_a_panic() {
+        // The node's `POST /v1/credit/bond` reaches these calls with whatever
+        // amount the JSON carries. A zero amount used to fall through both
+        // guards (`0 < 0` is false for a missing entry) and hit a `get_mut`
+        // unwrap on a key that was never inserted — an abort for the whole
+        // node under `panic = "abort"`. Zero is now a named refusal.
+        let unknown = [7u8; 20];
+        let mut book = CreditBook::new();
+        let err = book.post_bond(unknown, 0).unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
+        let err = book.release_bond(unknown, 0).unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
+
+        // A funded agent gets the same refusal: zero is a client error whatever
+        // the balance.
+        book.deposit(unknown, 1_000).unwrap();
+        assert!(book.post_bond(unknown, 0).is_err());
+        book.post_bond(unknown, 1_000).unwrap();
+        assert!(book.release_bond(unknown, 0).is_err());
+        assert_eq!(book.bond(&unknown), 1_000);
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn bond_operations_against_an_unknown_address_fail_cleanly() {
+        let mut book = CreditBook::new();
+        let err = book.post_bond([8u8; 20], 1_000).unwrap_err();
+        assert!(err.to_string().contains("free balance"), "{err}");
+        let err = book.release_bond([8u8; 20], 1_000).unwrap_err();
+        assert!(err.to_string().contains("no posted bond"), "{err}");
+        book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn a_zero_collateral_position_for_a_new_borrower_does_not_panic() {
+        // A 1-sat position under no-collateral terms requires zero collateral,
+        // so the availability check passes for a borrower the book has never
+        // seen. That combination used to reach `self.free.get_mut(..).unwrap()`
+        // on a missing key.
+        let mut book = CreditBook::new();
+        let zero_terms = CreditTerms {
+            base_collateral_bps: 0,
+            max_discount_bps: 0,
+            bond_ratio_bps: 0,
+            min_collateral_bps: 0,
+        };
+        let s = PositionSpec {
+            terms: zero_terms,
+            charge: ChargeSchedule {
+                rate_bps_per_window: 0,
+                window_blocks: 100,
+            },
+            borrower: [3u8; 20],
+            agent_id: [9u8; 32],
+            lender: [2u8; 20],
+            amount_sat: 1,
+            bond_sat: 0,
+            drawn_at_height: 0,
+            deadline_height: 100,
+        };
+        assert_eq!(CreditPosition::open(&s).unwrap().collateral_sat, 0);
+        let id = book
+            .open(&s)
+            .expect("a zero-collateral position still opens");
+        // And a zero repayment against it is a clean no-op, not a panic.
+        let r = book.repay(&id, 0, 1).unwrap();
+        assert_eq!(r.remaining_debt_sat, 1);
         book.check_conservation().unwrap();
     }
 }
