@@ -51,6 +51,11 @@ pub enum MempoolError {
         required: u64,
         offered: u64,
     },
+    /// The state verification was computed against changed between the
+    /// verify phase and the commit phase (a block landed, a spend conflicted,
+    /// a bond moved). Refusing rather than retrying is what keeps a
+    /// concurrent admission from ever committing on stale state.
+    Stale,
 }
 
 impl std::fmt::Display for MempoolError {
@@ -72,6 +77,10 @@ impl std::fmt::Display for MempoolError {
             MempoolError::Underpaid { required, offered } => {
                 write!(f, "fee {offered} below required {required}")
             }
+            MempoolError::Stale => write!(
+                f,
+                "chain state changed while this transaction was being verified"
+            ),
         }
     }
 }
@@ -289,6 +298,199 @@ impl Mempool {
         Ok(txid)
     }
 
+    /// Insert a fully-built entry, updating the spend map and byte count.
+    /// The single place pool state mutates on admission, so the two-phase and
+    /// one-lock paths cannot drift apart.
+    fn commit_entry(&mut self, txid: Hash512, entry: MempoolEntry) {
+        for input in &entry.tx.inputs {
+            self.spends.insert(input.outpoint(), txid);
+        }
+        self.bytes += entry.size_bytes();
+        self.entries.insert(txid, entry);
+    }
+
+    // -- Two-phase admission -------------------------------------------------
+    //
+    // `add` verifies signatures with the caller's lock held, which on the API
+    // path is the one `Mutex` the serve loop and every other request share:
+    // one peer's BLS/ML-DSA verification stalls every reader behind it, and a
+    // request that times out mid-verify leaves the lock held by a task that is
+    // still running.
+    //
+    // The split is exact. Phase 1 copies the state verification *reads* — the
+    // referenced UTXO entries, which `check_tx` resolves and nothing else —
+    // plus the parameters, the height, the fee basis, and the bond ledger for
+    // stake transactions only. Phase 2 runs every pairing on that copy with no
+    // lock held at all. Phase 3 re-checks that the state it verified against
+    // still holds, then commits. Anything that moved makes phase 3 return
+    // `Stale` rather than admitting a verdict the chain has moved past.
+    //
+    // The order in which a transaction is refused matches `add`, so a caller
+    // that already holds the lock sees the same errors in the same sequence.
+
+    /// Phase 1: snapshot exactly what verification reads. O(inputs), so it
+    /// belongs inside the caller's critical section.
+    pub fn admission_snapshot(
+        &self,
+        tx: &Transaction,
+        utxo: &UtxoSet,
+        height: u64,
+        params: &NetworkParams,
+        base_fee: u64,
+        bonds: &BondLedger,
+    ) -> AdmissionSnapshot {
+        let mut referenced = UtxoSet::new();
+        for input in &tx.inputs {
+            let op = input.outpoint();
+            if let Some(u) = utxo.get(&op) {
+                referenced.insert(op, u.clone());
+            }
+        }
+        // Bonds matter only to the stake overlay, the one path that can run a
+        // BLS check against them; copying a ledger nobody reads is wasted
+        // work on a contended critical section.
+        let stake = tx.is_stake_tx();
+        AdmissionSnapshot {
+            referenced,
+            height,
+            params: params.clone(),
+            base_fee,
+            bonds: if stake {
+                bonds.clone()
+            } else {
+                BondLedger::default()
+            },
+            stake,
+        }
+    }
+
+    /// Phase 2: validate against a snapshot with no lock held. Takes `&self`
+    /// because nothing here touches pool state — a caller may hold the write
+    /// lock for the whole call and still not serialize the work.
+    pub fn verify_admission(
+        &self,
+        tx: &Transaction,
+        snap: &AdmissionSnapshot,
+    ) -> Result<VerifiedAdmission, MempoolError> {
+        let delta = check_tx(
+            &snap.referenced,
+            tx,
+            snap.height,
+            &snap.params,
+            snap.base_fee,
+            snap.params.coinbase_maturity,
+        )
+        .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+
+        if snap.stake {
+            crate::bond::admit_stake_tx(
+                tx,
+                &snap.bonds,
+                &snap.params.network_id,
+                snap.height,
+                &crate::bls::RealBls,
+            )
+            .map_err(|e| MempoolError::Invalid(e.to_string()))?;
+        }
+
+        Ok(VerifiedAdmission {
+            gas_used: delta.gas_used,
+            fee_total: delta.fee_total,
+            // The state this verdict is true of, carried into phase 3 so the
+            // commit can prove the chain has not moved.
+            referenced: snap.referenced.clone(),
+            height: snap.height,
+            base_fee: snap.base_fee,
+            bonds: snap.bonds.clone(),
+            params: snap.params.clone(),
+            stake: snap.stake,
+        })
+    }
+
+    /// Phase 3: commit a verified transaction, refusing if the state it was
+    /// verified against has moved.
+    ///
+    /// The cheap conditions from `add` run here against live state, in the
+    /// order `add` uses them, so the set of refusals a caller can observe is
+    /// unchanged — only admission on stale state becomes impossible.
+    pub fn commit_admission(
+        &mut self,
+        tx: &Transaction,
+        verified: &VerifiedAdmission,
+        utxo: &UtxoSet,
+        height: u64,
+        base_fee: u64,
+        bonds: &BondLedger,
+    ) -> Result<Hash512, MempoolError> {
+        let txid = tx.txid();
+        // `add` checks the pool's own contents first, and a transaction that
+        // is already pooled must keep coming back as `AlreadyKnown` rather
+        // than being re-verified and refused for a second reason.
+        if self.entries.contains_key(&txid) {
+            return Err(MempoolError::AlreadyKnown);
+        }
+
+        // Stale state is refused before anything else: a verdict computed over
+        // entries the chain no longer holds is not a verdict about this chain.
+        if height != verified.height || base_fee != verified.base_fee {
+            return Err(MempoolError::Stale);
+        }
+        for op in tx.inputs.iter().map(|i| i.outpoint()) {
+            // A missing entry is `UnknownOutPoint` at verify time and must
+            // stay refused; an entry that differs means the chain moved.
+            match utxo.get(&op) {
+                Some(live) if verified.referenced.get(&op) == Some(live) => {}
+                _ => return Err(MempoolError::Stale),
+            }
+        }
+        if verified.stake && verified.bonds != *bonds {
+            return Err(MempoolError::Stale);
+        }
+
+        let required = required_fee(base_fee, verified.gas_used);
+        if verified.fee_total < required {
+            return Err(MempoolError::Underpaid {
+                required,
+                offered: verified.fee_total,
+            });
+        }
+
+        // Conflict before size, matching `add`: a double spend must be
+        // reported as one, not as "pool full".
+        for input in &tx.inputs {
+            let op = input.outpoint();
+            if self.spends.contains_key(&op) {
+                return Err(MempoolError::Conflict { outpoint: op });
+            }
+        }
+
+        let entry = MempoolEntry {
+            fee_rate: verified
+                .fee_total
+                .checked_div(verified.gas_used)
+                .unwrap_or(u64::MAX)
+                .max(Self::MIN_FEE_RATE),
+            fee_total: verified.fee_total,
+            gas_used: verified.gas_used,
+            accepted_at: height,
+            tx: tx.clone(),
+        };
+
+        let size = entry.size_bytes();
+        if size > verified.params.max_block_bytes {
+            return Err(MempoolError::Oversized {
+                size,
+                limit: verified.params.max_block_bytes,
+            });
+        }
+        if self.bytes + size > self.max_bytes {
+            return Err(MempoolError::Full);
+        }
+
+        self.commit_entry(txid, entry);
+        Ok(txid)
+    }
+
     /// Choose transactions for the next block: highest fee rate first.
     ///
     /// `gas_cap` is a hard stop, not a target. A selection that overshoots it
@@ -474,6 +676,38 @@ pub struct MempoolSummary {
     pub bytes: usize,
     pub total_gas: u64,
     pub total_fees: u64,
+}
+
+/// Phase 1's copy of the state verification reads.
+///
+/// O(inputs) rather than O(state): only the outputs the transaction spends
+/// are carried, because `check_tx` resolves exactly those (and the bond
+/// ledger, for stake transactions). That is what keeps phase 1 cheap enough
+/// to hold under a contended lock.
+#[derive(Debug, Clone)]
+pub struct AdmissionSnapshot {
+    referenced: UtxoSet,
+    height: u64,
+    params: NetworkParams,
+    base_fee: u64,
+    bonds: BondLedger,
+    stake: bool,
+}
+
+/// Phase 2's output: the verdict, plus the state it is a verdict about.
+///
+/// The carried state is what makes phase 3 able to *prove* the chain has not
+/// moved instead of assuming it.
+#[derive(Debug, Clone)]
+pub struct VerifiedAdmission {
+    gas_used: u64,
+    fee_total: u64,
+    referenced: UtxoSet,
+    height: u64,
+    base_fee: u64,
+    bonds: BondLedger,
+    params: NetworkParams,
+    stake: bool,
 }
 
 /// What a [`Mempool::reconcile`] did. Returned rather than logged so a caller can
@@ -992,5 +1226,268 @@ mod tests {
             "eviction removed transactions it had no cause to"
         );
         assert_eq!(pool.spends.len(), 2);
+    }
+
+    // -- two-phase admission ------------------------------------------------
+    //
+    // The split exists so signature verification can run without the
+    // shared-state lock. What these pin is that it changed nothing a caller
+    // can observe: the same transaction is admitted, refused for the same
+    // reason, and *never* committed on state the chain has moved past.
+
+    /// The split run end to end on a scratch pool, so a test can compare the
+    /// outcome with `Mempool::add` on an equally fresh pool.
+    ///
+    /// Test-only helper: production callers run the phases separately so the
+    /// lock they hold is released between them, which is the whole point.
+    trait SplitAdmission {
+        fn add_split(
+            &mut self,
+            tx: Transaction,
+            utxo: &UtxoSet,
+            height: u64,
+            params: &NetworkParams,
+            base_fee: u64,
+            bonds: &BondLedger,
+        ) -> Result<Hash512, MempoolError>;
+    }
+
+    impl SplitAdmission for Mempool {
+        fn add_split(
+            &mut self,
+            tx: Transaction,
+            utxo: &UtxoSet,
+            height: u64,
+            params: &NetworkParams,
+            base_fee: u64,
+            bonds: &BondLedger,
+        ) -> Result<Hash512, MempoolError> {
+            if self.entries.contains_key(&tx.txid()) {
+                return Err(MempoolError::AlreadyKnown);
+            }
+            let snapshot = self.admission_snapshot(&tx, utxo, height, params, base_fee, bonds);
+            let verified = self.verify_admission(&tx, &snapshot)?;
+            self.commit_admission(&tx, &verified, utxo, height, base_fee, bonds)
+        }
+    }
+
+    /// The split agrees with the one-lock path on every input class: a valid
+    /// spend, a double spend, and an unknown outpoint.
+    #[test]
+    fn two_phase_admission_matches_the_one_lock_path() {
+        let w = Wallet::new_random("split");
+        let (set, ops) = funded(&w, 3);
+        let fee = fat_fee();
+        let p = params();
+        let mut staged = Mempool::default();
+        let (op_a, op_b) = (ops[0], ops[1]);
+
+        let valid = spend(&w, op_b, FUNDED - fee, [7u8; 20]);
+        let conflict = spend(&w, op_a, FUNDED - fee, [7u8; 20]);
+        let unknown_op = OutPoint {
+            txid: [0xFF; 64],
+            index: 0,
+        };
+        let unknown = spend(&w, unknown_op, FUNDED - fee, [7u8; 20]);
+        staged
+            .add(conflict.clone(), &set, H, &p, BASE, &BondLedger::default())
+            .expect("the first spend of an output must pool");
+
+        for tx in [&valid, &conflict, &unknown] {
+            // Same starting pool for both paths: `staged` already holds the
+            // first spend of `op_a`, so `conflict` is a genuine double spend
+            // and `valid`/`unknown` are whatever they are on their own merits.
+            let mut one_lock = staged.clone();
+            let expected = one_lock.add(tx.clone(), &set, H, &p, BASE, &BondLedger::default());
+            let mut split = staged.clone();
+            let got = split.add_split(tx.clone(), &set, H, &p, BASE, &BondLedger::default());
+            assert_eq!(
+                expected,
+                got,
+                "the two-phase path refused `{}` differently from the one-lock path",
+                hex::encode(&tx.txid()[..4])
+            );
+        }
+    }
+
+    /// A transaction whose input disappears between the phases is refused as
+    /// stale, not committed against the state the chain replaced.
+    #[test]
+    fn a_spend_whose_input_is_spent_between_the_phases_is_refused() {
+        let w = Wallet::new_random("stale");
+        let (mut set, ops) = funded(&w, 1);
+        let fee = fat_fee();
+        let p = params();
+        let tx = spend(&w, ops[0], FUNDED - fee, [7u8; 20]);
+
+        let pool = Mempool::default();
+        let snapshot = pool.admission_snapshot(&tx, &set, H, &p, BASE, &BondLedger::default());
+        let verified = pool
+            .verify_admission(&tx, &snapshot)
+            .expect("verification against the snapshot must pass");
+
+        // The chain moves: the output is consumed. `UtxoSet::new()` is the
+        // shape a block that spent it leaves behind.
+        set = UtxoSet::new();
+
+        let mut pool = Mempool::default();
+        let err = pool
+            .commit_admission(&tx, &verified, &set, H, BASE, &BondLedger::default())
+            .expect_err("a vanished input must not commit");
+        assert_eq!(err, MempoolError::Stale);
+        assert_eq!(pool.len(), 0, "nothing was pooled");
+    }
+
+    /// A transaction whose input is *replaced* between the phases is refused,
+    /// not committed against the entry it was verified over. This is the case
+    /// that would otherwise admit on stale state without noticing.
+    #[test]
+    fn a_spend_whose_input_changed_value_between_the_phases_is_refused() {
+        let w = Wallet::new_random("changed");
+        let other = Wallet::new_random("other");
+        let (mut set, ops) = funded(&w, 1);
+        let fee = fat_fee();
+        let p = params();
+        let tx = spend(&w, ops[0], FUNDED - fee, [7u8; 20]);
+
+        let pool = Mempool::default();
+        let snapshot = pool.admission_snapshot(&tx, &set, H, &p, BASE, &BondLedger::default());
+        let verified = pool
+            .verify_admission(&tx, &snapshot)
+            .expect("verification against the snapshot must pass");
+
+        // Same outpoint, different entry: a reorg that rebuilt the output.
+        set.insert(
+            ops[0],
+            Utxo {
+                out: Output {
+                    value: 1,
+                    address: other.address().unwrap(),
+                },
+                height: 0,
+            },
+        );
+
+        let mut pool = Mempool::default();
+        let err = pool
+            .commit_admission(&tx, &verified, &set, H, BASE, &BondLedger::default())
+            .expect_err("a changed entry must not commit");
+        assert_eq!(err, MempoolError::Stale);
+    }
+
+    /// The height a transaction was verified for is part of the verdict: a
+    /// block landing between the phases moves it, and the commit refuses.
+    #[test]
+    fn a_height_that_moves_between_the_phases_is_refused() {
+        let w = Wallet::new_random("height");
+        let (set, ops) = funded(&w, 1);
+        let fee = fat_fee();
+        let p = params();
+        let tx = spend(&w, ops[0], FUNDED - fee, [7u8; 20]);
+
+        let pool = Mempool::default();
+        let snapshot = pool.admission_snapshot(&tx, &set, H, &p, BASE, &BondLedger::default());
+        let verified = pool
+            .verify_admission(&tx, &snapshot)
+            .expect("verification against the snapshot must pass");
+
+        let mut pool = Mempool::default();
+        let err = pool
+            .commit_admission(&tx, &verified, &set, H + 1, BASE, &BondLedger::default())
+            .expect_err("a moved height must not commit");
+        assert_eq!(err, MempoolError::Stale);
+    }
+
+    /// The fee basis is part of the verdict too: a reorg that changed the
+    /// base fee would change whether this transaction pays enough.
+    #[test]
+    fn a_base_fee_that_moves_between_the_phases_is_refused() {
+        let w = Wallet::new_random("fee-basis");
+        let (set, ops) = funded(&w, 1);
+        let fee = fat_fee();
+        let p = params();
+        let tx = spend(&w, ops[0], FUNDED - fee, [7u8; 20]);
+
+        let pool = Mempool::default();
+        let snapshot = pool.admission_snapshot(&tx, &set, H, &p, BASE, &BondLedger::default());
+        let verified = pool
+            .verify_admission(&tx, &snapshot)
+            .expect("verification against the snapshot must pass");
+
+        let mut pool = Mempool::default();
+        let err = pool
+            .commit_admission(&tx, &verified, &set, H, BASE * 4, &BondLedger::default())
+            .expect_err("a moved fee basis must not commit");
+        assert_eq!(err, MempoolError::Stale);
+    }
+
+    /// A valid transaction still admits through the split, and lands in the
+    /// pool exactly as `add` would have put it: same entry, same spend map,
+    /// same byte count.
+    #[test]
+    fn a_valid_transaction_admits_through_the_split() {
+        let w = Wallet::new_random("valid");
+        let (set, ops) = funded(&w, 1);
+        let fee = fat_fee();
+        let p = params();
+        let tx = spend(&w, ops[0], FUNDED - fee, [7u8; 20]);
+
+        let mut pool = Mempool::default();
+        let added = pool
+            .add_split(tx.clone(), &set, H, &p, BASE, &BondLedger::default())
+            .expect("a valid transaction must pool through the split");
+        assert_eq!(added, tx.txid());
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.spends.len(), 1);
+        assert_eq!(pool.bytes, pool.get(&tx.txid()).unwrap().size_bytes());
+
+        let entry = pool.get(&tx.txid()).expect("the entry is pooled");
+        assert_eq!(entry.fee_total, fee);
+        assert_eq!(entry.gas_used, tx.gas_used());
+        assert_eq!(entry.accepted_at, H);
+    }
+
+    /// Verification never needs write access to the pool: phase 2 is a pure
+    /// function of the transaction and its snapshot, so a caller with the
+    /// write lock elsewhere still cannot be serialised by it.
+    #[test]
+    fn verification_needs_no_write_access_to_the_pool() {
+        let w = Wallet::new_random("read-only");
+        let (set, ops) = funded(&w, 1);
+        let fee = fat_fee();
+        let p = params();
+        let tx = spend(&w, ops[0], FUNDED - fee, [7u8; 20]);
+        let pool = Mempool::default();
+
+        let snapshot = pool.admission_snapshot(&tx, &set, H, &p, BASE, &BondLedger::default());
+        let verified = pool
+            .verify_admission(&tx, &snapshot)
+            .expect("verification against a snapshot is a read");
+        assert_eq!(verified.gas_used, tx.gas_used());
+        assert_eq!(verified.fee_total, fee);
+        assert_eq!(pool.len(), 0, "verification pooled nothing");
+    }
+
+    /// The snapshot carries exactly the referenced entries, not the whole
+    /// UTXO set — the property that makes phase 1 O(inputs) under a lock.
+    #[test]
+    fn the_snapshot_carries_only_the_referenced_entries() {
+        let w = Wallet::new_random("narrow");
+        let (set, ops) = funded(&w, 4);
+        let p = params();
+        let tx = spend(&w, ops[1], 1_000, [7u8; 20]);
+
+        let snap =
+            Mempool::default().admission_snapshot(&tx, &set, H, &p, BASE, &BondLedger::default());
+        assert_eq!(
+            snap.referenced.len(),
+            1,
+            "only the spent outpoint is carried"
+        );
+        assert!(
+            snap.referenced.contains(&ops[1]),
+            "the spent outpoint must be present"
+        );
+        assert!(!snap.referenced.contains(&ops[0]));
     }
 }

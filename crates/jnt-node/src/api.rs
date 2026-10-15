@@ -295,6 +295,101 @@ fn with_shared<T>(
     Ok(f(&mut guard))
 }
 
+/// How long a request waits for the shared-state lock before giving up.
+///
+/// Long enough that a serve-loop iteration (which holds it for one pass of
+/// cheap, in-memory work) never makes a reader fail, short enough that a
+/// request never waits without bound behind it.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the bounded lock sleeps between attempts.
+const LOCK_POLL: Duration = Duration::from_millis(1);
+
+/// How many transactions may be verifying signatures at once.
+///
+/// Separate from the in-flight request cap, which counts *all* requests:
+/// verification is the only per-request work that runs on the blocking pool
+/// and costs real CPU, so a burst of broadcasts could otherwise occupy every
+/// blocking thread while reads queue behind them for the lock.
+const MAX_CONCURRENT_VERIFIES: usize = 4;
+
+/// The process-wide cap on concurrent `tx_broadcast` verifications.
+///
+/// Lazy, and held in an `Arc` because `try_acquire_owned` hands out a permit
+/// that owns a handle: the released permit must come back to this same
+/// counter, not a copy of it.
+fn verify_permits() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(
+        PERMITS.get_or_init(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFIES))
+        }),
+    )
+}
+
+/// Take one verification permit from the blocking pool.
+///
+/// Refuses rather than queues: a burst of broadcasts is shed here instead of
+/// occupying the blocking pool while reads queue behind them for the lock.
+/// The request is then retried by its owner, which is the honest answer to
+/// "the node is busy verifying".
+fn acquire_verify_permit(
+) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, Json<ErrorBody>)> {
+    match verify_permits().try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(_) => Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "too many transactions are being verified; retry shortly",
+        )),
+    }
+}
+
+/// Run `f` with exclusive access, but never wait without bound.
+///
+/// `lock()` waits for as long as the holder takes, so a request that arrives
+/// while the serve loop works is *queued*, not failed — and a request whose
+/// deadline fires mid-wait is still holding its turn when it is dropped. This
+/// polls with a deadline instead and reports 503 `busy`, which is a truthful
+/// answer: the caller can retry and the node is still healthy.
+///
+/// Must be called from a blocking thread: the loop sleeps, and sleeping on the
+/// current-threaded async runtime would stall every other request.
+fn with_shared_bounded<T>(
+    state: &ApiState,
+    f: impl FnOnce(&mut SharedNode) -> T,
+) -> Result<T, (StatusCode, Json<ErrorBody>)> {
+    let deadline = Instant::now() + LOCK_WAIT;
+    let mut guard = loop {
+        match state.shared.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "busy",
+                        "node state is busy; retry shortly",
+                    ));
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            // A poisoned lock means a panic happened while it was held. Every
+            // earlier holder completed (the release profile aborts on panic),
+            // so the data is intact — report it as busy rather than 500, so an
+            // operator sees "contended", not "corrupt".
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(fail(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    "node state lock is unavailable",
+                ));
+            }
+        }
+    };
+    Ok(f(&mut guard))
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -1191,17 +1286,51 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
     let state_for_task = state.clone();
     let tx_for_task = tx;
     let txid_for_result = txid;
-    let result = tokio::task::spawn_blocking(move || {
-        with_shared(&state_for_task, |sh| {
+    // Verification, then commit, then the relay note: three bounded lock
+    // sections, so the signature checks run with no lock held and anything
+    // that moved the chain between them is refused as stale rather than
+    // admitted on a verdict the chain has left behind.
+    let outcome = tokio::task::spawn_blocking(move || {
+        // One permit for the whole admission: the in-flight request cap above
+        // counts requests, and this counts the part of one that costs real
+        // CPU, so a burst of broadcasts cannot occupy the blocking pool.
+        let _verify = acquire_verify_permit()?;
+
+        // Phase 1 — snapshot the state verification reads, under the lock.
+        let snapshot = with_shared_bounded(&state_for_task, |sh| {
+            sh.pool.admission_snapshot(
+                &tx_for_task,
+                sh.chain.utxo(),
+                sh.chain.height() + 1,
+                sh.chain.params(),
+                sh.chain.expected_base_fee_for_next_block(),
+                sh.chain.bonds(),
+            )
+        })?;
+
+        // Phase 2 — every pairing, no lock held. A pure function of the
+        // transaction and its snapshot, so the serve loop keeps mining while
+        // this runs. A refusal here is the same 400 the one-lock path gave.
+        let verified = match Mempool::default().verify_admission(&tx_for_task, &snapshot) {
+            Ok(verified) => verified,
+            Err(e) => {
+                return Err(fail(StatusCode::BAD_REQUEST, "tx_refused", e.to_string()));
+            }
+        };
+
+        // Phase 3 — re-check the cheap conditions against live state, commit,
+        // and note the relay. A refusal here may be `Stale`: the chain moved
+        // while the transaction was being verified.
+        let outcome = with_shared_bounded(&state_for_task, |sh| {
             let sink = sh.chain.params().l2_deposit_sink();
             if tx_for_task.outputs.iter().any(|o| o.address == sink) {
                 refuse_funding_if_breached(sh, FundingPath::Deposit)?;
             }
-            let outcome = sh.pool.add(
-                tx_for_task,
+            let outcome = sh.pool.commit_admission(
+                &tx_for_task,
+                &verified,
                 sh.chain.utxo(),
                 sh.chain.height() + 1,
-                sh.chain.params(),
                 sh.chain.expected_base_fee_for_next_block(),
                 sh.chain.bonds(),
             );
@@ -1215,11 +1344,12 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
                 )),
                 Err(e) => Err(fail(StatusCode::BAD_REQUEST, "tx_refused", e.to_string())),
             }
-        })
+        });
+        outcome
     })
     .await
     .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal", "task join"))??;
-    result
+    outcome
 }
 
 #[derive(Deserialize)]

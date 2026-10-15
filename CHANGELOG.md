@@ -25,6 +25,22 @@ Versions follow the workspace `version` in `Cargo.toml`.
 - **Exposed binds no longer 500 every request.** `spawn` serves with
   `into_make_service_with_connect_info`, so the `ConnectInfo` extractor the
   per-IP rate limiter depends on is actually present.
+- **`POST /v1/tx/broadcast` no longer holds the shared-state lock through
+  signature verification.** Admission is three phases: a bounded snapshot of
+  exactly what verification reads (the referenced UTXO entries, the
+  parameters, the height, the fee basis, and the bond ledger for stake
+  transactions), every pairing on that snapshot with no lock held at all,
+  then a bounded re-check against live state and the commit. Anything that
+  moved the chain between the phases — height, base fee, a spent or changed
+  outpoint, the bond ledger — is refused as `MempoolError::Stale` rather
+  than committed on a stale verdict. Refusal order otherwise matches
+  `Mempool::add` exactly.
+- **The shared-state lock wait is bounded on the API path.** `with_shared`
+  now polls with a 2-second deadline and answers 503 `busy` instead of
+  queueing without bound behind the serve loop; the request deadline no
+  longer leaves a task holding its turn. A separate semaphore
+  (`MAX_CONCURRENT_VERIFIES = 4`) caps concurrent verifications so a burst
+  of broadcasts cannot occupy the blocking pool while reads queue.
 
 ### Changed (consensus — settle binds network and height)
 

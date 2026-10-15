@@ -677,6 +677,12 @@ impl P2pNode {
                             peer.add_ban_score(10);
                         }
                     }
+                    // Unreachable here: `add` holds one lock for the whole
+                    // call, so nothing can move the state it verified against.
+                    // Kept exhaustively because `commit_admission` can return
+                    // it and dropping an arm silently would hide a future
+                    // split of this path.
+                    Err(MempoolError::Stale) => relay.mark_known(txid),
                 }
             }
             Message::Block(block) => {
