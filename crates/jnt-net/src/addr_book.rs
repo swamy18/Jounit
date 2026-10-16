@@ -102,7 +102,8 @@ impl AddressBook {
 
         // Keep the book bounded and most-recent first.
         if self.entries.len() > MAX_ADDR_BOOK_ENTRIES {
-            self.entries.sort_by_key(|a| std::cmp::Reverse(a.last_seen_ms));
+            self.entries
+                .sort_by_key(|a| std::cmp::Reverse(a.last_seen_ms));
             self.entries.truncate(MAX_ADDR_BOOK_ENTRIES);
         }
 
@@ -122,7 +123,8 @@ impl AddressBook {
             });
         }
         if self.entries.len() > MAX_ADDR_BOOK_ENTRIES {
-            self.entries.sort_by_key(|a| std::cmp::Reverse(a.last_seen_ms));
+            self.entries
+                .sort_by_key(|a| std::cmp::Reverse(a.last_seen_ms));
             self.entries.truncate(MAX_ADDR_BOOK_ENTRIES);
         }
         let _ = self.save();
@@ -182,11 +184,8 @@ mod tests {
     use super::*;
 
     fn tmp_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "jnt-addr-book-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("jnt-addr-book-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir.join("peers.json")

@@ -609,9 +609,7 @@ impl L2State {
     /// halts the transaction before it can corrupt consensus state.
     fn charge(&mut self, addr: &Address, amount: u64) -> L2Result<()> {
         let have = self.balance(addr);
-        let next = have
-            .checked_sub(amount)
-            .ok_or(L2Error::Overflow)?;
+        let next = have.checked_sub(amount).ok_or(L2Error::Overflow)?;
         self.accounts.insert(*addr, next);
         Ok(())
     }

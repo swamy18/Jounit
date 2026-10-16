@@ -391,8 +391,7 @@ impl P2pNode {
             let total = peers.len();
 
             // Addresses already connected — never dial a peer we hold.
-            let connected: HashSet<SocketAddr> =
-                peers.values().map(|p| p.remote_addr).collect();
+            let connected: HashSet<SocketAddr> = peers.values().map(|p| p.remote_addr).collect();
 
             let mut cands: Vec<SocketAddr> = Vec::new();
 
@@ -560,8 +559,11 @@ impl P2pNode {
             count += 1;
             match event {
                 PeerEvent::Connected {
-                     peer_id, version, remote_addr, ..
-                 } => {
+                    peer_id,
+                    version,
+                    remote_addr,
+                    ..
+                } => {
                     // Record the address in the book for future reconnects.
                     // Inbound addresses are as valid a reconnect source as
                     // outbound — the peer was reachable, so it may be again.
