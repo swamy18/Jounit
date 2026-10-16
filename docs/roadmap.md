@@ -1242,7 +1242,7 @@ clean, no `benches/`, no HTTP server, no `jnt-mcp`/`jnt-elizaos-plugin`/
 | 23 | Validator lifecycle | **DECIDED, NOT IMPLEMENTED** | Decisions 2 and 11 record stake/bond/rotation as deliberately deferred; no stake ledger exists. |
 | 24 | BLS/finality activation | **DONE** | Binding on `testnet` (`finality_activation_height=20`), observation-only on `mini`, fail-closed on `mainnet`; restart/reorg tests in `m5_finality.rs`, `m5_node_finality.rs`, `m5_deposit_finality.rs`. |
 | 25 | Mainnet security campaign | **L1 + L2 DONE** | Full chaos/failure suite (`chaos.rs`, 15 tests) covers L2 state, deposits, VWC, worker flows. 14 fuzz targets, ~22.6M executions, 0 crashes. See `docs/security_audit.md`, `docs/fuzz.md`. |
-| 26 | Network stress/chaos | **SHIPPED** | 15-test deterministic chaos suite (`chaos.rs`), 2-process E2E test (`e2e_two_process.rs`); 1192 tests total (`cargo test --workspace`: 1192 passed, 0 failed, 1 ignored; see `scripts/test_count.sh`). |
+| 26 | Network stress/chaos | **SHIPPED** | 15-test deterministic chaos suite (`chaos.rs`), 2-process E2E test (`e2e_two_process.rs`); 1194 tests total (`cargo test --workspace`: 1194 passed, 0 failed, 1 ignored; see `scripts/test_count.sh`). |
 | 27 | Performance benchmarks | **SHIPPED** | `vwc_perf_probe` + puzzle/perf probes. See `docs/benchmarks.md`. |
 | 28 | SPEC ↔ implementation reconciliation | **RECONCILED** | Full matrix reconciled; SPEC §14.2 payload types match `l2.rs`; §15 node API added; matrix reflects current state. |
 | 29 | Mainnet readiness | **DONE** | `docs/mainnet-readiness.md` + `docs/testnet-readiness.md`: launch runbooks, monitoring, backup/recovery, versioning, upgrade mechanism, disclosure. M2/M4 still gated; see `docs/l2-exit-design.md`. |

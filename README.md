@@ -910,7 +910,7 @@ never consensus.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1192 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1194 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -976,7 +976,7 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1192 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1194 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnodes, no log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
