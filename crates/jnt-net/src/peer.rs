@@ -370,8 +370,9 @@ fn generate_nonce() -> u64 {
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0);
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(now);
     h.write_u64(seq);
