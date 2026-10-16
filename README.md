@@ -12,6 +12,9 @@ AI-native cryptocurrency. Mining that does useful work, and a payment layer buil
 person holds it, like Bitcoin. The *Jounit* name, `JNT` ticker and logos are
 community marks — see [License and trademark](#license-and-trademark).
 
+**Built by:** Swamy Gadila. The project is open for anyone to use, fork, audit,
+and redistribute — no single person owns it.
+
 ---
 
 ## Contents
