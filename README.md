@@ -8,9 +8,9 @@ AI-native cryptocurrency. Mining that does useful work, and a payment layer buil
 > no validator committee or pre-existing operator required, like Bitcoin. Run
 > `jnt-node init --network mainnet`, then `jnt-node run --network mainnet`.
 
-**Author and copyright:** Swamy Gadila. The code is Â© 2026 Swamy Gadila, and
-the *Jounit* name, `JNT` ticker and logos are his trademarks â€” see
-[License and trademark](#license-and-trademark).
+**Author and copyright:** Community-owned. The code is open source — no single
+person holds it, like Bitcoin. The *Jounit* name, `JNT` ticker and logos are
+community marks — see [License and trademark](#license-and-trademark).
 
 ---
 
@@ -999,27 +999,24 @@ evidence.
 
 ## License and trademark
 
-**Copyright Â© 2026 Swamy Gadila.**
+**Copyright © 2026.** The code is open — no single person holds it, like Bitcoin.
 
-**Code: `MIT OR Apache-2.0`** â€” the standard permissive Rust dual licence. Both
+**Code: `MIT OR Apache-2.0`** — the standard permissive Rust dual licence. Both
 texts ship at the repo root (`LICENSE-MIT`, `LICENSE-APACHE`). You may use,
 modify, run, audit and redistribute the software, including commercially.
 
-**Name and marks: trademarked by the author.** The *Jounit* name, the `JNT`
-ticker and the project's logos are trademarks of Swamy Gadila, not part of the
-code licence. See [TRADEMARK.md](TRADEMARK.md).
+**Name and marks: community-owned.** The *Jounit* name, the `JNT`
+ticker and the project's logos are community marks, not part of the code
+licence. See [TRADEMARK.md](TRADEMARK.md).
 
 The distinction is the same one Bitcoin uses: **the code is open so anyone can
-run it, and the name is protected so nobody can pass themselves off as us.**
-Nothing in an open-source licence can stop someone forking the code â€” that is
-deliberate, and it is how the ecosystem works. What the trademark stops is
-someone shipping a product under our name that is not this software.
+run it, and the name is a community mark.** Nothing in an open-source licence
+can stop someone from forking the code — that is deliberate, and it is how the
+ecosystem works. Forks are explicitly permitted. The code belongs to everyone
+under the terms above; the name belongs to the community.
 
-Forks are explicitly permitted. The code belongs to everyone under the terms
-above; the name belongs to the author.
-
-If you want to use the name or marks commercially, or you want a licence other
-than the one above, get in touch first.
+If you want to use the name or marks commercially, open an issue — no single
+person holds it.
 
 ---
 

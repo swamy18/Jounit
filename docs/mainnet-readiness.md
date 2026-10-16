@@ -9,7 +9,8 @@ Mainnet is blocked by three protocol decisions that cannot be satisfied by
 writing more code, and by operational gaps that are not code either. The
 blockers are named at the end.
 
-**Author and copyright holder:** Swamy Gadila (© 2026). The three protocol
+**Author and copyright holder:** Community-owned. No single person holds it,
+like Bitcoin. (© 2026). The three protocol
 blockers at the end are the launch gate: mainnet stays **NO-GO** until all
 three are closed, and none of the three can be satisfied by writing more code.
 The operational gaps (item 4) are a separate gate: they do not block a testnet,

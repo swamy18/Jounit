@@ -1,13 +1,13 @@
 # Jounit Trademarks and Brand Use
 
-The *Jounit* name, the `JNT` ticker and the project logos are trademarks of
-**Swamy Gadila**, the author and copyright holder of the software.
+The *Jounit* name, the `JNT` ticker and the project logos are community marks
+— no single person holds them, like Bitcoin.
 
 This document describes how they may be used. It is deliberately short, because
 a trademark policy that needs a lawyer to read is not a policy.
 
-It is **not** a licence. The software is © 2026 Swamy Gadila and is licensed
-under `MIT OR Apache-2.0` (see `LICENSE-MIT` and `LICENSE-APACHE`). This document
+It is **not** a licence. The software is open source and licensed under
+`MIT OR Apache-2.0` (see `LICENSE-MIT` and `LICENSE-APACHE`). This document
 covers only the marks.
 
 ---
@@ -85,8 +85,8 @@ exists to prevent.
 ## Reporting a problem
 
 If you believe something is using the marks improperly, open a private issue or
-contact the copyright holder, Swamy Gadila, directly. Do not open a public
-issue about someone else's project.
+contact the community maintainers directly. Do not open a public issue about
+someone else's project.
 
 ---
 
@@ -98,9 +98,10 @@ brand, and a brand that is not protected eventually gets used by someone who is
 not us, on a chain that is not this one, holding a token that looks like ours.
 Users then have no way to tell the difference.
 
-The code stays open. The name stays ours. That is the whole policy.
+The code stays open. The name stays with the community. That is the whole
+policy.
 
 ---
 
-Questions about licensing or brand use belong with the copyright holder,
-Swamy Gadila, or in an issue. Do not open a pull request to ask.
+Questions about licensing or brand use belong in an issue. Do not open a pull
+request to ask.
