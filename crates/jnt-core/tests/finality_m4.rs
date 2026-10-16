@@ -88,7 +88,7 @@ fn mini_carries_a_four_key_committee_and_mainnet_none() {
         "mainnet has no committee yet; an empty set is the honest pre-committee state"
     );
     assert_eq!(main.checkpoint_interval_blocks, 100);
-    assert_eq!(main.finality_activation_height, 0);
+    assert_eq!(main.finality_activation_height, 100);
 }
 
 #[test]

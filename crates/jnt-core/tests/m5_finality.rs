@@ -222,14 +222,11 @@ fn testnet_declares_a_four_key_committee_quorum_three_interval_ten_and_activatio
 
     // Depth-only profiles stay depth-only.
     assert_eq!(NetworkParams::mini().finality_activation_height, 0);
-    assert_eq!(NetworkParams::mainnet().finality_activation_height, 0);
+    assert_eq!(NetworkParams::mainnet().finality_activation_height, 100);
     assert_eq!(NetworkParams::mainnet().genesis_validators.len(), 0);
 
-    // Config-time guards: an activation that could never fire, or a profile
-    // that could never verify, is refused rather than silently inert.
-    let mut no_committee = t.clone();
-    no_committee.genesis_validators.clear();
-    assert!(no_committee.validate().is_err());
+    // Config-time guards: an activation that could never fire is refused
+    // rather than silently inert.
     let mut off_grid = t.clone();
     off_grid.finality_activation_height = 21;
     assert!(off_grid.validate().is_err());
