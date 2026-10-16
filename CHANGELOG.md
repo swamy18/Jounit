@@ -14,6 +14,21 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed (supply chain)
+
+- **Weekly audit job with pinned tools.** `.github/workflows/audit.yml`
+  installs `cargo-audit 0.22.2` and `cargo-deny 0.20.2` exact and locked,
+  runs `cargo audit` and the full `cargo deny check`, and carries a
+  `concurrency` group so scheduled runs never overlap.
+- **`deny.toml` is deny-by-default where it matters.** Vulnerabilities,
+  yanked crates and unknown registries/git sources fail; `BSD-3-Clause`
+  (subtle, matchit) and `Unicode-3.0` (unicode/ICU tables) are allowed with
+  the reason beside each; intra-workspace path dependencies are exempt from
+  the wildcard rule via `allow-wildcard-paths`, and the members are marked
+  `publish = false` — they were never published, and now they say so.
+- **Verified clean at pin time:** `cargo audit` (134 deps) and
+  `cargo deny check` both pass with zero findings.
+
 ### Fixed (key hygiene)
 
 - **Validator keys use their own passphrase.** New keys are encrypted under

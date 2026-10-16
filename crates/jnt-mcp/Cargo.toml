@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "jnt-mcp"
 description = "Keyless MCP surface over the Jounit payment/service layer."
 version.workspace = true

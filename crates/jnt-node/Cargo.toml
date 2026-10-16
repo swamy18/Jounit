@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "jnt-node"
 description = "Jounit node CLI: init, mine, send, status, verify, serve and export, with an opt-in REST API."
 version.workspace = true

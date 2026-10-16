@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "jnt-store"
 description = "Jounit persistent storage: an append-only block log, canonical index and crash-safe metadata. Holds no consensus rules."
 version.workspace = true

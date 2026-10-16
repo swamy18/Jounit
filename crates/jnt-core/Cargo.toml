@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "jnt-core"
 description = "Jounit protocol core: hybrid hash+neural PoW puzzle, UTXO ledger, difficulty, supply schedule."
 version.workspace = true

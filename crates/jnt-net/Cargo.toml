@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "jnt-net"
 description = "Jounit peer-to-peer transport: framing, handshake, block/tx/checkpoint relay over TCP (SPEC.md §13)."
 version.workspace = true

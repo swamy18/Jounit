@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# Scheduled runs must not overlap: a slow install plus two checks could
+# otherwise stack week over week.
+concurrency:
+  group: audit
+  cancel-in-progress: false
+
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -18,6 +24,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: rustfmt
-      - run: cargo install cargo-audit cargo-deny --locked
+      # Tool versions are pinned exact and installed locked. Both versions
+      # below are stable releases older than 14 days at the time of pinning.
+      # To bump: check crates.io for a stable release at least 14 days old,
+      # update both `--version` flags here, and let the job prove the new
+      # tools still pass on this lockfile.
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo install cargo-deny --locked --version 0.20.2
       - run: cargo audit
-      - run: cargo deny check advisories
+      - run: cargo deny check
