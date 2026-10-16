@@ -212,11 +212,15 @@ impl RecordLog {
         header[..4].copy_from_slice(&len.to_le_bytes());
         header[4..].copy_from_slice(&digest_of(payload));
 
+        let mut buf = Vec::with_capacity(8 + payload.len());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&digest_of(payload));
+        buf.extend_from_slice(payload);
+
+        // Single write so a crash leaves either a complete record or a truncated
+        // tail — never a header claiming bytes that were never part of the same write.
         self.file
-            .write_all(&header)
-            .map_err(|e| StoreError::io(&self.path, e))?;
-        self.file
-            .write_all(payload)
+            .write_all(&buf)
             .map_err(|e| StoreError::io(&self.path, e))?;
 
         let r = RecordRef { offset, len };

@@ -404,6 +404,7 @@ impl P2pNode {
             }
 
             // Then the address book, in most-recent-first order.
+            // invariant: poison needs a prior panic, which aborts the process
             if let Some(ab) = self.address_book.lock().unwrap().as_ref() {
                 for addr in ab.addresses() {
                     if !connected.contains(&addr) && !self.is_banned(addr.ip()) {
@@ -440,6 +441,7 @@ impl P2pNode {
                     println!("reconnected peer {id} -> {addr}");
                     dialed += 1;
                     // Record the address in the book.
+                    // invariant: poison needs a prior panic, which aborts the process
                     if let Some(ab) = self.address_book.lock().unwrap().as_mut() {
                         ab.add(addr);
                     }
@@ -563,6 +565,7 @@ impl P2pNode {
                     // Record the address in the book for future reconnects.
                     // Inbound addresses are as valid a reconnect source as
                     // outbound — the peer was reachable, so it may be again.
+                    // invariant: poison needs a prior panic, which aborts the process
                     if let Some(ab) = self.address_book.lock().unwrap().as_mut() {
                         ab.add(remote_addr);
                     }
