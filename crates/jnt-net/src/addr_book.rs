@@ -172,9 +172,8 @@ fn set_private_perms(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(perms) = fs::Permissions::from_mode(0o600).into() {
-            let _ = fs::set_permissions(path, perms);
-        }
+        let perms = fs::Permissions::from_mode(0o600);
+        let _ = fs::set_permissions(path, perms);
     }
     let _ = path;
 }
