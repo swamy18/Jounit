@@ -397,9 +397,10 @@ impl NetworkParams {
             // (fail closed), which is the honest pre-committee state.
             genesis_validators: Vec::new(),
             checkpoint_interval_blocks: 100,
-            // Binding finality is not activated on mainnet (Decision 12):
-            // `0` keeps the depth-based fallback only.
-            finality_activation_height: 0,
+            // Binding finality active from height 100 on mainnet — checkpoints
+            // become binding once the committee signs them; depth-based
+            // finality (100 blocks) covers everything before that.
+            finality_activation_height: 100,
             // Exits active from genesis on mainnet — withdrawals work without a
             // committee, same as Bitcoin spends.
             exit_activation_height: 1,
