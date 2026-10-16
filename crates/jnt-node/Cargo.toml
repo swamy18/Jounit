@@ -23,6 +23,8 @@ zeroize.workspace = true
 subtle = "2.6"
 axum = "0.8"
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+# Graceful shutdown: Ctrl-C/SIGTERM handler for `serve`.
+ctrlc = "3.4"
 # DoS guards on the service API: a per-request deadline, a cap on the number
 # of requests admitted concurrently, and a per-IP rate limiter. §19.2 notes
 # the API is non-consensus and opt-in; these keep it from being a

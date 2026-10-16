@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1501,6 +1501,19 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
 
     println!("press Ctrl-C to stop");
 
+    // Graceful shutdown: an atomic flag set by the Ctrl-C / SIGTERM handler so
+    // the serve loop can flush its store and stop the P2P node cleanly instead
+    // of being killed mid-write. `P2pNode::stop` and `BlockStore` flushes run
+    // in the Drop handlers that fire after the loop breaks.
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let flag = Arc::clone(&running);
+        ctrlc::set_handler(move || {
+            flag.store(false, Ordering::SeqCst);
+        })
+        .expect("only one Ctrl-C handler can be registered per process");
+    }
+
     // Decision 17's alarm half. The state machine (and its rate limit, which
     // exists because this loop can spin with `--interval-ms 0`) lives in
     // `conservation::BreachAlarm` so its timing rule is unit-testable; see the
@@ -1508,7 +1521,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let mut breach_alarm = jnt_node::conservation::BreachAlarm::new();
 
     // Chain thread: mine + relay loop
-    loop {
+    while running.load(Ordering::SeqCst) {
         // Bind through one `&mut` so the loop's field accesses are disjoint
         // borrows of the shared state rather than repeated reborrows of the
         // guard (which the borrow checker rejects for `chain` + `pool`).
@@ -1794,4 +1807,20 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
     }
+
+    // --- Graceful shutdown -------------------------------------------------
+    // Ctrl-C was observed: flush the chain before exiting so the store is left
+    // consistent, then let `P2pNode::stop` tear down peer threads on drop.
+    println!("shutting down: flushing chain state");
+    {
+        let sh = shared
+            .lock()
+            .map_err(|_| "state lock poisoned during shutdown".to_string())?;
+        store.save_chain(&sh.chain).ok();
+        store.write_meta(&sh.chain).ok();
+        store.persist_finality(&sh.chain).ok();
+    }
+    node.stop();
+    println!("shutdown complete");
+    Ok(())
 }
