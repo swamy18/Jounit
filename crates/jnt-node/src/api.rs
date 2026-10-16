@@ -1277,12 +1277,6 @@ async fn tx_broadcast(State(state): State<ApiState>, Json(req): Json<TxBroadcast
     // the request timeout and concurrency cap stay effective: the timeout
     // races the `spawn_blocking` await, and the in-flight cap bounds how many
     // such tasks can exist at once.
-    //
-    // Stated plainly: verification still runs under the shared-state lock —
-    // only off the async thread, not outside the lock. Moving it fully
-    // outside would need `Mempool` split into validate-then-commit, which
-    // re-opens fee/height races between the two phases; that split is deferred
-    // until admission is reworked, and this keeps the current exactness.
     let state_for_task = state.clone();
     let tx_for_task = tx;
     let txid_for_result = txid;
