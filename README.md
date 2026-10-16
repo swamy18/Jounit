@@ -875,8 +875,11 @@ jnt-node <COMMAND> [OPTIONS]
 Common options: `--network <mainnet|testnet|mini>` (default `mini`) and
 `--data-dir <path>` (default `./chain`).
 
-`serve` also takes `--listen`, `--connect`, `--peers`, `--interval`,
-`--api-listen` and `--no-mine`. `send --amount` is in satoshis while printed
+`serve` also takes `--listen`, `--connect`, `--bootnodes`, `--peers`,
+`--interval`, `--api-listen`, `--api-token`, `--api-allowed-host`
+and `--no-mine`. `--bootnodes` dials peers at startup (SPEC §13.6: v0.2 has no
+ADDR gossip, so bootnodes plus `peers.json` are the only peer sources).
+`send --amount` is in satoshis while printed
 
 The API defaults to loopback and needs no credentials. Binding anything
 non-loopback is refused unless a token is supplied:
@@ -979,7 +982,7 @@ replaces.
 | **No independent security review** | 1194 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
-| **Operations** | No bootnodes, no log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
+| **Operations** | No bootnode directory. `--bootnodes` dials configured peers at startup and `peers.json` persists learned addresses across restarts; no public bootnode list is published. No log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
 
 What this means in practice: **a fresh `jnt-node init --network mainnet` runs
 today, and on it withdrawals and binding finality are both inactive.** That is
