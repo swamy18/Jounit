@@ -172,7 +172,8 @@ mempool, store, fee schedule constants.
 ## Phase 6 — Integration + public testnet: **PARTIALLY PREPARED, NOT STARTED**
 Already in place: jnt-node CLI with serve/relay, P2P networking with ban
 scoring and keepalives, storage recovery, fuzz-smoke CI, difficulty-attack
-sims, 360 tests.
+sims, 360 tests (historical snapshot; current counts come from
+scripts/test_count.sh).
 Remaining for testnet:
 - Wire all modules end-to-end in jnt-node (L2 tx handling, dispute flow,
   checkpoint relay message type — §13.5 addition, needs a vector-stable

@@ -15,7 +15,7 @@ documentation changes (see §13/§15); no commits were created.
 ## 2. Tests passed / failed
 
 ```
-cargo test --workspace     → 870 passed, 0 failed, 1 ignored (vwc_perf_probe)   # supersedes the 773 snapshot below
+cargo test --workspace     → 870 passed, 0 failed, 1 ignored (vwc_perf_probe)   # historical snapshot as of dd2e1da, 2026-10-09; current counts come from scripts/test_count.sh
 cargo fmt --all --check    → clean
 cargo clippy --workspace --all-targets --all-features -- -D warnings → clean
 cargo build --workspace --release → succeeded
@@ -200,7 +200,8 @@ Classification of the work:
 
 **Bottom line: this is a defensible public-testnet candidate for the L1/L2 task
 and payment flow, and it is not mainnet-ready.** The core is implemented and
-now honestly verified — 773 tests, a real 9.35M-execution fuzz campaign with no
+now honestly verified — 773 tests (historical snapshot as of 2026-10-09; current
+counts come from scripts/test_count.sh), a real 9.35M-execution fuzz campaign with no
 crashes, and real performance numbers. The remaining work is not "polish": it is
 five protocol decisions that must not be guessed, and the exit decision is the
 one that gates mainnet value safety. Nothing here is claimed complete that is

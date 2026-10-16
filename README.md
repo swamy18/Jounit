@@ -1,7 +1,6 @@
 # Jounit (JNT)
 
-An AI-native cryptocurrency. Mining that puts real work on GPUs and AI hardware
-without weakening the security a blockchain depends on.
+AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
 > **Status: code complete, not launched.** Every mechanism described here is
 > implemented and tested. Mainnet has **not** launched â€” see
@@ -902,16 +901,23 @@ address, and hostnames listed via `--api-allowed-host` (comma-separated) or
 request at 10 seconds and 64 in flight.
 figures are in JNT.
 
+Credit, escrow and delegation state is node-local: it lives in memory, is
+reachable over the API, and is lost on restart — it is never persisted and
+never consensus.
+
 ---
 
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1159 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1192 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
 ```
+
+The test count above is refreshed from `scripts/test_count.sh`, which is the
+single source of truth — run it and paste the total rather than hand-editing.
 
 Targeted suites for the fast loops:
 
@@ -970,7 +976,7 @@ replaces.
 | Blocker | Why it is blocked |
 |---|---|
 | **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1159 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1192 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
 | **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnodes, no log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
