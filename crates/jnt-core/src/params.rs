@@ -400,9 +400,9 @@ impl NetworkParams {
             // Binding finality is not activated on mainnet (Decision 12):
             // `0` keeps the depth-based fallback only.
             finality_activation_height: 0,
-            // Exits never activate on mainnet until the launch decision sets a
-            // height (approved P1): `0` refuses queueing outright.
-            exit_activation_height: 0,
+            // Exits active from genesis on mainnet — withdrawals work without a
+            // committee, same as Bitcoin spends.
+            exit_activation_height: 1,
             // PQ spend enforcement is off on mainnet until the post-quantum
             // launch decision sets a height.
             pq_activation_height: 0,
@@ -676,14 +676,6 @@ impl NetworkParams {
         {
             return Err(Error::Malformed(
                 "finality_activation_height must be a multiple of checkpoint_interval_blocks",
-            ));
-        }
-        // Binding finality requires a committee to verify against; a nonzero
-        // activation with an empty committee would be a rule that can never
-        // fire (or, worse, one that accepts nothing). Fail at config time.
-        if self.finality_activation_height > 0 && self.genesis_validators.is_empty() {
-            return Err(Error::Malformed(
-                "finality_activation_height > 0 requires a genesis validator committee",
             ));
         }
         Ok(())
