@@ -55,10 +55,22 @@ pub fn write_frame<W: Write>(
 /// Read and validate exactly one frame from a stream.
 ///
 /// Returns `(msg_type, payload)` with `payload` already bounded to
-/// `MAX_FRAME_PAYLOAD` bytes, allocated exactly once. A violating length is
-/// rejected before `payload` is ever read, so a peer cannot force an
-/// oversized allocation.
+/// `MAX_FRAME_PAYLOAD` bytes, grown incrementally as bytes arrive rather than
+/// reserved up front. A violating length is rejected before `payload` is ever
+/// read, so a peer cannot force an oversized allocation; a lying length that
+/// passes the cap pins only the bytes actually delivered.
 pub fn read_frame<R: Read>(r: &mut R, params: &NetworkParams) -> NetResult<(u8, Vec<u8>)> {
+    read_frame_inner(r, params, |_| {})
+}
+
+/// `read_frame` with a per-chunk capacity probe, so tests can prove the
+/// growth policy instead of trusting it. The probe sees the payload's
+/// capacity after every chunk; production passes a no-op.
+fn read_frame_inner<R: Read>(
+    r: &mut R,
+    params: &NetworkParams,
+    mut on_chunk: impl FnMut(usize),
+) -> NetResult<(u8, Vec<u8>)> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).map_err(truncated("magic"))?;
     if magic != params.network_magic {
@@ -99,6 +111,7 @@ pub fn read_frame<R: Read>(r: &mut R, params: &NetworkParams) -> NetResult<(u8, 
             r.read_exact(&mut buf[..want])
                 .map_err(truncated("payload"))?;
             payload.extend_from_slice(&buf[..want]);
+            on_chunk(payload.capacity());
             remaining -= want;
         }
     }
@@ -177,6 +190,47 @@ mod tests {
             read_frame(&mut cursor, &p),
             Err(NetError::Truncated(_))
         ));
+    }
+
+    /// A peer declares two megabytes and delivers three bytes. The read must
+    /// fail truncated — and the peak allocation must stay near the delivered
+    /// bytes, not the declared length. This is the test that would catch a
+    /// reintroduction of `try_reserve(payload_len)`.
+    #[test]
+    fn a_lying_length_pins_only_delivered_bytes() {
+        struct Drip {
+            delivered: usize,
+        }
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.delivered >= 3 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "peer went quiet",
+                    ));
+                }
+                buf[0] = 0xAA;
+                self.delivered += 1;
+                Ok(1)
+            }
+        }
+
+        let p = NetworkParams::mini();
+        let mut w = Writer::new();
+        w.raw(&p.network_magic).u8(7).u32le(2_000_000);
+        let head = w.into_vec();
+        let mut r = head.as_slice().chain(Drip { delivered: 0 });
+
+        let mut peak = 0usize;
+        let err = read_frame_inner(&mut r, &p, |cap| peak = peak.max(cap));
+        assert!(
+            matches!(err, Err(NetError::Truncated(_))),
+            "a quiet peer is truncated, got {err:?}"
+        );
+        assert!(
+            peak <= 1024,
+            "declared 2MB but delivered 3 bytes, yet capacity peaked at {peak}"
+        );
     }
 
     // The Reader is the same one `jnt_core`'s own serializers use, and the

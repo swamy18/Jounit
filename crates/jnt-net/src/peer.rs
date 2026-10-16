@@ -113,7 +113,7 @@ impl PeerTable {
         if !handle.is_outbound {
             self.inbound.fetch_add(1, Ordering::Relaxed);
         }
-        self.live.lock().unwrap().insert(handle.id, handle);
+        self.live.lock().unwrap().insert(handle.id, handle); // invariant: poison needs a prior panic, which aborts the process
     }
 }
 

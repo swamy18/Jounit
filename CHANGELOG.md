@@ -14,6 +14,26 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed (robustness)
+
+- **Frame reads pin growth, not just the cap.** `read_frame` grows the
+  payload per 64 KiB chunk with no upfront reserve, and a capacity probe
+  (no-op in production) lets a regression test prove a 2 MB declaration
+  that delivers 3 bytes peaks near those 3 bytes — the test that catches a
+  reintroduced `try_reserve(payload_len)`.
+- **Zero-amount credit deposits are refused.** `POST /v1/credit/deposit`
+  with `amount_sat: 0` returned 200 while bond, repay and open all refuse
+  zero; it now refuses like its siblings, so empty rows cannot grow the
+  book one request at a time.
+- **Every remaining `unwrap`/`expect` on the network and API paths is now
+  either converted or justified.** The API listener conversion returns an
+  error instead of panicking the serve thread; lock acquisitions and
+  map lookups that can only fail on a prior panic carry one-line
+  `// invariant:` comments saying so. An adversarial sweep over every
+  mutating route (`api_robustness.rs`: zero amounts, empty strings,
+  `u64::MAX`, invalid hex, wrong-length addresses, unknown enum values)
+  asserts 4xx JSON everywhere, never a panic or a 500.
+
 ### Fixed (supply chain)
 
 - **Weekly audit job with pinned tools.** `.github/workflows/audit.yml`

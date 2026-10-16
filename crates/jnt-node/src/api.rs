@@ -1722,6 +1722,8 @@ async fn payment_submit(
         // links are the ones this node accepted, so an unrecorded ancestor is
         // not authority the node can vouch for.
         if !payment.chain.is_empty() {
+            // invariant: `last()` on a non-empty slice always succeeds; the
+            // guard above is what makes this total rather than hopeful.
             let recorded = sh.delegations.chain_of(payment.chain.last().unwrap());
             let provable = recorded.as_ref().map(|chain| {
                 chain.len() == payment.chain.len()
@@ -2003,6 +2005,14 @@ async fn credit_deposit(
     Json(req): Json<CreditDepositReq>,
 ) -> ApiResult {
     let addr = decode_address(&req.address_hex)?;
+    // A zero deposit moves nothing but still creates book entries and still
+    // costs a request: refused like every other zero-amount credit call, so
+    // a flood of them cannot grow the book one empty row at a time.
+    if req.amount_sat == 0 {
+        return Err(bad(
+            "amount_sat must be positive; a zero deposit moves nothing",
+        ));
+    }
     with_shared(&state, |sh| {
         sh.credit
             .deposit(addr, req.amount_sat)
@@ -2866,8 +2876,16 @@ pub fn spawn_with_options(
             rt.block_on(async move {
                 // Bound inside this runtime's context so the socket registers
                 // with the reactor: `from_std` must run where a reactor exists.
-                let listener = tokio::net::TcpListener::from_std(std_listener)
-                    .expect("api listener conversion");
+                // A conversion failure is reported on stderr, not panicked:
+                // this thread owns the whole API surface, and a panic here
+                // aborts the node under the release profile.
+                let listener = match tokio::net::TcpListener::from_std(std_listener) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        eprintln!("api: listener conversion failed: {e}");
+                        return;
+                    }
+                };
                 // `into_make_service_with_connect_info`: without it the
                 // `ConnectInfo` extractor in `exposed_auth` finds nothing and
                 // every request on an exposed bind fails 500 — the peer's

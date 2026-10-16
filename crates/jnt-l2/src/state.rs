@@ -974,11 +974,9 @@ impl L2State {
             // resolution. Both settle as `Correct` with no fee; the difference
             // is which deposits move, and `settle_inner` accounts for that.
             let settled = {
-                // `ids` was collected from these keys, and `tasks` is insert-only
-                // (`tasks.insert` at 714 and 1375 are the only writers here), so
-                // the entry cannot be gone: a miss means the map lost a row it
-                // never removed, which is a bug in this module rather than an
-                // input to route around.
+                // invariant: `ids` was collected from these keys, and `tasks`
+                // is insert-only, so the entry cannot be gone — a miss would
+                // be a bug in this module, not an input to route around.
                 let t = self.tasks.get_mut(&id).expect("id came from the map");
                 let attrs = (t.submitter, t.worker, t.challenger());
                 // The certificate binds to the result the settlement names, so
@@ -1025,9 +1023,13 @@ impl L2State {
                         outcome.worker_paid,
                         VwcVerification::WindowElapsed,
                     )
+                    // invariant: an implicit settlement carries a real worker,
+                    // result and nonzero height by construction above.
                     .expect("an implicit settlement has a real worker, result and height");
                     let cert_id = cert.id;
                     self.issue_vwc(cert)
+                        // invariant: a task settles once, so issuance cannot
+                        // collide — a collision would be registry corruption.
                         .expect("a task settles once, so issuance cannot collide");
                     cert_id
                 });
@@ -1046,6 +1048,7 @@ impl L2State {
             let expired = self
                 .tasks
                 .get_mut(&id)
+                // invariant: `id` came from the map and tasks is insert-only.
                 .expect("id came from the map; tasks is insert-only")
                 .try_expire(height);
             if let Some(o) = expired {
@@ -1053,6 +1056,7 @@ impl L2State {
                     .tasks
                     .get(&id)
                     .map(|t| t.submitter)
+                    // invariant: the entry above just produced this outcome.
                     .expect("expired task still exists; tasks is insert-only");
                 let _ = self.pay(&submitter, o.submitter_refunded);
                 self.burned = self.burned.saturating_add(o.worker_deposit_burned);
