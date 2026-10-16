@@ -189,17 +189,18 @@ fn a_matured_exit_is_settled_without_anyone_hand_building_the_claim() {
     assert_eq!(report.supply.exited_sat, amount + EXIT_FEE);
 }
 
-/// The crank must not act before the profile activates: a mainnet-shaped chain
+/// The crank must not act before the profile activates: a profile-shaped chain
 /// (`exit_activation_height == 0`, meaning *never*) refuses both a claim and the
 /// root that would carry it, so a node on such a profile settles nothing.
 #[test]
 fn a_profile_that_never_activates_cranks_nothing() {
-    let params = NetworkParams::mainnet();
+    let mut params = NetworkParams::mainnet();
+    params.exit_activation_height = 0;
     let chain = Chain::new(params.clone()).unwrap();
     let view = NodeL2::fresh(&params).unwrap();
     assert!(
         !chain.exit_active_at(1),
-        "mainnet has chosen no activation height, so exits are off"
+        "a profile with exit_activation_height == 0 keeps exits off"
     );
     assert!(view.crank_claims(&chain, [7u8; 20]).is_empty());
 }

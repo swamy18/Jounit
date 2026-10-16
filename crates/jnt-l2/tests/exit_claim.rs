@@ -465,12 +465,13 @@ fn exit_with_inexact_funding_is_refused() {
 // 3. Activation gating
 // ---------------------------------------------------------------------------
 
-/// Below activation (mainnet carries `0`) a claim is refused before any proof
+/// Below activation (a profile carrying `0`) a claim is refused before any proof
 /// is read — and an L2 section without a root is still fine there, because
 /// the root rule only exists at and after activation.
 #[test]
 fn pre_activation_claim_is_refused() {
-    let params = NetworkParams::mainnet();
+    let mut params = NetworkParams::mainnet();
+    params.exit_activation_height = 0;
     assert_eq!(params.exit_activation_height, 0);
     let miner = wallet(9);
     let me = addr(&miner);
