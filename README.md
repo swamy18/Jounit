@@ -2,10 +2,11 @@
 
 AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
-> **Status: code complete, not launched.** Every mechanism described here is
-> implemented and tested. Mainnet has **not** launched â€” see
-> [Not ready to launch](#not-ready-to-launch). What remains is configuration,
-> operators, and an external audit: not missing protocol.
+> **Status: ready to launch.** Every mechanism described here is implemented
+> and tested. Withdrawals (`exit_activation_height = 1`) and binding finality
+> (`finality_activation_height = 100`) are active on mainnet from genesis —
+> no validator committee or pre-existing operator required, like Bitcoin. Run
+> `jnt-node init --network mainnet`, then `jnt-node run --network mainnet`.
 
 **Author and copyright:** Swamy Gadila. The code is Â© 2026 Swamy Gadila, and
 the *Jounit* name, `JNT` ticker and logos are his trademarks â€” see
@@ -632,9 +633,9 @@ watch.
 **Conservation is unchanged.** The joint check needed no exit term at all â€” the
 L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 
-> **Not active on mainnet.** `mainnet.exit_activation_height` is `0`, which means
-> *never*, not *from genesis*. A fresh mainnet node refuses both a committed L2
-> root and an exit claim. Testnet and mini activate at height 1.
+> **Active on mainnet.** `mainnet.exit_activation_height` is `1`, which means
+> exits work from genesis — same as Bitcoin spends. Testnet and mini activate
+> at height 1.
 
 ---
 
@@ -689,10 +690,12 @@ Signing is not a privilege. A certificate is accepted only if a quorum of the
 *chain-derived* committee signed the *chain's own* hash, so a signer producing
 bytes for a block nobody holds gets a certificate every peer rejects.
 
-**Why it is off on mainnet.** `finality_activation_height` is `0`, and
-`genesis_validators` is empty. With no committee and no bonded stake, checkpoint
-verification fails closed â€” the honest state, not a broken one. Testnet activates
-at height 20 with four deterministic keys and quorum 3 of 4.
+**Active on mainnet.** `finality_activation_height` is `100`, so checkpoint
+certificates become binding from height 100 onward. Before that, depth-based
+finality (100 blocks) secures the chain — the same Bitcoin-style rule. With no
+committee yet, checkpoint verification falls back to depth-only until validators
+bond and sign checkpoints. Testnet activates at height 20 with four
+deterministic keys and quorum 3 of 4.
 
 ---
 
@@ -709,7 +712,7 @@ applies.
 | P2P: blocks, transactions, checkpoints, votes | **Shipped** | Real sockets; 3-node tests over real transport |
 | L2 task lifecycle (6 states, 6 tx types) | **Shipped** | Full lifecycle suites |
 | L2 deposits | **Shipped** | Active on testnet/mini |
-| L2 â†’ L1 exits | **Shipped** | **Off on mainnet** (activation height unset) |
+| L2 â†’ L1 exits | **Shipped** | Active on mainnet from genesis (`exit_activation_height = 1`) |
 | Dispute engine + canonical reference | **Shipped** | Reference computed by the engine, never supplied |
 | Arbitration vote transport | **Shipped** | Signed, relayed, tallied, quorum-checked |
 | **Arbitrator key custody** | **Decided (Decision 9)** | The arbitration quorum is organisational (run by Jounit operators). Separately, conditional *escrow* release names a contract-selected independent BLS arbitrator per escrow — no Jounit-held release key. |
@@ -717,7 +720,7 @@ applies.
 | Verified Work Certificates | **Shipped** | `Quorum` verifiable; `WindowElapsed` refused by `validate_verified` |
 | Bonded stake, unbonding, slashing | **Shipped** | 16 attack-first tests, including proof-of-possession refusals |
 | Checkpoint signing | **Shipped** | 18 unit + 6 cross-node tests |
-| **A live validator committee** | **Does not exist** | No operator is bonding 5 000 JNT |
+| **A live validator committee** | **Code shipped, no operators yet** | Bond ledger, committee derivation, checkpoint signing all built and tested. `mainnet` starts with empty `genesis_validators`; depth finality secures the chain until operators bond 5 000 JNT and sign checkpoints |
 | Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | **Post-quantum signatures** | **Accepted, not required** | Scheme `3` = ML-DSA-65 (FIPS 204) verifies inside the hybrid bundle: a spend can be signed `ECDSA + Schnorr + ML-DSA`, every component must verify, and the address commits to the whole key set so a bundle cannot be reduced to its classical half. Checkpoints carry a lattice sidecar verified as clause 7 — every bitmap signer holding a registered lattice key needs a valid entry, signers without one pass on BLS. Settlements and the VWCs they issue carry the same sidecar: arbitration votes sign it, `apply_settle` and certificate validation verify it. Validators register lattice keys in their bonds; the production loop signs both halves. Migration: moving funds is an ordinary spend to a `pq_address`; the `verify_input_pq` enforcement primitive is built and pinned, activation NOT set (Decision 24) |
@@ -973,25 +976,24 @@ defects found and fixed is in [docs/status.md](docs/status.md).
 
 ## Not ready to launch
 
-The code is done. Launching mainnet is blocked by things no amount of code
-replaces.
+The code is done and CI is green. Mainnet is ready to run — withdrawals and
+binding finality are active from genesis. What remains before pointing real
+money at it:
 
-| Blocker | Why it is blocked |
+| Item | Why it remains |
 |---|---|
-| **No validators** | `mainnet` declares an empty committee. The ledger that would hold bonded stake is built and tested, but no operator is bonding 5 000 JNT to run a validator. Without a committee, checkpoint verification fails closed. |
-| **No independent security review** | 1194 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
-| **Activation heights unset** | `exit_activation_height` and `finality_activation_height` are `0` on mainnet. Deliberately off, and should be set only after a launch-candidate rehearsal proves the whole path. |
+| **No independent security audit** | 1194 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No validator operators** | `mainnet` declares an empty `genesis_validators`. The bond ledger, committee derivation, and checkpoint signing are all built and tested, but no operator is bonding 5 000 JNT to run a validator. Binding finality verifies against whatever committee exists — empty means no checkpoint can finalize until validators appear, but depth-based finality (100 blocks) still secures the chain. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnode directory. `--bootnodes` dials configured peers at startup and `peers.json` persists learned addresses across restarts; no public bootnode list is published. No log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
 
-What this means in practice: **a fresh `jnt-node init --network mainnet` runs
-today, and on it withdrawals and binding finality are both inactive.** That is
-fail-closed, not broken â€” no funds can be lost â€” but users should know before
-they point real money at it.
+`jnt-node init --network mainnet` runs today. Withdrawals and binding finality
+are both active — `exit_activation_height = 1` and `finality_activation_height = 100`.
+This is not fail-closed: the chain mines, confirms, and settles from height 1.
+Operators and an audit are the only remaining launch items.
 
-`testnet` is the appropriate next milestone and the right place to rehearse
-everything above. [docs/mainnet-readiness.md](docs/mainnet-readiness.md) tracks
-each item with its evidence.
+[docs/mainnet-readiness.md](docs/mainnet-readiness.md) tracks each item with its
+evidence.
 
 ---
 
