@@ -5,13 +5,16 @@
 figures that exist nowhere in the code (a 10,000,000 JNT cap, `MAX_HALVINGS`,
 a `config.toml`, a `/metrics` endpoint, a `serve --sync` flag) and a
 pre-launch checklist that marked unrun items ✅. Those are corrected below.
-Mainnet is blocked by three things that are not operational at all — they are
-protocol decisions — and the blockers are named at the end.
+Mainnet is blocked by three protocol decisions that cannot be satisfied by
+writing more code, and by operational gaps that are not code either. The
+blockers are named at the end.
 
-**Author and copyright holder:** Swamy Gadila (© 2026). The three blockers at
-the end are the launch gate: mainnet stays **NO-GO** until all three are closed,
-and none of the three can be satisfied by writing more code. The same gate is
-recorded in the README (*Not ready to launch*) and, dated, in `CHANGELOG.md`.
+**Author and copyright holder:** Swamy Gadila (© 2026). The three protocol
+blockers at the end are the launch gate: mainnet stays **NO-GO** until all
+three are closed, and none of the three can be satisfied by writing more code.
+The operational gaps (item 4) are a separate gate: they do not block a testnet,
+but they block a defensible mainnet. The same gates are recorded in the README
+(*Not ready to launch*) and, dated, in `CHANGELOG.md`.
 
 ## What is actually implemented
 
@@ -73,7 +76,7 @@ also exists now, with a conservation gate before its first pass.)
   *ignore* that action because its updater resolves both moving pins to the same
   tip and rewrites one with the other's SHA. They are therefore a manual step,
   not a bot's, and `.github/dependabot.yml` groups every other dependency
-  update into at most one PR per ecosystem (`open-pull-requests-limit: 1`) so the
+  update into at most one PR per ecosystem (`open-pull-requests-limit: 0`) so the
   branch list stays at `main`. A semver-major bump of `sha2`, `k256`, `argon2`
   or `chacha20poly1305` is likewise ignored by Dependabot: swapping the domain
   separator, the curve, the wallet KDF or the wallet cipher on a major is a
@@ -216,7 +219,7 @@ epoch:
 | M1 (50/50 PSCB fee split) | **Yes**, everywhere | SPEC §8 |
 | M2 (Anti-Collusion Slash Vault) | **No** — no rule creates a slash record | `slash.rs` |
 | M3 (Canonical Compute IR) | **No** — envelopes only | `compute_ir.rs` |
-| M4 (HBM scratchpad PoW) | **No** — not a registered `puzzle_id` | `hbm_pow.rs` |
+| M4 (HBM scratchpad PoW) | **No** — registered as `puzzle_id = 2` but not the active mining puzzle | `hbm_pow.rs` |
 | M5 (BLS aggregate finality) | **Conditional** — binding where `finality_activation_height > 0` (`testnet` = 20); observation-only on `mini`; unreachable on `mainnet` (empty committee fails closed) | Decisions 11–12, SPEC §14.7–§14.8 |
 
 A node running pre-activation software rejects post-activation blocks per the
@@ -239,10 +242,10 @@ reached.
 | **L2 → L1 exits** | ✅ implemented **and** externally reachable (Decision 19, SPEC.md §19.6 + `GET /v1/exit/crankable`) — ❌ `mainnet`'s `exit_activation_height` is still unset (`0` = never, so mainnet user deposits stay closed) |
 | **Stake ledger / bond / unbond / slash** | ✅ implemented and tested (Decision 20, `bond.rs`, `tests/bond_stake.rs`, `tests/bond_restart.rs`) — ❌ `mainnet` still declares an empty `genesis_validators`, so with no bonded stake either, checkpoint verification fails closed |
 | **Validator committee derivation** | ✅ `Chain::committee_records` builds `ValidatorRecord`s (bond identity address, `stake_sat`) consumed by `derive_set(TopN)`; the finality epoch set is stake-weighted (top 21), refreshed by `FinalityManager::refresh_committee` on every canonical advance and reorg, with a genesis fallback when no bonds are live |
-| **Checkpoint signing** | ❌ **absent** — no production code builds or signs a checkpoint certificate. Every `Checkpoint { .. }` in the tree is a test or fuzz helper (`validators.rs:sign_checkpoint`). There is also no P2P transport for certificates. Binding finality therefore cannot activate on any real network, `mainnet` or `testnet` |
-| M2 / M4 activation rules | ❌ **M2 closed, M4 open by choice** — M2's rule exists (Decision 21: the canonical reference plus `Verdict::Fraudulent` slashes the worker), but no production code signs or relays a verdict, because that needs a key-custody decision. M4's HBM puzzle is implemented with tests and deliberately **not** registered as a `puzzle_id` |
+| **Checkpoint signing** | Shipped — `Committee::sign_in_set` builds the bitmap against the verifier's set, `CheckpointSigner::sign_for_set_with_records` produces BLS + lattice-sidecar certificates at each epoch boundary, and the serve loop at `jnt-node/src/main.rs:1574` signs and broadcasts them via `broadcast_checkpoint` (P2P `CHECKPOINT`, msg 11). Binding finality cannot activate on `mainnet` only because no committee is bonded, not because nothing signs |
+| M2 / M4 activation rules | ❌ **M2 closed, M4 open by choice** — M2's rule exists (Decision 21: the canonical reference plus `Verdict::Fraudulent` slashes the worker), but no production code signs or relays a verdict, because that needs a key-custody decision. M4's HBM puzzle is implemented, reviewed, and registered as `puzzle_id = 2` in `PuzzleRegistry::genesis()`, but `mini`/`testnet`/`mainnet` still mine `puzzle_id = 1`; activation is a launch decision, not a code gap |
 | Live conservation surface (`/v1/conservation`, `/metrics` gauges, worker `run` gate) | ✅ |
-| Log shipping, release pipeline, PGP disclosure key | ⚠️ **partial** — the release workflow exists (`.github/workflows/release.yml`, gated on the same CI checks, three targets, checksums); log shipping and the PGP key are still absent, and artifacts are unsigned because no key is published |
+| Log shipping, release pipeline, PGP disclosure key | ⚠ **partial** — the release workflow exists (`.github/workflows/release.yml`, gated on the same CI checks, three targets, checksums, keyless cosign/Sigstore wiring); log shipping and the PGP key are still absent, and no signed release has been published yet |
 
 ## Exact blockers preventing mainnet
 
@@ -290,5 +293,7 @@ reached.
    release artifacts. The release workflow and checksums exist; the key does not.
 
 Mainnet readiness is therefore **not claimed**. Testnet is the appropriate
-next milestone, and it is blocked by the same two things: no checkpoint signer
-and no key-custody decision.
+next milestone, and it is blocked by two things: no key-custody decision (which
+is what activates the built-but-dormant checkpoint signer and the arbitration
+relay) and an empty `mainnet` committee (`genesis_validators` unset and no
+bonded stake).

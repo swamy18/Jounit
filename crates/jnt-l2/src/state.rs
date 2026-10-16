@@ -533,7 +533,7 @@ impl L2State {
         if self.exits.contains_key(&(p.owner, p.nonce)) {
             return Err(L2Error::BadExitNonce);
         }
-        self.charge_unchecked(&p.owner, need);
+        self.charge(&p.owner, need)?;
         self.collect_fee(fee);
         self.exits_locked = self
             .exits_locked
@@ -602,10 +602,18 @@ impl L2State {
         Ok(())
     }
 
-    /// Debit a balance known to be sufficient (`ensure_balance` was called).
-    fn charge_unchecked(&mut self, addr: &Address, amount: u64) {
+    /// Debit a balance. The caller must have verified sufficiency first via
+    /// [`ensure_balance`]; this is the debit that follows. Uses `checked_sub`
+    /// so an underflow is a protocol error rather than a silent wrap — with
+    /// `overflow-checks` on, a contract violation surfaces as `Overflow` and
+    /// halts the transaction before it can corrupt consensus state.
+    fn charge(&mut self, addr: &Address, amount: u64) -> L2Result<()> {
         let have = self.balance(addr);
-        self.accounts.insert(*addr, have - amount);
+        let next = have
+            .checked_sub(amount)
+            .ok_or(L2Error::Overflow)?;
+        self.accounts.insert(*addr, next);
+        Ok(())
     }
 
     fn pay(&mut self, addr: &Address, amount: u64) -> L2Result<()> {
@@ -709,7 +717,7 @@ impl L2State {
         let contract = TaskContract::new(p, height, self.config.dispute_window)?;
         let need = p.payment_sat.checked_add(fee).ok_or(L2Error::Overflow)?;
         self.ensure_balance(&p.submitter, need)?;
-        self.charge_unchecked(&p.submitter, need);
+        self.charge(&p.submitter, need)?;
         self.collect_fee(fee);
         self.tasks.insert(p.task_id, contract);
         Ok(L2Effect::Posted {
@@ -729,7 +737,7 @@ impl L2State {
             .get_mut(&p.task_id)
             .ok_or(L2Error::UnknownTask)?
             .claim(p.worker, p, height)?;
-        self.charge_unchecked(&p.worker, need);
+        self.charge(&p.worker, need)?;
         self.collect_fee(fee);
         Ok(L2Effect::Claimed {
             task_id: p.task_id,
@@ -748,7 +756,7 @@ impl L2State {
             .get_mut(&p.task_id)
             .ok_or(L2Error::UnknownTask)?
             .submit_result(p.worker, p, height)?;
-        self.charge_unchecked(&p.worker, fee);
+        self.charge(&p.worker, fee)?;
         self.collect_fee(fee);
         Ok(L2Effect::ResultSubmitted {
             task_id: p.task_id,
@@ -767,7 +775,7 @@ impl L2State {
             .get_mut(&p.task_id)
             .ok_or(L2Error::UnknownTask)?
             .file_dispute(p.challenger, p, height)?;
-        self.charge_unchecked(&p.challenger, need);
+        self.charge(&p.challenger, need)?;
         self.collect_fee(fee);
         Ok(L2Effect::DisputeFiled {
             task_id: p.task_id,

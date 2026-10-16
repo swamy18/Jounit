@@ -1,17 +1,13 @@
 //! Validator checkpoint signing (M5 binding finality, Decisions 11–14).
 //!
-//! This module is the missing half of M5. The verification side has existed
+//! This module is the production side of M5. The verification side has existed
 //! since the gadget landed: `crate::bls_checkpoint::validate_checkpoint_against_set`
 //! checks six clauses with real `blst` pairings, `FinalityManager::accept` binds
 //! a certificate to the canonical block at its height, and `jnt-net` receives a
 //! `Message::Checkpoint`, runs it through `Chain::apply_checkpoint` and relays it
-//! to every other peer — refusing to propagate one that failed. What did not
-//! exist was code that *produces* a certificate. Every `Checkpoint { .. }` in
-//! this repository was a test or fuzz helper.
-//!
-//! The consequence was simple to state and hard to notice: binding finality
-//! could not activate anywhere, `mainnet` or `testnet`, because nothing ever
-//! signed. A node could verify a certificate it would never see.
+//! to every other peer — refusing to propagate one that failed. What this module
+//! adds is the code that *produces* a certificate, so binding finality can
+//! actually activate.
 //!
 //! # What this module is
 //!
@@ -23,7 +19,9 @@
 //!   certificate, so the signer set is whatever the operator assembled rather
 //!   than any party's say-so.
 //! - [`CheckpointSigner`] — the pure "given these keys, a height and the block
-//!   hash, produce a certificate" step. No I/O, no clock, no network.
+//!   hash, produce a certificate" step. No I/O, no clock, no network. Called by
+//!   `jnt-node`'s serve loop at each epoch boundary it crosses, signing for the
+//!   chain-derived committee records and broadcasting the result.
 //!
 //! # What this module is not
 //!

@@ -115,7 +115,7 @@ rejected as an unexpected argument.
 |---|---|
 | L2 → L1 exits are activation-gated, not missing | Withdrawal works only where the profile's `exit_activation_height > 0`. Check the value in `NetworkParams::testnet()`; if it is `0`, deposited L2 value cannot be withdrawn on testnet — by configuration, not because the protocol lacks the path. |
 | M2 (Anti-Collusion slash vault) inactive | The vault exists; no rule triggers it. |
-| M4 (HBM scratchpad) not a registered `puzzle_id` | Chain security rests on the §5 double-PoW puzzle only. |
+| M4 (HBM scratchpad) registered but not active | `puzzle_id = 2` is registered with a security review (`docs/security-review-hbm-2026-10-12.md`), but `mini`/`testnet` mine `puzzle_id = 1` (hybrid); chain security rests on the §5 double-PoW only. |
 | No stake ledger / validator rotation | The committee is fixed at genesis (Decision 8); bonding/unbonding are mainnet-gated. |
 | API is unauthenticated | Loopback/tunnel only. |
 | Metrics are gauges only | `/metrics` exports no request/error counters — scraping it does not reveal how many requests failed. Poll `/v1/status` alongside it. |
