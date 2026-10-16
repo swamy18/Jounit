@@ -14,6 +14,21 @@ Versions follow the workspace `version` in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed (key hygiene)
+
+- **Validator keys use their own passphrase.** New keys are encrypted under
+  `JNT_VALIDATOR_PASSPHRASE`, falling back to `JNT_WALLET_PASSPHRASE` with a
+  one-time warning against sharing one passphrase; creation without a
+  passphrase is refused. Old plaintext and wallet-passphrase files still load,
+  so existing operators are not locked out.
+- **Key material stays wiped in memory.** Decrypted wallet and validator
+  buffers are parsed directly from `Zeroizing` allocations, wallet save
+  buffers wipe on drop, and `Wallet`, BLS `SecretKey`, and
+  `ValidatorKeyFile` redact `Debug` output and wipe secrets on drop.
+- **`--api-token` warns when passed on the command line.** The flag still
+  works, but argv is visible in the process list; `JNT_API_TOKEN` remains the
+  recommended path.
+
 ### Fixed (API exposure)
 
 - **Exposed/wildcard binds no longer 403 every IP literal.** The Host check

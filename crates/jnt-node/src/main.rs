@@ -78,9 +78,17 @@ COMMON OPTIONS:
   --network <mainnet|mini>   Default: mini
   --data-dir <path>          Default: ./chain
   --allow-plaintext-wallet   Permit wallets.json to hold unencrypted keys
-                             (default: refuse; set JNT_WALLET_PASSPHRASE to
-                             encrypt the file with Argon2id + ChaCha20-Poly1305
-                             and 0600 permissions instead)
+                              (default: refuse; set JNT_WALLET_PASSPHRASE to
+                              encrypt the file with Argon2id + ChaCha20-Poly1305
+                              and 0600 permissions instead)
+
+VALIDATOR KEY OPTIONS:
+  (no flag; environment only)  Validator keys are encrypted under
+                              JNT_VALIDATOR_PASSPHRASE, falling back to
+                              JNT_WALLET_PASSPHRASE with a one-time warning
+                              that sharing one passphrase for both is
+                              discouraged. A validator key file in plaintext
+                              still loads, with a warning per file
 
 SERVE OPTIONS:
   --listen <host:port>       TCP address to accept inbound peers (optional)
@@ -382,7 +390,7 @@ impl Store {
             return Ok(Vec::new());
         }
         let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-        let text = if wallet_store::is_encrypted(&bytes) {
+        if wallet_store::is_encrypted(&bytes) {
             let passphrase = wallet_store::passphrase_from_env().ok_or_else(|| {
                 format!(
                     "{} is encrypted; set {} to read it",
@@ -390,9 +398,10 @@ impl Store {
                     wallet_store::PASSPHRASE_ENV
                 )
             })?;
+            // Zeroized end to end: the JSON is parsed straight from the
+            // wiping buffer, with no intermediate `String` or `Vec` copy.
             let plain = wallet_store::decrypt(&passphrase, &bytes)?;
-            String::from_utf8((*plain).clone())
-                .map_err(|_| "wallet file is not UTF-8".to_string())?
+            serde_json::from_slice(&plain).map_err(|e| e.to_string())
         } else {
             // One note, not a refusal: refusing to *read* an existing plaintext
             // file would lock the operator out of their own keys. The refusal
@@ -402,9 +411,9 @@ impl Store {
                 path.display(),
                 wallet_store::PASSPHRASE_ENV
             );
-            String::from_utf8(bytes).map_err(|_| "wallet file is not UTF-8".to_string())?
-        };
-        serde_json::from_str(&text).map_err(|e| e.to_string())
+            let bytes = zeroize::Zeroizing::new(bytes);
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+        }
     }
 
     /// Persist wallets encrypted under `JNT_WALLET_PASSPHRASE`, written 0600
@@ -413,10 +422,15 @@ impl Store {
     /// `--allow-plaintext-wallet` says the operator has decided to accept it.
     fn save_wallets(&self, wallets: &[Wallet]) -> Result<(), String> {
         fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-        let text = serde_json::to_string_pretty(wallets).map_err(|e| e.to_string())?;
+        // The serialized wallets hold secrets, so the buffer wipes on drop.
+        let text =
+            zeroize::Zeroizing::new(serde_json::to_vec_pretty(wallets).map_err(|e| e.to_string())?);
+        let mut text = text;
         let payload = match wallet_store::passphrase_from_env() {
-            Some(passphrase) => wallet_store::encrypt(&passphrase, text.as_bytes())?,
-            None if self.allow_plaintext_wallet => text.into_bytes(),
+            Some(passphrase) => wallet_store::encrypt(&passphrase, &text)?,
+            // Explicit operator opt-in: the plaintext file is the accepted
+            // risk, so move the buffer out rather than copying it again.
+            None if self.allow_plaintext_wallet => std::mem::take(&mut *text),
             None => {
                 return Err(format!(
                     "refusing to write plaintext private keys to {}: set {} to \
@@ -1083,10 +1097,11 @@ fn load_validator_committee(
         }
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let bytes = if wallet_store::is_encrypted(&bytes) {
-            let passphrase = wallet_store::passphrase_from_env().ok_or_else(|| {
+            let passphrase = validator_passphrase().ok_or_else(|| {
                 format!(
-                    "{} is encrypted; set {} to read it",
+                    "{} is encrypted; set {} (or {}) to read it",
                     path.display(),
+                    VALIDATOR_PASSPHRASE_ENV,
                     wallet_store::PASSPHRASE_ENV
                 )
             })?;
@@ -1096,8 +1111,9 @@ fn load_validator_committee(
             // Loud on every load, not just the first: a plaintext key file
             // is the exposure `validator add` now refuses to create.
             eprintln!(
-                "warning: {} holds an unencrypted validator key; set {} and re-add it to encrypt it",
+                "warning: {} holds an unencrypted validator key; set {} (or {}) and re-add it to encrypt it",
                 path.display(),
+                VALIDATOR_PASSPHRASE_ENV,
                 wallet_store::PASSPHRASE_ENV
             );
             zeroize::Zeroizing::new(bytes)
@@ -1119,10 +1135,11 @@ fn load_validator_committee(
 /// a validator key signs consensus messages. Mixing them would make a wallet
 /// backup a validator key backup, which is a different risk entirely.
 ///
-/// A new key is written encrypted under `JNT_WALLET_PASSPHRASE` (Argon2id +
-/// ChaCha20-Poly1305, mode 0600 where the platform supports it), because the
-/// file *is* the key — creation without a passphrase is refused rather than
-/// writing plaintext. `validator list` prints public keys only.
+/// A new key is written encrypted under `JNT_VALIDATOR_PASSPHRASE` (falling back
+/// to `JNT_WALLET_PASSPHRASE`) with Argon2id + ChaCha20-Poly1305, mode 0600
+/// where the platform supports it, because the file *is* the key — creation
+/// without a passphrase is refused rather than writing plaintext.
+/// `validator list` prints public keys only.
 fn cmd_validator(args: &Args) -> Result<(), String> {
     let store = Store::open(args)?;
     let params = store.params.clone();
@@ -1149,21 +1166,23 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
     // library stays free of any way to reach for randomness.
     // OS entropy, harvested here rather than inside jnt-core, so the consensus
     // library stays free of any way to reach for randomness.
-    let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    // The seed wipes on drop; it must not linger after the key is derived.
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed[..]);
     let sk = jnt_core::bls::SecretKey::derive(&seed).map_err(|e| e.to_string())?;
     let key = jnt_core::signing::ValidatorKey::new(sk, params.network_id.clone());
     let file = key.to_file();
-    let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+    let bytes =
+        zeroize::Zeroizing::new(serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?);
     // New keys are never written plaintext: without a passphrase there is no
     // key to encrypt under, so creation is refused rather than writing a
     // 0600 JSON scalar. Existing plaintext keys still load (with a loud
     // warning at load time), so this refuses new exposure without locking
     // operators out of keys they already hold.
-    let Some(passphrase) = wallet_store::passphrase_from_env() else {
+    let Some(passphrase) = validator_passphrase() else {
         return Err(format!(
             "refusing to write an unencrypted validator key: set {} and retry",
-            wallet_store::PASSPHRASE_ENV
+            VALIDATOR_PASSPHRASE_ENV
         ));
     };
     let bytes = wallet_store::encrypt(&passphrase, &bytes)
@@ -1190,6 +1209,40 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
     println!("  committee  public key must be bonded on chain before its signature counts");
     Ok(())
 }
+
+/// Passphrase validator keys are encrypted under: `JNT_VALIDATOR_PASSPHRASE`,
+/// falling back to `JNT_WALLET_PASSPHRASE` with a one-time warning.
+///
+/// The variables are separate on purpose: one passphrase for a wallet and for
+/// consensus-signing keys means one compromise opens both, and an operator
+/// who reuses one has usually not thought about it. The fallback exists for
+/// the existing deployments that set only the wallet variable — a new key
+/// can be re-added under the dedicated one, and a shared passphrase is
+/// reported rather than silently accepted.
+fn validator_passphrase() -> Option<String> {
+    if let Some(p) = std::env::var(VALIDATOR_PASSPHRASE_ENV)
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        return Some(p);
+    }
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if let Some(p) = wallet_store::passphrase_from_env() {
+        if WARNED.set(()).is_ok() {
+            eprintln!(
+                "warning: validator keys are using {}; set {} to give validator keys their own passphrase",
+                wallet_store::PASSPHRASE_ENV,
+                VALIDATOR_PASSPHRASE_ENV
+            );
+        }
+        return Some(p);
+    }
+    None
+}
+
+/// Environment variable carrying the validator-key passphrase.
+const VALIDATOR_PASSPHRASE_ENV: &str = "JNT_VALIDATOR_PASSPHRASE";
 
 fn cmd_wallet(args: &Args) -> Result<(), String> {
     let store = Store::open(args)?;
@@ -1290,6 +1343,17 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // env var, because a flag value is visible to other local users in `ps`.
     // Either is left unset for a loopback bind, which stays unauthenticated
     // by design.
+    // The flag is accepted, and reported on: argv is world-readable through
+    // `/proc` and `ps`, so a token there is a token every local account knows.
+    // The environment of a started process is not, which is why the env var is
+    // the recommended path and the flag is not removed (an operator who has
+    // already decided to accept the risk should not be blocked).
+    if args.str("api-token").is_some() {
+        eprintln!(
+            "warning: --api-token is visible in the process list; use the \
+             JNT_API_TOKEN environment variable instead"
+        );
+    }
     let api_token: Option<String> = args
         .str("api-token")
         .map(str::to_owned)

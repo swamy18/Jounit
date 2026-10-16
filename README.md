@@ -674,8 +674,11 @@ jnt-node validator --network testnet --data-dir ./chain --add --label my-key
 ```
 
 Keys live in `<data-dir>/validators/`, mode 0600 on unix, deliberately separate
-from `wallets.json` â€” a wallet holds funds this node spends, a validator key
-signs consensus messages. `serve` loads them, signs a checkpoint at each epoch
+from `wallets.json` — a wallet holds funds this node spends, a validator key
+signs consensus messages. New keys are encrypted under
+`JNT_VALIDATOR_PASSPHRASE` (falling back to `JNT_WALLET_PASSPHRASE` with a
+warning); creation without a passphrase is refused. Old plaintext key files
+still load, with a warning per file. `serve` loads them, signs a checkpoint at each epoch
 boundary for a block it holds as its own canonical tip, and broadcasts it. A node
 with no keys signs nothing and still verifies and relays.
 

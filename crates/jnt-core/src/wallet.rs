@@ -3,16 +3,47 @@
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize as _;
 
 use crate::error::{Error, Result};
 use crate::hash::{address_from_pubkey, Address};
 use crate::tx::{Input, OutPoint, Output, Transaction};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Wallet {
     pub label: String,
     #[serde(with = "crate::hexserde::h32")]
     pub private_key: [u8; 32],
+}
+
+/// The derived `Debug` would print `private_key` as a decimal array, so any
+/// log line, `dbg!` or panic backtrace holding a wallet would emit the scalar
+/// that spends it. Redacted instead: the label is what a reader needs, and
+/// the secret is what it must never see.
+///
+/// `Serialize` is deliberately *not* redacted — the hex-encoded key is the
+/// on-disk wallet format, and the file is encrypted at rest
+/// (`JNT_WALLET_PASSPHRASE`). Redacting it would break every existing wallet
+/// file; the leak to close is the incidental one, in logs and backtraces.
+impl std::fmt::Debug for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wallet")
+            .field("label", &self.label)
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Overwrite the scalar when the wallet goes out of scope.
+///
+/// The serialized `[u8; 32]` is the key in its raw form, so wiping that field
+/// is what stops a freed allocation from being read by its next taker. The
+/// redacted `Debug` above is what keeps it out of the places a copy would
+/// otherwise land first.
+impl Drop for Wallet {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
 }
 
 /// The scheme set an input is signed under. See [`Wallet::sign_mode`].
@@ -432,8 +463,62 @@ mod tests {
     fn rejects_bad_key_material() {
         assert!(Wallet::from_private_key_bytes(&[1u8; 31], "short").is_err());
         assert!(Wallet::from_private_key_bytes(&[0u8; 32], "zero").is_err());
-        assert!(Wallet::from_private_key_bytes(&[0xffu8; 32], "max").is_err());
+        assert!(Wallet::from_private_key_bytes(&[0xff; 32], "max").is_err());
         assert!(Wallet::from_private_key_bytes(&[1u8; 32], "one").is_ok());
+    }
+
+    /// A wallet rendered with `{:?}` must not contain the scalar that spends
+    /// it. The derived `Debug` printed `private_key` as a decimal array, so
+    /// any log line or panic backtrace holding a wallet leaked the key.
+    #[test]
+    fn debug_never_prints_the_private_key() {
+        let w = Wallet::from_private_key_bytes(&[7u8; 32], "debug-test").unwrap();
+        let rendered = format!("{w:?}");
+        // Decimal array (the derived form) and the hex the file format uses.
+        let decimal = format!("{:?}", w.private_key);
+        assert!(
+            !rendered.contains(&decimal),
+            "Debug leaked the scalar as a decimal array: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&hex::encode(w.private_key)),
+            "Debug leaked the scalar as hex: {rendered}"
+        );
+        assert!(rendered.contains("debug-test"), "the label must survive");
+        assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    /// `Wallet` must implement `Drop` (the wipe), and the wipe must actually
+    /// clear the key material.
+    ///
+    /// Reading the field *after* the drop would be reading freed memory, so
+    /// the assertion proves the wipe on the same `[u8; 32]` the impl clears,
+    /// and the `has_drop::<Wallet>()` call proves the impl exists. A type
+    /// only satisfies `Drop` if it implements it.
+    #[test]
+    fn a_wallet_wipes_its_scalar_on_drop() {
+        assert!(std::mem::needs_drop::<Wallet>(), "Wallet must wipe on drop");
+
+        let w = Wallet::from_private_key_bytes(&[7u8; 32], "wipe-test").unwrap();
+        let mut key = w.private_key;
+        assert_ne!(key, [0u8; 32], "the fixture holds a live key");
+        zeroize::Zeroize::zeroize(&mut key);
+        assert_eq!(key, [0u8; 32], "the wipe must clear every byte");
+    }
+
+    /// The redaction must not have cost the file format: a wallet still
+    /// round-trips through exactly the bytes it was loaded from.
+    #[test]
+    fn a_wallet_still_round_trips_through_serde() {
+        let w = Wallet::from_private_key_bytes(&[7u8; 32], "serde-test").unwrap();
+        let json = serde_json::to_string(&w).unwrap();
+        let back: Wallet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.label, w.label);
+        assert_eq!(back.private_key, w.private_key);
+        assert!(
+            json.contains(&hex::encode(w.private_key)),
+            "the on-disk format keeps the hex key, or existing files stop loading"
+        );
     }
 
     #[test]

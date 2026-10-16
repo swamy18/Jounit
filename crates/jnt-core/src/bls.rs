@@ -30,6 +30,7 @@ use blst::{min_pk, BLST_ERROR};
 
 use crate::bls_checkpoint::{BlsPublicKey, BlsSignature};
 use crate::hash::sha256_dom;
+use zeroize::Zeroize as _;
 
 /// Domain separation tag for all checkpoint signing (§14.5).
 ///
@@ -78,8 +79,26 @@ impl std::error::Error for BlsError {}
 /// which is both sufficient and safe. `Debug` is inherited from the inner type,
 /// so anything holding one must not `Debug`-format it;
 /// `signing::ValidatorKey` redacts for exactly that reason.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SecretKey(min_pk::SecretKey);
+
+/// Never render key material: the inner `blst` type derives `Debug`, so an
+/// inherited impl would print the scalar into logs and backtraces.
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretKey")
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Wipe the wrapped `blst` scalar on drop. `min_pk::SecretKey` zeroizes its own
+/// storage, so forwarding here keeps every owned copy wiped.
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl SecretKey {
     /// Derive a key from a 32-byte seed using the IETF `KeyGen` procedure
@@ -89,10 +108,12 @@ impl SecretKey {
     /// key on every platform and every run — which is what makes the test
     /// fixtures in this crate byte-reproducible.
     pub fn derive(seed: &[u8; 32]) -> Result<SecretKey, BlsError> {
-        let mut ikm = [0u8; 34];
+        // The seed-bearing input wipes on drop; it must not linger after key
+        // generation returns.
+        let mut ikm = zeroize::Zeroizing::new([0u8; 34]);
         ikm[..32].copy_from_slice(seed);
         ikm[32..].copy_from_slice(&[0x00, 0x20]); // I2OSP(len(seed), 2)
-        let sk = min_pk::SecretKey::key_gen(&ikm, &[]).map_err(|_| BlsError::BadSeed)?;
+        let sk = min_pk::SecretKey::key_gen(&ikm[..], &[]).map_err(|_| BlsError::BadSeed)?;
         Ok(SecretKey(sk))
     }
 
@@ -595,5 +616,23 @@ mod tests {
             raw.verify(false, &msg, other_dst, &[], &pk, false),
             BLST_ERROR::BLST_SUCCESS
         );
+    }
+
+    /// The wrapper must never render key material: the inner `blst` type
+    /// derives `Debug`, so an inherited impl would leak the scalar.
+    #[test]
+    fn debug_never_prints_the_secret_key() {
+        assert!(
+            std::mem::needs_drop::<SecretKey>(),
+            "SecretKey must wipe on drop"
+        );
+
+        let sk = SecretKey::derive(&SEED_A).unwrap();
+        let rendered = format!("{sk:?}");
+        assert!(
+            !rendered.contains(&hex::encode(sk.scalar())),
+            "Debug leaked the scalar: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 }

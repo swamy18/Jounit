@@ -42,6 +42,7 @@
 //! The node's `validator` command does the OS-entropy call.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize as _;
 
 use crate::bls::{RealBls, SecretKey};
 use crate::bls_checkpoint::{BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload};
@@ -59,7 +60,7 @@ use crate::hash::{Hash, Hash512};
 /// custody: it means the key is a pure function of a short string, so anyone who
 /// guesses the string owns the validator. `SecretKey::derive` stays where it
 /// belongs — in tests — and this file stores the output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorKeyFile {
     /// Format version. A file claiming anything else is refused, never guessed.
     pub version: u32,
@@ -69,17 +70,39 @@ pub struct ValidatorKeyFile {
     /// The compressed G1 public key. Round-trips to `ValidatorKey::public_key`.
     #[serde(with = "crate::hexserde::h48")]
     pub public_key: [u8; 48],
-    /// The 32-byte scalar, hex-encoded. Never logged; see [`ValidatorKey`]'s
-    /// `Debug` impl.
+    /// The 32-byte scalar, hex-encoded. Never logged; both this file struct
+    /// and [`ValidatorKey`] redact it in `Debug`, and the scalar wipes on drop.
     #[serde(with = "crate::hexserde::h32")]
     pub sk: [u8; 32],
 }
 
+/// A key file never renders its scalar: `Serialize` keeps the exact on-disk
+/// bytes for backward compatibility, while `Debug` carries only the marker.
+impl std::fmt::Debug for ValidatorKeyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatorKeyFile")
+            .field("version", &self.version)
+            .field("network_id", &self.network_id)
+            .field("public_key", &self.public_key)
+            .field("sk", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Wipe the in-memory file scalar on drop. The serialized file still contains
+/// the key by design (it is encrypted at rest); this only stops a freed
+/// allocation from carrying it afterward.
+impl Drop for ValidatorKeyFile {
+    fn drop(&mut self) {
+        self.sk.zeroize();
+    }
+}
+
 /// One validator's signing key.
 ///
-/// `Debug` is redacted on purpose. The `SecretKey` it wraps does not redact
-/// itself, so deriving `Debug` here would put a live consensus key into any log
-/// line, panic backtrace or CLI status dump that prints this value.
+/// `Debug` is redacted on purpose. Deriving `Debug` here would put a live
+/// consensus key into any log line, panic backtrace or CLI status dump that
+/// prints this value.
 ///
 /// Not `PartialEq`, and not by oversight: comparing these would mean comparing
 /// secret keys. `ValidatorKey::public_key` is the identity that matters, and
@@ -552,6 +575,19 @@ mod tests {
         // rendering must carry the marker and must not carry the secret.
         let k = key(1);
         let printed = format!("{k:?}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn debug_never_prints_the_key_file_scalar() {
+        // `ValidatorKeyFile` keeps the scalar for the on-disk format, so its
+        // `Debug` impl must redact while `Serialize` stays byte-compatible.
+        let file = key(7).to_file();
+        let printed = format!("{file:?}");
+        assert!(
+            !printed.contains(&hex::encode(file.sk)),
+            "Debug leaked the file scalar: {printed}"
+        );
         assert!(printed.contains("<redacted>"), "{printed}");
     }
 
