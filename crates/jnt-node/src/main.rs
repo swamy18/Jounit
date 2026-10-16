@@ -105,6 +105,10 @@ SERVE OPTIONS:
                               JNT_API_ALLOWED_HOSTS. IP literals need no
                               allowlisting; unknown names get 403
   --connect <host:port>      Dial an outbound peer (repeatable via CSV)
+  --bootnodes <list>           Comma-separated bootnode addresses to dial at
+                               startup and retry on each reconnect cycle
+                               (optional; v0.2 has no ADDR gossip so these are
+                               the only peer source alongside --connect)
   --peers <n>                Max total peers (default: 125)
   --interval <ms>            Serve loop period (default: 250)
   --no-mine                  Relay and validate only, never mine
@@ -152,26 +156,27 @@ impl Args {
                 // Flags that take a value; everything else is a boolean switch.
                 let takes_value = matches!(
                     name,
-                    "network"
-                        | "data-dir"
-                        | "blocks"
-                        | "amount"
-                        | "to"
-                        | "address"
-                        | "wallet"
-                        | "label"
-                        | "height"
-                        | "out"
-                        | "from"
-                        | "interval"
-                        | "fee"
-                        | "listen"
-                        | "api-listen"
-                        | "api-token"
-                        | "api-allowed-host"
-                        | "connect"
-                        | "peers"
-                        | "relay"
+                     "network"
+                         | "data-dir"
+                         | "blocks"
+                         | "amount"
+                         | "to"
+                         | "address"
+                         | "wallet"
+                         | "label"
+                         | "height"
+                         | "out"
+                         | "from"
+                         | "interval"
+                         | "fee"
+                         | "listen"
+                         | "api-listen"
+                         | "api-token"
+                         | "api-allowed-host"
+                         | "connect"
+                         | "peers"
+                         | "relay"
+                         | "bootnodes"
                 );
                 if takes_value {
                     let value = raw
@@ -1326,8 +1331,29 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     let max_peers = args.num("peers", 125)? as usize;
     // A relay-only node: it validates, relays and syncs, but does not mine.
     let no_mine = args.has("no-mine");
+    // Parse bootnode addresses (§13.6: v0.2 has no ADDR gossip, so bootnodes
+    // plus the address book are the only peer source).
+    let bootnodes: Vec<std::net::SocketAddr> = args
+        .str("bootnodes")
+        .map(|s| {
+            s.split(',')
+                .map(|a| {
+                    a.trim()
+                        .parse()
+                        .map_err(|e| format!("--bootnodes `{a}`: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     let mut config = P2pConfig::new(store.params.clone(), listen_addr);
     config.max_peers = max_peers;
+    config.bootnodes = bootnodes.clone();
+    // Persist known peer addresses to peers.json in the data directory, so
+    // a restart can reconnect to peers the node learned. Reuses the store's
+    // atomic-write pattern (write beside → fsync → rename → 0600).
+    config.address_book = Some(store.dir.join("peers.json"));
     // Loop period. Without one the loop mined as fast as the CPU allowed and
     // rewrote the whole chain file each time (SPEC.md §13.10 item 4).
     let interval_ms = args.num("interval", 250)?;
@@ -1375,6 +1401,9 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         api_allowed_hosts.extend(split_hosts(flag));
     }
 
+    // Capture address book path before config is moved into P2pNode::start.
+    let has_address_book = config.address_book.is_some();
+
     let node =
         P2pNode::start(config, chain.height(), chain.tip_hash()).map_err(|e| e.to_string())?;
 
@@ -1405,6 +1434,17 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     if let Some(addr) = listen_addr {
         println!("listening      {addr}");
     }
+    if !bootnodes.is_empty() {
+        let list = bootnodes
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("bootnodes      {list}");
+    }
+    if has_address_book {
+        println!("address book   {}", store.dir.join("peers.json").display());
+    }
 
     // Everything mutable now lives behind one lock shared with the API
     // thread: the serve loop takes it once per iteration, handlers take it
@@ -1424,7 +1464,19 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         println!("api            {bound}");
     }
 
-    // Dial configured outbound peers.
+    // Dial configured outbound peers: --bootnodes first, then --connect.
+    for addr in &bootnodes {
+        let dialed = {
+            let sh = shared
+                .lock()
+                .map_err(|_| "state lock poisoned".to_string())?;
+            node.connect(*addr, &sh.chain)
+        };
+        match dialed {
+            Ok(id) => println!("connected peer {id} -> {addr} (bootnode)"),
+            Err(e) => eprintln!("warn: bootnode connect {addr}: {e}"),
+        }
+    }
     for addr in &connect_peers {
         let dialed = {
             let sh = shared
@@ -1613,6 +1665,13 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             },
             Some(now_ms()),
         );
+
+        // §13.6 reconnect sweep: dial back to bootnodes and address-book peers
+        // that dropped. Tries at most one address per cycle (3 s timeout) so
+        // a dead peer does not stall the mine/validate path.
+        if !bootnodes.is_empty() || has_address_book {
+            node.reconnect(&sh.chain);
+        }
 
         // Keep the L2 view on the tip after both paths above. A reorg that
         // rewrote history takes the full-replay arm inside `sync`. A genesis

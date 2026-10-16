@@ -595,6 +595,8 @@ name = "jnt-net"
 version = "0.1.0"
 dependencies = [
  "jnt-core",
+ "rand",
+ "serde",
  "serde_json",
 ]
 

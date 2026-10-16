@@ -88,6 +88,8 @@ impl Peer {
                 max_peers: 8,
                 max_inbound: 8,
                 user_agent: "jounit-test/0.3".into(),
+                bootnodes: Vec::new(),
+                address_book: None,
             },
             chain.height(),
             chain.tip_hash(),

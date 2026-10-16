@@ -13,6 +13,7 @@
 //! channels, and `Error` from `jnt-core` is never mixed with network failures.
 //! See `error::NetError` for that separation.
 
+pub mod addr_book;
 pub mod error;
 pub mod frame;
 pub mod magic;

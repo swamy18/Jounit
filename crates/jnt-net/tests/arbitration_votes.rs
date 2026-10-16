@@ -57,6 +57,8 @@ impl LocalNode {
                 max_peers: 8,
                 max_inbound: 8,
                 user_agent: "arb-test/0.1".into(),
+                bootnodes: Vec::new(),
+                address_book: None,
             },
             chain.height(),
             chain.tip_hash(),

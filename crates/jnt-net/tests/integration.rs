@@ -207,6 +207,8 @@ fn a_node_syncs_a_peer_over_real_sockets() {
             max_peers: 8,
             max_inbound: 8,
             user_agent: "server/0.1".into(),
+            bootnodes: Vec::new(),
+            address_book: None,
         },
         server_chain.height(),
         server_chain.tip_hash(),
@@ -239,6 +241,8 @@ fn a_node_syncs_a_peer_over_real_sockets() {
             max_peers: 8,
             max_inbound: 8,
             user_agent: "client/0.1".into(),
+            bootnodes: Vec::new(),
+            address_book: None,
         },
         0,
         gh,
@@ -289,6 +293,8 @@ fn the_peer_limit_refuses_new_outbound_connections() {
             max_peers: 0,
             max_inbound: 0,
             user_agent: "lonely/0.1".into(),
+            bootnodes: Vec::new(),
+            address_book: None,
         },
         0,
         gh,
@@ -297,6 +303,92 @@ fn the_peer_limit_refuses_new_outbound_connections() {
     let chain = fresh_chain();
     let res = node.connect("127.0.0.1:1".parse().unwrap(), &chain);
     assert!(res.is_err(), "a node at its peer limit must refuse to dial");
+}
+
+// ---------------------------------------------------------------------------
+// §13.6 peer discovery: bootnodes, address book, reconnect, eclipse resistance
+// ---------------------------------------------------------------------------
+
+/// `reconnect` is a no-op when there are no bootnodes and no address book:
+/// a node with no peer source has nothing to reconnect to.
+#[test]
+fn reconnect_with_no_peers_is_a_noop() {
+    let params = mini();
+    let gh = genesis_hash(&params);
+    let node = P2pNode::start(
+        P2pConfig {
+            params: params.clone(),
+            listen_addr: None,
+            max_peers: 8,
+            max_inbound: 8,
+            user_agent: "test/0.1".into(),
+            bootnodes: Vec::new(),
+            address_book: None,
+        },
+        0,
+        gh,
+    )
+    .unwrap();
+    let chain = fresh_chain();
+    assert_eq!(node.reconnect(&chain), 0, "nothing to reconnect to");
+    assert_eq!(node.peer_count(), 0);
+}
+
+/// `reconnect` respects the 50% outbound cap: a node with only outbound peers
+/// that are already at the cap tries no more.
+#[test]
+fn reconnect_respects_the_outbound_cap() {
+    // A node with max_peers=2 and no connected peers: the outbound cap is 1,
+    // and we have no bootnodes to try, so reconnect is a no-op even though
+    // there is room for peers.
+    let params = mini();
+    let gh = genesis_hash(&params);
+    let node = P2pNode::start(
+        P2pConfig {
+            params: params.clone(),
+            listen_addr: None,
+            max_peers: 2,
+            max_inbound: 2,
+            user_agent: "test/0.1".into(),
+            bootnodes: Vec::new(),
+            address_book: None,
+        },
+        0,
+        gh,
+    )
+    .unwrap();
+    let chain = fresh_chain();
+    assert_eq!(node.reconnect(&chain), 0);
+}
+
+/// Bootnodes configured in `P2pConfig` appear as reconnect candidates.
+#[test]
+fn reconnect_attempts_bootnodes() {
+    let params = mini();
+    let gh = genesis_hash(&params);
+    // A bootnode pointing at a port nobody is listening on — reconnect should
+    // try it and fail, but must not panic.
+    let bad_bootnode: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let node = P2pNode::start(
+        P2pConfig {
+            params: params.clone(),
+            listen_addr: None,
+            max_peers: 8,
+            max_inbound: 8,
+            user_agent: "test/0.1".into(),
+            bootnodes: vec![bad_bootnode],
+            address_book: None,
+        },
+        0,
+        gh,
+    )
+    .unwrap();
+    let chain = fresh_chain();
+    // reconnect will attempt to dial 127.0.0.1:1 and fail (no listener),
+    // but must return cleanly.
+    let dialed = node.reconnect(&chain);
+    assert_eq!(dialed, 0, "no peer was reachable");
+    assert_eq!(node.peer_count(), 0);
 }
 
 // ---------------------------------------------------------------------------

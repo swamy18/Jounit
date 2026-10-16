@@ -3,8 +3,9 @@
 //! Owns connection listening, peer management, and dispatches network events
 //! to the chain thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -12,11 +13,15 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+
 use jnt_core::chain::Chain;
 use jnt_core::hash::{Hash512, ZERO_HASH512};
 use jnt_core::mempool::{Mempool, MempoolError};
 use jnt_core::params::NetworkParams;
 
+use crate::addr_book::AddressBook;
 use crate::error::{NetError, NetResult};
 use crate::msg::{InvEntry, Message, INV_TYPE_BLOCK, INV_TYPE_TX, MAX_INV_PER_MSG};
 use crate::peer::{
@@ -34,6 +39,18 @@ pub const INBOUND_VIOLATION_SCORE: u32 = 20;
 /// Maximum addresses tracked for inbound-bound scoring. Keeps the ban table
 /// bounded against a flood of distinct source addresses (§13.11 invariant 6).
 const MAX_BAN_TRACKED: usize = 1024;
+
+/// Default TCP connect timeout for an outbound peer dial (§13.8).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shorter timeout for reconnect attempts so a dead bootnode does not stall
+/// the serve loop for the full `CONNECT_TIMEOUT`.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Reconnect attempts per `poll_events` cycle. Each can block for up to
+/// `RECONNECT_TIMEOUT`, so at the default 250 ms loop period this keeps a
+/// single reconnect sweep under ~3 s without starving mining or sync.
+const RECONNECT_ATTEMPTS_PER_CYCLE: usize = 1;
 
 /// Per-address score with the wall-clock hour it was last updated, so the
 /// 1-per-hour decay of §13.9 can be applied without a background timer.
@@ -99,6 +116,13 @@ pub struct P2pConfig {
     pub max_peers: usize,
     pub max_inbound: usize,
     pub user_agent: String,
+    /// Well-known peers to dial at startup and on every reconnect cycle.
+    /// §13.6: v0.2 has no discovery protocol, so the only source of peers is
+    /// this configured set plus whatever the address book remembers.
+    pub bootnodes: Vec<SocketAddr>,
+    /// Where the persistent address book is stored. `None` disables
+    /// persistence — the book lives in memory only.
+    pub address_book: Option<PathBuf>,
 }
 
 impl P2pConfig {
@@ -109,6 +133,8 @@ impl P2pConfig {
             max_peers: MAX_PEERS,
             max_inbound: MAX_INBOUND,
             user_agent: "jounit/0.2.0".to_string(),
+            bootnodes: Vec::new(),
+            address_book: None,
         }
     }
 }
@@ -164,6 +190,10 @@ pub struct P2pNode {
     /// v0.2 has no address book (§13.6), so this map is the only place an
     /// address can be remembered, and it is deliberately the only one.
     ban_scores: Arc<Mutex<HashMap<IpAddr, BanState>>>,
+    /// Persistent peer address book. Populated from bootnodes and successful
+    /// handshakes; the reconnect loop dials from it. `None` when no
+    /// `address_book` path was configured.
+    address_book: Arc<Mutex<Option<AddressBook>>>,
     listener_thread: Option<JoinHandle<()>>,
 }
 
@@ -268,6 +298,11 @@ impl P2pNode {
             None
         };
 
+        let address_book = match &config.address_book {
+            Some(path) => Arc::new(Mutex::new(Some(AddressBook::new(path)))),
+            None => Arc::new(Mutex::new(None)),
+        };
+
         Ok(Self {
             config,
             peers,
@@ -277,12 +312,25 @@ impl P2pNode {
             event_rx,
             running,
             ban_scores,
+            address_book,
             listener_thread,
         })
     }
 
     /// Connect to a remote peer address as an initiator.
     pub fn connect(&self, addr: SocketAddr, chain: &Chain) -> NetResult<usize> {
+        self.connect_with_timeout(addr, chain, CONNECT_TIMEOUT)
+    }
+
+    /// Connect with a configurable TCP timeout. The default `connect` uses
+    /// `CONNECT_TIMEOUT` (§13.8); `reconnect` uses a shorter one so a dead
+    /// bootnode does not stall the serve loop.
+    fn connect_with_timeout(
+        &self,
+        addr: SocketAddr,
+        chain: &Chain,
+        timeout: Duration,
+    ) -> NetResult<usize> {
         // SPEC.md §13.8 bounds `max_peers` as the cap on thread and descriptor
         // count. It was never enforced here, so a node could open as many
         // outbound connections as it had addresses and blow past the bound the
@@ -294,7 +342,7 @@ impl P2pNode {
                 self.peer_count()
             )));
         }
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
+        let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
         let hs_config =
             HandshakeConfig::new(self.config.params.clone(), chain.height(), chain.tip_hash());
 
@@ -320,6 +368,89 @@ impl P2pNode {
 
         // `spawn_peer` already registered it, before its reader thread started.
         Ok(peer_id)
+    }
+
+    /// Attempt to reconnect to bootnodes and address-book peers that are not
+    /// currently connected.
+    ///
+    /// Called once per serve-loop cycle. Tries at most
+    /// `RECONNECT_ATTEMPTS_PER_CYCLE` addresses per call, so a single dead
+    /// bootnode costs one `RECONNECT_TIMEOUT` (3 s) rather than stalling the
+    /// whole loop. Randomizes the candidate order for eclipse resistance
+    /// (§13.6: without authenticated discovery, random order is the only
+    /// defence against an adversary feeding us only its own connections).
+    ///
+    /// Returns the number of peers dialed this cycle, regardless of success.
+    pub fn reconnect(&self, chain: &Chain) -> usize {
+        // Collect candidate addresses and current peer state under the lock,
+        // then drop it before dialing so `connect_with_timeout` can acquire it
+        // without a deadlock.
+        let (candidates, outbound_count, total_count) = {
+            let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic
+            let outbound_count = peers.values().filter(|p| p.is_outbound).count();
+            let total = peers.len();
+
+            // Addresses already connected — never dial a peer we hold.
+            let connected: HashSet<SocketAddr> =
+                peers.values().map(|p| p.remote_addr).collect();
+
+            let mut cands: Vec<SocketAddr> = Vec::new();
+
+            // Bootnodes first — they are the highest-priority reconnect targets.
+            for &b in &self.config.bootnodes {
+                if !connected.contains(&b) && !self.is_banned(b.ip()) {
+                    cands.push(b);
+                }
+            }
+
+            // Then the address book, in most-recent-first order.
+            if let Some(ab) = self.address_book.lock().unwrap().as_ref() {
+                for addr in ab.addresses() {
+                    if !connected.contains(&addr) && !self.is_banned(addr.ip()) {
+                        cands.push(addr);
+                    }
+                }
+            }
+
+            (cands, outbound_count, total)
+        };
+
+        // §13.8 eclipse-resistance heuristic: cap outbound at 50% of max_peers.
+        let max_outbound = self.config.max_peers / 2;
+        let remaining = max_outbound.saturating_sub(outbound_count);
+        if remaining == 0 || total_count >= self.config.max_peers {
+            return 0;
+        }
+
+        // Randomize candidate order so an adversarial address book cannot force
+        // a deterministic (and attackable) connection sequence.
+        let mut rng = thread_rng();
+        let mut shuffled = candidates;
+        shuffled.shuffle(&mut rng);
+
+        // Try up to `RECONNECT_ATTEMPTS_PER_CYCLE` addresses this cycle.
+        let to_try = shuffled
+            .into_iter()
+            .take(remaining.min(RECONNECT_ATTEMPTS_PER_CYCLE));
+
+        let mut dialed = 0;
+        for addr in to_try {
+            match self.connect_with_timeout(addr, chain, RECONNECT_TIMEOUT) {
+                Ok(id) => {
+                    println!("reconnected peer {id} -> {addr}");
+                    dialed += 1;
+                    // Record the address in the book.
+                    if let Some(ab) = self.address_book.lock().unwrap().as_mut() {
+                        ab.add(addr);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warn: reconnect {addr}: {e}");
+                }
+            }
+        }
+
+        dialed
     }
 
     /// Broadcast an inventory announcement to all peers except `exclude_peer`.
@@ -427,8 +558,15 @@ impl P2pNode {
             count += 1;
             match event {
                 PeerEvent::Connected {
-                    peer_id, version, ..
-                } => {
+                     peer_id, version, remote_addr, ..
+                 } => {
+                    // Record the address in the book for future reconnects.
+                    // Inbound addresses are as valid a reconnect source as
+                    // outbound — the peer was reachable, so it may be again.
+                    if let Some(ab) = self.address_book.lock().unwrap().as_mut() {
+                        ab.add(remote_addr);
+                    }
+
                     // If the peer is ahead, ask for blocks
                     if version.height > state.chain.height() {
                         let locator = create_locator(state.chain);
