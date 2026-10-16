@@ -115,6 +115,7 @@ fn mix_accesses(pad: &[Hash], seed: &Hash, lanes: usize, accesses: usize) -> Has
         // a different lane for the same state than a 64-bit node does — a
         // consensus split rather than a curiosity. `lanes` is validated > 0 by
         // `HbmConfig`, so the u64 divisor is never zero.
+        // invariant: `state` is always 64 bytes, so `state[..8]` converts to `[u8; 8]` without error.
         let idx = (u64::from_le_bytes(state[..8].try_into().unwrap()) % lanes as u64) as usize;
         let lane = &pad[idx];
         // XOR state with the lane, then SHA-256 to mix

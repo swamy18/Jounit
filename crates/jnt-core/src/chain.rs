@@ -186,14 +186,17 @@ impl Chain {
     }
 
     pub fn height(&self) -> u64 {
+        // invariant: `canon` always has at least the genesis block, so len() - 1 cannot underflow.
         (self.canon.len() - 1) as u64
     }
 
     pub fn tip_hash(&self) -> Hash512 {
+        // invariant: `canon` always has at least the genesis block.
         *self.canon.last().expect("chain always has a genesis block")
     }
 
     pub fn tip(&self) -> &Block {
+        // invariant: the tip hash was just read from `canon`, so it must resolve.
         self.block_by_hash(&self.tip_hash())
             .expect("tip is in canon")
     }

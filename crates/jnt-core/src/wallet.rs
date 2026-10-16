@@ -90,6 +90,7 @@ impl Wallet {
 
     pub fn pubkey(&self) -> Result<[u8; 33]> {
         let sk = self.signing_key()?;
+        // invariant: a compressed secp256k1 verifying key is always 33 bytes.
         Ok(sk.verifying_key().to_encoded_point(true).as_bytes()[..33]
             .try_into()
             .unwrap())

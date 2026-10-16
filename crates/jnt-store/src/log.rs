@@ -292,6 +292,7 @@ fn check_header(file: &mut File, path: &Path, file_len: u64) -> Result<(), Store
         .map_err(|e| StoreError::io(path, e))?;
     file.read_exact(&mut header)
         .map_err(|e| StoreError::io(path, e))?;
+    // invariant: `header` is `LOG_HEADER_LEN` bytes and we read exactly that, so slicing 4 is total.
     let magic: [u8; 4] = header[..4].try_into().unwrap();
     if magic != LOG_MAGIC {
         return Err(StoreError::BadMagic { path: path.into() });

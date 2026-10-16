@@ -326,6 +326,7 @@ impl Store {
             }
             self.block_store = Some(bs);
         }
+        // invariant: the `if` block above always sets `block_store` before this.
         Ok(self.block_store.as_mut().expect("just set"))
     }
 

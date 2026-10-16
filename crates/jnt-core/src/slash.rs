@@ -150,6 +150,7 @@ impl SlashVault {
         );
         self.total_burned = self.total_burned.saturating_add(record.burned);
         self.records.push(record);
+        // invariant: just pushed, so `last()` always succeeds.
         self.records.last().unwrap()
     }
 

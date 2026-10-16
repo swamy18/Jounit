@@ -87,6 +87,7 @@ pub fn sha512(parts: &[&[u8]]) -> Hash512 {
 /// Equivalent to `Bundle::single(SCHEME_SECP256K1_ECDSA, pubkey).address()`.
 /// Kept so callers that genuinely hold one key do not have to build a bundle.
 pub fn address_from_pubkey(pubkey: &[u8; 33]) -> Address {
+    // invariant: a single-scheme address is always structurally valid by construction.
     crate::sig::Bundle::single(crate::sig::SCHEME_SECP256K1_ECDSA, pubkey.to_vec())
         .address()
         .expect("a single ECDSA bundle is always structurally valid")
