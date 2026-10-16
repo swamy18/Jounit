@@ -33,6 +33,12 @@ Versions follow the workspace `version` in `Cargo.toml`.
   mutating route (`api_robustness.rs`: zero amounts, empty strings,
   `u64::MAX`, invalid hex, wrong-length addresses, unknown enum values)
   asserts 4xx JSON everywhere, never a panic or a 500.
+- **Invariant coverage extends to all non-test source.** A full sweep of
+  `crates/*/src/` tags every remaining `unwrap`/`expect`/`panic!` in
+  application code with a `// invariant:` comment (chain genesis/tip,
+  BLS seed derivation, secp256k1 key length, store header parse, slash
+  record push, address book load), so any future panic in a release
+  build points at a documented bug rather than an unguarded assumption.
 
 ### Fixed (supply chain)
 
@@ -89,8 +95,30 @@ Versions follow the workspace `version` in `Cargo.toml`.
   now polls with a 2-second deadline and answers 503 `busy` instead of
   queueing without bound behind the serve loop; the request deadline no
   longer leaves a task holding its turn. A separate semaphore
-  (`MAX_CONCURRENT_VERIFIES = 4`) caps concurrent verifications so a burst
-  of broadcasts cannot occupy the blocking pool while reads queue.
+   (`MAX_CONCURRENT_VERIFIES = 4`) caps concurrent verifications so a burst
+   of broadcasts cannot occupy the blocking pool while reads queue.
+
+### Added (P2P networking)
+
+- **Bootnode dialing.** `--bootnodes <host:port,host:port>` dials peers at
+  startup before `--connect`, so a node with no pre-configured peers can still
+  join the network. Addresses parse as `SocketAddr` CSV; bad entries are
+  reported on `stderr` without aborting startup (SPEC.md §13.6: v0.2 has no
+  `ADDR` gossip, so bootnodes plus the address book are the only peer source).
+- **Address book.** `peers.json` in the data directory persists `Connected`
+  peer addresses across restarts, using the store's atomic-write pattern
+  (temp file → fsync → rename → 0600). Capped at 1000 entries; a corrupt file
+  is treated as empty; `jnt-net::addr_book::AddressBook` owns all logic.
+- **Reconnect sweep.** `P2pNode::reconnect` runs once per serve-loop cycle:
+  it collects candidates from bootnodes + address book, filters out already
+  connected and banned peers, randomizes the order (eclipse resistance), caps
+  outbound at 50% of `max_peers`, and tries one address per cycle with a 3 s
+  connect timeout — a dead peer cannot stall the mine/validate path.
+- **Graceful shutdown.** The serve loop traps `Ctrl-C` / `SIGTERM` via a
+  handler that sets an `Arc<AtomicBool>`; the loop checks it each iteration and
+  on exit flushes the chain/meta/finality and calls `P2pNode::stop` before the
+  process terminates. `panic = "abort"` release builds no longer skip the
+  final store sync on operator shutdown.
 
 ### Changed (consensus — settle binds network and height)
 
