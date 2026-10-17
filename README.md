@@ -2,11 +2,12 @@
 
 AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
-> **Status: ready to launch.** Every mechanism described here is implemented
-> and tested. Withdrawals (`exit_activation_height = 1`) and binding finality
-> (`finality_activation_height = 100`) are active on mainnet from genesis —
-> no validator committee or pre-existing operator required, like Bitcoin. Run
-> `jnt-node init --network mainnet`, then `jnt-node run --network mainnet`.
+> **Status: NOT READY for mainnet.** Code is complete and CI is green, but three
+> protocol decisions that cannot be resolved by writing more code still block
+> launch: no bonded validator committee to sign checkpoints (binding finality
+> remains unreachable until operators bond), the arbitration key-custody
+> decision for arbitrators, and M2/M4 activation rules. See
+> [Mainnet Operational Readiness](docs/mainnet-readiness.md) for the full gate.
 
 **Author and copyright:** Community-owned. The code is open source — no single
 person holds it, like Bitcoin. The *Jounit* name, `JNT` ticker and logos are
@@ -771,7 +772,7 @@ never consensus.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # ~515 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1194 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
