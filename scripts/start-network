@@ -1,0 +1,179 @@
+#!/bin/bash
+# Start a local multi-node Jounit network for development and testing.
+#
+# Node 1 is the seed: it listens and mines. Nodes 2..N dial the seed with
+# --bootnodes and mine alongside it, exactly as independent operators would.
+# Zero configuration beyond this script is required; every flag it passes is
+# a documented jnt-node flag.
+#
+# Usage:
+#   scripts/start-network [--nodes N] [--base-port PORT] [--api-base-port PORT]
+#                         [--data-root DIR] [--network NAME] [--binary PATH]
+#                         [--no-mine]
+#
+# Defaults: 3 nodes, P2P ports 9833.., API ports 8083.., data under
+# ./localnet/, network mini. JNT_WALLET_PASSPHRASE (default:
+# localnet-dev-passphrase) encrypts each node wallet at rest.
+#
+# This is a reproducible local harness, not centralized operation: every
+# node is an ordinary jnt-node process and any of them can be stopped,
+# restarted or removed without special status.
+set -euo pipefail
+
+NODES=3
+BASE_PORT=9833
+API_BASE_PORT=8083
+DATA_ROOT="./localnet"
+NETWORK="mini"
+BIN=""
+NO_MINE=0
+PASSPHRASE="${JNT_WALLET_PASSPHRASE:-localnet-dev-passphrase}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --nodes)         NODES="$2"; shift 2 ;;
+        --base-port)     BASE_PORT="$2"; shift 2 ;;
+        --api-base-port) API_BASE_PORT="$2"; shift 2 ;;
+        --data-root)     DATA_ROOT="$2"; shift 2 ;;
+        --network)       NETWORK="$2"; shift 2 ;;
+        --binary)        BIN="$2"; shift 2 ;;
+        --no-mine)       NO_MINE=1; shift ;;
+        -h|--help)       sed -n '2,20p' "$0"; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+if [ -z "$BIN" ]; then
+    for candidate in "$REPO_ROOT/target/release/jnt-node" \
+                     "$REPO_ROOT/target/release/jnt-node.exe"; do
+        if [ -f "$candidate" ]; then
+            BIN="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
+    if command -v cargo >/dev/null 2>&1; then
+        echo "jnt-node binary not found; building (cargo build --release)..."
+        cargo build --release
+        BIN="$REPO_ROOT/target/release/jnt-node"
+        [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+    else
+        echo "jnt-node binary not found and cargo is unavailable in this shell." >&2
+        echo "Build it first with: cargo build --release" >&2
+        exit 1
+    fi
+fi
+
+if [ "$NODES" -lt 1 ]; then
+    echo "--nodes must be >= 1" >&2
+    exit 1
+fi
+
+mkdir -p "$DATA_ROOT"
+
+# An HTTP GET over bash's /dev/tcp, so the script needs no curl.
+http_get() {
+    local host="${1%%:*}" port="${1##*:}" path="$2"
+    exec 3<>"/dev/tcp/$host/$port" 2>/dev/null || return 1
+    printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$path" "$1" >&3
+    local out
+    out="$(timeout 5 cat <&3 2>/dev/null || true)"
+    exec 3<&- 2>/dev/null || true
+    exec 3>&- 2>/dev/null || true
+    printf '%s' "$out"
+}
+
+# Start node 1 (the seed) first, then the rest, then wait for the APIs and
+# for every node to agree on a tip.
+BOOTNODE="127.0.0.1:$BASE_PORT"
+for i in $(seq 1 "$NODES"); do
+    dir="$DATA_ROOT/node$i"
+    p2p_port=$((BASE_PORT + i - 1))
+    api_port=$((API_BASE_PORT + i - 1))
+
+    if [ ! -f "$dir/meta.json" ]; then
+        JNT_WALLET_PASSPHRASE="$PASSPHRASE" \
+            "$BIN" init --network "$NETWORK" --data-dir "$dir" --label "miner$i" \
+            >"$DATA_ROOT/node$i-init.log" 2>&1 || {
+                echo "init failed for node $i; see $DATA_ROOT/node$i-init.log" >&2
+                exit 1
+            }
+    fi
+
+    bootargs=()
+    if [ "$i" -gt 1 ]; then
+        bootargs=(--bootnodes "$BOOTNODE")
+    fi
+    mineargs=()
+    if [ "$NO_MINE" -eq 1 ]; then
+        mineargs=(--no-mine)
+    fi
+
+    JNT_WALLET_PASSPHRASE="$PASSPHRASE" nohup "$BIN" serve \
+        --network "$NETWORK" \
+        --data-dir "$dir" \
+        --listen "127.0.0.1:$p2p_port" \
+        --api-listen "127.0.0.1:$api_port" \
+        ${bootargs[@]+"${bootargs[@]}"} ${mineargs[@]+"${mineargs[@]}"} \
+        >"$DATA_ROOT/node$i.log" 2>&1 &
+    echo $! >"$DATA_ROOT/node$i.pid"
+    echo "node $i: p2p 127.0.0.1:$p2p_port  api 127.0.0.1:$api_port  pid $(cat "$DATA_ROOT/node$i.pid")  log $DATA_ROOT/node$i.log"
+done
+
+# Wait for every API to answer, then for every node to share one tip.
+echo "waiting for $NODES node APIs..."
+for i in $(seq 1 "$NODES"); do
+    api_port=$((API_BASE_PORT + i - 1))
+    ok=0
+    for _ in $(seq 1 150); do
+        if http_get "127.0.0.1:$api_port" "/v1/health" 2>/dev/null | grep -qE '"status": ?"ok"'; then
+            ok=1
+            break
+        fi
+        sleep 0.2
+    done
+    if [ "$ok" -ne 1 ]; then
+        echo "node $i API did not come up; see $DATA_ROOT/node$i.log" >&2
+        exit 1
+    fi
+done
+
+echo "waiting for chain sync (same tip on every node)..."
+tip=""
+synced=0
+for _ in $(seq 1 300); do
+    tips=""
+    alive=0
+    for i in $(seq 1 "$NODES"); do
+        api_port=$((API_BASE_PORT + i - 1))
+        body="$(http_get "127.0.0.1:$api_port" "/v1/status" 2>/dev/null || true)"
+        t="$(printf '%s' "$body" | grep -oE '"tip_hash": ?"[0-9a-f]+"' | head -n1 | grep -oE '[0-9a-f]{16,}' || true)"
+        if [ -n "$t" ]; then
+            tips="$tips $t"
+            alive=$((alive + 1))
+        fi
+    done
+    if [ "$alive" -eq "$NODES" ]; then
+        uniq_tips=$(printf '%s\n' $tips | sort -u | wc -l | tr -d ' ')
+        if [ "$uniq_tips" -eq 1 ]; then
+            tip="${tips# }"
+            synced=1
+            break
+        fi
+    fi
+    sleep 0.5
+done
+
+if [ "$synced" -eq 1 ]; then
+    echo "network up: $NODES nodes, shared tip ${tip:0:16}..."
+else
+    echo "warning: nodes did not report a shared tip within the timeout; check the logs under $DATA_ROOT/" >&2
+fi
+
+echo "status:  $BIN status --network $NETWORK --data-dir $DATA_ROOT/node1"
+echo "stop:    scripts/stop-network --data-root $DATA_ROOT"
+echo "reset:   scripts/reset-network --data-root $DATA_ROOT"

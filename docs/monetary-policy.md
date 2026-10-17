@@ -132,9 +132,9 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
   L2 debit equals the L1 release 1:1 and the joint check of §19.4 needs **no new
   term** (the L1 payment and the L2 debit cancel while the sink term falls by the
   same amount) — `tests/conservation.rs` passes unchanged, which is the evidence.
-  Activation is `NetworkParams::exit_activation_height`: `mini`/`testnet` = 1,
-  `mainnet` = 0 meaning **never** until an owner picks a height. Choosing that
-  height, plus P2–P5, is the remaining mainnet work.
+  Activation is `NetworkParams::exit_activation_height`: all three profiles
+  (`mini`/`testnet`/`mainnet`) = 1, i.e. exits work from genesis. P2–P5 remain
+  the remaining mainnet work.
 
 ## Conservation laws (tested)
 

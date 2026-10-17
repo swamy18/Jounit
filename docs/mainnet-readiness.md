@@ -49,7 +49,7 @@ also exists now, with a conservation gate before its first pass.)
   |---|---|---|
   | 1 | `cargo fmt --all --check` | clean |
   | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
-  | 3 | `cargo test --workspace` | 1194 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
+  | 3 | `cargo test --workspace` | 1206 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
   | 4 | `cargo build --workspace --release` | succeeds |
   | 5 | vector cross-check: `python sim/verify_vectors.py --check` | see `docs/status.md` |
   | 6 | confirm the only `#[ignore]`d test is the manual `vwc_perf_probe` | confirmed |
@@ -198,9 +198,11 @@ There is **no** `config.toml` and **no** `policy/` directory in the data dir
   each); `mainnet` allocates 100,000 JNT and grants nothing.
 - **Testnet** uses the dedicated `testnet` profile with four deterministic
   genesis validators (Decision 13).
-- **Bootnodes:** none exist yet. A bootnode is a `serve --listen` node that
-  joiners dial with `--connect`; no address book or DNS seeding is implemented
-  (SPEC §13.6 by design).
+- **Bootnodes:** none are published on the public internet yet. A bootnode is a
+  `serve --listen` node that joiners dial with `--bootnodes` (or recover via
+  `peers.json`); no DNS seeding or ADDR gossip is implemented (SPEC §13.6 by
+  design). `scripts/start-network` stands up a local multi-node network with
+  node 1 as the seed bootnode.
 
 ## 6. Upgrade mechanism
 
@@ -225,13 +227,15 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 1194 passed, 0 failed, 1 ignored |
+| `cargo test --workspace` passes | ✅ 1206 passed, 0 failed, 1 ignored |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
 | Fuzz: 14 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
 | Deterministic genesis across profiles | ✅ |
 | BLS finality adversarial tests | ✅ (18 checkpoint tests) |
 | L2 end-to-end (deposits, tasks, VWC, reputation) | ✅ (2-process E2E + chaos suite) |
+| Multi-node network test (3 real-TCP nodes: transit sync, live relay, restart catch-up) | ✅ (`jnt-net/tests/three_node_network.rs`) |
+| Local multi-node launch scripts (start / stop / reset) | ✅ (`scripts/start-network`, `stop-network`, `reset-network`) |
 | L2 → L1 exits | ✅ implemented and active on mainnet (`exit_activation_height = 1`) |
 | Stake ledger / bond / unbond / slash | ✅ implemented and tested — any positive bond accepted, no minimum stake (Decision 20 update) |
 | Validator committee derivation | ✅ stake-weighted TopN with genesis fallback |

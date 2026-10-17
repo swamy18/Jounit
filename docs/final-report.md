@@ -107,7 +107,8 @@ now explicitly listed as **not measured**.
    assumed the deposit sink could release funds — it cannot (no key). Rewritten.
 6. **Readiness docs documented things that do not exist**: a `config.toml`, a
    `/metrics` endpoint, a `/health` route (it is `/v1/health`), a `--bootnode`
-   flag, `serve --sync`, a worker run command. All corrected to the real CLI/API.
+   flag (the plural `--bootnodes` flag was added later and now exists),
+   `serve --sync`, a worker run command. All corrected to the real CLI/API.
 7. **`docs/security_audit.md` and `docs/status.md` cited wrong decision numbers
    / a non-existent `SPEC.md §15` node-API section** (it is §19.2). Corrected.
 8. **`docs/fuzz.md` and `docs/benchmarks.md` contained fabricated numbers.**

@@ -101,6 +101,15 @@ check worth running after any change.
 
 Run `jnt-node help` for the full command list; every command accepts `--help`.
 
+To stand up a local multi-node network (deterministic genesis, separate data
+dirs, node 1 as seed, the rest dialing it via `--bootnodes`):
+
+```sh
+scripts/start-network --nodes 3          # init, serve, wait until all share a tip
+scripts/stop-network                     # graceful stop via pid files
+scripts/reset-network                    # stop and delete the data root
+```
+
 ---
 
 ## Supply
@@ -698,12 +707,14 @@ Same code, different numbers.
 | Finality depth | 100 | 20 | 20 |
 | Coinbase maturity | 100 | 10 | 10 |
 | Genesis validators | **none** | 4 deterministic | 4 deterministic |
-| Binding finality | **off** | on at height 20 | off |
-| Exits | **off** | on at height 1 | on at height 1 |
+| Binding finality | on at height 100 | on at height 20 | off |
+| Exits | on at height 1 | on at height 1 | on at height 1 |
 | PQ spend requirement | **off** | off | off |
 
-`mainnet` deliberately ships with no committee and no activation, so it fails
-closed rather than verifying against nothing. The PQ row is the
+`mainnet` deliberately ships with no genesis committee, so every checkpoint
+fails closed until the stake-weighted committee derives from the bond ledger
+— never verifying against nothing. Exits and binding finality are already
+parameterized on (heights 1 and 100). The PQ row is the
 `pq_activation_height` of Decision 24: `0` means no input is refused for
 lacking an ML-DSA-65 component, and the rule is age-gated when it is flipped —
 only outputs created at or after the height must carry the component, so
@@ -770,7 +781,7 @@ never consensus.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1194 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1206 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors

@@ -1,0 +1,53 @@
+#!/bin/bash
+# Stop a local multi-node Jounit network started by scripts/start-network.
+#
+# Usage:
+#   scripts/stop-network [--data-root DIR]
+#
+# Reads the pid files under the data root, sends TERM, waits up to ten seconds
+# for each process to exit, then KILLs anything left. Idempotent: stopping an
+# already-stopped network is a no-op.
+set -euo pipefail
+
+DATA_ROOT="./localnet"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --data-root) DATA_ROOT="$2"; shift 2 ;;
+        -h|--help)   sed -n '2,11p' "$0"; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [ ! -d "$DATA_ROOT" ]; then
+    echo "no network under $DATA_ROOT (nothing to stop)"
+    exit 0
+fi
+
+pids=()
+for pidfile in "$DATA_ROOT"/node*.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        pids+=("$pid")
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+done
+
+# Wait for a clean exit, then force-kill whatever is left.
+for _ in $(seq 1 100); do
+    alive=0
+    for pid in ${pids[@]+"${pids[@]}"}; do
+        kill -0 "$pid" 2>/dev/null && alive=1
+    done
+    [ "$alive" -eq 0 ] && break
+    sleep 0.1
+done
+for pid in ${pids[@]+"${pids[@]}"}; do
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+done
+
+echo "stopped ${#pids[@]} node(s) under $DATA_ROOT"

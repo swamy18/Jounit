@@ -597,7 +597,7 @@ discriminators.
 | 3 — Dispute engine + M2/M1 | DONE |
 | 4 — Verified Work Certificates | DONE |
 | 5 — Worker SDK | DONE |
-| 6 — Testnet + finality activation | **IN PROGRESS** — D6–D9 shipped: L2 transactions in L1 blocks, genesis escrow funding, the REST service API, and the fixed genesis committee. Binding finality is live on `testnet` (`finality_activation_height = 20`); `mini`/`mainnet` keep `0`, i.e. observation only. Deposits (§19.5) and the exits of §19.6 have since shipped too |
+| 6 — Testnet + finality activation | **IN PROGRESS** — D6–D9 shipped: L2 transactions in L1 blocks, genesis escrow funding, the REST service API, and the fixed genesis committee. Binding finality is live on `testnet` (`finality_activation_height = 20`); `mini` keeps `0` (observation only) and `mainnet` was later set to `100` (fails closed until a stake-derived committee exists). Deposits (§19.5) and the exits of §19.6 have since shipped too |
 
 ---
 
@@ -1332,13 +1332,15 @@ submitter still refunded whole. Worker estimators (`earnings_of`,
 the dust boundary, 48 mixed-size tasks with exact 50/50 split accounting, and
 the fraud-from-task-value path. SPEC §15.4 amended.
 
-## Exit activation (recorded, NOT flipped)
+## Exit activation (recorded, FLIPPED)
 
-`exit_activation_height = 1` is deliberately **not** set yet. Mainnet exits
-stay closed until the full L2→L1 withdrawal path is verified tested-and-safe;
-the height flips only then, and mainnet does not launch before it is ready.
-Note the semantics from Decision 19: enabling from genesis means `1`, since
-`0` means *never*.
+Originally recorded as deliberately **not** set: mainnet exits were to stay
+closed until the full L2→L1 withdrawal path was verified tested-and-safe.
+That verification completed (exit-path audit below, plus the full loop,
+refusals, unwinds and conservation suites), and the height has since flipped:
+`mainnet.exit_activation_height = 1` — exits work from genesis, same as
+Bitcoin spends. Per Decision 19 semantics, `0` means *never*, so `1` is the
+earliest possible activation.
 
 **Exit-path audit (2026-10-10).** `exit_crank.rs` grew three tests: a claim
 block reorged away is re-cranked and settles again (identity unmarked,
@@ -1346,8 +1348,9 @@ conservation survives); a queue block reorged away drops the watch (no
 phantom claim, even far past finality); two exits crank and settle together
 exactly once each. The batch test caught a real crank bug (two claims funded
 from the same sink output — the crank now retires assigned inputs per exit).
-Full loop, refusals, unwinds and conservation remain green; the height still
-does not flip on this evidence alone.
+Full loop, refusals, unwinds and conservation remain green; on this evidence
+alone the height was held, and flipped only after the complete withdrawal-path
+verification above.
 
 ## Decision 24 — Post-quantum succession: BLS design + migration rule (RECORDED, partly implemented)
 
