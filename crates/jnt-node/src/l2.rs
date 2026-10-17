@@ -76,13 +76,25 @@ fn exit_claim_gas(inputs: usize, has_exit_fee: bool) -> u64 {
         .saturating_add(GAS_PER_OUTPUT.saturating_mul(outputs))
 }
 
+/// Node budget for one [`exact_subset`] call.
+///
+/// The search is exponential in the worst case and runs under the
+/// shared-state lock once per pending exit per tick, so an exit whose
+/// funding sits in no exact subset — cheapest form: hostile and never
+/// satisfiable — would otherwise pin the lock in an unbounded walk every
+/// tick. Exhausting the budget returns `None`, which keeps that exit
+/// queued for the next tick with a fresh budget; it never pays a
+/// different amount.
+const EXACT_SUBSET_STEPS: u32 = 100_000;
+
 /// A subset of exactly `n` outputs totalling exactly `target`, or `None`.
 ///
 /// Backtracking with pruning: greedy largest-first is not complete (e.g.
 /// target 10 from [6, 5, 5] fails), so this searches until it finds an exact
 /// match. A claim must consume sink outputs worth precisely its obligation —
 /// no change, no tip — so an exit whose funding sits in no exact subset stays
-/// queued rather than paying the wrong amount.
+/// queued rather than paying the wrong amount. The walk is bounded by
+/// [`EXACT_SUBSET_STEPS`] nodes.
 fn exact_subset(
     available: &[(jnt_core::tx::OutPoint, u64)],
     target: u64,
@@ -98,7 +110,12 @@ fn exact_subset(
     }
 
     let mut picked: Vec<jnt_core::tx::OutPoint> = Vec::with_capacity(n);
+    let mut steps = EXACT_SUBSET_STEPS;
 
+    // `steps` is the eighth argument; the walk state is passed one field at a
+    // time rather than bundled, and the codebase already allows this lint for
+    // a comparable walker (`Mempool::reconcile`).
+    #[allow(clippy::too_many_arguments)]
     fn search(
         items: &[(jnt_core::tx::OutPoint, u64)],
         suffix_sum: &[u64],
@@ -107,7 +124,12 @@ fn exact_subset(
         total: u64,
         picked: &mut Vec<jnt_core::tx::OutPoint>,
         n: usize,
+        steps: &mut u32,
     ) -> bool {
+        if *steps == 0 {
+            return false;
+        }
+        *steps -= 1;
         if picked.len() == n {
             return total == target;
         }
@@ -135,16 +157,35 @@ fn exact_subset(
                 total.saturating_add(value),
                 picked,
                 n,
+                steps,
             ) {
                 return true;
             }
             picked.pop();
         }
         // Try excluding items[start].
-        search(items, suffix_sum, start + 1, target, total, picked, n)
+        search(
+            items,
+            suffix_sum,
+            start + 1,
+            target,
+            total,
+            picked,
+            n,
+            steps,
+        )
     }
 
-    if search(&items, &suffix_sum, 0, target, 0, &mut picked, n) {
+    if search(
+        &items,
+        &suffix_sum,
+        0,
+        target,
+        0,
+        &mut picked,
+        n,
+        &mut steps,
+    ) {
         Some(picked)
     } else {
         None

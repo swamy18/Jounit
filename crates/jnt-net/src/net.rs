@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -35,6 +35,12 @@ use crate::syncer::{create_locator, find_fork_and_collect_inv, SyncManager, Sync
 /// SPEC.md §13.8: exceeding an inbound bound bans rather than merely
 /// disconnecting. Five strikes reaches `ban_score_threshold`.
 pub const INBOUND_VIOLATION_SCORE: u32 = 20;
+
+/// Disputes with a live tally in the transport-level `VoteBook` (§13.8). The
+/// book creates a tally for any task id it is handed, so without a cap a
+/// flood of distinct ids grows it without bound — every one of them allocated
+/// even when the vote inside is rejected.
+const MAX_VOTE_TALLIES: usize = 4_096;
 
 /// Maximum addresses tracked for inbound-bound scoring. Keeps the ban table
 /// bounded against a flood of distinct source addresses (§13.11 invariant 6).
@@ -183,7 +189,7 @@ pub struct P2pNode {
     peers: Arc<Mutex<HashMap<usize, PeerHandle>>>,
     inbound_count: Arc<AtomicUsize>,
     next_peer_id: AtomicUsize,
-    event_tx: Sender<PeerEvent>,
+    event_tx: SyncSender<PeerEvent>,
     event_rx: Receiver<PeerEvent>,
     running: Arc<AtomicBool>,
     /// Ban scores by address, for inbound-bound violations (SPEC.md §13.8/§13.9).
@@ -200,7 +206,16 @@ pub struct P2pNode {
 impl P2pNode {
     /// Bind the listener (if configured) and start the P2P networking layer.
     pub fn start(config: P2pConfig, initial_height: u64, initial_tip: Hash512) -> NetResult<Self> {
-        let (event_tx, event_rx) = channel();
+        // Bounded on purpose. The reader threads decode at line rate while the
+        // event loop validates as fast as it can; an unbounded queue between
+        // the two turns that gap into a memory-exhaustion vector (a peer
+        // streaming 4 MB frames OOMs the node in seconds while validation
+        // stalls). At capacity the reader blocks in `send`, which stops it
+        // reading and pushes TCP backpressure onto the sender — the behaviour
+        // a bounded queue is supposed to have. 256 comfortably covers honest
+        // bursts (sync is at most 64 requests in flight globally) while
+        // capping worst-case queued bytes.
+        let (event_tx, event_rx) = sync_channel(256);
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let inbound_count = Arc::new(AtomicUsize::new(0));
         let ban_scores = Arc::new(Mutex::new(HashMap::new()));
@@ -217,6 +232,12 @@ impl P2pNode {
             let l_event_tx = event_tx.clone();
             let l_bans = Arc::clone(&ban_scores);
             let l_config = config.clone();
+            // In-flight handshakes are invisible to `inbound_count` and
+            // `peers.len()` (both count only *registered* peers), so without
+            // this counter a single IP can open thousands of connections,
+            // complete no handshake, and pin one thread plus one socket each —
+            // exhausting descriptors long before `max_inbound` ever trips.
+            let l_handshakes = Arc::new(AtomicUsize::new(0));
 
             Some(thread::spawn(move || {
                 let mut peer_id_counter = 100_000usize; // Separate space for inbound IDs
@@ -247,6 +268,7 @@ impl P2pNode {
                             }
                             if l_inbound.load(Ordering::Relaxed) >= l_config.max_inbound
                                 || l_peers.lock().unwrap().len() >= l_config.max_peers
+                                || l_handshakes.load(Ordering::Relaxed) >= l_config.max_inbound
                             // invariant: poison needs a prior panic, which aborts the process
                             {
                                 score_violation(&l_bans, peer_addr.ip());
@@ -265,6 +287,8 @@ impl P2pNode {
                             let p_table = l_table.clone();
                             let p_event_tx = l_event_tx.clone();
                             let p_params = l_config.params.clone();
+                            let h_count = Arc::clone(&l_handshakes);
+                            h_count.fetch_add(1, Ordering::Relaxed);
 
                             thread::spawn(move || {
                                 match perform_handshake(&mut stream, &hs_config, false) {
@@ -283,6 +307,7 @@ impl P2pNode {
                                         drop(stream);
                                     }
                                 }
+                                h_count.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -745,7 +770,11 @@ impl P2pNode {
             Message::GetData(entries) => {
                 let (block_entries, tx_entries): (Vec<InvEntry>, Vec<InvEntry>) =
                     entries.into_iter().partition(|e| e.kind == INV_TYPE_BLOCK);
-                let blocks = syncer.handle_get_data(&block_entries, chain);
+                let blocks = syncer.handle_get_data(
+                    &block_entries,
+                    chain,
+                    self.config.params.max_block_bytes,
+                );
                 // Bounded to one block's worth of transaction data: the request
                 // is capped by `max_inv_per_msg`, but without this the response
                 // would not be, and a peer could ask for 500 transactions and
@@ -880,6 +909,18 @@ impl P2pNode {
                 // Ignored per spec
             }
             Message::Checkpoint(cp) => {
+                // Rate-gated before `apply_checkpoint`: acceptance runs a real
+                // BLS aggregate pairing, and the epoch/bitmap/quorum are public,
+                // so forged-but-structurally-valid certificates are cheap to
+                // produce and expensive to verify (§13.8).
+                let clock = now_ms.unwrap_or_else(crate::net::now_ms);
+                if !relay.allow_control_from(peer_id, clock) {
+                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                    if let Some(peer) = peers.get(&peer_id) {
+                        peer.add_ban_score(INBOUND_VIOLATION_SCORE);
+                    }
+                    return;
+                }
                 // M5 binding finality (Decisions 12/14). Apply the certificate
                 // through the chain, which verifies it, binds it to the
                 // canonical block at its height, and records any conflict
@@ -897,6 +938,17 @@ impl P2pNode {
                 }
             }
             Message::ArbitrationVote(vote) => {
+                // Same gate as checkpoints: `record` runs a BLS pairing per
+                // vote, and votes are as cheap to forge structurally as
+                // certificates are (§13.8).
+                let clock = now_ms.unwrap_or_else(crate::net::now_ms);
+                if !relay.allow_control_from(peer_id, clock) {
+                    let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
+                    if let Some(peer) = peers.get(&peer_id) {
+                        peer.add_ban_score(INBOUND_VIOLATION_SCORE);
+                    }
+                    return;
+                }
                 // Fraud arbitration (Decision 21). Record the vote against this
                 // node's own committee and height — never against the sender's
                 // say-so — then relay only what this node itself accepts, so a
@@ -912,10 +964,16 @@ impl P2pNode {
                     set.quorum_size()
                 };
                 let height = chain.height();
-                let accepted = votes
-                    .entry(vote.task_id, quorum)
-                    .record(&vote, &chain.params().network_id, height, &committee)
-                    .is_ok();
+                // `entry` creates a tally for any task id it is handed, so a
+                // flood of distinct ids would grow the book without bound —
+                // each rejected vote still allocating a tally. Cap the book;
+                // an already-known dispute is always allowed through.
+                let accepted = (votes.tally(&vote.task_id).is_some()
+                    || votes.len() < MAX_VOTE_TALLIES)
+                    && votes
+                        .entry(vote.task_id, quorum)
+                        .record(&vote, &chain.params().network_id, height, &committee)
+                        .is_ok();
                 if accepted {
                     let peers = self.peers.lock().unwrap(); // invariant: poison needs a prior panic, which aborts the process
                     for (id, peer) in peers.iter() {

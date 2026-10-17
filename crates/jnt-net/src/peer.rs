@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -403,7 +403,7 @@ pub fn spawn_peer(
     version: Version,
     is_outbound: bool,
     params: NetworkParams,
-    event_tx: Sender<PeerEvent>,
+    event_tx: SyncSender<PeerEvent>,
     table: PeerTable,
 ) -> NetResult<PeerHandle> {
     let remote_addr = stream.peer_addr()?;

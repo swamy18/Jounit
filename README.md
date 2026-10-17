@@ -747,7 +747,8 @@ Common options: `--network <mainnet|testnet|mini>` (default `mini`) and
 `--interval`, `--api-listen`, `--api-token`, `--api-allowed-host`
 and `--no-mine`. `--bootnodes` dials peers at startup (SPEC §13.6: v0.2 has no
 ADDR gossip, so bootnodes plus `peers.json` are the only peer sources).
-`send --amount` is in satoshis while printed
+`send --amount` takes JNT (`--amount-sat` takes satoshis); printed balances
+are in JNT.
 
 The API defaults to loopback and needs no credentials. Binding anything
 non-loopback is refused unless a token is supplied:

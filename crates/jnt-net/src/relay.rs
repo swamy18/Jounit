@@ -49,6 +49,18 @@ pub const MAX_TX_INV_BATCH: usize = 64;
 /// so exceeding it scores the peer rather than merely dropping the message.
 pub const TX_RELAY_PER_PEER_PER_MIN: u32 = 600;
 
+/// Per-peer control messages (checkpoint certificates + arbitration votes)
+/// accepted per minute.
+///
+/// Separate budget from the transaction window on purpose: both message types
+/// are BLS-pairing-checked on arrival, so a flood of forged-but-structurally-
+/// valid ones burns the event loop's CPU exactly like a transaction flood —
+/// but folding them into the tx window would let a validator's honest votes
+/// exhaust its own transaction relay (and a spammer's txs starve honest
+/// votes). Honest rates are nothing like 60/min: one checkpoint per epoch,
+/// one vote per signer per dispute.
+pub const CONTROL_PER_PEER_PER_MIN: u32 = 60;
+
 /// How long an unanswered transaction request is held (§13.14).
 ///
 /// Requests are held until answered, and the in-flight cap bounds how many — but
@@ -97,6 +109,9 @@ pub struct RelayManager {
     known_order: VecDeque<Hash512>,
     /// Per-peer rate windows. Keyed by peer id, which is bounded by `max_peers`.
     per_peer: HashMap<usize, PeerRate>,
+    /// Per-peer windows for pairing-checked control messages (see
+    /// `CONTROL_PER_PEER_PER_MIN`).
+    control: HashMap<usize, PeerRate>,
     /// Transactions this node admitted from a peer, and refused.
     ///
     /// Kept because a refusal is otherwise completely silent. A node that
@@ -123,6 +138,7 @@ impl RelayManager {
             known: HashSet::new(),
             known_order: VecDeque::new(),
             per_peer: HashMap::new(),
+            control: HashMap::new(),
             accepted: 0,
             refused: 0,
         }
@@ -181,6 +197,22 @@ impl RelayManager {
         rate.count <= TX_RELAY_PER_PEER_PER_MIN
     }
 
+    /// Charge an inbound control message (checkpoint or arbitration vote)
+    /// against `peer_id`'s window. Same shape as `allow_from`, separate
+    /// budget — see `CONTROL_PER_PEER_PER_MIN`.
+    pub fn allow_control_from(&mut self, peer_id: usize, now_ms: u64) -> bool {
+        let rate = self.control.entry(peer_id).or_insert(PeerRate {
+            window_start_ms: now_ms,
+            count: 0,
+        });
+        if now_ms.saturating_sub(rate.window_start_ms) >= 60_000 {
+            rate.window_start_ms = now_ms;
+            rate.count = 0;
+        }
+        rate.count = rate.count.saturating_add(1);
+        rate.count <= CONTROL_PER_PEER_PER_MIN
+    }
+
     /// Process an inbound `INV`/`GETDATA` entry list for transactions, returning
     /// the txids worth requesting.
     ///
@@ -204,14 +236,17 @@ impl RelayManager {
             if e.kind != INV_TYPE_TX {
                 continue;
             }
+            // Capacity before the dedup scans: when the queue is full every
+            // scan below is pure waste, and a flood of new hashes is exactly
+            // the case that reaches here with the queue already at its cap.
+            if self.pending.len() >= MAX_RELAY_PENDING {
+                break;
+            }
             if pool.contains(&e.hash) || self.requested.contains_key(&e.hash) {
                 continue;
             }
             if self.pending.iter().any(|(h, _)| *h == e.hash) {
                 continue;
-            }
-            if self.pending.len() >= MAX_RELAY_PENDING {
-                break;
             }
             self.pending.push_back((e.hash, peer_id));
         }
@@ -321,6 +356,7 @@ impl RelayManager {
         self.requested.retain(|_, r| r.peer_id != peer_id);
         self.pending.retain(|(_, pid)| *pid != peer_id);
         self.per_peer.remove(&peer_id);
+        self.control.remove(&peer_id);
     }
 
     pub fn in_flight_count(&self) -> usize {

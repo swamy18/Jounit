@@ -195,6 +195,12 @@ impl SyncManager {
             if e.kind != INV_TYPE_BLOCK {
                 continue;
             }
+            // Capacity before the dedup scans: when the queue is already full
+            // every scan below is pure waste, and a flood of new hashes — the
+            // case that matters — arrives precisely with the queue at its cap.
+            if self.pending.len() >= MAX_PENDING_INV {
+                continue;
+            }
             if chain.block_by_hash(&e.hash).is_some() {
                 continue;
             }
@@ -202,11 +208,6 @@ impl SyncManager {
                 continue;
             }
             if self.pending.iter().any(|(_, q)| q.hash == e.hash) {
-                continue;
-            }
-            // A peer can keep advertising new hashes forever; the queue is
-            // bounded and the excess is dropped rather than accumulated.
-            if self.pending.len() >= MAX_PENDING_INV {
                 continue;
             }
             self.pending.push_back((peer_id, e.clone()));
@@ -266,14 +267,36 @@ impl SyncManager {
         self.pending.retain(|(pid, _)| *pid != peer_id);
     }
 
-    /// Process an inbound GETDATA message: fetch requested blocks from the chain.
-    pub fn handle_get_data(&self, entries: &[InvEntry], chain: &Chain) -> Vec<Block> {
+    /// Process an inbound GETDATA message: fetch requested blocks from the
+    /// chain, bounded to `max_block_bytes` of response — the same budget the
+    /// transaction path enforces, for the same reason: the request is capped
+    /// by `max_inv_per_msg` (500) but without a response budget a 32 KB
+    /// request would clone up to 500 held blocks into the peer's outbound
+    /// queue (§13.14). Always serves at least one, so a single large block
+    /// cannot make the budget effectively zero, and never more than
+    /// `SYNC_BATCH_SIZE` — what an honest requester asks for.
+    pub fn handle_get_data(
+        &self,
+        entries: &[InvEntry],
+        chain: &Chain,
+        max_block_bytes: usize,
+    ) -> Vec<Block> {
         let mut blocks = Vec::new();
+        let mut bytes = 0usize;
         for e in entries {
-            if e.kind == INV_TYPE_BLOCK {
-                if let Some(b) = chain.block_by_hash(&e.hash) {
-                    blocks.push(b.clone());
+            if e.kind != INV_TYPE_BLOCK {
+                continue;
+            }
+            if blocks.len() >= SYNC_BATCH_SIZE {
+                break;
+            }
+            if let Some(b) = chain.block_by_hash(&e.hash) {
+                let size = b.serialize().len();
+                if !blocks.is_empty() && bytes.saturating_add(size) > max_block_bytes {
+                    break;
                 }
+                bytes = bytes.saturating_add(size);
+                blocks.push(b.clone());
             }
         }
         blocks

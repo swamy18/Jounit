@@ -600,6 +600,13 @@ fn cmd_init(args: &Args) -> Result<(), String> {
             store.dir.display()
         ));
     }
+    if store.dir.join("wallets.json").exists() {
+        return Err(format!(
+            "{} already holds a wallets.json; init would overwrite existing keys — \
+             move the file aside or use another --data-dir",
+            store.dir.display()
+        ));
+    }
     let chain = Chain::new(store.params.clone()).map_err(|e| e.to_string())?;
 
     let mut wallets = Vec::new();
@@ -751,7 +758,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
         } else {
             base_fee.saturating_mul(gas).saturating_add(1_000)
         };
-        if total >= amount_sat + fee {
+        if total >= amount_sat.saturating_add(fee) {
             break;
         }
         total += value;
@@ -763,14 +770,14 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     } else {
         base_fee.saturating_mul(gas).saturating_add(1_000)
     };
-    if total < amount_sat + fee {
+    if total < amount_sat.saturating_add(fee) {
         return Err(format!(
             "insufficient funds: have {total} sat, need {} sat",
-            amount_sat + fee
+            amount_sat.saturating_add(fee)
         ));
     }
 
-    let change = total - amount_sat - fee;
+    let change = total.saturating_sub(amount_sat).saturating_sub(fee);
     let mut outputs = vec![Output {
         value: amount_sat,
         address: to,
@@ -958,11 +965,15 @@ fn cmd_status(args: &Args) -> Result<(), String> {
             let addr = w.address().map_err(|e| e.to_string())?;
             let outputs = chain.utxo().outputs_for_address(&addr);
             let total: u64 = outputs.iter().map(|(_, v)| v).sum();
+            // `is_mature` is the rule the mempool admission uses (a spend
+            // lands in the next block, at `height() + 1`), so the report
+            // matches what the API would actually accept — a plain
+            // `<= chain.height()` understates by one block.
             let mature: u64 = chain
                 .utxo()
                 .iter()
                 .filter(|(_, u)| u.out.address == addr)
-                .filter(|(_, u)| u.height + store.params.coinbase_maturity <= chain.height())
+                .filter(|(_, u)| chain.is_mature(u.height))
                 .map(|(_, u)| u.out.value)
                 .sum();
             println!(
@@ -1221,6 +1232,14 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
     }
 
     let label = args.str_or("label", "validator");
+    // The label becomes a filename (`validators/<label>.json`): refuse path
+    // separators and the Windows drive/ADS colon so `--label ../x` or
+    // `C:\x` cannot place a key file outside the validators directory.
+    if label.is_empty() || label.contains('/') || label.contains('\\') || label.contains(':') {
+        return Err(format!(
+            "invalid label `{label}`: letters, digits, dot, dash and underscore only"
+        ));
+    }
     // OS entropy, harvested here rather than inside `jnt-core`, so the consensus
     // library stays free of any way to reach for randomness.
     // OS entropy, harvested here rather than inside jnt-core, so the consensus
@@ -1270,7 +1289,8 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
 }
 
 /// Passphrase validator keys are encrypted under: `JNT_VALIDATOR_PASSPHRASE`,
-/// falling back to `JNT_WALLET_PASSPHRASE` with a one-time warning.
+/// falling back to `JNT_WALLET_PASSPHRASE` with a one-time warning. Returned
+/// `Zeroizing`, so the parsed copy wipes on drop.
 ///
 /// The variables are separate on purpose: one passphrase for a wallet and for
 /// consensus-signing keys means one compromise opens both, and an operator
@@ -1278,12 +1298,12 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
 /// the existing deployments that set only the wallet variable — a new key
 /// can be re-added under the dedicated one, and a shared passphrase is
 /// reported rather than silently accepted.
-fn validator_passphrase() -> Option<String> {
+fn validator_passphrase() -> Option<zeroize::Zeroizing<String>> {
     if let Some(p) = std::env::var(VALIDATOR_PASSPHRASE_ENV)
         .ok()
         .filter(|p| !p.is_empty())
     {
-        return Some(p);
+        return Some(zeroize::Zeroizing::new(p));
     }
     use std::sync::OnceLock;
     static WARNED: OnceLock<()> = OnceLock::new();
@@ -1605,6 +1625,15 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         // moves — so it is safe to run on every tick alongside the mine step.
         sh.advance_escrow_finality();
 
+        // Drain the inclusion queue every tick, not only when mining. With
+        // `--no-mine` (or while mining is stalled) nothing else would ever
+        // take it, and `live_proposals` re-derives the same tasks each tick,
+        // so the queue would grow without bound. A node that builds no
+        // blocks discards them honestly: inclusion is the only way L2 state
+        // changes (SPEC.md §19.1), and other miners re-derive the same
+        // proposals from the votes they share.
+        let l2_queue = std::mem::take(&mut sh.l2_to_include);
+
         // Mine one block if we have a miner wallet. `mine_from_pool` selects
         // from the pool and evicts what the *canonical* chain confirms; the
         // L2 queue only matters when the API has actually received L2
@@ -1625,7 +1654,6 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
                 // mine at all. The rest are simply settled in a later block.
                 .take(sh.chain.params().max_tx_count)
                 .collect::<Vec<_>>();
-            let l2_queue = std::mem::take(&mut sh.l2_to_include);
             // An L2-bearing block must commit the root replay will derive
             // (approved P1). The chain may not consult the L2 view — that is
             // the view the chain exists to authenticate — so the miner derives
@@ -1651,8 +1679,12 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             if let Ok(block) = mined {
                 let hash = block.block_hash();
                 let height = block.header.height;
-                store.save_chain(&sh.chain).ok();
-                store.write_meta(&sh.chain).ok();
+                if let Err(e) = store.save_chain(&sh.chain) {
+                    eprintln!("warning: chain persist failed: {e}");
+                }
+                if let Err(e) = store.write_meta(&sh.chain) {
+                    eprintln!("warning: meta persist failed: {e}");
+                }
                 println!("mined height {height}  {}", &hash512_to_hex(&hash)[..16]);
                 node.broadcast_block(hash, None);
             }
@@ -1836,11 +1868,17 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
 
         // Blocks from peers are persisted per batch, not per event.
         if sh.chain.height() != before {
-            store.save_chain(&sh.chain).ok();
-            store.write_meta(&sh.chain).ok();
+            if let Err(e) = store.save_chain(&sh.chain) {
+                eprintln!("warning: chain persist failed: {e}");
+            }
+            if let Err(e) = store.write_meta(&sh.chain) {
+                eprintln!("warning: meta persist failed: {e}");
+            }
         }
         // Binding finality can advance without a height change.
-        store.persist_finality(&sh.chain).ok();
+        if let Err(e) = store.persist_finality(&sh.chain) {
+            eprintln!("warning: finality persist failed: {e}");
+        }
 
         // Monitors read this through the API; a plain counter, never a
         // consensus input.
@@ -1869,9 +1907,15 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         let sh = shared
             .lock()
             .map_err(|_| "state lock poisoned during shutdown".to_string())?;
-        store.save_chain(&sh.chain).ok();
-        store.write_meta(&sh.chain).ok();
-        store.persist_finality(&sh.chain).ok();
+        store
+            .save_chain(&sh.chain)
+            .map_err(|e| format!("shutdown flush failed (chain): {e}"))?;
+        store
+            .write_meta(&sh.chain)
+            .map_err(|e| format!("shutdown flush failed (meta): {e}"))?;
+        store
+            .persist_finality(&sh.chain)
+            .map_err(|e| format!("shutdown flush failed (finality): {e}"))?;
     }
     node.stop();
     println!("shutdown complete");

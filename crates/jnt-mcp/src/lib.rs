@@ -317,11 +317,27 @@ impl JounitMcp {
     fn payment_submit(&self, request: &Value) -> Result<Value, McpError> {
         let endpoint = str_field(request, "endpoint")?;
         let payment_hex = str_field(request, "payment_hex")?;
+        // The node admits a machine payment only with the grant it claims to
+        // spend under plus the owner's signature over that grant — three
+        // fields beyond the payment itself. Forward them under the same
+        // names `verify.authorization` already uses, so an agent builds one
+        // shape and reuses it for both.
+        let authorization_hex = str_field(request, "authorization_hex")?;
+        let sigs_hex = str_field(request, "sigs_hex")?;
+        let keys_hex = str_field(request, "keys_hex")?;
         http_json(
             endpoint,
             "POST",
             "/v1/payment/submit",
-            Some(&json!({ "payment_hex": payment_hex }).to_string()),
+            Some(
+                &json!({
+                    "payment_hex": payment_hex,
+                    "authorization_hex": authorization_hex,
+                    "auth_sigs_hex": sigs_hex,
+                    "auth_keys_hex": keys_hex,
+                })
+                .to_string(),
+            ),
         )
     }
 
@@ -388,7 +404,9 @@ fn bundle_from_bytes(bytes: &[u8]) -> Result<jnt_core::sig::Bundle, McpError> {
 
 /// A minimal `host:port` HTTP/1.1 client, so this crate stays dependency-free
 /// and never reaches an address the caller did not name. Loopback is the
-/// expected endpoint (the node API is loopback by default).
+/// expected endpoint (the node API is loopback by default). When the operator
+/// has set `JNT_API_TOKEN`, it is sent as a bearer header — an exposed bind
+/// requires it (SPEC.md §19.2); a loopback node ignores it.
 fn http_json(
     endpoint: &str,
     method: &str,
@@ -401,10 +419,14 @@ fn http_json(
         .parse()
         .map_err(|e| McpError::bad(format!("endpoint `{endpoint}`: {e}")))?;
     let body = body.unwrap_or("");
+    let auth = match std::env::var("JNT_API_TOKEN") {
+        Ok(token) if !token.is_empty() => format!("Authorization: Bearer {token}\r\n"),
+        _ => String::new(),
+    };
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: {addr}\r\n\
-         Connection: close\r\n\
+         {auth}Connection: close\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\r\n{body}",
         body.len()

@@ -1155,7 +1155,10 @@ async fn tx_build(State(state): State<ApiState>, Json(req): Json<TxBuildReq>) ->
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 "insufficient_funds",
-                format!("have {total} sat, need {} sat", req.amount_sat + fee),
+                format!(
+                    "have {total} sat, need {} sat",
+                    req.amount_sat.saturating_add(fee)
+                ),
             ));
         }
         if fee > req.max_fee_sat {
@@ -1166,7 +1169,7 @@ async fn tx_build(State(state): State<ApiState>, Json(req): Json<TxBuildReq>) ->
             ));
         }
 
-        let change = total - req.amount_sat - fee;
+        let change = total.saturating_sub(req.amount_sat).saturating_sub(fee);
         let mut outputs = vec![jnt_core::tx::Output {
             value: req.amount_sat,
             address: to,
@@ -2628,6 +2631,22 @@ impl Default for RateLimiter {
 }
 
 impl RateLimiter {
+    /// Bucket key for a peer address. IPv6 sources are grouped by /64: one
+    /// delegated prefix can mint 2^64 addresses, so keying per-address would
+    /// let a single holder rotate past `MAX_RATE_TRACKED` and restart with a
+    /// full bucket every time. IPv4 stays per-address.
+    fn bucket_key(peer: IpAddr) -> IpAddr {
+        match peer {
+            IpAddr::V4(_) => peer,
+            IpAddr::V6(v6) => {
+                let octets = v6.octets();
+                let mut masked = [0u8; 16];
+                masked[..8].copy_from_slice(&octets[..8]);
+                IpAddr::V6(std::net::Ipv6Addr::from(masked))
+            }
+        }
+    }
+
     /// Refuse a request when the bucket for `peer` is empty. Uses a blocking
     /// lock because the API runtime is current-threaded and the critical
     /// section is a few integer ops — an async lock would needlessly yield on
@@ -2648,7 +2667,7 @@ impl RateLimiter {
                 }
             }
         }
-        let bucket = map.entry(peer).or_insert(Bucket {
+        let bucket = map.entry(Self::bucket_key(peer)).or_insert(Bucket {
             tokens: CAP,
             last: now,
         });
@@ -2738,6 +2757,49 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
     app.with_state(state)
 }
 
+/// A middleware refusal in the handlers' `{error, detail}` JSON shape, so rate
+/// limits, auth failures and timeouts are parsed by the same decoder as every
+/// other error instead of being prose.
+fn guard_fail(status: StatusCode, error: &'static str, detail: &str) -> Response {
+    (
+        status,
+        Json(ErrorBody {
+            error,
+            detail: detail.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Wrap a plain-text error produced deeper in the stack — axum's default
+/// 404/405 and `Json` extractor rejections arrive as `text/plain` — in the
+/// same JSON shape the handlers use, so one parser sees every failure.
+/// Anything already JSON or non-error passes through untouched.
+async fn jsonize_errors(resp: Response) -> Response {
+    let status = resp.status();
+    if !status.is_client_error() {
+        return resp;
+    }
+    let is_text = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/plain"));
+    if !is_text {
+        return resp;
+    }
+    let detail = match axum::body::to_bytes(resp.into_body(), 16 * 1024).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    };
+    let error = match status {
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        _ => "bad_request",
+    };
+    guard_fail(status, error, &detail)
+}
+
 /// Always-on guard: bound the in-flight request count, then run the request
 /// with a deadline. A peer that can't acquire a permit gets 429; a peer whose
 /// request overruns the deadline gets 504. Either way the response is produced
@@ -2746,19 +2808,22 @@ async fn dos_guard(State(cfg): State<DosConfig>, req: Request, next: Next) -> Re
     let permit = match cfg.concurrency.try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            let mut resp =
-                axum::response::Response::new(axum::body::Body::from("too many requests"));
-            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            return resp;
+            return guard_fail(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many concurrent requests",
+            )
         }
     };
     match tokio::time::timeout(cfg.timeout, next.run(req)).await {
-        Ok(resp) => resp,
+        Ok(resp) => jsonize_errors(resp).await,
         Err(_) => {
             drop(permit);
-            let mut resp = axum::response::Response::new(axum::body::Body::from("gateway timeout"));
-            *resp.status_mut() = StatusCode::GATEWAY_TIMEOUT;
-            resp
+            guard_fail(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "request exceeded the deadline",
+            )
         }
     }
 }
@@ -2773,9 +2838,11 @@ async fn host_check(State(cfg): State<HostConfig>, req: Request, next: Next) -> 
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok());
     if !host_allowed(&cfg, host) {
-        let mut resp = axum::response::Response::new(axum::body::Body::from("forbidden"));
-        *resp.status_mut() = StatusCode::FORBIDDEN;
-        return resp;
+        return guard_fail(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Host header not allowed",
+        );
     }
     next.run(req).await
 }
@@ -2788,10 +2855,11 @@ async fn exposed_auth(
 ) -> Response {
     // Per-IP token bucket: shed floods before doing any auth work.
     if !cfg.limiter.check(addr.ip()) {
-        let mut resp =
-            axum::response::Response::new(axum::body::Body::from("request rate exceeded"));
-        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-        return resp;
+        return guard_fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "request rate exceeded",
+        );
     }
     if let Some(token) = &cfg.token {
         let bearer = req
@@ -2802,10 +2870,19 @@ async fn exposed_auth(
             .map(|s| s.trim());
         use subtle::ConstantTimeEq;
         let provided = bearer.unwrap_or("");
-        if !bool::from(provided.as_bytes().ct_eq(token.as_bytes())) {
-            let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
-            *resp.status_mut() = StatusCode::UNAUTHORIZED;
-            return resp;
+        // Hash both sides to a fixed width first: `ct_eq` is constant time in
+        // the bytes it does compare, but it stops at the first difference —
+        // and a direct compare against the token leaks its length. SHA-256
+        // makes every input exactly 32 bytes, so neither length nor content
+        // of the secret escapes.
+        let provided_hash = jnt_core::hash::sha256(&[provided.as_bytes()]);
+        let token_hash = jnt_core::hash::sha256(&[token.as_bytes()]);
+        if !bool::from(provided_hash[..].ct_eq(&token_hash)) {
+            return guard_fail(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing or invalid bearer token",
+            );
         }
     }
     next.run(req).await
@@ -2841,7 +2918,10 @@ pub fn spawn_with_options(
     token: Option<String>,
     allowed_hosts: Vec<String>,
 ) -> Result<SocketAddr, String> {
-    if !listen.ip().is_loopback() && token.is_none() {
+    // An empty token is no token: the guard below filters empties out of the
+    // config, so accepting `Some("")` here would pass the refusal and then
+    // run the exposed surface unauthenticated.
+    if !listen.ip().is_loopback() && token.as_deref().unwrap_or("").is_empty() {
         return Err(format!(
             "refusing non-loopback API bind {listen} without a bearer token: \
              set JNT_API_TOKEN and supply --api-listen, or bind loopback \

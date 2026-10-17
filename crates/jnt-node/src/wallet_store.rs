@@ -41,9 +41,14 @@ const NONCE_LEN: usize = 12;
 /// Poly1305 tag, appended by `encrypt`.
 const TAG_LEN: usize = 16;
 
-/// The passphrase to encrypt under, if the operator supplied one.
-pub fn passphrase_from_env() -> Option<String> {
-    std::env::var(PASSPHRASE_ENV).ok().filter(|p| !p.is_empty())
+/// The passphrase to encrypt under, if the operator supplied one. Returned
+/// `Zeroizing` so the parsed copy wipes on drop — the env block outlives the
+/// call either way, but the heap copy need not linger.
+pub fn passphrase_from_env() -> Option<Zeroizing<String>> {
+    std::env::var(PASSPHRASE_ENV)
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(Zeroizing::new)
 }
 
 /// Whether a file's bytes are an encrypted wallet file rather than JSON.

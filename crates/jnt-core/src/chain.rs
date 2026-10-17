@@ -342,6 +342,32 @@ impl Chain {
         v
     }
 
+    /// The difficulty a child of `parent_hash` must declare, computed from the
+    /// parent's *own* branch: `history` walks `canon`, which for a side parent
+    /// would read the wrong timestamps. An ancestry that does not reach a
+    /// stored ancestor can never be applied canonically either, so it is
+    /// refused rather than guessed at. This must agree term-for-term with
+    /// `apply_block`'s check or a valid side branch would be refused here and
+    /// accepted there.
+    fn expected_difficulty_at(&self, parent_hash: &Hash512) -> Result<u128> {
+        let window = self.params.difficulty_window as usize + 1;
+        let mut stamps: Vec<u64> = Vec::with_capacity(window);
+        let mut cursor = *parent_hash;
+        let mut parent_difficulty = 0u128;
+        loop {
+            let b = self.blocks.get(&cursor).ok_or(Error::UnknownParent)?;
+            if stamps.is_empty() {
+                parent_difficulty = b.header.difficulty;
+            }
+            stamps.push(b.header.timestamp_ms);
+            if stamps.len() >= window || b.header.height == 0 {
+                break;
+            }
+            cursor = b.header.prev_hash;
+        }
+        Ok(next_difficulty(&self.params, parent_difficulty, &stamps))
+    }
+
     fn puzzle_for(&self, id: u64) -> Result<&PuzzleSpec> {
         self.registry.get(id)
     }
@@ -1446,10 +1472,25 @@ impl Chain {
         if let Some(now) = now_ms {
             validate_local_clock(block.header.timestamp_ms, now, &self.params)?;
         }
-        self.validate_standalone(&block)?;
+        // Cheap refusals before any proof-of-work is verified. The parent must
+        // be known, and the declared difficulty must be exactly what the
+        // retarget rule produces from that parent's branch — the same rule
+        // `apply_block` enforces, hoisted ahead of `pow_satisfies`. A header
+        // claiming difficulty 1 has a trivially satisfiable target but still
+        // costs the verifier a full proof check (an 8 MiB HBM scratchpad in
+        // production), so checking difficulty after the proof would let anyone
+        // burn the node's CPU for free, repeatedly, with a "valid" side block.
         if !self.blocks.contains_key(&block.header.prev_hash) {
             return Err(Error::UnknownParent);
         }
+        let expected_diff = self.expected_difficulty_at(&block.header.prev_hash)?;
+        if block.header.difficulty != expected_diff {
+            return Err(Error::BadDifficulty {
+                expected: expected_diff,
+                got: block.header.difficulty,
+            });
+        }
+        self.validate_standalone(&block)?;
 
         // Validate that the parent exists before recording work against it.
         let parent_work = self.cumulative_work(&block.header.prev_hash);
@@ -2409,15 +2450,19 @@ mod tests {
         bad.header.merkle_root[0] ^= 1;
         assert!(matches!(chain.submit(bad), Err(Error::BadMerkleRoot)));
 
-        // A difficulty the retarget rule would not produce is rejected by the
-        // state rules even though the proof itself is fine for that difficulty.
+        // A difficulty the retarget rule would not produce is refused outright
+        // by `submit`, before the proof for that (too-cheap) difficulty is even
+        // checked — a side block nobody paid real work for must never reach
+        // the verifier's PoW path. `validate_standalone` alone still accepts
+        // it: without a parent it cannot know what difficulty the branch is at.
         let mut easy = tip.clone();
         easy.header.difficulty = 1;
         easy.header.nonce = 0;
         chain.validate_standalone(&easy).unwrap();
-        // Too little work to become the tip, so it is merely stored as a side
-        // block; the fork-choice rule is what keeps it out.
-        chain.submit(easy).unwrap();
+        assert!(matches!(
+            chain.submit(easy),
+            Err(Error::BadDifficulty { .. })
+        ));
         assert_eq!(chain.tip_hash(), tip.block_hash());
 
         // Now a high-difficulty block where a single header bit is flipped.
