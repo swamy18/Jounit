@@ -109,10 +109,10 @@ bls_pk, stake_sat }`, `SelectionRule::TopN`, `derive_set`, `set_hash`,
   parameter**. Nothing derives it from `Chain`; grepping `stake`/`bond` across
   `jnt-core/src` finds only M2 `slash.rs` and doc comments — there is **no stake
   transaction, no bonded-stake ledger, and no unbonding**.
-- Decision 2's "min 5 000 JNT **bonded**, unbonding after a full finality
+- Decision 2's "bonded, unbonding after a full finality
   window" and "TopN by stake at the genesis epoch" therefore have no mechanism
-  to consume, and `NetworkParams` has **no** `min_validator_stake_sat` /
-  `validator_count` fields (`params.rs`), even though Decision 2 says those
+  to consume, and `NetworkParams` has **no** `validator_count` field
+  (`params.rs`), even though Decision 2 says those
   values live there.
 
 → **Decision D8** (§4): how stake enters the chain at all.

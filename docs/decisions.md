@@ -65,11 +65,14 @@ protocol rule.
 The five open items are decided as follows, values parameterised in
 `NetworkParams` at implementation time, none wired into consensus now:
 
-1. **Minimum stake: 5 000 JNT** (`min_validator_stake_sat`), **bonded** with
+1. **Minimum stake: none.** Any positive bond amount is accepted — Jounit
+   is permissionless. The committee is stake-weighted (TopN), so smaller bonds
+   simply rank lower and fail to make the top 21. Bonded with
    unbonding after a full finality window (`finality_depth` blocks) so a
    departing validator cannot sign a checkpoint the chain cannot hold them to.
-   Rationale: meaningful skin-in-the-game at ~0.0125% of supply; low enough for
-   a wide testnet set.
+   Rationale: no stake barrier to entry keeps participation open to human users
+   and autonomous AI agents alike; skin-in-the-game comes from the bond itself,
+   which is slashed on equivocation.
 2. **Selection: TopN over staked candidates, N = 21** — the already-implemented
    `SelectionRule::TopN` default. Stake-weighted sampling is explicitly
    rejected for now (unimplemented machinery, weaker auditability). For testnet
@@ -79,8 +82,7 @@ The five open items are decided as follows, values parameterised in
 3. **Rewards: none for now.** Checkpoint signing earns **no new issuance and no
    fee share** at testnet. Revisit only if testnet shows signing liveness
    problems. (This deliberately leaves monetary policy exactly as it is.)
-4. **Slashing for equivocation: burn the equivocator's entire bond**
-   (5 000 JNT). Evidence = the already-exposed `equivocation_evidence`
+4. **Slashing for equivocation: burn the equivocator's entire bond.** Evidence = the already-exposed `equivocation_evidence`
    (two valid conflicting signed checkpoints, same key). 100% seizure is
    justified because equivocation is unambiguous, non-accidental, and attacks
    finality itself. The `slash.rs` vault handles the mechanics (vested
@@ -104,9 +106,9 @@ build it now.
 
 - D3 → Phase 2 (Step 6 tx types): add `l2_fee_for(tx_type)` and route the flat
   fee through `split_fees` as `full_base`.
-- §14.6 → Phase 6: `min_validator_stake_sat`, `validator_count` (21), bonded
-  stake accounting, equivocation → full-bond SlashRecord, fixed-committee
-  bootstrap mode, activation flag.
+- §14.6 → Phase 6: `validator_count` (21), bonded
+    stake accounting (any positive bond accepted), equivocation → full-bond
+    SlashRecord, fixed-committee bootstrap mode, activation flag.
 
 *(The gap audit follows in the second half of this file.)*
 ---
@@ -317,7 +319,7 @@ note in §16):**
 **Explicitly unchanged:** the 5 000-sat post / 2 000 claim / 2 000 submit /
 10 000 dispute / 20 000 settle schedule; the M1 50/50 burn/PSCB split; L2 fee =
 `full_base`; the L1 gas floor; `payment_jnt` as a market price; no validator
-rewards/fee share; min bond 5 000 JNT; TopN 21; full-bond equivocation burn;
+rewards/fee share; no minimum bond amount; TopN 21; full-bond equivocation burn;
 binding finality only at the end of Phase 6.
 
 **Still open, still not silently decided:** a task whose escrow or worker deposit
@@ -545,11 +547,11 @@ economics that Decision 2 deliberately left parameterised.
 
 Consequence to be honest about: with no stake ledger, `derive_set` is fed by
 **genesis** rather than by chain state, so "TopN by stake at the seed block" is
-exercised as a pure function over the genesis list, not over live stake. Real
-bonded stake (`min_validator_stake_sat` = 5 000 JNT, unbonding after
-`finality_depth`) remains required for mainnet and is **not** built here.
+exercised as a pure function over the genesis list, not over live stake. No
+minimum bond amount is required for mainnet — any positive stake is accepted —
+and is **not** built here.
 
-**Unchanged:** Decision 2's numbers (5 000 JNT, N = 21), no rewards, no fee
+**Unchanged:** Decision 2's numbers (N = 21), no rewards, no fee
 share, no issuance from validators, and equivocation burning the entire bond
 through the existing M2 slash path.
 
@@ -673,11 +675,11 @@ The M4 audit (no code changed) re-examined the tree after M3 against STEPS
 1–3 and found: no stake ledger, no bond/unbond path, no committee in params,
 two checkpoint validators with no declared canonical one, no checkpoint codec
 at all (serialize only), no finality wire message, and `Chain` consulting none
-of it. The Decision 2 economics (5,000 JNT bonded, TopN 21, no rewards, no fee
+of it. The Decision 2 economics (any positive bond accepted, TopN 21, no rewards, no fee
 share, full-bond equivocation burn) therefore have no mechanism to run on —
 which is exactly what Decision 8 scoped out of Phase 6 ("no stake transaction
-type, no bonded-stake ledger, and no unbonding are built in Phase 6", with real
-bonded stake "required for mainnet"). That scoping is honored, not
+type, no bonded-stake ledger, and no unbonding are built in Phase 6", with no
+minimum bond amount). That scoping is honored, not
 re-designed: the items below build only what Decisions 2 (bootstrap mode) and
 8 authorized, and binding finality is explicitly NOT activated. If a future
 milestone wants binding finality, it needs its own decision.
@@ -690,7 +692,7 @@ observation without activation.**
 
 1. **Economics (STEP 2 verdict).** The implementation does not support bonded
    stake — no stake fields, no bond ledger, no reward or slash-bond path — and
-   M4 adds none of them. Unchanged and still standing: 5,000 JNT minimum,
+   M4 adds none of them. Unchanged and still standing: no minimum bond amount,
    TopN 21 (reused as the committee-size cap), no validator rewards, no fee
    share, no issuance from validators, full-bond equivocation burn, L2 dispute
    slashing untouched. Bonding, unbonding, rewards and bond-slashing arrive
@@ -1008,7 +1010,7 @@ real signed deposit) and the pre-existing `api`/`conservation_api` suites.
 
 ## P2 — Bonded stake / mainnet validator committee (mainnet blocker)
 
-Decision 2 fixes the economics (5,000 JNT `min_validator_stake_sat`, bonded,
+Decision 2 fixes the economics (no minimum stake — any positive bond accepted; bonded,
 unbonding after `finality_depth`; TopN 21; no rewards; no fee share;
 full-bond equivocation burn) and Decision 8 deliberately builds **none** of the
 mechanism — no stake transaction, no bond ledger, no unbonding. Consequences
@@ -1257,15 +1259,18 @@ addresses published in open-source configuration.)
 
 ## Decision 20 — Bonded stake + mainnet committee (P2)
 
-**Status: APPROVED 2026-10-10, IMPLEMENTED 2026-10-10.** Resolves P2's design;
+**Status: APPROVED 2026-10-10, IMPLEMENTED 2026-10-10, REVISED 2026-10-17.** Resolves P2's design;
 the mechanism follows as a new L1 rule. Decision 2's economics stand (TopN 21,
 no rewards, no fee share); this decision supplies what Decision 8 deliberately
 left unbuilt.
 
-1. **Minimum stake: 5,000 JNT, fixed in the consensus rules.** Not a parameter,
-   per the launch principle above.
+1. **No minimum stake.** Any positive bond amount is accepted into the bond
+   ledger. The 5,000 JNT minimum stake from the original Decision 2 design has
+   been **removed**: Jounit is permissionless. The committee is stake-weighted
+   (TopN by stake), so smaller bonds simply rank lower and fail to make the top
+   21. This is fixed in the consensus rules — not a tunable.
 2. **Committee: the first 21 eligible validators by valid bond-transaction
-   order.** Eligibility = a valid bond of at least the minimum. No
+   order.** Eligibility = a valid bond of any positive amount. No
    genesis-fixed identities, no privileged or permanent founder seats: the
    committee fills from bond order on a live chain, reproducibly from chain
    state alone.
@@ -1276,8 +1281,10 @@ left unbuilt.
    (`EquivocationEvidence`, Decision 14) already exists; punishment was
    deferred only for lack of a bond. Adding validator rewards of any kind stays
    a monetary decision and out of scope (Decision 2 item 3 stands).
-
-## Decision 21 — M2 fraud rule: deterministic CPU re-execution (P3)
+5. **A mainnet committee.** `NetworkParams::mainnet()` carries an **empty**
+   `genesis_validators`, so checkpoint verification fails closed and binding
+   finality is untestable on mainnet. Choosing the bootstrap committee is a
+   decision.
 
 **Status: APPROVED 2026-10-10, IMPLEMENTED 2026-10-10.** A compute result is
 fraudulent if and only if deterministic CPU re-execution over the identical

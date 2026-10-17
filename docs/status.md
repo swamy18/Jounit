@@ -770,8 +770,9 @@ SPEC.md §14.6 is written as **DESIGN ONLY**: the complete deterministic
 machinery (identity, epoch-bound set hash, seed-block derivation, rotation,
 six-clause checkpoint validation) is specified and implemented as a pure
 library in `validators.rs` — with five economics questions explicitly listed
-as open and reserved for the protocol owner (minimum stake, selection rule
-beyond the TopN default, rewards, slashing amounts, activation timing).
+as open and reserved for the protocol owner (selection rule beyond the TopN
+default, rewards, slashing amounts, activation timing). No minimum stake is
+required — any positive bond is accepted.
 
 `Chain::submit` does not reference `validators.rs` (grep-verified); no
 consensus rule changed; no monetary rule changed.

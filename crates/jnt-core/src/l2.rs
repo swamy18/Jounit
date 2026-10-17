@@ -38,7 +38,7 @@ use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512};
 use crate::params::{
     FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_EXIT_QUEUE_SAT, FEE_TX_POST_TASK_SAT,
-    FEE_TX_SUBMIT_RESULT_SAT, SETTLE_FEE_MIN_SAT,
+    FEE_TX_SUBMIT_RESULT_SAT, L2_FLAT_FEE_MINIMUM_SAT, SETTLE_FEE_MIN_SAT,
 };
 use crate::ser::{Reader, Writer};
 use crate::sig::{Bundle, Component, SCHEME_SECP256K1_ECDSA, SCHEME_SECP256K1_SCHNORR};
@@ -142,7 +142,17 @@ impl L2TxType {
     /// fee is proportional to task value — see [`settle_fee_sat`]. Callers
     /// estimating a settlement must use that function with the task's escrow;
     /// this floor is only the minimum every settle pays.
+    ///
+    /// Every fee is clamped to [`L2_FLAT_FEE_MINIMUM_SAT`] so that no
+    /// re-parameterization can accidentally produce a zero or sub-floor fee.
     pub fn fee_sat(self) -> u64 {
+        self.fee_sat_raw().max(L2_FLAT_FEE_MINIMUM_SAT)
+    }
+
+    /// The raw D3 flat fee before the minimum-fee floor. Internal callers that
+    /// need the exact constant (e.g. for fee accounting displays) use this;
+    /// consensus application must use [`fee_sat`] to get the floored value.
+    pub fn fee_sat_raw(self) -> u64 {
         match self {
             L2TxType::PostTask => FEE_TX_POST_TASK_SAT,
             L2TxType::ClaimTask => FEE_TX_CLAIM_TASK_SAT,
@@ -1113,6 +1123,28 @@ mod tests {
         assert_eq!(L2TxType::Dispute.fee_sat(), 10_000);
         assert_eq!(L2TxType::Settle.fee_sat(), 1_000);
         assert_eq!(L2TxType::ExitQueue.fee_sat(), 2_000);
+    }
+
+    #[test]
+    fn every_fee_meets_the_flat_minimum_floor() {
+        // D3: flat minimum fee floor — no L2 fee may fall below
+        // L2_FLAT_FEE_MINIMUM_SAT, even if a per-type constant were re-parameterized.
+        for t in [
+            L2TxType::PostTask,
+            L2TxType::ClaimTask,
+            L2TxType::SubmitResult,
+            L2TxType::Dispute,
+            L2TxType::Settle,
+            L2TxType::ExitQueue,
+        ] {
+            assert!(
+                t.fee_sat() >= L2_FLAT_FEE_MINIMUM_SAT,
+                "{} fee {} below minimum {}",
+                t.name(),
+                t.fee_sat(),
+                L2_FLAT_FEE_MINIMUM_SAT
+            );
+        }
     }
 
     #[test]

@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use jnt_core::block::GENESIS_TIMESTAMP_MS;
 use jnt_core::bls::SecretKey;
-use jnt_core::bond::MIN_VALIDATOR_STAKE_SAT;
 use jnt_core::chain::Chain;
 use jnt_core::hash::Address;
 use jnt_core::params::NetworkParams;
@@ -60,7 +59,7 @@ fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash512) {
     let w = wallet(1);
     let bonder = w.address().unwrap();
     let mut chain = Chain::new(params).unwrap();
-    // 80 coinbases: 70 × 76 JNT funds a 5,000 JNT bond with room for fees.
+    // 80 coinbases: 70 × 76 JNT funds a 5-JNT bond with room for fees.
     mine_empty_to(&mut chain, bonder, 80);
 
     let ops: Vec<OutPoint> = (1..=70u64)
@@ -77,7 +76,7 @@ fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash512) {
         .map(|op| chain.utxo().get(op).unwrap().out.value)
         .sum();
     let fee = chain.expected_base_fee_for_next_block() * 18_000 + 1_000_000;
-    let bond_amount = MIN_VALIDATOR_STAKE_SAT;
+    let bond_amount = 1_000;
     let mut tx = w
         .build_tx(
             &ops,

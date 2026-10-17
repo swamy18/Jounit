@@ -13,7 +13,7 @@
 use jnt_core::block::GENESIS_TIMESTAMP_MS;
 use jnt_core::bls::{RealBls, SecretKey};
 use jnt_core::bls_checkpoint::{BlsPublicKey, Checkpoint, CheckpointPayload};
-use jnt_core::bond::{bond_identity, bond_pop, MIN_VALIDATOR_STAKE_SAT, UNBONDING_PERIOD_BLOCKS};
+use jnt_core::bond::{bond_identity, bond_pop, UNBONDING_PERIOD_BLOCKS};
 use jnt_core::chain::Chain;
 use jnt_core::error::Error;
 use jnt_core::hash::Address;
@@ -25,7 +25,9 @@ use jnt_core::tx::{
 };
 use jnt_core::wallet::Wallet;
 
-const BOND: u64 = MIN_VALIDATOR_STAKE_SAT;
+/// A bond amount used in tests: 5 JNT (any positive amount is accepted; the
+/// committee is stake-weighted, so this is just a test convenience).
+const BOND: u64 = 5 * jnt_core::params::SAT_PER_JNT;
 
 fn wallet(seed: u8) -> Wallet {
     Wallet::from_private_key_bytes(&[seed; 32], "bond-stake").unwrap()
@@ -55,7 +57,7 @@ fn mine(chain: &mut Chain, to: Address, n: u64) {
 }
 
 /// A chain with one rich wallet: 80 coinbases mined, the matured ones
-/// returned. 70 Ã— 76 JNT funds a 5,000-JNT bond with room for fees.
+/// returned. 70 × 76 JNT funds a 5-JNT bond with room for fees.
 fn rich_chain() -> (Chain, Wallet, Vec<OutPoint>) {
     let mut chain = Chain::new(NetworkParams::mini()).unwrap();
     let w = wallet(1);
@@ -283,6 +285,22 @@ fn happy_path_bond_registers_and_joins_the_committee() {
 }
 
 #[test]
+fn a_bond_below_the_old_minimum_is_still_accepted() {
+    // Regression for the 5,000 JNT minimum stake removal: any positive amount
+    // is valid. A 1-satoshi bond must be accepted and join the committee.
+    let (mut chain, w, ops) = rich_chain();
+    let bonder = w.address().unwrap();
+    let (sk, pk) = bls_pair(7);
+    let tiny_bond = bond_tx_value(&chain, &w, &ops[..66], &sk, 1);
+    let bond_id = tiny_bond.txid();
+    submit_block(&mut chain, bonder, vec![tiny_bond]).unwrap();
+
+    let record = chain.bonds().get(&bond_id).expect("bond must be recorded");
+    assert_eq!(record.amount_sat, 1, "a 1-sat bond must be accepted");
+    assert_eq!(chain.committee_keys(), vec![pk], "1-sat bond still joins the committee");
+}
+
+#[test]
 fn a_checkpoint_from_outside_the_bonded_committee_is_refused() {
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
@@ -317,11 +335,14 @@ fn bond_refusals_name_their_rule_and_record_nothing() {
     let fee = fee_for(&chain, 1, 2);
     let total = utxo_total(&chain, &ops[..1]);
 
-    // Below-minimum bond, fully funded so the refusal is the minimum rule.
-    let small = bond_tx_value(&chain, &w, &ops[..66], &sk, MIN_VALIDATOR_STAKE_SAT - 1);
-    assert_eq!(
-        submit_block(&mut chain, bonder, vec![small]).unwrap_err(),
-        Error::StakeInvalid("bond below minimum stake")
+    // Zero-value bond: refused by the stake check (positive amount required).
+    let zero_bond = bond_tx_value(&chain, &w, &ops[..66], &sk, 0);
+    assert!(
+        matches!(
+            jnt_core::bond::check_bond_tx(&zero_bond, chain.bonds(), &net_id),
+            Err(Error::StakeInvalid("bond must lock a positive amount"))
+        ),
+        "zero-value bond must be refused"
     );
 
     // Bond type without a payload.
@@ -555,35 +576,35 @@ fn mempool_admits_a_valid_bond_and_refuses_a_broken_one() {
     pool.add(bond, chain.utxo(), h, &net, base, chain.bonds())
         .expect("a valid bond must pool");
 
-    // A below-minimum impostor with the same shape is refused by name.
+    // A zero-value bond impostor with the same shape is refused by name.
     let bonder = w.address().unwrap();
     let fee = fee_for(&chain, 1, 2);
     let total = utxo_total(&chain, &ops[67..68]);
-    let mut small = w
+    let mut zero_bond = w
         .build_tx(
             &ops[67..68],
             vec![
                 Output {
-                    value: 1_000,
+                    value: 0,
                     address: bond_identity(&net.network_id, &bonder, &pk),
                 },
                 Output {
-                    value: total - 1_000 - fee,
+                    value: total - fee,
                     address: bonder,
                 },
             ],
             fee,
         )
         .unwrap();
-    small.tx_type = TX_BOND;
-    small.stake = Some(StakePayload::Bond {
+    zero_bond.tx_type = TX_BOND;
+    zero_bond.stake = Some(StakePayload::Bond {
         bls_pk: pk,
         pop: bond_pop(&sk, &net.network_id, &bonder),
         mldsa_pk: None,
     });
-    w.sign(&mut small).unwrap();
+    w.sign(&mut zero_bond).unwrap();
     let err = pool
-        .add(small, chain.utxo(), h, &net, base, chain.bonds())
+        .add(zero_bond, chain.utxo(), h, &net, base, chain.bonds())
         .unwrap_err();
     assert!(
         matches!(err, jnt_core::mempool::MempoolError::Invalid(_)),
@@ -715,12 +736,11 @@ fn happy_path_slash_burns_the_full_bond() {
     assert_eq!(chain.slash_vault().active_count(), 1);
     assert!(chain.burned_fees_total() - burned_before >= BOND / 2);
 
-    // Half vests to the PSCB reserve block by block: 125M per mini block.
-    // Baslined after the slash block (whose own fee also fed the reserve),
-    // then only empty blocks â€” every sat of growth is vesting.
+    // Half vests to the PSCB reserve block by block.
+    // With BOND = 5 JNT: vest_total = 250_000_000, vest_per_block = 125_000.
     let pscb_after_slash = chain.pscb_reserve();
     mine(&mut chain, bonder, 5);
-    assert_eq!(chain.pscb_reserve() - pscb_after_slash, 5 * 125_000_000);
+    assert_eq!(chain.pscb_reserve() - pscb_after_slash, 5 * 125_000);
 }
 
 #[test]

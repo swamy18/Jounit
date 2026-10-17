@@ -139,6 +139,22 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// takes it per iteration, handlers take it per request. No handler ever
 /// holds it across an await (handlers do not await), so the async runtime
 /// only exists to accept sockets and parse HTTP.
+///
+/// # State classification: consensus vs. node-local
+///
+/// **Consensus state** (rebuilt from blocks, replayed identically by every
+/// node): `chain` (L1), `pool` (mempool admission view), and `l2` (NodeL2 —
+/// accounts, tasks, escrow balances, exit queue). An L2 transaction that fails
+/// to apply is *skipped deterministically*, never made a consensus rule.
+///
+/// **Node-local state** (not consensus, not replayed, not committed to blocks):
+/// `receipts`, `payment_tracker`, `payment_store`, `reservations`, `credit`,
+/// `delegations`, `escrows`, `policies`, `policy_registry`, `revoked_policies`.
+/// These are operational caches and service-layer features: they must never be
+/// treated as an alternative source of truth for global JNT ownership or
+/// spendable balance. Coin movement happens only through L1 UTXOs and L2
+/// account balances (the consensus surface above); credit/escrow are gates
+/// on admission, not sources of spendable funds.
 pub struct SharedNode {
     pub chain: Chain,
     pub pool: Mempool,

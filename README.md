@@ -645,10 +645,11 @@ L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 ## Validators and finality
 
 **Bonded stake** (`bond.rs`, Decision 20). Three transaction types â€” `TX_BOND`,
-`TX_UNBOND`, `TX_SLASH` â€” feed a bond ledger with a bond-order index. Minimum
-stake is `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, an immutable consensus constant
-rather than a tunable. Unbonding locks for `UNBONDING_PERIOD_BLOCKS` = 1 008
-(seven days). Provable equivocation burns the full bond.
+    `TX_UNBOND`, `TX_SLASH` â€” feed a bond ledger with a bond-order index. Any
+    positive bond amount is accepted — there is no minimum stake threshold;
+    the committee is stake-weighted (TopN), so smaller bonds rank lower and
+    simply fail to make the top 21. Unbonding locks for `UNBONDING_PERIOD_BLOCKS` = 1 008
+    (seven days). Provable equivocation burns the full bond.
 
 The committee is the **top 21 bonded validators by stake** (`derive_set` /
 `SelectionRule::TopN`), each record carrying its bond-identity `stake_address`
@@ -723,7 +724,7 @@ applies.
 | Verified Work Certificates | **Shipped** | `Quorum` verifiable; `WindowElapsed` refused by `validate_verified` |
 | Bonded stake, unbonding, slashing | **Shipped** | 16 attack-first tests, including proof-of-possession refusals |
 | Checkpoint signing | **Shipped** | 18 unit + 6 cross-node tests |
-| **A live validator committee** | **Code shipped, no operators yet** | Bond ledger, committee derivation, checkpoint signing all built and tested. `mainnet` starts with empty `genesis_validators`; depth finality secures the chain until operators bond 5 000 JNT and sign checkpoints |
+| **A live validator committee** | **Code shipped, no operators yet** | Bond ledger, committee derivation, checkpoint signing all built and tested. `mainnet` starts with empty `genesis_validators`; depth finality secures the chain until operators post any positive bond amount and sign checkpoints |
 | Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
 | Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
 | **Post-quantum signatures** | **Accepted, not required** | Scheme `3` = ML-DSA-65 (FIPS 204) verifies inside the hybrid bundle: a spend can be signed `ECDSA + Schnorr + ML-DSA`, every component must verify, and the address commits to the whole key set so a bundle cannot be reduced to its classical half. Checkpoints carry a lattice sidecar verified as clause 7 — every bitmap signer holding a registered lattice key needs a valid entry, signers without one pass on BLS. Settlements and the VWCs they issue carry the same sidecar: arbitration votes sign it, `apply_settle` and certificate validation verify it. Validators register lattice keys in their bonds; the production loop signs both halves. Migration: moving funds is an ordinary spend to a `pq_address`; the `verify_input_pq` enforcement primitive is built and pinned, activation NOT set (Decision 24) |
@@ -733,7 +734,7 @@ applies.
 | **Delegation chains** | **Wired into the payment path** | A payment and a request carry a signed, root-first delegation chain; identity is proved from the chain rather than from the payer address, so a spend cannot claim more than its whole ancestry permits. The node records links, verifies owner signatures on every policy, propagates revocation to descendants, and refuses a chain it did not record. Still non-consensus (no `TXVALIDATOR` policy byte) |
 | **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. The transition lives on the escrow (`release_arbiter`/`release_mutual`), the escrow id and the release hash both bind network and condition, and **oracle conditions are refused at open** — with no oracle verifier implemented, an escrow that could never release cannot be opened at all. Every escrow **expires 1 008 blocks after open and refunds its payer**, and a release past that timeout is refused, so a lost key or a silent arbitrator cannot hold value. Settlement is the non-custodial Item 10 ledger commit, not an on-chain payout |
 | **Wallet keys at rest** | **Hardened** | `wallets.json` is written mode 0600 through a temp-file rename and encrypted under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305); an encrypted file without the passphrase is refused by name, and plaintext writes require `--allow-plaintext-wallet` |
-| **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
+| **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), any positive bond accepted (no minimum stake threshold), `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
 | M1 fee split | **Consensus-active** | The only mechanism that is |
 | M2 slash vault | Holds L2 slashes | Not otherwise triggered |
 | M3 compute IR | Provides the reference | Envelopes carried, no interpreter |
@@ -986,7 +987,7 @@ money at it:
 | Item | Why it remains |
 |---|---|
 | **No independent security review** | 1194 passing tests are not externally reviewed. This cannot be self-certified, by anyone, ever. |
-| **No validator operators** | `mainnet` declares an empty `genesis_validators`. The bond ledger, committee derivation, and checkpoint signing are all built and tested, but no operator is bonding 5 000 JNT to run a validator. Binding finality verifies against whatever committee exists — empty means no checkpoint can finalize until validators appear, but depth-based finality (100 blocks) still secures the chain. |
+| **No validator operators** | `mainnet` declares an empty `genesis_validators`. The bond ledger, committee derivation, and checkpoint signing are all built and tested, but no operator has posted any positive bond amount to run a validator. Binding finality verifies against whatever committee exists — empty means no checkpoint can finalize until validators appear, but depth-based finality (100 blocks) still secures the chain. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnode directory. `--bootnodes` dials configured peers at startup and `peers.json` persists learned addresses across restarts; no public bootnode list is published. No log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
 

@@ -569,9 +569,10 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 8. `coinbase.value ≤ block_reward(height) + tip_total` — miners may **not** over-claim
 9. Standard tx: `lock_time` is advisory in v0.1
 10. Bond (`2`): inputs share exactly one signer (the bonder); BLS key valid
-    and not already bonded; exactly one output pays the derived bond identity
-    `SHA256("jounit/bond-identity/v1" ‖ network_id ‖ bonder ‖ bls_pk)[..20]`
-    with value `≥ 5 000 JNT`; that output is consumed into the bond ledger by
+     and not already bonded; exactly one output pays the derived bond identity
+     `SHA256("jounit/bond-identity/v1" ‖ network_id ‖ bonder ‖ bls_pk)[..20]`
+     with a positive value (no minimum stake threshold — Jounit is permissionless);
+     that output is consumed into the bond ledger by
     the applying block (it never rests in the UTXO set, so a later release
     cannot double-count it)
 11. Unbond (`3`): bond exists; single signer is the bonder;
@@ -1385,7 +1386,8 @@ byte.
 ### 14.6 M5 — Validator-set semantics (DESIGN ONLY — not consensus-active)
 
 > **Amendment (Decision 20 — consensus-active):** the economics below are now
-> decided and implemented. Minimum stake is **5 000 JNT, fixed**; the committee
+> decided and implemented. **No minimum stake** — any positive bond is accepted
+> (Jounit is permissionless); the committee
 > is the **first 21 eligible bonds by `(bond_height, bond_index)`** (bond
 > order, not stake weight; no genesis-fixed identities, no privileged seats);
 > unbonding is **1008 blocks, fixed**; equivocation burns the **full bond**

@@ -259,9 +259,10 @@ revenue attached to it.
 ### What already exists
 
 - `bond.rs` — bond ledger, bond-order-derived committee, provable slashing.
-- `MIN_VALIDATOR_STAKE_SAT` = 5 000 JNT, immutable consensus constant.
+   Any positive bond amount is accepted (no minimum stake threshold — Jounit is
+   permissionless).
 - `validators.rs`, `signing.rs`, `finality.rs` — the committee and checkpoint
-  machinery.
+   machinery.
 - Task escrow — a source of real inference demand.
 
 ### The core difficulty
@@ -279,10 +280,10 @@ rule exists to prevent.
 
 ### Blocker
 
-**There are no validators.** The README is explicit: no operator is bonding
-5 000 JNT, `genesis_validators` is empty on mainnet, and binding finality is
-off. The economic design is sound but has nothing to attach to. This item is
-blocked on adoption, not on code.
+**There are no validators.** The README is explicit: `genesis_validators` is
+empty on mainnet, no operator has posted any positive bond, and binding
+finality is off. The economic design is sound but has nothing to attach to.
+This item is blocked on adoption, not on code.
 
 **Risk:** medium technically, but gated behind adoption.
 

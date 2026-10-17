@@ -30,7 +30,7 @@
 //!
 //! # Fail-closed rules (locked)
 //!
-//! - below-minimum bonds, duplicate bonds, duplicate BLS keys, bad keys,
+//! - zero-value bonds, duplicate bonds, duplicate BLS keys, bad keys,
 //!   bonds whose BLS key has no proof of possession, and multi-signer bond
 //!   transactions are refused by name;
 //! - unbonding before `bond_height + UNBONDING_PERIOD_BLOCKS`, by anyone but
@@ -50,9 +50,6 @@ use crate::slash::{VESTING_BLOCKS_MAINNET, VESTING_BLOCKS_MINI};
 use crate::tx::{StakePayload, Transaction, TX_BOND, TX_SLASH, TX_UNBOND};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Minimum bond: 5,000 JNT, fixed in the consensus rules (Decision 20 item 1,
-/// launch principle: an immutable constant, never a tunable).
-pub const MIN_VALIDATOR_STAKE_SAT: u64 = 5_000 * crate::params::SAT_PER_JNT;
 /// Unbonding delay: 7 days at the mainnet 10-minute block time (Decision 20
 /// item 3, fixed). On 1-second test profiles the same count is ~17 minutes,
 /// which is a faster test cycle, not a weaker rule.
@@ -85,7 +82,9 @@ pub struct BondRecord {
     /// the committee identity (that stays the BLS key), only the key clause 7
     /// looks up for this validator's sidecar entry.
     pub mldsa_pk: Option<[u8; 1952]>,
-    /// Locked value, always `>= MIN_VALIDATOR_STAKE_SAT` by construction.
+    /// Locked value. No minimum threshold: any positive bond amount is
+    /// accepted. The committee is stake-weighted (TopN), so a small bond
+    /// simply ranks lower in `committee()` and is unlikely to make the top 21.
     pub amount_sat: u64,
     /// Height of the block that bonded.
     pub bond_height: u64,
@@ -371,8 +370,8 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
             ));
         }
     };
-    if bond_out.value < MIN_VALIDATOR_STAKE_SAT {
-        return Err(Error::StakeInvalid("bond below minimum stake"));
+    if bond_out.value == 0 {
+        return Err(Error::StakeInvalid("bond must lock a positive amount"));
     }
     Ok(BondDraft {
         bonder,
@@ -598,7 +597,7 @@ mod tests {
                     // Stake rises with i, so the four earliest bonds are also
                     // the four lowest: under the old "first 21 by bond order"
                     // rule they kept their seats, under TopN they are cut.
-                    amount_sat: MIN_VALIDATOR_STAKE_SAT + u64::from(i) * 1_000,
+                    amount_sat: 1_000 + u64::from(i) * 1_000,
                     bond_height: height,
                     bond_index: 0,
                 },
@@ -659,7 +658,7 @@ mod tests {
             bonder: [3u8; 20],
             bls_pk: bls_key(3),
             mldsa_pk: None,
-            amount_sat: MIN_VALIDATOR_STAKE_SAT,
+                    amount_sat: 1_000,
             bond_height: 10,
             bond_index: 1,
         };

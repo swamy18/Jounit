@@ -55,11 +55,18 @@ pub const SETTLE_FEE_MIN_SAT: u64 = 1_000;
 /// exit implementation and recorded in `docs/decisions.md` (P1 record); it is a
 /// fee for a *new* type, not a change to any decided value.
 pub const FEE_TX_EXIT_QUEUE_SAT: u64 = 2_000;
+/// The flat minimum fee floor for any L2 transaction (D3). Every L2 fee type
+/// must meet or exceed this value. The `fee_sat` function applies `max(fee,
+/// L2_FLAT_FEE_MINIMUM_SAT)` as a final floor so a future re-parameterization
+/// cannot accidentally produce a zero or sub-floor fee.
+pub const L2_FLAT_FEE_MINIMUM_SAT: u64 = 1_000;
 
 /// The D3 schedule as one table, so the exact set is asserted in one place and a
 /// future change has a single spot to be checked against the decision record.
 /// `TxSettle` lists the anti-spam floor, not the fee: the actual settle fee is
 /// proportional to task value (Decision 23, `settle_fee_sat` in `l2.rs`).
+/// Every entry is at least `L2_FLAT_FEE_MINIMUM_SAT` — the flat minimum fee
+/// floor applied by `L2TxType::fee_sat`.
 pub const L2_FEE_SCHEDULE: &[(&str, u64)] = &[
     ("TxPostTask", FEE_TX_POST_TASK_SAT),
     ("TxClaimTask", FEE_TX_CLAIM_TASK_SAT),

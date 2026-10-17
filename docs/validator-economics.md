@@ -11,7 +11,7 @@ mechanism). This file does not change any of them.
 
 | Item | Decision status | Implementation status |
 |---|---|---|
-| Minimum stake (5,000 JNT bonded) | **Decided** (Decision 2.1) | **Missing** — no field, no ledger |
+| Minimum stake | **Decided: none** (revised — no minimum; any positive bond accepted, Jounit is permissionless) | **Implemented** (`bond.rs`, `check_bond_tx` accepts any positive amount) |
 | Stake/bond transaction | Not decided as a wire rule | **Missing** |
 | Unbonding (after `finality_depth`) | **Decided** (Decision 2.1) | **Missing** |
 | Validator-set derivation | **Decided** (Decision 11.2) | **Implemented** (`validators.rs`), fed by genesis |
