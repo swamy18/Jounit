@@ -658,7 +658,7 @@ mod tests {
             bonder: [3u8; 20],
             bls_pk: bls_key(3),
             mldsa_pk: None,
-                    amount_sat: 1_000,
+            amount_sat: 1_000,
             bond_height: 10,
             bond_index: 1,
         };

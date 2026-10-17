@@ -297,7 +297,11 @@ fn a_bond_below_the_old_minimum_is_still_accepted() {
 
     let record = chain.bonds().get(&bond_id).expect("bond must be recorded");
     assert_eq!(record.amount_sat, 1, "a 1-sat bond must be accepted");
-    assert_eq!(chain.committee_keys(), vec![pk], "1-sat bond still joins the committee");
+    assert_eq!(
+        chain.committee_keys(),
+        vec![pk],
+        "1-sat bond still joins the committee"
+    );
 }
 
 #[test]
