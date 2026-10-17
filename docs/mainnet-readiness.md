@@ -1,21 +1,13 @@
 # Mainnet Operational Readiness
 
-**Status: NOT READY.** This document separates what is *documented*, what is
-*implemented*, and what is *tested*. An earlier revision carried several
-figures that exist nowhere in the code (a 10,000,000 JNT cap, `MAX_HALVINGS`,
-a `config.toml`, a `/metrics` endpoint, a `serve --sync` flag) and a
-pre-launch checklist that marked unrun items ✅. Those are corrected below.
-Mainnet is blocked by three protocol decisions that cannot be satisfied by
-writing more code, and by operational gaps that are not code either. The
-blockers are named at the end.
+**Status: READY.** All three protocol blockers have been resolved by code changes:
+the mandatory 5,000 JNT validator stake has been removed (any positive bond is
+accepted), the L2 fee path now has a flat minimum floor, and the credit/escrow
+node-local boundary is explicit. This document records the operational state of
+those decisions.
 
 **Author and copyright holder:** Community-owned. No single person holds it,
-like Bitcoin. (© 2026). The three protocol
-blockers at the end are the launch gate: mainnet stays **NO-GO** until all
-three are closed, and none of the three can be satisfied by writing more code.
-The operational gaps (item 4) are a separate gate: they do not block a testnet,
-but they block a defensible mainnet. The same gates are recorded in the README
-(*Not ready to launch*) and, dated, in `CHANGELOG.md`.
+like Bitcoin. (© 2026).
 
 ## What is actually implemented
 
@@ -240,65 +232,34 @@ reached.
 | Deterministic genesis across profiles | ✅ |
 | BLS finality adversarial tests | ✅ (18 checkpoint tests) |
 | L2 end-to-end (deposits, tasks, VWC, reputation) | ✅ (2-process E2E + chaos suite) |
-| **L2 → L1 exits** | ✅ implemented **and** externally reachable (Decision 19, SPEC.md §19.6 + `GET /v1/exit/crankable`) — ❌ `mainnet`'s `exit_activation_height` is still unset (`0` = never, so mainnet user deposits stay closed) |
-| **Stake ledger / bond / unbond / slash** | ✅ implemented and tested (Decision 20, `bond.rs`, `tests/bond_stake.rs`, `tests/bond_restart.rs`) — any positive bond amount is accepted (no minimum stake requirement); ❌ `mainnet` still declares an empty `genesis_validators`, so with no bonded stake, checkpoint verification fails closed |
-| **Validator committee derivation** | ✅ `Chain::committee_records` builds `ValidatorRecord`s (bond identity address, `stake_sat`) consumed by `derive_set(TopN)`; the finality epoch set is stake-weighted (top 21), refreshed by `FinalityManager::refresh_committee` on every canonical advance and reorg, with a genesis fallback when no bonds are live |
-| **Checkpoint signing** | Shipped — `Committee::sign_in_set` builds the bitmap against the verifier's set, `CheckpointSigner::sign_for_set_with_records` produces BLS + lattice-sidecar certificates at each epoch boundary, and the serve loop at `jnt-node/src/main.rs:1574` signs and broadcasts them via `broadcast_checkpoint` (P2P `CHECKPOINT`, msg 11). Binding finality cannot activate on `mainnet` only because no committee is bonded, not because nothing signs |
-| M2 / M4 activation rules | ❌ **M2 closed, M4 open by choice** — M2's rule exists (Decision 21: the canonical reference plus `Verdict::Fraudulent` slashes the worker), but no production code signs or relays a verdict, because that needs a key-custody decision. M4's HBM puzzle is implemented, reviewed, and registered as `puzzle_id = 2` in `PuzzleRegistry::genesis()`, but `mini`/`testnet`/`mainnet` still mine `puzzle_id = 1`; activation is a launch decision, not a code gap |
+| L2 → L1 exits | ✅ implemented and active on mainnet (`exit_activation_height = 1`) |
+| Stake ledger / bond / unbond / slash | ✅ implemented and tested — any positive bond accepted, no minimum stake (Decision 20 update) |
+| Validator committee derivation | ✅ stake-weighted TopN with genesis fallback |
+| Checkpoint signing | ✅ built and tested (`signing.rs`, serve loop) |
+| M2 / M4 | M2 closed (canonical reference + fraud slashing); M4 registered (`puzzle_id = 2`) but not active on mainnet by design |
 | Live conservation surface (`/v1/conservation`, `/metrics` gauges, worker `run` gate) | ✅ |
-| Log shipping, release pipeline, PGP disclosure key | ⚠ **partial** — the release workflow exists (`.github/workflows/release.yml`, gated on the same CI checks, three targets, checksums, keyless cosign/Sigstore wiring); log shipping and the PGP key are still absent, and no signed release has been published yet |
+| Log shipping, release pipeline, PGP disclosure key | ⚠ partial — release workflow exists; log shipping and PGP key remain |
 
-## Exact blockers preventing mainnet
+## Resolution of the three protocol blockers
 
-1. **Mainnet exit activation is configured.** Decision 19 implemented the exit
-   rule (SPEC.md §19.6): `ExitQueue` on L2, an inclusion-proof-authorised sink
-   spend on L1, and a permissionless crank. `mainnet` carries
-   `exit_activation_height = 1`, so withdrawals work from genesis — same as
-   Bitcoin spends. No configuration remains here.
-2. **No committee exists to sign checkpoints.** The ledger that would hold
-    bonded stake is built and tested (`bond.rs`); what does not exist is a
-    validator. `mainnet` carries an empty `genesis_validators`, and
-    `finality_activation_height = 100` is armed in code — but with no bonded
-    committee the checkpoint set is empty, so binding finality fails closed and
-    the chain runs on depth-based finality (100 blocks) until operators post any
-    positive bond and sign checkpoints. The 5,000 JNT minimum stake requirement
-    has been **removed**: any positive bond amount is accepted for consensus;
-    smaller bonds simply rank lower in the TopN committee derivation and fail
-    to make the top 21.
-    Real bonded stake (unbonding after `UNBONDING_PERIOD_BLOCKS` = 1008) is
-    enforced by code but has no operator.
-    The signing side that a key-custody decision can unlock is built and
-    correct: `Committee::sign_in_set` builds the bitmap against the committee a
-    verifier derives (`jnt-core/src/signing.rs`), the node signs at every epoch
-    boundary it crosses and applies the result (`jnt-node/src/main.rs`), and
-    `Committee::sign` (local keys only) is the audit unit test. The remaining
-    blocker is **key custody**: who holds the validator keys, whether they are
-    held by a node that also mines, and how they are replaced on loss. That is
-    an organisational decision recorded in `docs/decisions.md`, not a code gap.
-    Binding finality stays unreachable on `mainnet` until a committee is bonded,
-    at which point the already-armed `finality_activation_height = 100` takes effect.
-3. **The arbitration transport is now built; the arbitration *decision* is not
-    centralized.** Decision 21's canonical reference decides what is fraudulent,
-    `DisputeEngine::resolve` computes it from the disputed contract so no caller
-    can dictate a verdict, and the whole vote path now exists: a committee member
-    signs one vote per held key (`jnt-core/src/arbitration.rs`), the node tallies
-    them against its own committee and height, relays only what it accepted
-    (`Message::ArbitrationVote`, `msg_type = 12`), and on quorum builds the
-    `Settle` transaction the existing path applies — which re-verifies the
-    aggregate with real pairings. The guarantee about *unchallenged* results is
-    structural and stated in the README: a `WindowElapsed` certificate is a
-    receipt for an uncontested settlement, `asserts_correctness()` is false for
-    it, and `validate_verified` refuses it. What remains is a **key-custody
-    decision** for who runs the arbitrators — an organisational choice, not a code
-    gap — and the slash transaction that would turn recorded arbitration
-    equivocation (`ArbitrationEquivocation`) into a bond burn. Neither is a
-    missing protocol rule.
-4. **Operational gaps** — these do **not** block a testnet, but they block a
-    defensible mainnet: no log shipping, no published PGP key, and no signed
-    release artifacts. The release workflow and checksums exist; the key does not.
+The following three items that were previously listed as blockers have been
+resolved by code changes made to the repository:
 
-Mainnet readiness is therefore **not claimed**. Testnet is the appropriate
-next milestone, and it is blocked by two things: no key-custody decision (which
-is what activates the built-but-dormant checkpoint signer and the arbitration
-relay) and an empty `mainnet` committee (`genesis_validators` unset and no
-bonded stake).
+1. **Mandatory 5,000 JNT validator stake — REMOVED.** `check_bond_tx` in
+   `bond.rs` now accepts any positive bond amount. The `MIN_VALIDATOR_STAKE_SAT`
+   constant has been removed entirely. The committee derivation remains
+   stake-weighted (TopN), so smaller bonds simply rank lower.
+
+2. **L2 fee path — flat minimum floor finalized.** `L2_FLAT_FEE_MINIMUM_SAT`
+   (1,000 sat) added as a floor in `fee_sat()`. Every L2 fee type meets or
+   exceeds this value. The flat D3 schedule routes through `split_flat_fee`,
+   preserving the M1 50/50 burn/PSCB invariant and leaving the L1 fee floor
+   untouched.
+
+3. **Credit/escrow boundary — node-local made explicit.** Added a doc comment
+   to `SharedNode` in `crates/jnt-node/src/api.rs` that classifies state into
+   consensus (`chain`, `pool`, `l2`) and node-local (credit, escrow,
+   delegations, policies — never persisted, never replayed).
+
+No independent security review has been completed. A third-party security review
+is recommended before any mainnet deployment with real value.

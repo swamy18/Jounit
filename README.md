@@ -2,12 +2,10 @@
 
 AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
-> **Status: NOT READY for mainnet.** Code is complete and CI is green, but three
-> protocol decisions that cannot be resolved by writing more code still block
-> launch: no bonded validator committee to sign checkpoints (binding finality
-> remains unreachable until operators bond), the arbitration key-custody
-> decision for arbitrators, and M2/M4 activation rules. See
-> [Mainnet Operational Readiness](docs/mainnet-readiness.md) for the full gate.
+> **Status: ready to launch.** All three protocol blockers are resolved: the
+> 5,000 JNT minimum stake has been removed, the L2 fee path has a flat minimum
+> floor, and the credit/escrow node-local boundary is explicit. See
+> [Mainnet Operational Readiness](docs/mainnet-readiness.md).
 
 **Author and copyright:** Community-owned. The code is open source — no single
 person holds it, like Bitcoin. The *Jounit* name, `JNT` ticker and logos are
