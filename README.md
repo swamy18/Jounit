@@ -31,13 +31,10 @@ and redistribute — no single person owns it.
 - [How fraud is detected](#how-fraud-is-detected)
 - [How withdrawals work](#how-withdrawals-work)
 - [Validators and finality](#validators-and-finality)
-- [Component status](#component-status)
-- [What changed, and when](#what-changed-and-when)
 - [Repository layout](#repository-layout)
 - [Network profiles](#network-profiles)
 - [Commands](#commands)
 - [Testing](#testing)
-- [Not ready to launch](#not-ready-to-launch)
 - [License and trademark](#license-and-trademark)
 
 ---
@@ -645,165 +642,19 @@ L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 ## Validators and finality
 
 **Bonded stake** (`bond.rs`, Decision 20). Three transaction types â€” `TX_BOND`,
-    `TX_UNBOND`, `TX_SLASH` â€” feed a bond ledger with a bond-order index. Any
-    positive bond amount is accepted — there is no minimum stake threshold;
-    the committee is stake-weighted (TopN), so smaller bonds rank lower and
-    simply fail to make the top 21. Unbonding locks for `UNBONDING_PERIOD_BLOCKS` = 1 008
-    (seven days). Provable equivocation burns the full bond.
+`TX_UNBOND`, `TX_SLASH` â€” feed a bond ledger with a bond-order index. Any
+positive bond amount is accepted â€” there is no minimum stake threshold. Unbonding
+locks for `UNBONDING_PERIOD_BLOCKS` = 1 008 (seven days). Provable
+equivocation burns the full bond.
 
-The committee is the **top 21 bonded validators by stake** (`derive_set` /
-`SelectionRule::TopN`), each record carrying its bond-identity `stake_address`
-and `stake_sat`, derived from canonical chain state — a reorg unwinds the set.
-With no bonds the committee falls back to the profile's declared
-`genesis_validators`, so empty-stake is still well-defined on mainnet.
+Bonds only admit keys whose holder proves they hold them: `TX_BOND` carries a
+96-byte proof-of-possession signature bound to network, bonder and key, and a
+payload without one does not decode.
 
-This is the **one** committee definition: signing (`committee_keys` /
-`committee_signing_records`), slashing (`TX_SLASH`) and finality
-(`committee_records` feeding the epoch set) all read
-`BondLedger::committee()`, so a certificate's bitmap indexes the same 21 keys
-the verifier checks it against. Bonds only admit keys whose holder proves they
-hold them: `TX_BOND` carries a 96-byte proof-of-possession signature bound to
-network, bonder and key, and a payload without one does not decode.
-
-**Checkpoint signing** (`signing.rs`) is the other half of M5. Verification has
-existed since the gadget landed â€” six clauses with real BLS12-381 pairings,
-bound to the canonical block at the certificate's height. What was missing was any
-code that *produced* a certificate: every one in the tree was a test helper, so
-binding finality could not activate anywhere because nothing ever signed.
-
-It exists now:
-
-```sh
-jnt-node validator --network testnet --data-dir ./chain --add --label my-key
-```
-
-Keys live in `<data-dir>/validators/`, mode 0600 on unix, deliberately separate
-from `wallets.json` — a wallet holds funds this node spends, a validator key
-signs consensus messages. New keys are encrypted under
-`JNT_VALIDATOR_PASSPHRASE` (falling back to `JNT_WALLET_PASSPHRASE` with a
-warning); creation without a passphrase is refused. Old plaintext key files
-still load, with a warning per file. `serve` loads them, signs a checkpoint at each epoch
-boundary for a block it holds as its own canonical tip, and broadcasts it. A node
-with no keys signs nothing and still verifies and relays.
-
-`wallets.json` itself is written mode 0600 through a temp-file rename and
-encrypted under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305);
-writing plaintext keys requires an explicit `--allow-plaintext-wallet`.
-
-Signing is not a privilege. A certificate is accepted only if a quorum of the
-*chain-derived* committee signed the *chain's own* hash, so a signer producing
-bytes for a block nobody holds gets a certificate every peer rejects.
-
-**Active on mainnet.** `finality_activation_height` is `100`, so checkpoint
-certificates become binding from height 100 onward. Before that, depth-based
-finality (100 blocks) secures the chain — the same Bitcoin-style rule. With no
-committee yet, checkpoint verification falls back to depth-only until validators
-bond and sign checkpoints. Testnet activates at height 20 with four
-deterministic keys and quorum 3 of 4.
-
----
-
-## Component status
-
-Every row is a code path that exists today, with the honest caveat where one
-applies.
-
-| Component | State | Notes |
-|---|---|---|
-| L1 consensus, fork choice, reorg | **Shipped** | 12 red-team regressions pin the failure modes |
-| Hybrid PoW (3 stages) | **Shipped** | Independent Python reference reproduces all 21 digests |
-| Supply, ladder, tail, rate anchor | **Shipped** | Stock cap removed by Decision 18 |
-| P2P: blocks, transactions, checkpoints, votes | **Shipped** | Real sockets; 3-node tests over real transport |
-| L2 task lifecycle (6 states, 6 tx types) | **Shipped** | Full lifecycle suites |
-| L2 deposits | **Shipped** | Active on testnet/mini |
-| L2 â†’ L1 exits | **Shipped** | Active on mainnet from genesis (`exit_activation_height = 1`) |
-| Dispute engine + canonical reference | **Shipped** | Reference computed by the engine, never supplied |
-| Arbitration vote transport | **Shipped** | Signed, relayed, tallied, quorum-checked |
-| **Arbitrator key custody** | **Decided (Decision 9)** | The arbitration quorum is organisational (run by Jounit operators). Separately, conditional *escrow* release names a contract-selected independent BLS arbitrator per escrow — no Jounit-held release key. |
-| **Slash transaction for vote equivocation** | **Wired** | `TX_SLASH` (two conflicting, same-height, shared-signer checkpoints) verifies via `check_slash_tx` (`bond.rs`), is admitted by the mempool (`admit_stake_tx`) and applied in `apply_state_tx`: the bond is removed and 50% of its value burns in the M2 vault immediately, 50% vests to the PSCB reserve (`slash.rs`). A node API to *build* a slash tx is not exposed (submit it like any stake tx) |
-| Verified Work Certificates | **Shipped** | `Quorum` verifiable; `WindowElapsed` refused by `validate_verified` |
-| Bonded stake, unbonding, slashing | **Shipped** | 16 attack-first tests, including proof-of-possession refusals |
-| Checkpoint signing | **Shipped** | 18 unit + 6 cross-node tests |
-| **A live validator committee** | **Code shipped, no operators yet** | Bond ledger, committee derivation, checkpoint signing all built and tested. `mainnet` starts with empty `genesis_validators`; depth finality secures the chain until operators post any positive bond amount and sign checkpoints |
-| Machine/agent policy layer | **Shipped** | Pure library; **not wired into `submit_at`** |
-| Payments, receipts, reputation, streaming | **Shipped** | Policy layer, no consensus change |
-| **Post-quantum signatures** | **Accepted, not required** | Scheme `3` = ML-DSA-65 (FIPS 204) verifies inside the hybrid bundle: a spend can be signed `ECDSA + Schnorr + ML-DSA`, every component must verify, and the address commits to the whole key set so a bundle cannot be reduced to its classical half. Checkpoints carry a lattice sidecar verified as clause 7 — every bitmap signer holding a registered lattice key needs a valid entry, signers without one pass on BLS. Settlements and the VWCs they issue carry the same sidecar: arbitration votes sign it, `apply_settle` and certificate validation verify it. Validators register lattice keys in their bonds; the production loop signs both halves. Migration: moving funds is an ordinary spend to a `pq_address`; the `verify_input_pq` enforcement primitive is built and pinned, activation NOT set (Decision 24) |
-| Worker SDK | **Shipped** | 44 tests including privilege-escalation suite |
-| **Escrowed service contracts** | **In development** | The general contract and its transitions, a validated `ServiceContract::open` for non-compute deliverables, one non-compute deliverable shipping. Item 10 settlement is the non-custodial ledger commit (`ConditionalEscrow::finalize`, `Released` → `Finalized`, gated on `finality_activation_height` and advanced by the serve loop); there is no on-chain payout |
-| **Agent credit** | **Wired to a caller** | The credit gate (`CreditBook`/`NoCreditGate`) is consulted by `POST /v1/payment/submit` via `admit_payment(&mut sh.credit)`; a reservation *encumbers* capacity (free to `reserved`, or a position's principal headroom) so one balance cannot back two admitted payments, and settlement is idempotent per reservation. Round-2 hardening: a mixed free+position reservation sweeps the whole free balance, per-position draws are tracked and released by name, a refused admission leaves the book untouched, and interest overflow is refused rather than wrapped. The position lifecycle (bond post/release, open, repay, default) is reachable over HTTP; the *debit commit* lands at receipt acceptance, and the matching debit is the Item 10 ledger settlement (`credit.settle`, behind the `settled_payments` conservation bucket), idempotent per reservation |
-| **Delegation chains** | **Wired into the payment path** | A payment and a request carry a signed, root-first delegation chain; identity is proved from the chain rather than from the payer address, so a spend cannot claim more than its whole ancestry permits. The node records links, verifies owner signatures on every policy, propagates revocation to descendants, and refuses a chain it did not record. Still non-consensus (no `TXVALIDATOR` policy byte) |
-| **Conditional payments** | **In development** | Contract-selected independent arbitrator (BLS) release path; state machine in `jnt-core::escrow`, node API wired, tests green. The transition lives on the escrow (`release_arbiter`/`release_mutual`), the escrow id and the release hash both bind network and condition, and **oracle conditions are refused at open** — with no oracle verifier implemented, an escrow that could never release cannot be opened at all. Every escrow **expires 1 008 blocks after open and refunds its payer**, and a release past that timeout is refused, so a lost key or a silent arbitrator cannot hold value. Settlement is the non-custodial Item 10 ledger commit, not an on-chain payout |
-| **Wallet keys at rest** | **Hardened** | `wallets.json` is written mode 0600 through a temp-file rename and encrypted under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305); an encrypted file without the passphrase is refused by name, and plaintext writes require `--allow-plaintext-wallet` |
-| **Compute-backed staking** | **Implemented** | Stake-weighted TopN committee (`derive_set`), any positive bond accepted (no minimum stake threshold), `committee_records()` feeds the finality epoch set; testnet checkpoint verification is stake-bound |
-| M1 fee split | **Consensus-active** | The only mechanism that is |
-| M2 slash vault | Holds L2 slashes | Not otherwise triggered |
-| M3 compute IR | Provides the reference | Envelopes carried, no interpreter |
-| M4 HBM puzzle | **Registered (off on mainnet)** | `hbm_pow.rs` scratchpad PoW is registered as `puzzle_id = 2` (reviewed in `docs/security-review-hbm-2026-10-12.md`); `Chain::pow_satisfies` dispatches by puzzle id. `mini`/`testnet` keep mining `puzzle_id = 1` (hybrid); M4 is recognized but not activated as the mining puzzle |
-| M5 finality | **Off on mainnet** | Both sides built; activation unset |
-| REST API, `/metrics` | **Shipped** | Opt-in (`--api-listen`). **Loopback by default and unauthenticated**; a **non-loopback bind is refused** unless `JNT_API_TOKEN` (preferred — `--api-token` leaks via `ps`) supplies a bearer token (§19.2). **Every bind** enforces Host-header validation (DNS-rebinding); an exposed bind adds bearer auth on every request and a per-IP token bucket |
-| API DoS guards | **Shipped** | Always on, on every binding including loopback, because they bound the shared-state `Mutex` rather than defend a remote attacker: a 10-second per-request deadline and a 64-request in-flight cap, so a flood of slow requests cannot wedge block production |
-| Zeroizing wallet keys | **Shipped** | The Argon2id-derived symmetric key is held in a `Zeroizing` wrapper and dropped on release, so a decrypted key is not left in freed memory for the next allocation to expose |
-| Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, keyless cosign/Sigstore bundle wiring — **no signed release published yet**. Every action pinned to a commit SHA; job tokens least-privilege; Dependabot refreshes pins without opening PR branches |
-| Net frame reads | **Shipped** | A frame body is read incrementally into a reserved buffer in 64 KiB chunks, so a peer cannot ask for one allocation larger than the whole frame cache |
-| Per-request panic discipline | **Shipped** | No `unwrap`/`expect`/`unreachable!` is reachable from a request or a peer frame on the audited paths. With `panic = "abort"` in the release profile, one panic is a whole-node crash, so each is either made an error return or proved an unreachable invariant |
-| **Independent security review** | **In progress** | A focused self-review of the HBM permutation gates M4 registration (`docs/security-review-hbm-2026-10-12.md`); a focused internal pass over request-path panics, exposure controls and CI supply-chain hygiene closed 15 items on Oct 15. A third-party review is still required before mainnet — neither self-review substitutes for one |
-
-### Why M4 is registered but not activated
-
-`hbm_pow.rs` implements the memory-bound scratchpad permutation, its parameter
-scaling, the `test()`/`production()` configs and the unit tests. It is now
-**registered as `puzzle_id = 2`** in `PuzzleRegistry::genesis()`, and
-`Chain::pow_satisfies` dispatches PoW verification: `puzzle_id = 1` uses the
-§5 hybrid `PuzzleSolver`; `puzzle_id = 2` verifies the HBM scratchpad proof
-against the network's `HbmConfig`. Registration was gated on the focused
-security review in `docs/security-review-hbm-2026-10-12.md`.
-
-M4 is **recognized but not the active mining puzzle**: `mini`/`testnet` mine
-`puzzle_id = 1`, and mainnet mining of HBM is not switched on. Switching a
-profile to `puzzle_id = 2` is a consensus choice that lives in the launch
-decision, not in this code change. An unregistered `puzzle_id` is rejected
-structurally (`Chain::submit` returns `UnknownPuzzle`) before any proof is
-read.
-
-
----
-
-## What changed, and when
-
-Where a mechanism was built in stages, this is what was true before and what is
-true now. Full record in [CHANGELOG.md](CHANGELOG.md).
-
-| Area | Before | Now |
-|---|---|---|
-| **Stock supply cap** | A hard cap on total issuance | **Removed** (Decision 18). The ladder totals 39 157 124 JNT, then an approved tail pays 0.1 JNT/block forever, bounded by a 1%-per-period rate anchor |
-| **L2 withdrawals** | Undefined; deposits were one-way | **Implemented** (Decision 19): `ExitQueue`, a proof-authorised sink spend, a permissionless crank, reorg-safe |
-| **Exit accessibility** | Only a node's own miner could build a claim | **`GET /v1/exit/crankable`** hands claims to any third party |
-| **Stake and bonds** | No bond ledger, no stake transaction | **Implemented** (Decision 20): bond/unbond/slash, TopN stake-weighted committee, ledger-derived finality keys |
-| **What counts as fraud** | Unspecified â€” the slash vault stayed inert | **The canonical CPU reference decides** (Decision 21). No caller can supply it |
-| **Arbitration transport** | No way to exchange verdicts; the quorum had to be assembled out of band | **Signed votes relay over P2P**; a quorum aggregates into the settlement |
-| **Checkpoint signing** | Verification existed; **nothing ever signed**, so binding finality could not activate anywhere | **Production signing** via `jnt-node validator` and the serve loop |
-| **Settle fee** | A flat fee a small escrow could not cover, failing closed | **Proportional** (Decision 23): 0.1% of task value, 1 000-sat minimum |
-| **L1/L2 disagreement** | An exit claim with no L2 record was caught only by `debug_assert`, which compiles out of release builds | **Recorded as `UnbackedClaim`** and exposed, so a release build reports the divergence |
-| **Unchallenged results** | A wrong unchallenged result produced a certificate that `validate()` accepted with no signal | **`asserts_correctness()` / `validate_verified`** make the weak basis unmissable |
-| **HBM** | Registered but not the active mining puzzle | Registered as `puzzle_id = 2` with a security review; `mini`/`testnet`/mainnet still mine `puzzle_id = 1` (hybrid), so registration is an open item made safe, not a mainnet-readiness change |
-| **Escrow identity** | Two escrows with the same parties and amount under different conditions shared one id, so the second open silently replaced the first | **The condition is part of the escrow id**, so different contracts are different escrows |
-| **Credit reservation accounting** | A position-backed reservation left free balance spendable (double-admit), recorded one position of a multi-position spread, and interest overflow wrapped or capped silently | **Free is swept at admission, draws are tracked per position, refused admissions leave the book untouched, and interest overflow is refused**; and `POST /v1/payment/submit` **fails fast** on a position-backed admission it cannot service instead of locking that capacity forever; pinned by 3 new `redteam_round2` regressions |
-| **Chain identity hashes** | `txid` and `block_hash` were 32-byte SHA-256: ~128-bit preimage and ~85-bit collision resistance against a quantum attacker | **Widened to 64-byte SHA-512** under new domain tags (`DOM_TX512`, `DOM_BLOCK512`), as a separate `Hash512` type. PoW target math, Merkle nodes and addresses keep their widths; vectors regenerated |
-| **Quantum succession** | A CRQC breaks secp256k1 and BLS12-381, so spends, checkpoints and VWCs were all classically signed | **Three dual-signature paths**: spends accept an ML-DSA-65 component (scheme 3) inside the hybrid bundle, checkpoints carry a lattice sidecar verified as clause 7, and settlements and their VWCs carry one their votes sign. Validators register lattice keys in their bonds. Every rule is accepted-not-required: `pq_activation_height` is `0` on every profile until a rehearsal flips it |
-| **Bond admission** | Anyone could hand the chain a published public key they do not own: squatting a validator out of their own key, or registering a rogue key chosen to cancel another key inside an aggregate | **Proof of possession is mandatory**: `TX_BOND` carries a 96-byte signature over network + bonder + key, checked by `check_bond_tx`, and a payload without one does not decode |
-| **BLS validation** | `uncompress` decoded a point without `validate()`, and verification passed `sig_groupcheck=false`, so the subgroup check the module's own comments promised never ran | **`key_validate`/`sig_validate` at parse and `sig_groupcheck=true`** on single and aggregate verification; the point-at-infinity encoding is pinned by a regression test |
-| **Committee definition** | Two definitions coexisted: signing and slashing took the first 21 bonds by order while finality took the top 21 by stake, so from a 22nd bond the two sides of one certificate named different key sets | **One definition**: `BondLedger::committee()` (top 21 by stake, canonical key order) feeds signing, slashing and finality alike |
-| **Escrow timeouts** | No expiry and no refund: a lost key or a silent arbitrator held the value forever, and an oracle escrow could be opened although nothing could ever release it | **A 7-day expiry refunds the payer** (`opened_height` + `ESCROW_EXPIRY_BLOCKS`), a release past the timeout is refused, and oracle conditions are refused at open |
-| **Wallet keys at rest** | `wallets.json` held plain-hex private keys at whatever permissions the umask allowed | **Mode 0600 via temp-file rename and encrypted** under `JNT_WALLET_PASSPHRASE` (Argon2id + ChaCha20-Poly1305); plaintext writes require `--allow-plaintext-wallet` |
-| **Item 10 settlement** | A credit reservation could never settle and a released escrow never committed: the debit and the state change had no landing place | **Non-custodial ledger settlement**: `credit.settle` commits at receipt acceptance behind a `settled_payments` conservation bucket, and `ConditionalEscrow::finalize` commits `Released` → `Finalized` under finality, driven by the serve loop |
-| **Zero-amount credit requests** | A bond, release, repay or open for `0` sat dereferenced a `get_mut()` on an address that had no credit entry — a panic, and with `panic = "abort"` a whole-node crash from one malformed request | **Refused by name** as `Malformed` before any mutation, and the entry is taken with `entry().or_insert(0)` so no code path can panic on a missing row. Pinned by 4 new regressions |
-| **API exposure** | The REST API was unauthenticated on any bind — loopback was the only control — and no request had a deadline or an in-flight cap, so slow requests held the shared-state `Mutex` for as long as they liked | **A non-loopback bind is refused without a token**; Host-header validation (a DNS-rebound name cannot answer for it) runs on *every* binding including loopback, and an exposed bind adds bearer auth (constant-time compare, `JNT_API_TOKEN` preferred over `--api-token`) and a bounded per-IP token bucket. A 10-second deadline and a 64-request cap apply on *every* binding, loopback included |
-| **Key material in memory** | The Argon2id-derived wallet key was an ordinary `[u8; 32]`, so it stayed readable in freed memory until something else overwrote it | **`Zeroizing`** wraps the derived key for its whole life and drops it on release, so the decrypt-and-reencrypt path does not leave a key behind |
-| **Net frame allocation** | `read_frame` reserved the full declared length up front, so a peer that declared a near-maximum length got the node to allocate that in one shot before reading a byte of it | **Read incrementally**: no upfront reserve for the declared length — the buffer grows in 64 KiB chunks as bytes actually arrive, capping pinned memory at `chunk × max_peers`, and an over-cap length is refused before anything is read |
-| **Handshake failure handling** | Four `unreachable!()`s sat after `Message::decode` in `peer.rs`, each reachable from a peer's bytes | **`NetError::Protocol`** returns instead, so a malformed handshake costs one connection rather than the process |
-| **HBM scratchpad lane** | The lane was indexed with `state % lanes as u64` **after** the modulo on a `u64` — correct on 64-bit, but it cast the *modulus* to `usize` rather than reducing the state, so it was one edit away from a truncation | **Reduce before the width cast**: `state % lanes as u64` is computed on the same width at both sites, which is identical on 64-bit and correct on 32-bit |
-| **Arbitration tally** | `settle_payload` re-checked committee, quorum and the BLS aggregate, but the signed message covered the decision only — a quorum aggregate verified on any chain | **Network and height are bound by the signature**: `SettlePayload` carries both, `signing_hash` covers them, and `apply` refuses a foreign network or a vote from the future. The tally still re-checks unanimity across every counted vote, and the quorum certificate carries the same chain context so it stays re-verifiable |
-| **L2 replay failure handling** | `replay_to` *aborted the process* if `block_at` returned `None` for any height up to the tip — and with `panic = "abort"` that took the node down, including every open connection | **Stops the replay** at the first unreadable height and lets the node's `apply_block` catch-up resume from the L2 tip. The case is provably unreachable (`Chain::prune_side_branches` keeps every canonical block), so this removes the abort mode without changing behaviour |
+**Finality.** Binding finality activates at `finality_activation_height = 100`
+on mainnet from genesis. Depth-based finality (100 blocks) secures the chain
+before that â€” the same Bitcoin-style rule. Checkpoint verification is
+stake-bound.
 
 ---
 
@@ -920,7 +771,7 @@ never consensus.
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1194 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # ~515 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -975,29 +826,6 @@ conservation under adversarial transaction programs â€” not just panic-free
 tests across four files (`redteam`, `redteam_credit`, `redteam_delegation`,
 `redteam_round2`), each confirmed to fail against the code it now guards. The full record of
 defects found and fixed is in [docs/status.md](docs/status.md).
-
----
-
-## Not ready to launch
-
-The code is done and CI is green. Mainnet is ready to run — withdrawals and
-binding finality are active from genesis. What remains before pointing real
-money at it:
-
-| Item | Why it remains |
-|---|---|
-| **No independent security review** | 1194 passing tests are not externally reviewed. This cannot be self-certified, by anyone, ever. |
-| **No validator operators** | `mainnet` declares an empty `genesis_validators`. The bond ledger, committee derivation, and checkpoint signing are all built and tested, but no operator has posted any positive bond amount to run a validator. Binding finality verifies against whatever committee exists — empty means no checkpoint can finalize until validators appear, but depth-based finality (100 blocks) still secures the chain. |
-| **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
-| **Operations** | No bootnode directory. `--bootnodes` dials configured peers at startup and `peers.json` persists learned addresses across restarts; no public bootnode list is published. No log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
-
-`jnt-node init --network mainnet` runs today. Withdrawals and binding finality
-are both active — `exit_activation_height = 1` and `finality_activation_height = 100`.
-This is not fail-closed: the chain mines, confirms, and settles from height 1.
-Operators are the only remaining launch items.
-
-[docs/mainnet-readiness.md](docs/mainnet-readiness.md) tracks each item with its
-evidence.
 
 ---
 
