@@ -770,7 +770,8 @@ only, while a non-loopback bind additionally accepts any IP literal, the bound
 address, and hostnames listed via `--api-allowed-host` (comma-separated) or
 `JNT_API_ALLOWED_HOSTS`. A missing, unknown, or bracket-malformed `Host` is
 403. Exposed binds also rate-limit per remote address, and every bind caps a
-request at 10 seconds and 64 in flight.
+request at 10 seconds, 64 requests in flight, 128 open connections, and 30
+seconds to finish sending request headers (the slowloris bound).
 figures are in JNT.
 
 Credit, escrow and delegation state is node-local: it lives in memory, is

@@ -214,6 +214,57 @@ fn health_status_fees_and_finality_answer() {
 }
 
 #[test]
+fn utxo_listing_pages_with_a_stable_cursor() {
+    let params = NetworkParams::mini();
+    let miner = wallet(71, "page-miner");
+    // 15 coinbases, all listed: an immature output is still an unspent one,
+    // `spendable` is just a flag on it.
+    let chain = mine_to(&params, &miner, 15);
+    let node = start_with(chain);
+    let path = format!("/v1/utxo/{}", address_to_hex(&miner.address().unwrap()));
+
+    // Default request: the whole list, as before the cursor existed.
+    let (s, body) = get(&node, &path);
+    assert_eq!(s, 200);
+    assert_eq!(body["count"], 15);
+    assert!(body["next_cursor"].is_null());
+    assert_eq!(body["utxos"].as_array().unwrap().len(), 15);
+
+    // Walk pages of 6 (6 + 6 + 3): `count` stays the total, every outpoint
+    // appears exactly once, and the order is deterministic.
+    let mut cursor = Some(0u64);
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    for _ in 0..10 {
+        let Some(c) = cursor else {
+            break;
+        };
+        let (s, page) = get(&node, &format!("{path}?limit=6&cursor={c}"));
+        assert_eq!(s, 200);
+        assert_eq!(page["count"], 15, "count is the total, not the page");
+        for u in page["utxos"].as_array().unwrap() {
+            seen.push((
+                u["txid"].as_str().unwrap().to_string(),
+                u["index"].as_u64().unwrap(),
+            ));
+        }
+        cursor = page["next_cursor"].as_u64();
+    }
+    assert!(cursor.is_none(), "the walk must end on a null next_cursor");
+    assert_eq!(seen.len(), 15, "every output listed exactly once");
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "sorted across page boundaries, never overlapping"
+    );
+
+    // A cursor past the end is an empty page, not an error.
+    let (s, past) = get(&node, &format!("{path}?limit=6&cursor=999"));
+    assert_eq!(s, 200);
+    assert_eq!(past["count"], 15);
+    assert!(past["utxos"].as_array().unwrap().is_empty());
+    assert!(past["next_cursor"].is_null());
+}
+
+#[test]
 fn metrics_endpoint_serves_prometheus_gauges_in_the_exposition_format() {
     let node = start();
     // `http`/`exchange` deliberately strip the headers, so this test reads the
@@ -449,6 +500,77 @@ fn a_local_transaction_is_built_signed_broadcast_then_looked_up() {
     let (s, pool) = get(&node, "/v1/mempool");
     assert_eq!(s, 200);
     assert_eq!(pool["count"], 1);
+}
+
+#[test]
+fn mempool_pages_by_txid_with_count_as_the_total() {
+    let params = NetworkParams::mini();
+    let a = wallet(61, "page-a");
+    let b = wallet(62, "page-b");
+    // Alternate the coinbases between two wallets so each has its own mature
+    // outputs: two broadcasts, two independent inputs, no shared coin to race
+    // the coin selection on.
+    let mut chain = Chain::new(params).unwrap();
+    for h in 1..=15u64 {
+        let m = if h % 2 == 0 { &b } else { &a };
+        let block = chain
+            .mine_block(
+                m.address().unwrap(),
+                vec![],
+                GENESIS_TIMESTAMP_MS + h * 1_000,
+            )
+            .unwrap();
+        chain.submit(block).unwrap();
+    }
+    let node = start_with(chain);
+    for w in [&a, &b] {
+        let from = w.address().unwrap();
+        let (s, built) = post(
+            &node,
+            "/v1/tx/build",
+            &serde_json::json!({
+                "from": address_to_hex(&from),
+                "to": address_to_hex(&from),
+                "amount_sat": 1_000_000,
+                "max_fee_sat": 1_000_000,
+            }),
+        );
+        assert_eq!(s, 200, "build failed: {built}");
+        let mut tx = Transaction::deserialize(
+            &hex::decode(built["unsigned_tx_hex"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        w.sign(&mut tx).unwrap();
+        let (s, body) = post(
+            &node,
+            "/v1/tx/broadcast",
+            &serde_json::json!({ "signed_tx_hex": hex::encode(tx.serialize()) }),
+        );
+        assert_eq!(s, 200, "broadcast failed: {body}");
+    }
+
+    // Page one at a time: `count` stays the total, the cursor walks each tx
+    // exactly once, and the last page ends with a null `next_cursor`.
+    let (s, p1) = get(&node, "/v1/mempool?limit=1");
+    assert_eq!(s, 200);
+    assert_eq!(p1["count"], 2, "count is the total, not the page");
+    assert_eq!(p1["entries"].as_array().unwrap().len(), 1);
+    let first = p1["entries"][0]["tx_hash"].as_str().unwrap().to_string();
+    let next = p1["next_cursor"]
+        .as_u64()
+        .expect("a partial page must offer the next cursor");
+
+    let (s, p2) = get(&node, &format!("/v1/mempool?limit=1&cursor={next}"));
+    assert_eq!(s, 200);
+    assert_eq!(p2["count"], 2);
+    let entries = p2["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_ne!(
+        entries[0]["tx_hash"].as_str().unwrap(),
+        first,
+        "the second page is the other transaction"
+    );
+    assert!(p2["next_cursor"].is_null(), "the last page ends the walk");
 }
 
 #[test]

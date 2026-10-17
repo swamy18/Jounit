@@ -2835,9 +2835,10 @@ rootless block would silently disable exits.
 *L2 side.* `L2TxType::ExitQueue` (`0x15`) carries `ExitQueuePayload`. It debits
 `amount + exit_fee + queue_fee` from the owner and records
 `(owner, nonce) → (amount, destination, exit_fee, queued_height)`. It is refused
-by name on a zero amount, a repeated or rewound per-owner nonce, an inactive
-profile, or an insufficient balance — the record is written only after every
-check passes, so a refused queue leaves no partial state. No cancellation:
+by name on a zero amount, an exit fee below `MIN_EXIT_FEE_SAT` (1,000 sat), a
+repeated or rewound per-owner nonce, an inactive profile, or an insufficient
+balance — the record is written only after every check passes, so a refused
+queue leaves no partial state. No cancellation:
 a cancel/claim race needs its own ordering rule for no benefit, and the value is
 encumbered for exactly one finality window.
 

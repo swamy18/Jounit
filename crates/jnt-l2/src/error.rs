@@ -89,6 +89,10 @@ pub enum L2Error {
     /// (`exit_activation_height == 0`) or the queue height predates
     /// activation. Queueing would encumber funds with no release.
     ExitNotActive,
+    /// The exit's prepaid release fee is below `MIN_EXIT_FEE_SAT`. A zero or
+    /// dust fee pays nobody to file the L1 release, so the exit would never be
+    /// claimed — refused at queue time instead.
+    ExitFeeBelowMinimum,
     /// An exit nonce that repeats or rewinds the owner's last queue nonce.
     /// Nonces are strictly increasing per owner (approved P1 replay rule).
     BadExitNonce,
@@ -159,6 +163,9 @@ impl fmt::Display for L2Error {
             L2Error::InvalidGenesis(why) => write!(f, "invalid l2 genesis: {why}"),
             L2Error::DuplicateDeposit => write!(f, "deposit already credited"),
             L2Error::ExitNotActive => write!(f, "exits are not active at this height"),
+            L2Error::ExitFeeBelowMinimum => {
+                write!(f, "exit fee is below the protocol minimum")
+            }
             L2Error::BadExitNonce => write!(f, "exit nonce repeats or rewinds"),
             L2Error::UnknownExit => write!(f, "no such queued exit"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),

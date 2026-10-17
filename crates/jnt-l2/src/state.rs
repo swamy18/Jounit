@@ -34,7 +34,8 @@ use jnt_core::fees::split_flat_fee;
 use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{
     settle_fee_sat, ClaimTaskPayload, DisputePayload, ExitQueuePayload, L2Payload, L2Transaction,
-    PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, VWC_HASH_EXPIRED,
+    PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT,
+    VWC_HASH_EXPIRED,
 };
 use jnt_core::ser::{Reader, Writer};
 use jnt_core::slash::SlashVault;
@@ -501,10 +502,10 @@ impl L2State {
     /// Queue an L2 → L1 exit: debit `amount + exit_fee + queue fee` from the
     /// owner and record the pending exit the release rule later pays out.
     ///
-    /// Fail-closed: below the activation height, on a zero amount, on a
-    /// repeated or rewound nonce, or on insufficient balance — the record is
-    /// written only after every check passes, so a refused queue leaves no
-    /// partial state.
+    /// Fail-closed: below the activation height, on a zero amount, on a fee
+    /// below [`MIN_EXIT_FEE_SAT`], on a repeated or rewound nonce, or on
+    /// insufficient balance — the record is written only after every check
+    /// passes, so a refused queue leaves no partial state.
     pub fn queue_exit(
         &mut self,
         p: &ExitQueuePayload,
@@ -519,6 +520,12 @@ impl L2State {
         }
         if p.amount_sat == 0 {
             return Err(L2Error::ZeroAmount("exit"));
+        }
+        // The fee pays whoever later files the L1 release claim; zero or dust
+        // would leave the exit unclaimed. A payload rule like the zero-amount
+        // check, so it fires before any state is touched (SPEC.md exit rules).
+        if p.exit_fee_sat < MIN_EXIT_FEE_SAT {
+            return Err(L2Error::ExitFeeBelowMinimum);
         }
         let last = self.exit_nonce.get(&p.owner).copied().unwrap_or(0);
         if p.nonce <= last {

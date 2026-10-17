@@ -68,6 +68,13 @@
 //! GET  /v1/credit/balance/{address} free balance + bond + live positions
 //! ```
 //!
+//! The list endpoints (`/v1/utxo/{address}`, `/v1/mempool`,
+//! `/v1/tasks/open`) page with `?limit=&cursor=`: `limit` defaults to 100 and
+//! caps at 1,000, `cursor` is an offset into a deterministically ordered list
+//! (outpoint, then txid, then task id — never `HashMap` order), `count` is
+//! always the total before pagination, and `next_cursor` carries the offset
+//! for the next page or `null` on the last one.
+//!
 //! # Exposure and its guards
 //!
 //! Loopback is the default binding and is unauthenticated by design: every test
@@ -107,6 +114,7 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tower::Service as _;
 
 use jnt_core::agent::{derive_agent_id, AgentRole};
 use jnt_core::chain::Chain;
@@ -810,22 +818,73 @@ async fn balance(State(state): State<ApiState>, Path(addr): Path<String>) -> Api
     })
 }
 
-async fn utxos(State(state): State<ApiState>, Path(addr): Path<String>) -> ApiResult {
+/// Pagination for the list endpoints: `?limit=&cursor=`. The cursor is an
+/// offset into a deterministically ordered list, so page N means the same on
+/// every node and every call. Lists at or below [`DEFAULT_PAGE_LIMIT`] return
+/// whole, exactly as before the parameters existed.
+#[derive(Debug, Default, serde::Deserialize)]
+struct PageParams {
+    limit: Option<usize>,
+    cursor: Option<u64>,
+}
+
+/// Unrequested page size, and the hard cap when one is requested.
+const DEFAULT_PAGE_LIMIT: usize = 100;
+const MAX_PAGE_LIMIT: usize = 1_000;
+
+/// The requested page of `all`: items `[cursor, cursor + limit)`, the total
+/// before pagination, and the cursor for the next page — `null` once this page
+/// was the last. `limit` is clamped, and a cursor past the end yields an empty
+/// page rather than an error.
+fn take_page<T>(all: Vec<T>, page: &PageParams) -> (Vec<T>, usize, Value) {
+    let limit = page
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .clamp(1, MAX_PAGE_LIMIT);
+    let total = all.len();
+    let start = page.cursor.unwrap_or(0).min(total as u64) as usize;
+    let end = start.saturating_add(limit).min(total);
+    let next = if end < total {
+        json!(end as u64)
+    } else {
+        Value::Null
+    };
+    let items = all.into_iter().skip(start).take(end - start).collect();
+    (items, total, next)
+}
+
+async fn utxos(
+    State(state): State<ApiState>,
+    Path(addr): Path<String>,
+    Query(page): Query<PageParams>,
+) -> ApiResult {
     let addr = decode_address(&addr)?;
     with_shared(&state, |sh| {
         let mut out = Vec::new();
         for (op, u) in sh.chain.utxo().iter() {
             if u.out.address == addr {
-                out.push(json!({
-                    "txid": hash512_to_hex(&op.txid),
-                    "index": op.index,
-                    "value_sat": u.out.value,
-                    "height": u.height,
-                    "spendable": sh.chain.is_mature(u.height),
-                }));
+                out.push((
+                    (op.txid, op.index),
+                    json!({
+                        "txid": hash512_to_hex(&op.txid),
+                        "index": op.index,
+                        "value_sat": u.out.value,
+                        "height": u.height,
+                        "spendable": sh.chain.is_mature(u.height),
+                    }),
+                ));
             }
         }
-        Json(json!({ "address": address_to_hex(&addr), "utxos": out }))
+        // Outpoint order, not `HashMap` iteration order: the cursor's offsets
+        // must mean the same thing on every node and on every call.
+        out.sort_by_key(|(k, _)| *k);
+        let (items, total, next) = take_page(out.into_iter().map(|(_, v)| v).collect(), &page);
+        Json(json!({
+            "address": address_to_hex(&addr),
+            "count": total,
+            "next_cursor": next,
+            "utxos": items,
+        }))
     })
 }
 
@@ -885,26 +944,30 @@ async fn tx_lookup(State(state): State<ApiState>, Path(hash): Path<String>) -> A
     })?
 }
 
-async fn mempool_view(State(state): State<ApiState>) -> ApiResult {
+async fn mempool_view(State(state): State<ApiState>, Query(page): Query<PageParams>) -> ApiResult {
     with_shared(&state, |sh| {
-        let entries: Vec<Value> = sh
-            .pool
-            .entries()
-            .map(|(txid, e)| {
+        let mut entries = Vec::new();
+        for (txid, e) in sh.pool.entries() {
+            entries.push((
+                *txid,
                 json!({
                     "tx_hash": hash512_to_hex(txid),
                     "fee_rate": e.fee_rate,
                     "fee_sat": e.fee_total,
                     "inputs": e.tx.inputs.len(),
                     "outputs": e.tx.outputs.len(),
-                })
-            })
-            .collect();
-        Json(json!({ "count": entries.len(), "entries": entries }))
+                }),
+            ));
+        }
+        // Txid order: pool iteration is `HashMap` order and must not leak into
+        // a cursor, or two calls could hand out different pages.
+        entries.sort_by_key(|(k, _)| *k);
+        let (items, total, next) = take_page(entries.into_iter().map(|(_, v)| v).collect(), &page);
+        Json(json!({ "count": total, "entries": items, "next_cursor": next }))
     })
 }
 
-async fn tasks_open(State(state): State<ApiState>) -> ApiResult {
+async fn tasks_open(State(state): State<ApiState>, Query(page): Query<PageParams>) -> ApiResult {
     with_shared(&state, |sh| {
         let open: Vec<Value> = sh
             .l2
@@ -914,7 +977,10 @@ async fn tasks_open(State(state): State<ApiState>) -> ApiResult {
             .filter(|t| matches!(t.state, ContractState::Open))
             .map(|t| task_json(t))
             .collect();
-        Json(json!({ "count": open.len(), "tasks": open }))
+        // `tasks()` is documented sorted by task id and the filter preserves
+        // that order, so the cursor's offsets are stable without a re-sort.
+        let (items, total, next) = take_page(open, &page);
+        Json(json!({ "count": total, "tasks": items, "next_cursor": next }))
     })
 }
 
@@ -2445,6 +2511,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// connections.
 const MAX_CONCURRENCY: usize = 64;
 
+/// Concurrent connections the API listener holds open. The router's semaphore
+/// only counts requests that finished reading their headers, so connections
+/// stuck mid-headers (the slowloris shape) need their own bound: over the cap
+/// an accept is closed before any bytes are read.
+const MAX_API_CONNECTIONS: usize = 128;
+
+/// Time a client gets to finish sending request headers — including the idle
+/// gap between keep-alive requests. hyper's default is the same 30s, but only
+/// when a timer is installed; `axum::serve` installs none, which leaves the
+/// deadline inert and header reading unbounded. The request handler has its
+/// own deadline in `REQUEST_TIMEOUT`.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Opt-in service API configuration. Carries the bearer token an exposed bind
 /// requires, the bound address plus the hostname allowlist checked by
 /// Host-header validation (DNS-rebinding defense), the in-flight request
@@ -2976,13 +3055,61 @@ pub fn spawn_with_options(
                         return;
                     }
                 };
-                // `into_make_service_with_connect_info`: without it the
-                // `ConnectInfo` extractor in `exposed_auth` finds nothing and
-                // every request on an exposed bind fails 500 — the peer's
-                // address is what the per-IP rate limiter keys on.
-                let svc = app.into_make_service_with_connect_info::<SocketAddr>();
-                if let Err(e) = axum::serve(listener, svc).await {
-                    eprintln!("api: serve error: {e}");
+                // A manual accept loop rather than `axum::serve`, for the two
+                // bounds that exposes and `axum::serve` does not: a cap on
+                // concurrent *connections* (`MAX_CONCURRENCY` only counts
+                // requests that reached the router, so sockets stuck in the
+                // header phase need their own bound) and hyper's header-read
+                // deadline, which only arms with a timer installed.
+                let connections = Arc::new(tokio::sync::Semaphore::new(MAX_API_CONNECTIONS));
+                loop {
+                    let (stream, peer) = match listener.accept().await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            // Accept failures are transient (EMFILE, an aborted
+                            // handshake): the API outlives them instead of
+                            // exiting with this thread.
+                            eprintln!("api: accept error: {e}");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                        // Over the cap: close before reading a single byte.
+                        drop(stream);
+                        continue;
+                    };
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        // `ConnectInfo` on every request: without it the
+                        // `exposed_auth` extractor on an exposed bind finds
+                        // nothing and every request fails 500 — the peer's
+                        // address is what the per-IP rate limiter keys on.
+                        // hyper hands each request's `Incoming` body to the
+                        // service; the Router takes axum's `Body`, which wraps
+                        // any http body.
+                        let svc = tower::service_fn(move |mut req: axum::http::Request<_>| {
+                            req.extensions_mut().insert(ConnectInfo(peer));
+                            let req = req.map(axum::body::Body::new);
+                            let mut app = app.clone();
+                            async move { app.call(req).await }
+                        });
+                        let mut builder = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        );
+                        builder.http1().timer(hyper_util::rt::TokioTimer::new());
+                        builder.http1().header_read_timeout(HEADER_READ_TIMEOUT);
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let _ = builder
+                            .serve_connection_with_upgrades(
+                                io,
+                                hyper_util::service::TowerToHyperService::new(svc),
+                            )
+                            .await;
+                        // Released only when the connection is fully closed: the
+                        // cap holds for a connection's whole life, not a request.
+                        drop(permit);
+                    });
                 }
             });
         })

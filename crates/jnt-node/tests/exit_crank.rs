@@ -439,3 +439,64 @@ fn two_exits_crank_and_settle_together_exactly_once_each() {
     let report = jnt_node::conservation::conservation_report(&s.chain, &s.view);
     assert!(report.ok(), "conservation must survive two releases");
 }
+
+/// The L1 rule checks that a block with L2 transactions *commits* an
+/// `l2_state_root`, never that it equals the replayed root — a lying root is
+/// accepted. That is deliberate and safe (SPEC.md exit rules, `exit.rs`
+/// module docs): replay arms the exit watch only when the committed root
+/// matches its own, so a lie **stalls** that queue block's exits instead of
+/// releasing them against a root their proof cannot match, and theft is
+/// impossible because the claim proves the record against the committed root.
+/// This pins the contract: block accepted, queue applied, watch never armed,
+/// nothing crankable ever.
+#[test]
+fn a_lying_l2_root_is_accepted_but_never_arms_the_exit_watch() {
+    let params = NetworkParams::mini();
+    let miner = wallet(9);
+    let me = addr(&miner);
+    let dest = addr(&wallet(8));
+    let mut chain = Chain::new(params.clone()).unwrap();
+    fund(&mut chain, &miner, me, 1);
+
+    let mut view = NodeL2::replay_from(&chain, &params).unwrap();
+    let gas = 16_000u64 + 1_000 + 2 * 250;
+    let l1_fee = chain.expected_base_fee_for_next_block() * gas;
+    let amount = SINK_VALUE - EXIT_FEE - l1_fee;
+    let q = chain.height() + 1;
+    let payload = ExitQueuePayload::build(&miner, 1, amount, dest, EXIT_FEE).unwrap();
+    let tx = L2Transaction::new(L2Payload::ExitQueue(payload));
+    let mut root = view.simulate_root(q, std::slice::from_ref(&tx));
+    root[0] ^= 0xFF; // any root that is not the replayed one
+    let block = chain
+        .mine_block_with_l2_root(
+            me,
+            vec![],
+            vec![tx],
+            root,
+            ts(q),
+            None,
+            jnt_core::chain::DEFAULT_MAX_ATTEMPTS,
+        )
+        .unwrap();
+    chain
+        .submit(block)
+        .expect("presence-only rule: a lying root is accepted at L1");
+    view.sync(&chain).unwrap();
+
+    // The queue transaction itself applied — only the watch is withheld.
+    assert_eq!(view.state().exit_count(), 1);
+    assert!(
+        view.pending_exits().is_empty(),
+        "a lying root arms no watch"
+    );
+    assert!(view.crank_claims(&chain, me).is_empty());
+
+    // Far past finality: the stall is permanent, not just immaturity.
+    mine_empty_to(&mut chain, me, q + params.finality_depth);
+    view.sync(&chain).unwrap();
+    assert!(view.pending_exits().is_empty());
+    assert!(
+        view.crank_claims(&chain, me).is_empty(),
+        "a lying root's exits never become claimable"
+    );
+}

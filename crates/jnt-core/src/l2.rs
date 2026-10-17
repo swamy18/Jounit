@@ -801,9 +801,21 @@ impl SettlePayload {
 // ExitQueue
 // ---------------------------------------------------------------------------
 
+/// Smallest `exit_fee_sat` an exit may carry (SPEC.md exit rules).
+///
+/// A zero-fee exit still gets confirmed — it debits the owner and encumbers
+/// the value — but nobody is paid to file the L1 release, so it would never
+/// be claimed. The floor makes "the fee is zero" a refusal at queue time
+/// rather than an exit that stalls for free.
+pub const MIN_EXIT_FEE_SAT: u64 = 1_000;
+
 /// Queues an L2 → L1 exit (approved P1, E-1…E-3): debits `amount_sat` plus the
 /// prepaid L1 release fee (`exit_fee_sat`) from the owner's L2 account and
 /// records the pending exit the release rule later pays out.
+///
+/// The fee is what pays whoever later files the L1 release claim — an exit
+/// queued with no fee earns its cranker nothing, so it would sit unclaimed
+/// forever. [`MIN_EXIT_FEE_SAT`] is the enforced floor (SPEC.md exit rules).
 ///
 /// The nonce is strictly increasing per owner (replay protection, mirroring
 /// the agent authorization discipline); the destination is bound by the

@@ -17,7 +17,7 @@ use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
     ClaimTaskPayload, ExitQueuePayload, L2Payload, L2Transaction, L2TxType, PostTaskPayload,
     SettlePayload, SubmitResultPayload, Verdict, L2_TX_CLAIM, L2_TX_DISPUTE, L2_TX_EXIT_QUEUE,
-    L2_TX_POST, L2_TX_SETTLE, L2_TX_SUBMIT,
+    L2_TX_POST, L2_TX_SETTLE, L2_TX_SUBMIT, MIN_EXIT_FEE_SAT,
 };
 use jnt_core::state_root::verify_inclusion;
 use jnt_core::wallet::Wallet;
@@ -247,14 +247,14 @@ fn exit_queue_then_release_moves_value_out_exactly_once() {
     assert_eq!(funded, CREDITED);
 
     let before = w.state.balance(&addr(&w.submitter));
-    w.apply(&queue_tx(&w, 1, 1_000_000, 500), 5);
+    w.apply(&queue_tx(&w, 1, 1_000_000, 1_000), 5);
     // Debit is amount + prepaid release fee + the flat queue fee (2,000).
     assert_eq!(
         w.state.balance(&addr(&w.submitter)),
-        before - 1_000_000 - 500 - 2_000
+        before - 1_000_000 - 1_000 - 2_000
     );
     // The value sits encumbered, still inside L2: conservation is unchanged.
-    assert_eq!(w.state.exits_locked_total(), 1_000_500);
+    assert_eq!(w.state.exits_locked_total(), 1_001_000);
     assert_eq!(w.state.funded_total(), funded);
     w.assert_conserved("queue");
     let record = w
@@ -271,8 +271,8 @@ fn exit_queue_then_release_moves_value_out_exactly_once() {
     assert_eq!(released, record);
     assert!(w.state.exit(&addr(&w.submitter), 1).is_none());
     assert_eq!(w.state.exits_locked_total(), 0);
-    assert_eq!(w.state.exited_total(), 1_000_500);
-    assert_eq!(w.state.funded_total(), funded - 1_000_500);
+    assert_eq!(w.state.exited_total(), 1_001_000);
+    assert_eq!(w.state.funded_total(), funded - 1_001_000);
     w.assert_conserved("release");
 }
 
@@ -296,15 +296,15 @@ fn queue_before_activation_is_refused() {
 #[test]
 fn queue_nonce_replay_and_rewind_are_refused() {
     let mut w = world_with(exits_on());
-    w.apply(&queue_tx(&w, 1, 100_000, 0), 5);
-    w.apply(&queue_tx(&w, 2, 100_000, 0), 6);
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
+    w.apply(&queue_tx(&w, 2, 100_000, 1_000), 6);
     // A repeated nonce in *new* bytes (different amount, so a different txid
     // that clears the replay set) is refused by the nonce rule, not the txid
     // rule. A byte-identical resubmission would fail earlier as `Replay` —
     // both layers hold, and this test pins the nonce one specifically.
     for bad in [1, 2] {
         let dest = addr(&w.worker);
-        let p = ExitQueuePayload::build(&w.submitter, bad, 200_000, dest, 0).unwrap();
+        let p = ExitQueuePayload::build(&w.submitter, bad, 200_000, dest, 1_000).unwrap();
         let err = w
             .state
             .apply(
@@ -316,7 +316,7 @@ fn queue_nonce_replay_and_rewind_are_refused() {
             .expect_err("a repeated nonce must be refused");
         assert_eq!(err, L2Error::BadExitNonce);
     }
-    w.apply(&queue_tx(&w, 3, 100_000, 0), 7);
+    w.apply(&queue_tx(&w, 3, 100_000, 1_000), 7);
     assert_eq!(w.state.exit_count(), 3);
     w.assert_conserved("nonces");
 }
@@ -329,7 +329,7 @@ fn queue_without_funds_and_zero_amount_are_refused() {
     let mut w = world_with(exits_on());
     let poor = wallet(9);
     let dest = addr(&w.worker);
-    let p = ExitQueuePayload::build(&poor, 1, 1_000_000, dest, 0).unwrap();
+    let p = ExitQueuePayload::build(&poor, 1, 1_000_000, dest, 1_000).unwrap();
     let err = w
         .state
         .apply(
@@ -356,6 +356,32 @@ fn queue_without_funds_and_zero_amount_are_refused() {
     w.assert_conserved("refused queues");
 }
 
+/// The prepaid release fee must clear `MIN_EXIT_FEE_SAT`: zero (or dust) pays
+/// nobody to file the L1 release, so the exit would sit unclaimed forever.
+/// Refused before any state moves; exactly the minimum queues.
+#[test]
+fn queue_below_the_minimum_exit_fee_is_refused() {
+    let mut w = world_with(exits_on());
+    let dest = addr(&w.worker);
+    for fee in [0, MIN_EXIT_FEE_SAT - 1] {
+        let p = ExitQueuePayload::build(&w.submitter, 1, 100_000, dest, fee).unwrap();
+        let err = w
+            .state
+            .apply(
+                &L2Transaction::new(L2Payload::ExitQueue(p)),
+                5,
+                &w.validators,
+                &w.verifier,
+            )
+            .expect_err("a sub-minimum exit fee must be refused");
+        assert_eq!(err, L2Error::ExitFeeBelowMinimum);
+    }
+    assert_eq!(w.state.exit_count(), 0);
+    w.assert_conserved("refused fee");
+    w.apply(&queue_tx(&w, 1, 100_000, MIN_EXIT_FEE_SAT), 6);
+    assert_eq!(w.state.exit_count(), 1);
+}
+
 /// Releasing an unknown exit — never queued, or already released and therefore
 /// removed — is refused by name. There is no second release.
 #[test]
@@ -366,7 +392,7 @@ fn release_of_unknown_or_released_exit_is_refused() {
         w.state.note_release(&owner, 1).expect_err("unknown exit"),
         L2Error::UnknownExit
     );
-    w.apply(&queue_tx(&w, 1, 100_000, 0), 5);
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
     w.state.note_release(&owner, 1).unwrap();
     assert_eq!(
         w.state.note_release(&owner, 1).expect_err("second release"),
@@ -403,7 +429,7 @@ fn committed_root_matches_state_root_without_exits() {
 #[test]
 fn exit_record_proves_against_the_committed_root_until_release() {
     let mut w = world_with(exits_on());
-    w.apply(&queue_tx(&w, 1, 100_000, 25), 5);
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
     let owner = addr(&w.submitter);
     let root = w.state.committed_root();
     assert_ne!(root, w.state.state_root(), "the exit must move the root");
@@ -427,7 +453,7 @@ fn exit_record_proves_against_the_committed_root_until_release() {
 #[test]
 fn state_wire_round_trips_with_queued_exits() {
     let mut w = world_with(exits_on());
-    w.apply(&queue_tx(&w, 1, 100_000, 25), 5);
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
     let bytes = w.state.encode();
     let back = L2State::decode(&bytes).expect("a fresh encode must decode");
     assert_eq!(back, w.state);
@@ -455,7 +481,7 @@ fn replay_rebuilds_identical_exit_state() {
     }
     let tx = {
         let w = wallet(1);
-        let p = ExitQueuePayload::build(&w, 1, 100_000, addr(&wallet(2)), 0).unwrap();
+        let p = ExitQueuePayload::build(&w, 1, 100_000, addr(&wallet(2)), 1_000).unwrap();
         L2Transaction::new(L2Payload::ExitQueue(p))
     };
     for l2 in [&mut first, &mut second] {
