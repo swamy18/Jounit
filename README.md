@@ -774,9 +774,12 @@ request at 10 seconds, 64 requests in flight, 128 open connections, and 30
 seconds to finish sending request headers (the slowloris bound).
 figures are in JNT.
 
-Credit, escrow and delegation state is node-local: it lives in memory, is
-reachable over the API, and is lost on restart — it is never persisted and
-never consensus.
+Credit, escrow and delegation state is node-local and never consensus, but it
+is no longer lost on restart: the books beside the chain (receipts, replay
+tracker, payments, reservations, policy accounting, credit, delegations,
+issued policies, revocations) persist to `state.bin` — an atomic,
+digest-checked file with a fail-closed load (a corrupt file refuses to start)
+— flushed when their bytes change, plus once at shutdown.
 
 ---
 

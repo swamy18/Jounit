@@ -43,7 +43,7 @@ use jnt_net::relay::RelayManager;
 use jnt_net::syncer::SyncManager;
 use jnt_node::l2::NodeL2;
 use jnt_node::wallet_store;
-use jnt_store::{AppendOutcome, BlockStore};
+use jnt_store::{AppendOutcome, BlockStore, StateFile};
 use std::io::Write as _;
 
 const USAGE: &str = "\
@@ -1527,6 +1527,25 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // the API must not reach the network or the disk on its own.
     let peers = Arc::new(AtomicUsize::new(0));
     let shared = Arc::new(Mutex::new(jnt_node::api::SharedNode::new(chain, l2)));
+
+    // Node-local books: receipts, replay tracker, payments, reservations,
+    // policy accounting, credit, delegations, issued policies, revocations.
+    // They are not consensus state - the chain is durable and L2 replays
+    // from it - but they exist only in this process, so they load here,
+    // before the API starts, and a corrupt file refuses to start instead of
+    // silently serving an empty book (fail-closed).
+    let state_file = StateFile::new(store.dir.join("state.bin"));
+    if let Some(bytes) = state_file
+        .load()
+        .map_err(|e| format!("node state failed to load: {e}"))?
+    {
+        let mut sh = shared
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        sh.decode_state(&bytes)
+            .map_err(|e| format!("node state failed to decode: {e}"))?;
+        println!("state          {}", store.dir.join("state.bin").display());
+    }
     if let Some(api_addr) = api_listen {
         let bound = jnt_node::api::spawn_with_options(
             Arc::clone(&shared),
@@ -1592,6 +1611,12 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // `conservation::BreachAlarm` so its timing rule is unit-testable; see the
     // poll below.
     let mut breach_alarm = jnt_node::conservation::BreachAlarm::new();
+
+    // Node books flush on this schedule: at most once every 5s, and only
+    // when their bytes changed, so an idle node never rewrites the file.
+    // The final flush runs after the loop, in the shutdown block.
+    let mut last_state_save = std::time::Instant::now();
+    let mut last_state_blob: Option<Vec<u8>> = None;
 
     // Chain thread: mine + relay loop
     while running.load(Ordering::SeqCst) {
@@ -1880,6 +1905,21 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             eprintln!("warning: finality persist failed: {e}");
         }
 
+        // Node books on the 5s/changed schedule, encoded under the lock this
+        // iteration already holds. `last_state_blob` only advances on a
+        // successful save, so a failed write retries on the next window.
+        if last_state_save.elapsed() >= std::time::Duration::from_secs(5) {
+            let blob = sh.encode_state();
+            if last_state_blob.as_deref() != Some(blob.as_slice()) {
+                if let Err(e) = state_file.save(&blob) {
+                    eprintln!("warning: node state persist failed: {e}");
+                } else {
+                    last_state_blob = Some(blob);
+                }
+            }
+            last_state_save = std::time::Instant::now();
+        }
+
         // Monitors read this through the API; a plain counter, never a
         // consensus input.
         peers.store(node.peer_count(), Ordering::Relaxed);
@@ -1916,6 +1956,9 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         store
             .persist_finality(&sh.chain)
             .map_err(|e| format!("shutdown flush failed (finality): {e}"))?;
+        state_file
+            .save(&sh.encode_state())
+            .map_err(|e| format!("shutdown flush failed (state): {e}"))?;
     }
     node.stop();
     println!("shutdown complete");

@@ -951,6 +951,68 @@ impl PolicyBook {
     }
 }
 
+/// Largest entry count the policy-book codec will read back, and the largest
+/// capacity it will restore. Checked before any allocation; real books are
+/// capped at [`DEFAULT_MAX_POLICIES`].
+const MAX_POLICY_BOOK_READ: usize = 1 << 20;
+
+/// Restart recovery for the whole book: the per-policy accounting windows,
+/// nonces and audit totals a node has already committed.
+///
+/// The book is node-local and non-consensus, but losing it loses every spent
+/// nonce and every window's tally - after a restart the first replayed
+/// authorization would look fresh. The encoding stores the book's own cap and
+/// refuses to restore more entries than it allows.
+impl PolicyBook {
+    /// Canonical encoding of the whole book.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(16 + self.states.len() * 48);
+        w.u64le(self.max_policies as u64);
+        w.u32le(self.states.len() as u32);
+        for (hash, state) in &self.states {
+            w.fixed(hash)
+                .u64le(state.window_start_height)
+                .u64le(state.spent_in_window_sat)
+                .u64le(state.total_spent_sat)
+                .u64le(state.last_nonce)
+                .u64le(state.authorizations);
+        }
+        w.into_vec()
+    }
+
+    /// Decode what [`PolicyBook::encode`] wrote. Bounded and fail-closed: a
+    /// count above the book's own capacity, a duplicate policy hash, or
+    /// trailing bytes produce an error rather than a half-built book.
+    pub fn decode(r: &mut crate::ser::Reader<'_>) -> Result<Self, crate::error::Error> {
+        use crate::error::Error;
+        let max_raw = r.u64le()?;
+        if max_raw > MAX_POLICY_BOOK_READ as u64 {
+            return Err(Error::Malformed("policy book capacity over codec cap"));
+        }
+        let max = max_raw as usize;
+        let count = r.u32le()? as usize;
+        if count > max {
+            return Err(Error::Malformed("policy count over book capacity"));
+        }
+        let mut book = PolicyBook::with_capacity(max);
+        for _ in 0..count {
+            let hash: crate::hash::Hash = r.fixed()?;
+            let state = PolicyState {
+                window_start_height: r.u64le()?,
+                spent_in_window_sat: r.u64le()?,
+                total_spent_sat: r.u64le()?,
+                last_nonce: r.u64le()?,
+                authorizations: r.u64le()?,
+            };
+            book.states.insert(hash, state);
+        }
+        if book.states.len() != count {
+            return Err(Error::Malformed("duplicate policy hash in book"));
+        }
+        Ok(book)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +1064,33 @@ mod tests {
         p.validate().expect("policy must validate");
         let bytes = p.serialize();
         assert_eq!(SpendPolicy::deserialize(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn the_policy_book_survives_restart_round_trip() {
+        let p = policy("jounit/testnet");
+        let mut book = PolicyBook::default();
+        book.authorize(&p, "jounit/testnet", &req(p.agent_id, [1u8; 20], 400, 5, 1))
+            .unwrap();
+
+        let bytes = book.encode();
+        let mut cursor = crate::ser::Reader::new(&bytes);
+        let mut back = PolicyBook::decode(&mut cursor).expect("book decodes");
+        assert!(cursor.is_done(), "decode must consume exactly its bytes");
+        assert_eq!(back.encode(), bytes, "re-encode must be byte-identical");
+        assert_eq!(back.len(), 1);
+        let state = back.state(&p.hash()).expect("accounting restored");
+        assert_eq!(state.last_nonce, 1);
+        assert_eq!(state.spent_in_window_sat, 400);
+        // The nonce is still spent: replaying the grant refuses after restart.
+        assert!(back
+            .authorize(&p, "jounit/testnet", &req(p.agent_id, [1u8; 20], 400, 5, 1))
+            .is_err());
+
+        // A count beyond the book's own capacity is refused before any read.
+        let mut lying = bytes.clone();
+        lying[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(PolicyBook::decode(&mut crate::ser::Reader::new(&lying)).is_err());
     }
 
     #[test]

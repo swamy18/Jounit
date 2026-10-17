@@ -544,6 +544,69 @@ impl ReceiptBook {
     }
 }
 
+/// Largest entry count the book codec will read back, and the largest capacity
+/// it will restore. Checked before any allocation, so a lying count cannot ask
+/// for memory it brought no bytes for; real books are capped at
+/// [`DEFAULT_MAX_RECEIPTS`].
+const MAX_RECEIPT_BOOK_READ: usize = 1 << 20;
+
+/// Restart recovery for the whole book.
+///
+/// The book is node-local and non-consensus, but losing it loses which
+/// payments this node already acknowledged: the replay guard and the
+/// contradicting-receipt refusal both live here. The encoding stores the
+/// receipts themselves and rebuilds `by_payment`/`by_request` from them, so
+/// the derived indexes cannot disagree with the receipts they name.
+impl ReceiptBook {
+    /// Canonical encoding of the whole book.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(16 + self.by_id.len() * 320);
+        w.u64le(self.max_receipts as u64);
+        w.u32le(self.by_id.len() as u32);
+        for receipt in self.by_id.values() {
+            let bytes = receipt.serialize();
+            w.u32le(bytes.len() as u32).raw(&bytes);
+        }
+        w.into_vec()
+    }
+
+    /// Decode what [`ReceiptBook::encode`] wrote. Bounded and fail-closed: a
+    /// count above the book's own capacity, a receipt that does not decode,
+    /// two receipts claiming one payment, or trailing bytes produce an error
+    /// rather than a half-built book.
+    pub fn decode(r: &mut crate::ser::Reader<'_>) -> Result<Self, crate::error::Error> {
+        use crate::error::Error;
+        let max_raw = r.u64le()?;
+        if max_raw > MAX_RECEIPT_BOOK_READ as u64 {
+            return Err(Error::Malformed("receipt book capacity over codec cap"));
+        }
+        let max = max_raw as usize;
+        let count = r.u32le()? as usize;
+        if count > max {
+            return Err(Error::Malformed("receipt count over book capacity"));
+        }
+        let mut book = ReceiptBook::with_capacity(max);
+        for _ in 0..count {
+            let len = r.u32le()? as usize;
+            let bytes = r.fixed_slice(len)?;
+            let receipt = ServiceReceipt::deserialize(bytes)
+                .map_err(|_| Error::Malformed("stored receipt does not decode"))?;
+            let id = receipt.receipt_id();
+            if let Some(existing) = book.by_payment.insert(receipt.payment_id, id) {
+                if existing != id {
+                    return Err(Error::Malformed("two receipts claim one payment"));
+                }
+            }
+            book.by_request.insert(receipt.request_id, id);
+            book.by_id.insert(id, receipt);
+        }
+        if book.by_id.len() != count {
+            return Err(Error::Malformed("duplicate receipts in encoded book"));
+        }
+        Ok(book)
+    }
+}
+
 /// True when two receipts claim the same payment but disagree on content —
 /// the contradicting-receipt case a verifier must treat as fail-closed.
 pub fn receipts_conflict(a: &ServiceReceipt, b: &ServiceReceipt) -> bool {
@@ -697,6 +760,39 @@ mod tests {
         assert!(book.by_receipt_id(&r.receipt_id()).is_some());
         assert!(book.by_payment_id(&r.payment_id).is_some());
         assert!(book.by_request_id(&r.request_id).is_some());
+    }
+
+    #[test]
+    fn the_receipt_book_survives_restart_round_trip() {
+        let pay = payment_like();
+        let r = receipt_for(&pay);
+        let mut book = ReceiptBook::default();
+        book.accept(&r, NET).unwrap();
+
+        let bytes = book.encode();
+        let mut cursor = crate::ser::Reader::new(&bytes);
+        let back = ReceiptBook::decode(&mut cursor).expect("book decodes");
+        assert!(cursor.is_done(), "decode must consume exactly its bytes");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.encode(), bytes, "re-encode must be byte-identical");
+        let restored = back
+            .by_payment_id(&r.payment_id)
+            .expect("payment lookup restored");
+        assert_eq!(restored.serialize(), r.serialize());
+        assert!(back.by_request_id(&r.request_id).is_some());
+        assert!(back.by_receipt_id(&r.receipt_id()).is_some());
+
+        // A count claiming a receipt the bytes do not hold is refused.
+        let mut lying = bytes.clone();
+        lying[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(ReceiptBook::decode(&mut crate::ser::Reader::new(&lying)).is_err());
+
+        // The same receipt written twice is refused, not stored once silently.
+        let mut duplicate = bytes.clone();
+        duplicate[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let entry = bytes[12..].to_vec();
+        duplicate.extend_from_slice(&entry);
+        assert!(ReceiptBook::decode(&mut crate::ser::Reader::new(&duplicate)).is_err());
     }
 
     #[test]

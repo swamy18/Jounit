@@ -23,7 +23,7 @@ like Bitcoin. (© 2026).
 | Fuzz harness | `fuzz/` (14 targets, cargo-fuzz nightly + ASan) |
 | Benchmarks | inline `#[ignore]`d probes, **not** a `benches/` harness |
 | Escrowed service contracts | `jnt-l2::ServiceContract` (generic over deliverable and attestation) with `ServiceContract::open` for non-compute services; `crates/jnt-l2/tests/service_contract.rs` drives a sort deliverable through claim → submit → settle. **No wire payload for a non-compute contract** — that is a new L2 transaction type and a consensus change |
-| Agent credit | `jnt-core::credit::CreditBook` + the `CreditGate` trait, consulted by `POST /v1/payment/submit`; reservation encumbers capacity, settlement is idempotent per reservation, bonds are pledged to the position they price; bond/open/repay/default reachable over HTTP. **Non-consensus and node-local**: there is no `TXCREDIT` and no credit persistence across a restart of `SharedNode` (the book has `encode`/`decode`, the store does not wire it) |
+| Agent credit | `jnt-core::credit::CreditBook` + the `CreditGate` trait, consulted by `POST /v1/payment/submit`; reservation encumbers capacity, settlement is idempotent per reservation, bonds are pledged to the position they price; bond/open/repay/default reachable over HTTP. **Non-consensus and node-local**: there is no `TXCREDIT`; credit persists across restarts through `SharedNode::encode_state`/`decode_state` and the node's atomic, digest-checked `state.bin` (fail-closed load), alongside the other node-local books |
 | Delegation chains | `jnt-core::delegation` narrowing rule, sub-agent derivation, `DelegationBook` lineage, and a signed root-first chain carried by `MachinePayment`/`PaymentRequest`; node records links, verifies owner policy signatures, propagates revocation to descendants. **Non-consensus**: delegation is not a consensus input and is not part of any transaction byte |
 | Conditional escrow | `jnt-core::escrow::ConditionalEscrow` with `release_arbiter`/`release_mutual` on the type, a release hash binding network and condition, and fail-closed oracle conditions. **Non-integrated with L1 escrow settlement** — no `TXESCROW` and no coin movement |
 | Checkpoint certificates | `Committee::sign_in_set` builds the bitmap against the committee a verifier derives; the node signs against `chain.committee_keys()` for the epoch; `jnt_core::signing` covers the pure signing step |
@@ -263,7 +263,9 @@ resolved by code changes made to the repository:
 3. **Credit/escrow boundary — node-local made explicit.** Added a doc comment
    to `SharedNode` in `crates/jnt-node/src/api.rs` that classifies state into
    consensus (`chain`, `pool`, `l2`) and node-local (credit, escrow,
-   delegations, policies — never persisted, never replayed).
+   delegations, policies — never replayed, never committed). The node-local
+   books now also persist to the node's `state.bin`; see the Agent credit row
+   above and `SharedNode::encode_state`.
 
 No independent security review has been completed. A third-party security review
 is recommended before any mainnet deployment with real value.

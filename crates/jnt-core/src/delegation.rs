@@ -496,6 +496,109 @@ impl DelegationBook {
     }
 }
 
+/// Largest entry count the delegation-book codec will read back per map.
+/// Checked before any allocation; real books hold one link per delegated
+/// policy, far below this.
+const MAX_DELEGATION_READ: usize = 1 << 20;
+
+/// Restart recovery for the whole book: the recorded lineage links, the agent
+/// ids they belong to, and the policy bytes each link was proven against.
+///
+/// The book is node-local and non-consensus, but losing it loses who descends
+/// from whom - a node would re-admit a chain it had already refused. The
+/// encoding stores all three maps and, on the way back, re-checks the
+/// invariants [`DelegationBook::link`] maintains: every stored policy hashes
+/// to the key it is stored under, and no link or agent entry names a policy
+/// the book does not hold.
+impl DelegationBook {
+    /// Canonical encoding of the whole book: policies first, then the links
+    /// and agent entries that name them, so the decoder can re-check every
+    /// reference as it reads.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(
+            12 + self.parents.len() * 64 + self.policies.len() * 256,
+        );
+        w.u32le(self.policies.len() as u32);
+        for (hash, policy) in &self.policies {
+            w.fixed(hash);
+            let bytes = policy.serialize();
+            w.u32le(bytes.len() as u32).raw(&bytes);
+        }
+        w.u32le(self.parents.len() as u32);
+        for (child, parent) in &self.parents {
+            w.fixed(child).fixed(parent);
+        }
+        w.u32le(self.agents.len() as u32);
+        for (agent, child) in &self.agents {
+            w.fixed(agent).fixed(child);
+        }
+        w.into_vec()
+    }
+
+    /// Decode what [`DelegationBook::encode`] wrote. Bounded and fail-closed:
+    /// a count above the cap, a policy that does not decode or hashes to a
+    /// different key, a link naming a policy the book does not hold, or
+    /// trailing bytes produce an error rather than a half-built book.
+    pub fn decode(r: &mut crate::ser::Reader<'_>) -> Result<Self, crate::error::Error> {
+        use crate::error::Error;
+        let malformed = Error::Malformed;
+
+        let policy_count = r.u32le()? as usize;
+        if policy_count > MAX_DELEGATION_READ {
+            return Err(malformed("policy count over codec cap"));
+        }
+        let mut book = DelegationBook::new();
+        for _ in 0..policy_count {
+            let hash: [u8; 32] = r.fixed()?;
+            let len = r.u32le()? as usize;
+            let bytes = r.fixed_slice(len)?;
+            let policy = SpendPolicy::deserialize(bytes)
+                .map_err(|_| malformed("stored policy does not decode"))?;
+            if policy.hash() != hash {
+                return Err(malformed("stored policy hashes to another key"));
+            }
+            book.policies.insert(hash, policy);
+        }
+        if book.policies.len() != policy_count {
+            return Err(malformed("duplicate policy in book"));
+        }
+
+        let link_count = r.u32le()? as usize;
+        if link_count > MAX_DELEGATION_READ {
+            return Err(malformed("link count over codec cap"));
+        }
+        for _ in 0..link_count {
+            let child: [u8; 32] = r.fixed()?;
+            let parent: [u8; 32] = r.fixed()?;
+            // `link` records both endpoints beside every edge; a link whose
+            // policy is missing cannot be walked back to what it descends from.
+            if !book.policies.contains_key(&child) || !book.policies.contains_key(&parent) {
+                return Err(malformed("link names a policy the book does not hold"));
+            }
+            if book.parents.insert(child, parent).is_some() {
+                return Err(malformed("duplicate link for one child"));
+            }
+        }
+
+        let agent_count = r.u32le()? as usize;
+        if agent_count > MAX_DELEGATION_READ {
+            return Err(malformed("agent count over codec cap"));
+        }
+        for _ in 0..agent_count {
+            let agent: AgentId = r.fixed()?;
+            let child: [u8; 32] = r.fixed()?;
+            // `link` writes the agent entry only for a child it also linked.
+            if !book.parents.contains_key(&child) {
+                return Err(malformed("agent entry without a link"));
+            }
+            if book.agents.insert(agent, child).is_some() {
+                return Err(malformed("duplicate agent id"));
+            }
+        }
+        Ok(book)
+    }
+}
+
 /// Authorize a spend at the end of a delegation chain.
 ///
 /// The composition is deliberate: this function owns the chain, and
@@ -794,6 +897,33 @@ mod tests {
                 cap: MAX_DELEGATION_DEPTH
             })
         );
+    }
+
+    #[test]
+    fn the_delegation_book_survives_restart_round_trip() {
+        let mut r = root();
+        r.agent_id = derive_agent_id(NET, AgentRole::Machine, &r.owner);
+        let c = child_of(&r);
+        let mut book = DelegationBook::new();
+        book.link(&r, &c).unwrap();
+
+        let bytes = book.encode();
+        let mut cursor = crate::ser::Reader::new(&bytes);
+        let back = DelegationBook::decode(&mut cursor).expect("book decodes");
+        assert!(cursor.is_done(), "decode must consume exactly its bytes");
+        assert_eq!(back.encode(), bytes, "re-encode must be byte-identical");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.parent_of(&c), book.parent_of(&c));
+        assert_eq!(back.chain_of(&c), book.chain_of(&c));
+        assert_eq!(back.depth_of(&c), book.depth_of(&c));
+        assert!(back.has_descendants(&r.hash()));
+
+        // Policy bytes that hash to another key are refused: the last byte of
+        // the last (policy) section is either a decode failure or a key
+        // mismatch, and both are refusals.
+        let mut lying = bytes.clone();
+        *lying.last_mut().unwrap() ^= 0xFF;
+        assert!(DelegationBook::decode(&mut crate::ser::Reader::new(&lying)).is_err());
     }
 
     #[test]

@@ -23,9 +23,10 @@
 //! - **State it holds is non-consensus and node-local**: receipts, payment
 //!   ids, policy accounting and the credit book (`CreditBook`: free balances,
 //!   bonds, positions) are this node's view for lookup/authorization
-//!   convenience. They are not persisted and a restart loses them — losing
-//!   them changes no coin, but a credit position open at shutdown does not
-//!   come back.
+//!   convenience. They are never consensus, but they do survive a restart:
+//!   the serve command persists them to `state.bin` (atomic, digest-checked,
+//!   fail-closed load) and flushes at shutdown. A bad file can only cost this
+//!   node its own bookkeeping — it can never mint or move a coin.
 //!
 //! Endpoints (§13 for L1, §19.2 for the L2 additions, plus the payment/
 //! receipt surface items 16–17 require):
@@ -129,6 +130,7 @@ use jnt_core::mempool::Mempool;
 use jnt_core::params::{NetworkParams, L2_FEE_SCHEDULE, SAT_PER_JNT};
 use jnt_core::payment::{MachinePayment, PaymentTracker};
 use jnt_core::receipt::{ReceiptBook, ReceiptOutcome};
+use jnt_core::ser::{Reader, Writer};
 use jnt_core::service::{authorize_request_with_chain, SessionError};
 use jnt_core::tx::{Transaction, GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 use jnt_l2::reputation::ledger_from_state;
@@ -142,6 +144,85 @@ use crate::l2::NodeL2;
 /// policies and requests — none of which approach that. Explicit rather than
 /// framework-default so the bound is visible in this file's docs.
 const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
+
+/// Version of the node-local state envelope written by
+/// [`SharedNode::encode_state`]. A build that writes a different format writes
+/// a different value, so an old file is refused by name instead of misread
+/// field by field.
+const STATE_ENVELOPE_VERSION: u8 = 1;
+
+/// Largest entry count any single map section in the state envelope may
+/// declare, checked before allocation. Real books are bounded by their own
+/// caps (thousands of entries) and the state file itself is bounded at 64 MB
+/// by `jnt-store`, so this is a lying-count guard, not a target.
+const MAX_STATE_ENTRIES: usize = 1 << 20;
+
+/// Length-prefix one section into the state envelope.
+fn put_section(w: &mut Writer, bytes: &[u8]) {
+    w.u32le(bytes.len() as u32).raw(bytes);
+}
+
+/// Read one length-prefixed section out of the state envelope.
+fn take_section(r: &mut Reader<'_>, what: &str) -> Result<Vec<u8>, String> {
+    let len = r.u32le().map_err(|e| format!("{what}: {e}"))? as usize;
+    let bytes = r.fixed_slice(len).map_err(|e| format!("{what}: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
+/// Decode one section with a decoder that must consume it exactly: trailing
+/// bytes inside a section are malformed here, not left for a later section to
+/// trip over.
+fn decode_section<T>(
+    r: &mut Reader<'_>,
+    what: &str,
+    dec: impl FnOnce(&mut Reader<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let section = take_section(r, what)?;
+    let mut inner = Reader::new(&section);
+    let out = dec(&mut inner)?;
+    inner
+        .expect_end()
+        .map_err(|e| format!("{what}: trailing bytes ({e})"))?;
+    Ok(out)
+}
+
+/// Encode a `Hash`-keyed map as `count + (key, length-prefixed value)*`.
+fn encode_state_map<T>(map: &BTreeMap<Hash, T>, enc: impl Fn(&T) -> Vec<u8>) -> Vec<u8> {
+    let mut w = Writer::with_capacity(8 + map.len() * 64);
+    w.u32le(map.len() as u32);
+    for (key, value) in map {
+        w.fixed(key);
+        let bytes = enc(value);
+        w.u32le(bytes.len() as u32).raw(&bytes);
+    }
+    w.into_vec()
+}
+
+/// Inverse of [`encode_state_map`]: bounded count, no duplicate keys, every
+/// value fully decoded before it is admitted to the map.
+fn decode_state_map<T>(
+    r: &mut Reader<'_>,
+    what: &str,
+    dec: impl Fn(&[u8]) -> Result<T, String>,
+) -> Result<BTreeMap<Hash, T>, String> {
+    let count = r.u32le().map_err(|e| format!("{what}: {e}"))? as usize;
+    if count > MAX_STATE_ENTRIES {
+        return Err(format!(
+            "{what}: {count} entries over the {MAX_STATE_ENTRIES} cap"
+        ));
+    }
+    let mut map = BTreeMap::new();
+    for _ in 0..count {
+        let key: Hash = r.fixed().map_err(|e| format!("{what}: {e}"))?;
+        let len = r.u32le().map_err(|e| format!("{what}: {e}"))? as usize;
+        let bytes = r.fixed_slice(len).map_err(|e| format!("{what}: {e}"))?;
+        let value = dec(bytes)?;
+        if map.insert(key, value).is_some() {
+            return Err(format!("{what}: duplicate key"));
+        }
+    }
+    Ok(map)
+}
 
 /// Everything the API and the serve loop share. One lock: the serve loop
 /// takes it per iteration, handlers take it per request. No handler ever
@@ -162,7 +243,11 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// treated as an alternative source of truth for global JNT ownership or
 /// spendable balance. Coin movement happens only through L1 UTXOs and L2
 /// account balances (the consensus surface above); credit/escrow are gates
-/// on admission, not sources of spendable funds.
+/// on admission, not sources of spendable funds. The one thing they do
+/// survive is a restart: [`SharedNode::encode_state`] and
+/// [`SharedNode::decode_state`] carry them into the node's `state.bin`,
+/// loaded fail-closed by the serve command. Persistence restores this node's
+/// own view; it never confers ownership.
 pub struct SharedNode {
     pub chain: Chain,
     pub pool: Mempool,
@@ -243,6 +328,132 @@ impl SharedNode {
             tx_to_relay: Vec::new(),
             l2_to_include: Vec::new(),
         }
+    }
+
+    /// Encode every node-local book this node owns - receipts, replay tracker,
+    /// recorded payments, credit reservations, policy accounting, credit book,
+    /// delegation links, escrows, issued policies and revocations - into one
+    /// versioned, section-length-prefixed blob for `jnt_store::StateFile`.
+    ///
+    /// Chain, mempool, L2 and the relay queues are deliberately absent: the
+    /// chain is already durable, L2 is replayed from it, and the rest is
+    /// derived or transient. This is node-local bookkeeping only, never a
+    /// consensus input - see the state classification on [`SharedNode`].
+    pub fn encode_state(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(4096);
+        w.u8(STATE_ENVELOPE_VERSION);
+        put_section(&mut w, &self.receipts.encode());
+        put_section(&mut w, &self.payment_tracker.encode());
+        put_section(
+            &mut w,
+            &encode_state_map(&self.payment_store, |p| p.serialize()),
+        );
+        put_section(
+            &mut w,
+            &encode_state_map(&self.reservations, |r| r.encode()),
+        );
+        put_section(&mut w, &self.policies.encode());
+        put_section(&mut w, &self.credit.encode());
+        put_section(&mut w, &self.delegations.encode());
+        put_section(&mut w, &encode_state_map(&self.escrows, |e| e.encode()));
+        put_section(
+            &mut w,
+            &encode_state_map(&self.policy_registry, |p| p.serialize()),
+        );
+        let mut revoked = Writer::with_capacity(4 + self.revoked_policies.len() * 32);
+        revoked.u32le(self.revoked_policies.len() as u32);
+        for hash in &self.revoked_policies {
+            revoked.fixed(hash);
+        }
+        put_section(&mut w, &revoked.into_vec());
+        w.into_vec()
+    }
+
+    /// Inverse of [`SharedNode::encode_state`]. Every section decodes into a
+    /// local first and only then commits to `self`, so a refused blob leaves
+    /// the node's books exactly as they were - a failed load is never a
+    /// half-loaded state.
+    ///
+    /// Every failure is a refusal, never a partial best effort: the caller is
+    /// startup, and a node that cannot read its own books must stop rather
+    /// than run on an empty set of them.
+    pub fn decode_state(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|e| format!("state envelope: {e}"))?;
+        if version != STATE_ENVELOPE_VERSION {
+            return Err(format!(
+                "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION}"
+            ));
+        }
+
+        let receipts = decode_section(&mut r, "receipts", |sr| {
+            ReceiptBook::decode(sr).map_err(|e| format!("{e}"))
+        })?;
+        let payment_tracker = decode_section(&mut r, "payment_tracker", |sr| {
+            PaymentTracker::decode(sr).map_err(|e| format!("{e}"))
+        })?;
+        let payment_store = decode_section(&mut r, "payment_store", |sr| {
+            decode_state_map(sr, "payment_store", |b| {
+                MachinePayment::deserialize(b).map_err(|e| format!("payment: {e}"))
+            })
+        })?;
+        let reservations = decode_section(&mut r, "reservations", |sr| {
+            decode_state_map(sr, "reservations", |b| {
+                jnt_core::credit::Reservation::decode(&mut Reader::new(b))
+                    .map_err(|e| format!("reservation: {e}"))
+            })
+        })?;
+        let policies = decode_section(&mut r, "policies", |sr| {
+            jnt_core::agent::PolicyBook::decode(sr).map_err(|e| format!("{e}"))
+        })?;
+        let credit = decode_section(&mut r, "credit", |sr| {
+            jnt_core::credit::CreditBook::decode(sr).map_err(|e| format!("{e}"))
+        })?;
+        let delegations = decode_section(&mut r, "delegations", |sr| {
+            jnt_core::delegation::DelegationBook::decode(sr).map_err(|e| format!("{e}"))
+        })?;
+        let escrows = decode_section(&mut r, "escrows", |sr| {
+            decode_state_map(sr, "escrows", |b| {
+                jnt_core::escrow::ConditionalEscrow::decode(&mut Reader::new(b))
+                    .map_err(|e| format!("escrow: {e}"))
+            })
+        })?;
+        let policy_registry = decode_section(&mut r, "policy_registry", |sr| {
+            decode_state_map(sr, "policy_registry", |b| {
+                jnt_core::agent::SpendPolicy::deserialize(b).map_err(|e| format!("policy: {e}"))
+            })
+        })?;
+        let revoked_policies = decode_section(&mut r, "revoked_policies", |sr| {
+            let count = sr.u32le().map_err(|e| format!("revoked_policies: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "revoked_policies: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut set = BTreeSet::new();
+            for _ in 0..count {
+                let hash: Hash = sr.fixed().map_err(|e| format!("revoked_policies: {e}"))?;
+                set.insert(hash);
+            }
+            if set.len() != count {
+                return Err("revoked_policies: duplicate entry".into());
+            }
+            Ok(set)
+        })?;
+        // Anything after the last section means the envelope is malformed.
+        r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
+
+        self.receipts = receipts;
+        self.payment_tracker = payment_tracker;
+        self.payment_store = payment_store;
+        self.reservations = reservations;
+        self.policies = policies;
+        self.credit = credit;
+        self.delegations = delegations;
+        self.escrows = escrows;
+        self.policy_registry = policy_registry;
+        self.revoked_policies = revoked_policies;
+        Ok(())
     }
 
     /// Advance escrows whose release has matured under finality to `Finalized`

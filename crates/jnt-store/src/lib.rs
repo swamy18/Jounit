@@ -46,12 +46,14 @@
 pub mod blocks;
 pub mod log;
 pub mod meta;
+pub mod state;
 
 use std::path::{Path, PathBuf};
 
 pub use blocks::{AppendOutcome, BlockStore, StoreInfo};
 pub use log::{RecordLog, RecordRef, Recovery};
 pub use meta::{Meta, MetaFile};
+pub use state::StateFile;
 
 /// Everything the store can go wrong with.
 ///
@@ -93,6 +95,12 @@ pub enum StoreError {
     BadBlock { detail: String },
     /// Metadata is unreadable even though its checksum matched its write.
     BadMeta { detail: String },
+    /// A node-local state file exists but does not verify — a short file, a
+    /// lying length, or a digest that no longer matches the payload.
+    ///
+    /// Never returned for a missing file: that is a fresh node, not a damaged
+    /// one. See [`state`].
+    BadState { path: PathBuf, detail: String },
 }
 
 impl StoreError {
@@ -141,6 +149,9 @@ impl std::fmt::Display for StoreError {
             }
             StoreError::BadBlock { detail } => write!(f, "undecodable block: {detail}"),
             StoreError::BadMeta { detail } => write!(f, "unreadable metadata: {detail}"),
+            StoreError::BadState { path, detail } => {
+                write!(f, "{}: unreadable node state ({detail})", path.display())
+            }
         }
     }
 }

@@ -794,6 +794,50 @@ impl PaymentTracker {
     }
 }
 
+/// Largest entry count the tracker codec will read back, and the largest
+/// capacity it will restore. Checked before any allocation; real trackers are
+/// capped at [`DEFAULT_MAX_TRACKED_PAYMENTS`].
+const MAX_TRACKER_READ: usize = 1 << 20;
+
+impl PaymentTracker {
+    /// Canonical encoding of the replay tracker, so a restart cannot make an
+    /// already-seen payment acceptable again.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(16 + self.seen.len() * 40);
+        w.u64le(self.max_payments as u64);
+        w.u32le(self.seen.len() as u32);
+        for (id, expires_at) in &self.seen {
+            w.fixed(id).u64le(*expires_at);
+        }
+        w.into_vec()
+    }
+
+    /// Decode what [`PaymentTracker::encode`] wrote. Bounded and fail-closed:
+    /// a count above the tracker's own capacity, a duplicate id, or trailing
+    /// bytes produce an error rather than a half-built tracker.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let max_raw = r.u64le()?;
+        if max_raw > MAX_TRACKER_READ as u64 {
+            return Err(Error::Malformed("tracker capacity over codec cap"));
+        }
+        let max = max_raw as usize;
+        let count = r.u32le()? as usize;
+        if count > max {
+            return Err(Error::Malformed("tracker count over capacity"));
+        }
+        let mut tracker = PaymentTracker::with_capacity(max);
+        for _ in 0..count {
+            let id: Hash = r.fixed()?;
+            let expires_at = r.u64le()?;
+            tracker.seen.insert(id, expires_at);
+        }
+        if tracker.seen.len() != count {
+            return Err(Error::Malformed("duplicate payment id in tracker"));
+        }
+        Ok(tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +881,29 @@ mod tests {
             nonce,
         };
         book.authorize(&p, NET, &req).expect("in-policy grant")
+    }
+
+    #[test]
+    fn the_payment_tracker_survives_restart_round_trip() {
+        let mut tracker = PaymentTracker::default();
+        tracker.observe(&[7u8; 32], 900).unwrap();
+        tracker.observe(&[8u8; 32], 950).unwrap();
+
+        let bytes = tracker.encode();
+        let mut cursor = crate::ser::Reader::new(&bytes);
+        let mut back = PaymentTracker::decode(&mut cursor).expect("tracker decodes");
+        assert!(cursor.is_done(), "decode must consume exactly its bytes");
+        assert_eq!(back.encode(), bytes, "re-encode must be byte-identical");
+        assert!(back.contains(&[7u8; 32]));
+        assert!(back.contains(&[8u8; 32]));
+        assert!(!back.contains(&[9u8; 32]));
+        // The replay guard survived: the same id is refused again.
+        assert!(back.observe(&[7u8; 32], 901).is_err());
+
+        // A count beyond the book's own capacity is refused before any read.
+        let mut lying = bytes.clone();
+        lying[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(PaymentTracker::decode(&mut crate::ser::Reader::new(&lying)).is_err());
     }
 
     #[test]

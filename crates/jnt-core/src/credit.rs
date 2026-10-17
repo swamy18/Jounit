@@ -1398,6 +1398,82 @@ pub struct Reservation {
     pub position_id: Option<Hash>,
 }
 
+/// Largest entry count the reservation codec will read back for one draw list.
+/// Checked before any allocation; a draw list is bounded in practice by the
+/// book's own position count.
+const MAX_RESERVATION_DRAWS: usize = 1 << 20;
+
+/// Restart recovery for a reservation.
+///
+/// Reservations are node-local and non-consensus, but losing one loses the
+/// record that a credit line was already charged: without it the same credit
+/// admits a second payment. The encoding is the struct field for field, and
+/// the draw list is checked against the bytes actually present before any
+/// buffer is allocated.
+impl Reservation {
+    /// Canonical encoding, self-delimiting.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = crate::ser::Writer::with_capacity(80 + 40 * self.position_draws.len());
+        w.fixed(&self.id)
+            .fixed(&self.debtor)
+            .u64le(self.amount_sat)
+            .u64le(self.from_free_sat);
+        w.u32le(self.position_draws.len() as u32);
+        for (position, amount) in &self.position_draws {
+            w.fixed(position).u64le(*amount);
+        }
+        match self.position_id {
+            Some(id) => {
+                w.u8(1).fixed(&id);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
+        w.into_vec()
+    }
+
+    /// Decode what [`Reservation::encode`] wrote. Bounded and fail-closed: a
+    /// draw count the remaining bytes cannot back, an unknown position tag, or
+    /// trailing bytes produce an error rather than a half-built reservation.
+    pub fn decode(r: &mut crate::ser::Reader<'_>) -> Result<Self> {
+        let id: Hash = r.fixed()?;
+        let debtor: Address = r.fixed()?;
+        let amount_sat = r.u64le()?;
+        let from_free_sat = r.u64le()?;
+        let draws = r.u32le()? as usize;
+        if draws > MAX_RESERVATION_DRAWS {
+            return Err(Error::Malformed("reservation draw count over codec cap"));
+        }
+        // Each draw is exactly 40 bytes on the wire: a count the remaining
+        // buffer cannot hold is a lying count, refused before allocation.
+        if draws.saturating_mul(40) > r.remaining() {
+            return Err(Error::Malformed(
+                "reservation draw count over remaining bytes",
+            ));
+        }
+        let mut position_draws = Vec::with_capacity(draws);
+        for _ in 0..draws {
+            let position: Hash = r.fixed()?;
+            let amount = r.u64le()?;
+            position_draws.push((position, amount));
+        }
+        let position_id = match r.u8()? {
+            0 => None,
+            1 => Some(r.fixed()?),
+            _ => return Err(Error::Malformed("reservation position tag")),
+        };
+        Ok(Reservation {
+            id,
+            debtor,
+            amount_sat,
+            from_free_sat,
+            position_draws,
+            position_id,
+        })
+    }
+}
+
 /// The credit-gate is the only optional input to admission, so a node that has
 /// not wired credit plugs this in and gets the pre-credit behavior: every
 /// payment that is otherwise valid is admitted.
@@ -2614,5 +2690,35 @@ mod tests {
         let r = book.repay(&id, 0, 1).unwrap();
         assert_eq!(r.remaining_debt_sat, 1);
         book.check_conservation().unwrap();
+    }
+
+    #[test]
+    fn a_reservation_survives_restart_round_trip() {
+        let reservation = Reservation {
+            id: [9u8; 32],
+            debtor: [7u8; 20],
+            amount_sat: 500,
+            from_free_sat: 200,
+            position_draws: vec![([3u8; 32], 200), ([4u8; 32], 300)],
+            position_id: Some([3u8; 32]),
+        };
+
+        let bytes = reservation.encode();
+        let mut cursor = crate::ser::Reader::new(&bytes);
+        let back = Reservation::decode(&mut cursor).expect("reservation decodes");
+        assert!(cursor.is_done(), "decode must consume exactly its bytes");
+        assert_eq!(back, reservation);
+        assert_eq!(back.encode(), bytes, "re-encode must be byte-identical");
+
+        // A draw count the remaining bytes cannot back is refused before any
+        // allocation: 999 draws * 40 bytes is more than the file holds.
+        let mut lying = bytes.clone();
+        lying[68..72].copy_from_slice(&999u32.to_le_bytes());
+        assert!(Reservation::decode(&mut crate::ser::Reader::new(&lying)).is_err());
+
+        // An unknown position tag is refused rather than guessed.
+        let mut bad_tag = bytes.clone();
+        bad_tag[152] = 2;
+        assert!(Reservation::decode(&mut crate::ser::Reader::new(&bad_tag)).is_err());
     }
 }
