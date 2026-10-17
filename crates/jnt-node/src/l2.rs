@@ -78,38 +78,77 @@ fn exit_claim_gas(inputs: usize, has_exit_fee: bool) -> u64 {
 
 /// A subset of exactly `n` outputs totalling exactly `target`, or `None`.
 ///
-/// Largest-first and refusing to overshoot: a claim must consume sink outputs
-/// worth precisely its obligation, so the walk stops as soon as the running
-/// total passes the target rather than trimming an output that would leave
-/// change nobody may claim. Returns `None` rather than approximating — leaving
-/// an exit queued costs its owner time, while paying the wrong amount costs
-/// them money.
+/// Backtracking with pruning: greedy largest-first is not complete (e.g.
+/// target 10 from [6, 5, 5] fails), so this searches until it finds an exact
+/// match. A claim must consume sink outputs worth precisely its obligation —
+/// no change, no tip — so an exit whose funding sits in no exact subset stays
+/// queued rather than paying the wrong amount.
 fn exact_subset(
     available: &[(jnt_core::tx::OutPoint, u64)],
     target: u64,
     n: usize,
 ) -> Option<Vec<jnt_core::tx::OutPoint>> {
-    let mut order: Vec<&(jnt_core::tx::OutPoint, u64)> = available.iter().collect();
-    order.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-    let mut picked = Vec::with_capacity(n);
-    let mut total = 0u64;
-    for (op, value) in order {
-        if picked.len() == n {
-            break;
-        }
-        match total.checked_add(*value) {
-            Some(next) if next == target => {
-                picked.push(*op);
-                return Some(picked);
-            }
-            Some(next) if next < target => {
-                total = next;
-                picked.push(*op);
-            }
-            _ => {}
-        }
+    let mut items: Vec<(jnt_core::tx::OutPoint, u64)> = available.to_vec();
+    items.sort_by_key(|e| std::cmp::Reverse(e.1));
+
+    // Suffix sums for pruning: total value still available from index i onward.
+    let mut suffix_sum = vec![0u64; items.len() + 1];
+    for i in (0..items.len()).rev() {
+        suffix_sum[i] = suffix_sum[i + 1].saturating_add(items[i].1);
     }
-    None
+
+    let mut picked: Vec<jnt_core::tx::OutPoint> = Vec::with_capacity(n);
+
+    fn search(
+        items: &[(jnt_core::tx::OutPoint, u64)],
+        suffix_sum: &[u64],
+        start: usize,
+        target: u64,
+        total: u64,
+        picked: &mut Vec<jnt_core::tx::OutPoint>,
+        n: usize,
+    ) -> bool {
+        if picked.len() == n {
+            return total == target;
+        }
+        if start >= items.len() {
+            return false;
+        }
+        // Not enough items left to fill the count.
+        if items.len() - start < n - picked.len() {
+            return false;
+        }
+        // Even taking everything remaining cannot reach the target.
+        if total > target || total.saturating_add(suffix_sum[start]) < target {
+            return false;
+        }
+
+        let (op, value) = items[start];
+        // Try including items[start].
+        if value <= target.saturating_sub(total) {
+            picked.push(op);
+            if search(
+                items,
+                suffix_sum,
+                start + 1,
+                target,
+                total.saturating_add(value),
+                picked,
+                n,
+            ) {
+                return true;
+            }
+            picked.pop();
+        }
+        // Try excluding items[start].
+        search(items, suffix_sum, start + 1, target, total, picked, n)
+    }
+
+    if search(&items, &suffix_sum, 0, target, 0, &mut picked, n) {
+        Some(picked)
+    } else {
+        None
+    }
 }
 
 /// L2 dispute-window parameters follow the L1 network profile: `mini` gets the

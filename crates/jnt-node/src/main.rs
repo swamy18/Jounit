@@ -9,8 +9,8 @@
 //! jnt-node verify                                 replay the chain and diff the state
 //! jnt-node show-block --height 10
 //! jnt-node balance  --address jt1...
-//! jnt-node send     --to jt1... --amount 1000       build a tx, mine it, keep it
-//!                                                   (--amount is in satoshis)
+//! jnt-node send     --to jt1... --amount 10          build a tx, mine it, keep it
+//!                                                   (--amount is in JNT; use --amount-sat for satoshis)
 //! jnt-node wallet   --new --label miner
 //! jnt-node export   --out chain.json
 //! jnt-node serve     --listen 0.0.0.0:8333         relay blocks to and from peers
@@ -68,7 +68,8 @@ COMMANDS:
 
 SEND OPTIONS:
   --to <address>             Recipient (required)
-  --amount <sat>             Amount to send (required)
+  --amount <jnt>             Amount to send in JNT (required)
+  --amount-sat <sat>         Exact amount in satoshis (alternative to --amount)
   --relay <host:port>        Hand the signed transaction to a running node
                              instead of mining it here; the node's mempool
                              holds it and relays it to its peers
@@ -160,6 +161,7 @@ impl Args {
                         | "data-dir"
                         | "blocks"
                         | "amount"
+                        | "amount-sat"
                         | "to"
                         | "address"
                         | "wallet"
@@ -224,6 +226,15 @@ impl Args {
         match self.flags.get(name) {
             Some(v) => v.parse().map_err(|_| format!("--{name} must be a number")),
             None => Ok(default),
+        }
+    }
+
+    /// Parse a JNT amount (decimal, e.g. `10.5`) into satoshis. Returns `None`
+    /// when the flag is absent.
+    fn jnt(&self, name: &str) -> Result<Option<u64>, String> {
+        match self.flags.get(name) {
+            Some(v) => parse_jnt_sat(v).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -497,6 +508,38 @@ fn jnt(sat: u64) -> String {
     format!("{}.{:08}", sat / SAT_PER_JNT, sat % SAT_PER_JNT)
 }
 
+/// Convert a JNT decimal string (e.g. `10.5`) to satoshis. Rejects negatives and
+/// values with more than 8 decimal places.
+fn parse_jnt_sat(v: &str) -> Result<u64, String> {
+    let neg = v.starts_with('-');
+    let v = v.trim_start_matches('-');
+    let (whole, frac) = match v.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (v, ""),
+    };
+    let whole: u64 = whole
+        .parse()
+        .map_err(|_| "--amount must be a number".to_string())?;
+    let frac_sat: u64 = if frac.is_empty() {
+        0
+    } else {
+        if frac.len() > 8 {
+            return Err("--amount has more than 8 decimal places".into());
+        }
+        let padded = format!("{frac:<0width$}", width = 8);
+        padded
+            .parse::<u64>()
+            .map_err(|_| "--amount must be a number".to_string())?
+    };
+    if neg {
+        return Err("--amount must be positive".into());
+    }
+    whole
+        .checked_mul(SAT_PER_JNT)
+        .and_then(|v| v.checked_add(frac_sat))
+        .ok_or_else(|| "--amount overflows satoshis".into())
+}
+
 /// One-line L2 summary shared by every command that moves the tip.
 ///
 /// This is the whole of the node's L2 observability for M1: which height was
@@ -663,9 +706,19 @@ fn cmd_send(args: &Args) -> Result<(), String> {
 
     let to = address_from_hex(args.str("to").ok_or("--to <address> is required")?)
         .map_err(|e| e.to_string())?;
-    let amount = args.num("amount", 0)?;
-    if amount == 0 {
-        return Err("--amount must be greater than zero (in satoshis)".into());
+    // `--amount` is denominated in JNT (matching every other printed figure).
+    // `--amount-sat` is available for exact satoshi amounts.
+    let amount_sat = if let Some(sat) = args.str("amount-sat") {
+        sat.parse::<u64>()
+            .map_err(|_| "--amount-sat must be a number")?
+    } else {
+        match args.jnt("amount")? {
+            Some(sat) => sat,
+            None => return Err("--amount is required".into()),
+        }
+    };
+    if amount_sat == 0 {
+        return Err("--amount must be greater than zero".into());
     }
 
     // Only matured coinbase outputs are spendable in v0.1.
@@ -698,7 +751,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
         } else {
             base_fee.saturating_mul(gas).saturating_add(1_000)
         };
-        if total >= amount + fee {
+        if total >= amount_sat + fee {
             break;
         }
         total += value;
@@ -710,16 +763,16 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     } else {
         base_fee.saturating_mul(gas).saturating_add(1_000)
     };
-    if total < amount + fee {
+    if total < amount_sat + fee {
         return Err(format!(
             "insufficient funds: have {total} sat, need {} sat",
-            amount + fee
+            amount_sat + fee
         ));
     }
 
-    let change = total - amount - fee;
+    let change = total - amount_sat - fee;
     let mut outputs = vec![Output {
-        value: amount,
+        value: amount_sat,
         address: to,
     }];
     if change > 0 {
@@ -753,7 +806,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
         relay_transaction(relay_addr, &chain, &tx)?;
         println!("txid    {txid}");
         println!("relayed to {relay_addr} (not mined here; the node's mempool holds it)");
-        println!("amount  {} JNT", jnt(amount));
+        println!("amount  {} JNT", jnt(amount_sat));
         println!("fee     {} JNT", jnt(fee));
         return Ok(());
     }
@@ -770,7 +823,7 @@ fn cmd_send(args: &Args) -> Result<(), String> {
 
     println!("txid    {txid}");
     println!("height  {height}");
-    println!("amount  {} JNT", jnt(amount));
+    println!("amount  {} JNT", jnt(amount_sat));
     println!("fee     {} JNT", jnt(fee));
     println!("burned  {} JNT (base fee, destroyed)", jnt(burned));
     print_l2_summary(&l2, &chain);

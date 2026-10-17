@@ -250,17 +250,18 @@ reached.
 
 ## Exact blockers preventing mainnet
 
-1. **Mainnet exit activation is unconfigured.** Decision 19 implemented the exit
-   rule (SPEC.md §19.6) and superseded Decision 10's deferral: `ExitQueue` on L2,
-   an inclusion-proof-authorised sink spend on L1, and a permissionless crank.
-   `mainnet` currently carries `exit_activation_height = 0` — *never*, not *from
-   genesis* — so it accepts neither a committed `l2_state_root` nor an exit claim,
-   and mainnet user deposits stay closed. Choosing a height is **configuration**,
-   not missing protocol.
+1. **Mainnet exit activation is configured.** Decision 19 implemented the exit
+   rule (SPEC.md §19.6): `ExitQueue` on L2, an inclusion-proof-authorised sink
+   spend on L1, and a permissionless crank. `mainnet` carries
+   `exit_activation_height = 1`, so withdrawals work from genesis — same as
+   Bitcoin spends. No configuration remains here.
 2. **No committee exists to sign checkpoints.** The ledger that would hold
    bonded stake is built and tested (`bond.rs`); what does not exist is a
    validator. `mainnet` carries an empty `genesis_validators`, and
-   `finality_activation_height = 0` keeps the chain on depth-based finality.
+   `finality_activation_height = 100` is armed in code — but with no bonded
+   committee the checkpoint set is empty, so binding finality fails closed and
+   the chain runs on depth-based finality (100 blocks) until operators bond
+   5,000 JNT and sign checkpoints.
    Real bonded stake (`MIN_VALIDATOR_STAKE_SAT` = 5,000 JNT, unbonding after
    `UNBONDING_PERIOD_BLOCKS` = 1008) is enforced by code but has no operator.
    The signing side that a key-custody decision can unlock is built and
@@ -271,8 +272,8 @@ reached.
    blocker is **key custody**: who holds the validator keys, whether they are
    held by a node that also mines, and how they are replaced on loss. That is
    an organisational decision recorded in `docs/decisions.md`, not a code gap.
-   Binding finality must stay `finality_activation_height = 0` on `mainnet`
-   until that decision is made and a committee is actually bonded.
+   Binding finality stays unreachable on `mainnet` until a committee is bonded,
+   at which point the already-armed `finality_activation_height = 100` takes effect.
 3. **The arbitration transport is now built; the arbitration *decision* is not
    centralized.** Decision 21's canonical reference decides what is fraudulent,
    `DisputeEngine::resolve` computes it from the disputed contract so no caller

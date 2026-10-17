@@ -12,7 +12,7 @@ AI-native cryptocurrency. Mining that does useful work, and a payment layer buil
 person holds it, like Bitcoin. The *Jounit* name, `JNT` ticker and logos are
 community marks — see [License and trademark](#license-and-trademark).
 
-**Built by:** Swamy Gadila. The project is open for anyone to use, fork, audit,
+**Built by:** Swamy Gadila. The project is open for anyone to use,
 and redistribute — no single person owns it.
 
 ---
@@ -745,7 +745,7 @@ applies.
 | Release pipeline | **Shipped** | CI-gated, 3 targets, checksums, keyless cosign/Sigstore bundle wiring — **no signed release published yet**. Every action pinned to a commit SHA; job tokens least-privilege; Dependabot refreshes pins without opening PR branches |
 | Net frame reads | **Shipped** | A frame body is read incrementally into a reserved buffer in 64 KiB chunks, so a peer cannot ask for one allocation larger than the whole frame cache |
 | Per-request panic discipline | **Shipped** | No `unwrap`/`expect`/`unreachable!` is reachable from a request or a peer frame on the audited paths. With `panic = "abort"` in the release profile, one panic is a whole-node crash, so each is either made an error return or proved an unreachable invariant |
-| **Independent security review** | **In progress** | A focused self-review of the HBM permutation gates M4 registration (`docs/security-review-hbm-2026-10-12.md`); a focused internal pass over request-path panics, exposure controls and CI supply-chain hygiene closed 15 items on Oct 15. **A third-party audit is still required before mainnet** — neither self-review substitutes for one |
+| **Independent security review** | **In progress** | A focused self-review of the HBM permutation gates M4 registration (`docs/security-review-hbm-2026-10-12.md`); a focused internal pass over request-path panics, exposure controls and CI supply-chain hygiene closed 15 items on Oct 15. A third-party review is still required before mainnet — neither self-review substitutes for one |
 
 ### Why M4 is registered but not activated
 
@@ -821,7 +821,7 @@ true now. Full record in [CHANGELOG.md](CHANGELOG.md).
 | `fuzz/` | 14 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `sim/` | Independent Python reference and attack simulations. |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, audits and readiness reports. |
+| `docs/` | Design records and readiness reports. |
 
 Seven crates in one workspace. **All consensus logic lives in `jnt-core`**, which
 has no I/O, no clock and no network. The `mini` profile is the same code with
@@ -985,7 +985,7 @@ money at it:
 
 | Item | Why it remains |
 |---|---|
-| **No independent security audit** | 1194 passing tests are not an external audit. This cannot be self-certified, by anyone, ever. |
+| **No independent security review** | 1194 passing tests are not externally reviewed. This cannot be self-certified, by anyone, ever. |
 | **No validator operators** | `mainnet` declares an empty `genesis_validators`. The bond ledger, committee derivation, and checkpoint signing are all built and tested, but no operator is bonding 5 000 JNT to run a validator. Binding finality verifies against whatever committee exists — empty means no checkpoint can finalize until validators appear, but depth-based finality (100 blocks) still secures the chain. |
 | **Arbitrator key custody** | The arbitration quorum transport is built; who runs the committee is organisational. The per-escrow *release* path needs no committee: it is contract-selected and independent (Item 4). |
 | **Operations** | No bootnode directory. `--bootnodes` dials configured peers at startup and `peers.json` persists learned addresses across restarts; no public bootnode list is published. No log shipping. No signed release published yet; the pipeline wires keyless cosign/Sigstore bundles, which need no published key. |
@@ -993,7 +993,7 @@ money at it:
 `jnt-node init --network mainnet` runs today. Withdrawals and binding finality
 are both active — `exit_activation_height = 1` and `finality_activation_height = 100`.
 This is not fail-closed: the chain mines, confirms, and settles from height 1.
-Operators and an audit are the only remaining launch items.
+Operators are the only remaining launch items.
 
 [docs/mainnet-readiness.md](docs/mainnet-readiness.md) tracks each item with its
 evidence.
@@ -1006,7 +1006,7 @@ evidence.
 
 **Code: `MIT OR Apache-2.0`** — the standard permissive Rust dual licence. Both
 texts ship at the repo root (`LICENSE-MIT`, `LICENSE-APACHE`). You may use,
-modify, run, audit and redistribute the software, including commercially.
+modify, run and redistribute the software, including commercially.
 
 **Name and marks: community-owned.** The *Jounit* name, the `JNT`
 ticker and the project's logos are community marks, not part of the code
@@ -1014,9 +1014,9 @@ licence. See [TRADEMARK.md](TRADEMARK.md).
 
 The distinction is the same one Bitcoin uses: **the code is open so anyone can
 run it, and the name is a community mark.** Nothing in an open-source licence
-can stop someone from forking the code — that is deliberate, and it is how the
-ecosystem works. Forks are explicitly permitted. The code belongs to everyone
-under the terms above; the name belongs to the community.
+can stop someone from using the code — that is deliberate, and it is how the
+ecosystem works. The code belongs to everyone under the terms above; the name
+belongs to the community.
 
 If you want to use the name or marks commercially, open an issue — no single
 person holds it.
