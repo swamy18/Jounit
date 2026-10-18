@@ -2425,3 +2425,174 @@ fn two_escrows_between_the_same_parties_are_distinct_contracts() {
         "a release hash must name its own escrow"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Settlement links: payment -> the L1 tx that paid it
+// ---------------------------------------------------------------------------
+
+/// Bridge a payment while the chain is at height 0 (the policy window the
+/// bridge authors under), then mine `n` blocks paying the payer wallet so its
+/// wallet can fund the transaction that settles the payment.
+fn bridge_then_fund(credit: u64, n: u64) -> (Node, MachinePayment, Wallet) {
+    let node = start();
+    let payer = wallet(61, "api-payer");
+    let (payment, _receipt, auth, sigs, keys) = run_bridge(&node, credit);
+    let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
+    assert_eq!(s, 200, "payment submit refused: {body}");
+    {
+        let mut sh = node.shared.lock().unwrap();
+        let addr = payer.address().unwrap();
+        for h in 1..=n {
+            let block = sh
+                .chain
+                .mine_block(addr, vec![], GENESIS_TIMESTAMP_MS + h * 1_000)
+                .unwrap();
+            sh.chain.submit(block).unwrap();
+        }
+    }
+    (node, payment, payer)
+}
+
+/// Build, sign and broadcast `amount_sat` from `from` to `to`; returns the
+/// txid hex exactly as `POST /v1/tx/broadcast` reported it.
+fn pay_tx(node: &Node, from: &Wallet, to: &[u8; 20], amount_sat: u64) -> String {
+    let (s, built) = post(
+        node,
+        "/v1/tx/build",
+        &serde_json::json!({
+            "from": address_to_hex(&from.address().unwrap()),
+            "to": address_to_hex(to),
+            "amount_sat": amount_sat,
+            "max_fee_sat": 1_000_000,
+        }),
+    );
+    assert_eq!(s, 200, "build failed: {built}");
+    let mut tx =
+        Transaction::deserialize(&hex::decode(built["unsigned_tx_hex"].as_str().unwrap()).unwrap())
+            .unwrap();
+    from.sign(&mut tx).unwrap();
+    let (s, body) = post(
+        node,
+        "/v1/tx/broadcast",
+        &serde_json::json!({ "signed_tx_hex": hex::encode(tx.serialize()) }),
+    );
+    assert_eq!(s, 200, "broadcast failed: {body}");
+    body["tx_hash"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn a_settlement_refuses_a_tx_that_never_pays_the_recipient() {
+    let (node, payment, payer) = bridge_then_fund(BRIDGE_AMOUNT_SAT + 100, 12);
+    let id_hex = hash_to_hex(&payment.signing_hash());
+    let stranger = wallet(63, "stranger").address().unwrap();
+
+    // An unknown txid: there is nothing to bind to.
+    let (s, body) = post(
+        &node,
+        &format!("/v1/payment/{id_hex}/settle"),
+        &serde_json::json!({ "tx_hash": hash512_to_hex(&[9u8; 64]) }),
+    );
+    assert_eq!(s, 404, "{body}");
+    assert_eq!(body["error"], "unknown_transaction");
+
+    // A real tx - but it pays a stranger, so it settles nothing.
+    let wrong = pay_tx(&node, &payer, &stranger, BRIDGE_AMOUNT_SAT + 100);
+    let (s, body) = post(
+        &node,
+        &format!("/v1/payment/{id_hex}/settle"),
+        &serde_json::json!({ "tx_hash": wrong }),
+    );
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(body["error"], "settlement_does_not_pay_recipient");
+
+    // Neither refusal left a link behind.
+    let (s, body) = get(&node, &format!("/v1/payment/{id_hex}"));
+    assert_eq!(s, 200);
+    assert!(body["settlement"].is_null(), "no link was ever recorded");
+
+    // And an unknown payment is a 404, not a 500.
+    let (s, _) = post(
+        &node,
+        &format!("/v1/payment/{}/settle", hash_to_hex(&[1u8; 32])),
+        &serde_json::json!({ "tx_hash": hash512_to_hex(&[9u8; 64]) }),
+    );
+    assert_eq!(s, 404);
+}
+
+#[test]
+fn a_settlement_link_survives_confirmation_and_refuses_a_second_tx() {
+    let (node, payment, payer) = bridge_then_fund(BRIDGE_AMOUNT_SAT + 100, 12);
+    let id_hex = hash_to_hex(&payment.signing_hash());
+    let recipient = payment.recipient;
+
+    // The payer pays the recipient: pending, and reported as such.
+    let tx1 = pay_tx(&node, &payer, &recipient, BRIDGE_AMOUNT_SAT + 100);
+    let (s, body) = post(
+        &node,
+        &format!("/v1/payment/{id_hex}/settle"),
+        &serde_json::json!({ "tx_hash": tx1 }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["payment_id"], id_hex);
+    assert_eq!(body["settlement"]["tx_hash"], tx1);
+    assert_eq!(body["settlement"]["status"], "pending");
+    assert!(body["settlement"]["confirmed_height"].is_null());
+
+    // The same txid again is idempotent, not a second link.
+    let (s, body) = post(
+        &node,
+        &format!("/v1/payment/{id_hex}/settle"),
+        &serde_json::json!({ "tx_hash": tx1 }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["duplicate"], true);
+
+    // GET shows the same pending link.
+    let (s, body) = get(&node, &format!("/v1/payment/{id_hex}"));
+    assert_eq!(s, 200);
+    assert_eq!(body["settlement"]["tx_hash"], tx1);
+    assert_eq!(body["settlement"]["status"], "pending");
+
+    // Mine the paying tx into a block: the link re-resolves to confirmed.
+    {
+        let mut sh = node.shared.lock().unwrap();
+        let txid = jnt_core::hash::hash512_from_hex(&tx1).unwrap();
+        let tx = sh
+            .pool
+            .get(&txid)
+            .expect("the paying tx is in the pool")
+            .tx
+            .clone();
+        let height = sh.chain.height() + 1;
+        let addr = payer.address().unwrap();
+        let block = sh
+            .chain
+            .mine_block(addr, vec![tx], GENESIS_TIMESTAMP_MS + height * 1_000)
+            .unwrap();
+        sh.chain.submit(block).unwrap();
+    }
+    let (s, body) = get(&node, &format!("/v1/payment/{id_hex}"));
+    assert_eq!(s, 200);
+    assert_eq!(body["settlement"]["status"], "confirmed");
+    assert_eq!(body["settlement"]["confirmed_height"].as_u64().unwrap(), 13);
+    assert_eq!(body["settlement"]["tx_hash"], tx1);
+
+    // A second tx that also pays the recipient: one payment, one link.
+    let tx2 = pay_tx(&node, &payer, &recipient, BRIDGE_AMOUNT_SAT + 100);
+    let (s, body) = post(
+        &node,
+        &format!("/v1/payment/{id_hex}/settle"),
+        &serde_json::json!({ "tx_hash": tx2 }),
+    );
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "already_settled");
+
+    // The original link is untouched by the conflict.
+    let (s, body) = post(
+        &node,
+        &format!("/v1/payment/{id_hex}/settle"),
+        &serde_json::json!({ "tx_hash": tx1 }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["duplicate"], true);
+}

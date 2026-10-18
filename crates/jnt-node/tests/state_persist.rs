@@ -140,6 +140,8 @@ fn populate(node: &mut SharedNode) {
     let pay = machine_payment();
     let payment_id: Hash = pay.signing_hash();
     node.payment_store.insert(payment_id, pay);
+    // One settlement link: a payment bound to the tx that paid its recipient.
+    node.payment_tx.insert(payment_id, [7u8; 64]);
 
     let receipt = signed_receipt();
     node.receipts
@@ -170,6 +172,7 @@ fn node_books_survive_an_encode_decode_round_trip() {
         a.receipts.by_payment_id(&[1u8; 32]).map(|r| r.serialize())
     );
     assert_eq!(b.payment_store.len(), 1);
+    assert_eq!(b.payment_tx, a.payment_tx, "settlement links round-trip");
     assert!(b.policy_registry.contains_key(&policy().hash()));
     assert!(b.revoked_policies.contains(&[3u8; 32]));
     assert_eq!(b.delegations.recorded().count(), 1);

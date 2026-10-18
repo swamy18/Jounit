@@ -55,6 +55,7 @@
 //! POST /v1/authorize           policy + payer-signed request -> authorization
 //! POST /v1/payment/submit      verify + record a machine payment
 //! GET  /v1/payment/{id}        recorded payment
+//! POST /v1/payment/{id}/settle bind it to the tx that paid the recipient
 //! POST /v1/receipt             verify + record a service receipt
 //! GET  /v1/receipt/{id}        receipt by id (or by payment id)
 //! GET  /v1/exit/crankable      the exit claims this node could settle now
@@ -149,7 +150,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// [`SharedNode::encode_state`]. A build that writes a different format writes
 /// a different value, so an old file is refused by name instead of misread
 /// field by field.
-const STATE_ENVELOPE_VERSION: u8 = 1;
+const STATE_ENVELOPE_VERSION: u8 = 2;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -224,6 +225,51 @@ fn decode_state_map<T>(
     Ok(map)
 }
 
+/// Locate a transaction in the chain (as a confirmed height) or the mempool
+/// (as pending). The chain walk mirrors `tx_lookup`: a node with no tx index
+/// pays O(tip) per lookup, which is the honest cost of that design choice.
+fn locate_tx(sh: &SharedNode, txid: &Hash512) -> Option<(Option<u64>, Transaction)> {
+    for height in 1..=sh.chain.height() {
+        let Some(block) = sh.chain.block_at(height) else {
+            continue;
+        };
+        for tx in &block.txs {
+            if tx.txid() == *txid {
+                return Some((Some(height), tx.clone()));
+            }
+        }
+    }
+    sh.pool.get(txid).map(|entry| (None, entry.tx.clone()))
+}
+
+/// The settlement object a client sees: the txid plus where that tx lives
+/// right now.
+fn settlement_json(txid: &Hash512, confirmed_height: Option<u64>) -> Value {
+    json!({
+        "tx_hash": hash512_to_hex(txid),
+        "status": if confirmed_height.is_some() { "confirmed" } else { "pending" },
+        "confirmed_height": confirmed_height,
+    })
+}
+
+/// A payment's settlement field: `null` when nothing is linked, otherwise the
+/// link re-resolved against the live chain and mempool. A linked tx this node
+/// can no longer find (evicted from the mempool or reorged out) is reported
+/// as `missing`, never silently dropped.
+fn settlement_value(sh: &SharedNode, id: &Hash) -> Value {
+    let Some(txid) = sh.payment_tx.get(id) else {
+        return Value::Null;
+    };
+    match locate_tx(sh, txid) {
+        Some((confirmed_height, _)) => settlement_json(txid, confirmed_height),
+        None => json!({
+            "tx_hash": hash512_to_hex(txid),
+            "status": "missing",
+            "confirmed_height": null,
+        }),
+    }
+}
+
 /// Everything the API and the serve loop share. One lock: the serve loop
 /// takes it per iteration, handlers take it per request. No handler ever
 /// holds it across an await (handlers do not await), so the async runtime
@@ -237,8 +283,9 @@ fn decode_state_map<T>(
 /// to apply is *skipped deterministically*, never made a consensus rule.
 ///
 /// **Node-local state** (not consensus, not replayed, not committed to blocks):
-/// `receipts`, `payment_tracker`, `payment_store`, `reservations`, `credit`,
-/// `delegations`, `escrows`, `policies`, `policy_registry`, `revoked_policies`.
+/// `receipts`, `payment_tracker`, `payment_store`, `payment_tx`,
+/// `reservations`, `credit`, `delegations`, `escrows`, `policies`,
+/// `policy_registry`, `revoked_policies`.
 /// These are operational caches and service-layer features: they must never be
 /// treated as an alternative source of truth for global JNT ownership or
 /// spendable balance. Coin movement happens only through L1 UTXOs and L2
@@ -258,6 +305,12 @@ pub struct SharedNode {
     pub payment_tracker: PaymentTracker,
     /// Payment id -> payment, same cap as the tracker.
     pub payment_store: BTreeMap<Hash, MachinePayment>,
+    /// payment id -> the L1 transaction that paid this payment's recipient at
+    /// least its amount, as this node saw it. Evidence of settlement, not an
+    /// accounting lock: no coin moves here (see the state classification
+    /// above), and a link whose tx vanishes is reported as `missing`, never
+    /// silently dropped.
+    pub payment_tx: BTreeMap<Hash, Hash512>,
     /// Admission-time credit reservation keyed by payment id. Consumed when the
     /// matching `ServiceReceipt` is accepted (roadmap item 10 / §19.4): that is
     /// the settlement event, so the credit debit is committed here rather than
@@ -318,6 +371,7 @@ impl SharedNode {
             receipts: ReceiptBook::default(),
             payment_tracker: PaymentTracker::default(),
             payment_store: BTreeMap::new(),
+            payment_tx: BTreeMap::new(),
             reservations: BTreeMap::new(),
             policies: jnt_core::agent::PolicyBook::default(),
             credit: jnt_core::credit::CreditBook::new(),
@@ -331,9 +385,10 @@ impl SharedNode {
     }
 
     /// Encode every node-local book this node owns - receipts, replay tracker,
-    /// recorded payments, credit reservations, policy accounting, credit book,
-    /// delegation links, escrows, issued policies and revocations - into one
-    /// versioned, section-length-prefixed blob for `jnt_store::StateFile`.
+    /// recorded payments, settlement links, credit reservations, policy
+    /// accounting, credit book, delegation links, escrows, issued policies and
+    /// revocations - into one versioned, section-length-prefixed blob for
+    /// `jnt_store::StateFile`.
     ///
     /// Chain, mempool, L2 and the relay queues are deliberately absent: the
     /// chain is already durable, L2 is replayed from it, and the rest is
@@ -366,6 +421,12 @@ impl SharedNode {
             revoked.fixed(hash);
         }
         put_section(&mut w, &revoked.into_vec());
+        let mut settled = Writer::with_capacity(4 + self.payment_tx.len() * 96);
+        settled.u32le(self.payment_tx.len() as u32);
+        for (payment, txid) in &self.payment_tx {
+            settled.fixed(payment).fixed(txid);
+        }
+        put_section(&mut w, &settled.into_vec());
         w.into_vec()
     }
 
@@ -440,12 +501,28 @@ impl SharedNode {
             }
             Ok(set)
         })?;
+        let payment_tx = decode_section(&mut r, "payment_tx", |sr| {
+            let count = sr.u32le().map_err(|e| format!("payment_tx: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "payment_tx: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut map = BTreeMap::new();
+            for _ in 0..count {
+                let payment: Hash = sr.fixed().map_err(|e| format!("payment_tx: {e}"))?;
+                let txid: Hash512 = sr.fixed().map_err(|e| format!("payment_tx: {e}"))?;
+                map.insert(payment, txid);
+            }
+            Ok(map)
+        })?;
         // Anything after the last section means the envelope is malformed.
         r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
 
         self.receipts = receipts;
         self.payment_tracker = payment_tracker;
         self.payment_store = payment_store;
+        self.payment_tx = payment_tx;
         self.reservations = reservations;
         self.policies = policies;
         self.credit = credit;
@@ -1344,6 +1421,78 @@ async fn payment_get(State(state): State<ApiState>, Path(id): Path<String>) -> A
             "nonce": p.nonce,
             "expires_at_height": p.expires_at_height,
             "network_id": p.network_id,
+            "settlement": settlement_value(sh, &id),
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct PaymentSettleReq {
+    tx_hash: String,
+}
+
+/// Bind a recorded payment to the L1 transaction that settles it.
+///
+/// The node verifies the binding itself — the transaction must exist in this
+/// node's chain or mempool and must pay the payment's recipient at least the
+/// payment's amount — so the link is evidence, not a caller's say-so. A repeat
+/// of the same txid is idempotent; a second, different txid is a conflict.
+async fn payment_settle(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<PaymentSettleReq>,
+) -> ApiResult {
+    let id = decode_hash(&id)?;
+    let txid = decode_hash512(&req.tx_hash)?;
+    with_shared(&state, |sh| {
+        let (recipient, amount_sat) = {
+            let p = sh
+                .payment_store
+                .get(&id)
+                .ok_or_else(|| not_found("unknown payment"))?;
+            (p.recipient, p.amount_sat)
+        };
+        if let Some(linked) = sh.payment_tx.get(&id) {
+            if *linked == txid {
+                let height = locate_tx(sh, &txid).and_then(|(h, _)| h);
+                return Ok(Json(json!({
+                    "payment_id": hash_to_hex(&id),
+                    "settlement": settlement_json(&txid, height),
+                    "duplicate": true,
+                })));
+            }
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "already_settled",
+                format!("payment already settles against {}", hash512_to_hex(linked)),
+            ));
+        }
+        let Some((confirmed_height, tx)) = locate_tx(sh, &txid) else {
+            return Err(fail(
+                StatusCode::NOT_FOUND,
+                "unknown_transaction",
+                "no such transaction in this node's chain or mempool",
+            ));
+        };
+        let paid: u64 = tx
+            .outputs
+            .iter()
+            .filter(|o| o.address == recipient)
+            .map(|o| o.value)
+            .sum();
+        if paid < amount_sat {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "settlement_does_not_pay_recipient",
+                format!(
+                    "transaction pays {paid} sat to the recipient; this payment needs {amount_sat} sat"
+                ),
+            ));
+        }
+        sh.payment_tx.insert(id, txid);
+        Ok(Json(json!({
+            "payment_id": hash_to_hex(&id),
+            "settlement": settlement_json(&txid, confirmed_height),
         })))
     })?
 }
@@ -3012,6 +3161,7 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/policy/revoke", post(policy_revoke))
         .route("/v1/payment/submit", post(payment_submit))
         .route("/v1/payment/{payment_id}", get(payment_get))
+        .route("/v1/payment/{payment_id}/settle", post(payment_settle))
         .route("/v1/receipt", post(receipt_submit))
         .route("/v1/receipt/{receipt_id}", get(receipt_get))
         .route("/v1/credit/deposit", post(credit_deposit))
