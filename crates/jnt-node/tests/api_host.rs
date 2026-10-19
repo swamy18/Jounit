@@ -38,6 +38,7 @@ fn start(listen: &str, token: Option<&str>, allowed: &[&str]) -> SocketAddr {
         listen.parse().unwrap(),
         token.map(str::to_owned),
         allowed.iter().map(|s| s.to_string()).collect(),
+        Vec::new(),
     )
     .expect("the API must bind its test socket")
 }

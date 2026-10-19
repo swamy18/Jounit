@@ -55,6 +55,70 @@ pub const DOM_CREDIT_TERMS: &[u8] = b"jounit/credit-terms/v1";
 /// with a terms id or any other derived hash.
 pub const DOM_CREDIT_POSITION: &[u8] = b"jounit/credit-position/v1";
 
+/// Domain tag for a credit attestation: a mint authorization's signing hash
+/// never collides with terms, positions, or any other message its issuer signs.
+pub const DOM_CREDIT_ATTESTATION: &[u8] = b"jounit/credit-attestation/v1";
+
+/// A trusted issuer's signed authorization to mint `amount_sat` of local
+/// credit for `subject` on `network_id`, accepted only at heights
+/// `issue_height ..= expires_height`. Non-consensus: it gates this node's
+/// `CreditBook` only — it moves no coin and means nothing to any other node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditAttestation {
+    pub network_id: String,
+    pub subject: Address,
+    pub amount_sat: u64,
+    pub issue_height: u64,
+    pub expires_height: u64,
+    pub issuer: crate::bls_checkpoint::BlsPublicKey,
+    pub sig: crate::bls_checkpoint::BlsSignature,
+}
+
+impl CreditAttestation {
+    /// Sign an attestation. The signature covers every field — the network
+    /// string included — so changing any of them invalidates it.
+    pub fn sign(
+        sk: &crate::bls::SecretKey,
+        network_id: String,
+        subject: Address,
+        amount_sat: u64,
+        issue_height: u64,
+        expires_height: u64,
+    ) -> Self {
+        let mut att = CreditAttestation {
+            network_id,
+            subject,
+            amount_sat,
+            issue_height,
+            expires_height,
+            issuer: sk.public_key(),
+            sig: crate::bls_checkpoint::BlsSignature([0u8; 96]),
+        };
+        att.sig = sk.sign(&att.signing_hash());
+        att
+    }
+
+    /// The hash the signature covers.
+    pub fn signing_hash(&self) -> Hash {
+        let mut w = Writer::new();
+        w.u32le(self.network_id.len() as u32)
+            .raw(self.network_id.as_bytes())
+            .fixed(&self.subject)
+            .u64le(self.amount_sat)
+            .u64le(self.issue_height)
+            .u64le(self.expires_height)
+            .fixed(&self.issuer.0);
+        sha256_dom(DOM_CREDIT_ATTESTATION, &[w.as_slice()])
+    }
+
+    /// Verify the signature against `self.issuer`. Height, network and
+    /// trusted-issuer checks are the accepting node's to make; this only says
+    /// the issuer really signed this attestation.
+    pub fn verify(&self) -> bool {
+        crate::bls::RealBls::verify(&self.issuer, &self.signing_hash(), &self.sig)
+    }
+}
+
 /// A lender's underwriting parameters for one class of position.
 ///
 /// These are a lender's choice, set before a position is opened and immutable

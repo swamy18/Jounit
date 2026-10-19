@@ -64,6 +64,7 @@
 //! POST /v1/escrow/{id}/settle  bind the release to the L2 exit that pays it
 //! GET  /v1/escrow/{id}         escrow state
 //! POST /v1/credit/deposit      fund an address's credit line (non-consensus book)
+//! POST /v1/credit/mint         mint via a trusted issuer's signed attestation
 //! POST /v1/credit/bond         move free credit into a posted bond, or release it
 //! POST /v1/credit/open         open a credit position under a lender's terms
 //! POST /v1/credit/repay        repay against a position, interest first
@@ -151,7 +152,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// [`SharedNode::encode_state`]. A build that writes a different format writes
 /// a different value, so an old file is refused by name instead of misread
 /// field by field.
-const STATE_ENVELOPE_VERSION: u8 = 3;
+const STATE_ENVELOPE_VERSION: u8 = 4;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -337,6 +338,12 @@ pub struct SharedNode {
     /// a payment can only be committed if the payer's line covers it, but the
     /// coin itself still moves through the ordinary §1 UTXO path later.
     pub credit: jnt_core::credit::CreditBook,
+    /// Attestation hash -> the height its validity ends. One attestation, one
+    /// mint: without this a trusted signature inside its window would mint the
+    /// same credit repeatedly. Persisted, so a restart is not a replay, and
+    /// pruned the moment an entry's own expiry passes — an expired attestation
+    /// is unusable anyway, height check first.
+    pub attestations_used: BTreeMap<Hash, u64>,
     /// Delegation link book (roadmap item 3). Node-local authority for who
     /// descends from whom: the policy layer is not a consensus rule (SPEC §18.2.1
     /// / D4), but the engine that *issued* the policies must be the one that
@@ -399,6 +406,7 @@ impl SharedNode {
             escrow_exit: BTreeMap::new(),
             policy_registry: BTreeMap::new(),
             revoked_policies: BTreeSet::new(),
+            attestations_used: BTreeMap::new(),
             tx_to_relay: Vec::new(),
             l2_to_include: Vec::new(),
         }
@@ -454,6 +462,12 @@ impl SharedNode {
             bound.u64le(b.nonce);
         }
         put_section(&mut w, &bound.into_vec());
+        let mut used = Writer::with_capacity(4 + self.attestations_used.len() * 40);
+        used.u32le(self.attestations_used.len() as u32);
+        for (id, expires) in &self.attestations_used {
+            used.fixed(id).u64le(*expires);
+        }
+        put_section(&mut w, &used.into_vec());
         w.into_vec()
     }
 
@@ -560,6 +574,21 @@ impl SharedNode {
             }
             Ok(map)
         })?;
+        let attestations_used = decode_section(&mut r, "attestations_used", |sr| {
+            let count = sr.u32le().map_err(|e| format!("attestations_used: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "attestations_used: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut map = BTreeMap::new();
+            for _ in 0..count {
+                let id: Hash = sr.fixed().map_err(|e| format!("attestations_used: {e}"))?;
+                let expires = sr.u64le().map_err(|e| format!("attestations_used: {e}"))?;
+                map.insert(id, expires);
+            }
+            Ok(map)
+        })?;
         // Anything after the last section means the envelope is malformed.
         r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
 
@@ -573,6 +602,7 @@ impl SharedNode {
         self.delegations = delegations;
         self.escrows = escrows;
         self.escrow_exit = escrow_exit;
+        self.attestations_used = attestations_used;
         self.policy_registry = policy_registry;
         self.revoked_policies = revoked_policies;
         Ok(())
@@ -614,6 +644,10 @@ impl SharedNode {
 pub struct ApiState {
     shared: Arc<Mutex<SharedNode>>,
     peers: Arc<AtomicUsize>,
+    /// BLS public keys trusted to sign credit attestations. Empty — the
+    /// default — means no issuer is trusted and `POST /v1/credit/mint`
+    /// refuses everything: credit backing is fail-closed, never implicit.
+    credit_issuers: Vec<jnt_core::bls_checkpoint::BlsPublicKey>,
 }
 
 /// Uniform error body: a stable machine-readable code plus a detail string
@@ -2488,7 +2522,9 @@ async fn exit_crankable(
 /// coin. It exists so the credit gate can be exercised end-to-end (the book is
 /// otherwise empty and every admission would refuse). A production node would
 /// gate this behind an L1 deposit proof; in this crate the gate is pure
-/// arithmetic and consensus-neutral regardless.
+/// arithmetic and consensus-neutral regardless. The production-shaped gate this
+/// node does ship is `POST /v1/credit/mint` — a trusted issuer's signed
+/// attestation — and a production operator should route backing through it.
 #[derive(Deserialize)]
 struct CreditDepositReq {
     address_hex: String,
@@ -2515,6 +2551,124 @@ async fn credit_deposit(
         Ok(Json(json!({
             "address": address_to_hex(&addr),
             "balance": sh.credit.free(&addr),
+        })))
+    })?
+}
+
+/// `POST /v1/credit/mint` — mint credit carrying a trusted issuer's signed
+/// attestation: the production gate that `POST /v1/credit/deposit` documents
+/// but does not have. Fail-closed three independent ways: a node configured
+/// with no issuer keys refuses every mint; an attestation from any other key,
+/// for another network, outside its height window, or with a bad signature is
+/// refused; and a minted attestation's hash is recorded (persisted, so a
+/// restart is not a replay) so one authorization can never mint twice. This
+/// credits the local book only — no coin moves.
+#[derive(Deserialize)]
+struct CreditMintReq {
+    network_id: String,
+    subject: String,
+    amount_sat: u64,
+    issue_height: u64,
+    expires_height: u64,
+    issuer: String,
+    sig: String,
+}
+
+async fn credit_mint(State(state): State<ApiState>, Json(req): Json<CreditMintReq>) -> ApiResult {
+    let issuers = state.credit_issuers.clone();
+    if issuers.is_empty() {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "no_credit_issuers",
+            "no trusted credit issuer is configured; pass --credit-issuer <48-byte hex>",
+        ));
+    }
+    if req.amount_sat == 0 {
+        return Err(bad(
+            "amount_sat must be positive; a zero mint moves nothing",
+        ));
+    }
+    let subject = decode_address(&req.subject)?;
+    let issuer = decode_public_key(&req.issuer, "issuer")?;
+    let sig_raw = decode_hex_bytes(&req.sig, "sig")?;
+    let sig: [u8; 96] = sig_raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| bad("sig must be 96 hex bytes"))?;
+    let att = jnt_core::credit::CreditAttestation {
+        network_id: req.network_id,
+        subject,
+        amount_sat: req.amount_sat,
+        issue_height: req.issue_height,
+        expires_height: req.expires_height,
+        issuer,
+        sig: jnt_core::bls_checkpoint::BlsSignature(sig),
+    };
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        if att.network_id != network {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "wrong_network",
+                format!(
+                    "the attestation is for {:?}, this node runs {network:?}",
+                    att.network_id
+                ),
+            ));
+        }
+        let height = sh.chain.height();
+        if height < att.issue_height {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "attestation_from_the_future",
+                format!(
+                    "issued at height {}, this node is at {height}",
+                    att.issue_height
+                ),
+            ));
+        }
+        if height > att.expires_height {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "attestation_expired",
+                format!(
+                    "expired at height {}, this node is at {height}",
+                    att.expires_height
+                ),
+            ));
+        }
+        if !issuers.contains(&att.issuer) {
+            return Err(fail(
+                StatusCode::FORBIDDEN,
+                "untrusted_issuer",
+                "the issuer is not one of this node's trusted keys",
+            ));
+        }
+        if !att.verify() {
+            return Err(bad("attestation signature does not verify"));
+        }
+        // Prune first: an entry past its own expiry is unusable anyway (the
+        // height check above already refused it), so the map holds exactly
+        // the attestations still inside their window.
+        sh.attestations_used.retain(|_, expires| *expires >= height);
+        let id = att.signing_hash();
+        if sh.attestations_used.contains_key(&id) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "attestation_reused",
+                "this attestation has already minted",
+            ));
+        }
+        sh.credit
+            .deposit(att.subject, att.amount_sat)
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, "credit_refused", e.to_string()))?;
+        sh.attestations_used.insert(id, att.expires_height);
+        Ok(Json(json!({
+            "address": address_to_hex(&att.subject),
+            "amount_sat": att.amount_sat,
+            "balance": sh.credit.free(&att.subject),
+            "attestation_hash": hash_to_hex(&id),
+            "height": height,
         })))
     })?
 }
@@ -3348,6 +3502,7 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/receipt", post(receipt_submit))
         .route("/v1/receipt/{receipt_id}", get(receipt_get))
         .route("/v1/credit/deposit", post(credit_deposit))
+        .route("/v1/credit/mint", post(credit_mint))
         .route("/v1/credit/bond", post(credit_bond))
         .route("/v1/credit/open", post(credit_open))
         .route("/v1/credit/repay", post(credit_repay))
@@ -3528,12 +3683,13 @@ pub fn spawn(
     listen: SocketAddr,
     token: Option<String>,
 ) -> Result<SocketAddr, String> {
-    spawn_with_options(shared, peers, listen, token, Vec::new())
+    spawn_with_options(shared, peers, listen, token, Vec::new(), Vec::new())
 }
 
 /// Start the API like [`spawn`], additionally allowlisting hostnames for the
 /// Host-header check on a non-loopback bind (`--api-allowed-host` /
-/// `JNT_API_ALLOWED_HOSTS`). Entries are normalized (lowercased, port
+/// `JNT_API_ALLOWED_HOSTS`) and naming the BLS keys trusted to sign credit
+/// attestations (`--credit-issuer`). Entries are normalized (lowercased, port
 /// stripped); empties are dropped.
 pub fn spawn_with_options(
     shared: Arc<Mutex<SharedNode>>,
@@ -3541,6 +3697,7 @@ pub fn spawn_with_options(
     listen: SocketAddr,
     token: Option<String>,
     allowed_hosts: Vec<String>,
+    credit_issuers: Vec<jnt_core::bls_checkpoint::BlsPublicKey>,
 ) -> Result<SocketAddr, String> {
     // An empty token is no token: the guard below filters empties out of the
     // config, so accepting `Some("")` here would pass the refusal and then
@@ -3572,7 +3729,14 @@ pub fn spawn_with_options(
         concurrency: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY)),
         limiter: RateLimiter::default(),
     };
-    let app = router(ApiState { shared, peers }, &cfg);
+    let app = router(
+        ApiState {
+            shared,
+            peers,
+            credit_issuers,
+        },
+        &cfg,
+    );
 
     std::thread::Builder::new()
         .name("jnt-api".into())

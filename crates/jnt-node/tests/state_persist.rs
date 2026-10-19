@@ -157,6 +157,9 @@ fn populate(node: &mut SharedNode) {
             nonce: 5,
         },
     );
+
+    // A minted attestation that must never mint again, across a restart.
+    node.attestations_used.insert([6u8; 32], 500);
 }
 
 #[test]
@@ -186,6 +189,10 @@ fn node_books_survive_an_encode_decode_round_trip() {
     assert_eq!(
         b.escrow_exit, a.escrow_exit,
         "escrow exit bindings round-trip"
+    );
+    assert_eq!(
+        b.attestations_used, a.attestations_used,
+        "used attestations round-trip"
     );
     assert!(b.policy_registry.contains_key(&policy().hash()));
     assert!(b.revoked_policies.contains(&[3u8; 32]));

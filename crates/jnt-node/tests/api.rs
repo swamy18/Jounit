@@ -45,7 +45,7 @@ use jnt_core::service::{
 use jnt_core::sig::Bundle;
 use jnt_core::tx::{Output, Transaction};
 use jnt_core::wallet::Wallet;
-use jnt_node::api::{spawn, SharedNode};
+use jnt_node::api::{spawn_with_options, SharedNode};
 use jnt_node::l2::NodeL2;
 
 use serde_json::{json, Value};
@@ -73,15 +73,23 @@ fn start() -> Node {
 
 /// Start a server over a chain the caller has already mined.
 fn start_with(chain: Chain) -> Node {
+    start_with_issuers(chain, Vec::new())
+}
+
+/// Start a server over `chain` that trusts `issuers` to sign credit
+/// attestations; empty issuers means every `/v1/credit/mint` is refused.
+fn start_with_issuers(chain: Chain, issuers: Vec<jnt_core::bls_checkpoint::BlsPublicKey>) -> Node {
     let params = NetworkParams::mini();
     let l2 = NodeL2::fresh(&params).unwrap();
     let shared = Arc::new(Mutex::new(SharedNode::new(chain, l2)));
     let peers = Arc::new(AtomicUsize::new(0));
-    let addr = spawn(
+    let addr = spawn_with_options(
         Arc::clone(&shared),
         peers,
         "127.0.0.1:0".parse().unwrap(),
         None,
+        Vec::new(),
+        issuers,
     )
     .expect("the API must bind its loopback socket");
     Node { addr, shared }
@@ -2950,4 +2958,119 @@ fn settle_refuses_an_unknown_escrow_and_malformed_hex() {
     );
     assert_eq!(s, 400, "{body}");
     assert_eq!(body["error"], "bad_request");
+}
+
+// ---------------------------------------------------------------------------
+// Credit attestation: minting gated by a trusted issuer's signature
+// ---------------------------------------------------------------------------
+
+/// The `POST /v1/credit/mint` body for an attestation, fields verbatim.
+fn mint_json(att: &jnt_core::credit::CreditAttestation) -> serde_json::Value {
+    serde_json::json!({
+        "network_id": att.network_id,
+        "subject": address_to_hex(&att.subject),
+        "amount_sat": att.amount_sat,
+        "issue_height": att.issue_height,
+        "expires_height": att.expires_height,
+        "issuer": hex::encode(att.issuer.0),
+        "sig": hex::encode(att.sig.0),
+    })
+}
+
+#[test]
+fn a_mint_needs_a_trusted_signature_and_can_never_mint_twice() {
+    let issuer_sk = jnt_core::bls::SecretKey::from_scalar(&[81u8; 32]).unwrap();
+    let stranger_sk = jnt_core::bls::SecretKey::from_scalar(&[82u8; 32]).unwrap();
+    let subject = wallet(75, "credit-subject").address().unwrap();
+    let sign_att = |sk: &jnt_core::bls::SecretKey, net: &str, amount, issue, expires| {
+        jnt_core::credit::CreditAttestation::sign(
+            sk,
+            net.to_string(),
+            subject,
+            amount,
+            issue,
+            expires,
+        )
+    };
+
+    // No configured issuer: every mint refused, whatever the attestation says.
+    let node = start();
+    let att = sign_att(&issuer_sk, NET, 5_000, 0, 9_000);
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 403, "{body}");
+    assert_eq!(body["error"], "no_credit_issuers");
+
+    // A node that trusts this issuer: the signed attestation mints its amount.
+    let node = start_with_issuers(
+        Chain::new(NetworkParams::mini()).unwrap(),
+        vec![issuer_sk.public_key()],
+    );
+    let att = sign_att(&issuer_sk, NET, 5_000, 0, 9_000);
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["amount_sat"], 5_000);
+    assert_eq!(body["balance"], 5_000);
+
+    // The same attestation again is refused: one signature, one mint.
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "attestation_reused");
+
+    // The balance agrees with what minted.
+    let (s, body) = get(
+        &node,
+        &format!("/v1/credit/balance/{}", address_to_hex(&subject)),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["free_balance"], 5_000);
+
+    // An issuer this node does not trust: refused even with a perfect
+    // signature, because trust is configuration, never inference.
+    let node = start_with_issuers(
+        Chain::new(NetworkParams::mini()).unwrap(),
+        vec![stranger_sk.public_key()],
+    );
+    let att = sign_att(&issuer_sk, NET, 5_000, 0, 9_000);
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 403, "{body}");
+    assert_eq!(body["error"], "untrusted_issuer");
+
+    let node = start_with_issuers(
+        Chain::new(NetworkParams::mini()).unwrap(),
+        vec![issuer_sk.public_key()],
+    );
+
+    // A tampered amount under a valid signature: refused before minting.
+    let mut att = sign_att(&issuer_sk, NET, 7_000, 0, 9_000);
+    att.amount_sat = 90_000;
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 400, "{body}");
+
+    // Another network's attestation: refused by name, not verified into.
+    let att = sign_att(&issuer_sk, "other/net", 5_000, 0, 9_000);
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "wrong_network");
+
+    // Not yet issued: refused as from the future.
+    let att = sign_att(&issuer_sk, NET, 5_000, 99, 9_000);
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "attestation_from_the_future");
+
+    // An expired attestation: refuse after its window, even signed by the
+    // trusted key. The window closes at height 0 here, so one block does it.
+    let att = sign_att(&issuer_sk, NET, 5_000, 0, 0);
+    {
+        let mut guard = node.shared.lock().unwrap();
+        let sh = &mut *guard;
+        let b = sh
+            .chain
+            .mine_block([9u8; 20], vec![], GENESIS_TIMESTAMP_MS + 1_000)
+            .unwrap();
+        sh.chain.submit(b).unwrap();
+    }
+    let (s, body) = post(&node, "/v1/credit/mint", &mint_json(&att));
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(body["error"], "attestation_expired");
 }

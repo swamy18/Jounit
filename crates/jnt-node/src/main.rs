@@ -1475,6 +1475,27 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         api_allowed_hosts.extend(split_hosts(flag));
     }
 
+    // Trusted credit issuers for POST /v1/credit/mint: comma-separated
+    // 48-byte hex BLS public keys. Absent = no issuer = every mint refused
+    // (fail-closed); credit backing is configured, never assumed.
+    let mut credit_issuers: Vec<jnt_core::bls_checkpoint::BlsPublicKey> = Vec::new();
+    for part in args.str_or("credit-issuer", "").split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let raw = hex::decode(part).map_err(|e| format!("--credit-issuer: {e}"))?;
+        let mut key = [0u8; 48];
+        if raw.len() != 48 {
+            return Err(format!(
+                "--credit-issuer: each key must be 48 bytes, got {}",
+                raw.len()
+            ));
+        }
+        key.copy_from_slice(&raw);
+        credit_issuers.push(jnt_core::bls_checkpoint::BlsPublicKey(key));
+    }
+
     // Capture address book path before config is moved into P2pNode::start.
     let has_address_book = config.address_book.is_some();
 
@@ -1553,6 +1574,7 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             api_addr,
             api_token.clone(),
             api_allowed_hosts,
+            credit_issuers,
         )?;
         println!("api            {bound}");
     }
