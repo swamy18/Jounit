@@ -61,6 +61,7 @@
 //! GET  /v1/exit/crankable      the exit claims this node could settle now
 //! POST /v1/escrow/open         open a conditional escrow with a chosen arbitrator
 //! POST /v1/escrow/{id}/release arbiter- or mutual-release a live escrow (non-consensus)
+//! POST /v1/escrow/{id}/settle  bind the release to the L2 exit that pays it
 //! GET  /v1/escrow/{id}         escrow state
 //! POST /v1/credit/deposit      fund an address's credit line (non-consensus book)
 //! POST /v1/credit/bond         move free credit into a posted bond, or release it
@@ -126,7 +127,7 @@ use jnt_core::hash::{
     address_from_hex, address_to_hex, hash512_from_hex, hash512_to_hex, hash_from_hex, hash_to_hex,
     Address, Hash, Hash512,
 };
-use jnt_core::l2::L2Transaction;
+use jnt_core::l2::{L2Payload, L2Transaction};
 use jnt_core::mempool::Mempool;
 use jnt_core::params::{NetworkParams, L2_FEE_SCHEDULE, SAT_PER_JNT};
 use jnt_core::payment::{MachinePayment, PaymentTracker};
@@ -150,7 +151,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// [`SharedNode::encode_state`]. A build that writes a different format writes
 /// a different value, so an old file is refused by name instead of misread
 /// field by field.
-const STATE_ENVELOPE_VERSION: u8 = 2;
+const STATE_ENVELOPE_VERSION: u8 = 3;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -270,6 +271,17 @@ fn settlement_value(sh: &SharedNode, id: &Hash) -> Value {
     }
 }
 
+/// A released escrow whose coin move is bound to a real L2 exit: the exit's
+/// identity (owner, nonce) plus the queue txid the settle call carried. The
+/// identity is what lets [`SharedNode::advance_escrow_finality`] ask consensus
+/// whether *this* exit paid the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscrowExitBinding {
+    pub txid: Hash512,
+    pub owner: Address,
+    pub nonce: u64,
+}
+
 /// Everything the API and the serve loop share. One lock: the serve loop
 /// takes it per iteration, handlers take it per request. No handler ever
 /// holds it across an await (handlers do not await), so the async runtime
@@ -336,6 +348,13 @@ pub struct SharedNode {
     /// Non-consensus: the ledger tracks the state machine, and the actual coin
     /// release reuses the §1 L1 exit / §19.4 path.
     pub escrows: BTreeMap<jnt_core::hash::Hash, jnt_core::escrow::ConditionalEscrow>,
+    /// escrow id -> the L2 exit queued to pay that escrow's release: the
+    /// bond that makes `Finalized` mean "the coin actually left". With a
+    /// binding recorded, the escrow finalizes only when
+    /// `Chain::exit_released` says consensus paid the destination (SPEC
+    /// §20.2); without one, the height-stamp behavior of an un-settled
+    /// escrow stands.
+    pub escrow_exit: BTreeMap<Hash, EscrowExitBinding>,
     /// Policies this node has issued authorizations under, keyed by policy hash.
     ///
     /// The node keeps the policy object because admission (`POST
@@ -377,6 +396,7 @@ impl SharedNode {
             credit: jnt_core::credit::CreditBook::new(),
             delegations: jnt_core::delegation::DelegationBook::new(),
             escrows: BTreeMap::new(),
+            escrow_exit: BTreeMap::new(),
             policy_registry: BTreeMap::new(),
             revoked_policies: BTreeSet::new(),
             tx_to_relay: Vec::new(),
@@ -427,6 +447,13 @@ impl SharedNode {
             settled.fixed(payment).fixed(txid);
         }
         put_section(&mut w, &settled.into_vec());
+        let mut bound = Writer::with_capacity(4 + self.escrow_exit.len() * 124);
+        bound.u32le(self.escrow_exit.len() as u32);
+        for (id, b) in &self.escrow_exit {
+            bound.fixed(id).fixed(&b.txid).fixed(&b.owner);
+            bound.u64le(b.nonce);
+        }
+        put_section(&mut w, &bound.into_vec());
         w.into_vec()
     }
 
@@ -516,6 +543,23 @@ impl SharedNode {
             }
             Ok(map)
         })?;
+        let escrow_exit = decode_section(&mut r, "escrow_exit", |sr| {
+            let count = sr.u32le().map_err(|e| format!("escrow_exit: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "escrow_exit: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut map = BTreeMap::new();
+            for _ in 0..count {
+                let id: Hash = sr.fixed().map_err(|e| format!("escrow_exit: {e}"))?;
+                let txid: Hash512 = sr.fixed().map_err(|e| format!("escrow_exit: {e}"))?;
+                let owner: Address = sr.fixed().map_err(|e| format!("escrow_exit: {e}"))?;
+                let nonce = sr.u64le().map_err(|e| format!("escrow_exit: {e}"))?;
+                map.insert(id, EscrowExitBinding { txid, owner, nonce });
+            }
+            Ok(map)
+        })?;
         // Anything after the last section means the envelope is malformed.
         r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
 
@@ -528,6 +572,7 @@ impl SharedNode {
         self.credit = credit;
         self.delegations = delegations;
         self.escrows = escrows;
+        self.escrow_exit = escrow_exit;
         self.policy_registry = policy_registry;
         self.revoked_policies = revoked_policies;
         Ok(())
@@ -536,12 +581,17 @@ impl SharedNode {
     /// Advance escrows whose release has matured under finality to `Finalized`
     /// (roadmap item 10, §19.4). Called each serve-loop tick so a released
     /// escrow becomes settleable without an extra client round-trip; it is also
-    /// safe to call from read paths because it is idempotent and pure height
-    /// math (no coin moves — finality is a ledger height-stamp only).
+    /// safe to call from read paths because it is idempotent.
+    ///
+    /// For an escrow bound to an exit, `Finalized` is written only when
+    /// `Chain::exit_released` says consensus actually paid the destination -
+    /// SPEC §20.2's "when the coin actually leaves ... on the base layer". An
+    /// unbound escrow keeps the ledger height-stamp it has always had: no coin
+    /// was ever tied to it, so there is nothing to wait for.
     pub fn advance_escrow_finality(&mut self) {
         let now = self.chain.height();
         let activation = self.chain.params().finality_activation_height;
-        for escrow in self.escrows.values_mut() {
+        for (id, escrow) in self.escrows.iter_mut() {
             // The timeout first: an open escrow past `ESCROW_EXPIRY_BLOCKS`
             // refunds its payer, which is what stops a silent or unreachable
             // arbitrator from holding the value forever. Only a *released*
@@ -549,7 +599,13 @@ impl SharedNode {
             if escrow.expired_at(now) {
                 let _ = escrow.refund(now);
             }
-            let _ = escrow.finalize(now, activation);
+            let released = match self.escrow_exit.get(id) {
+                Some(binding) => self.chain.exit_released(&binding.owner, binding.nonce),
+                None => true,
+            };
+            if released {
+                let _ = escrow.finalize(now, activation);
+            }
         }
     }
 }
@@ -2698,6 +2754,118 @@ async fn escrow_open(State(state): State<ApiState>, Json(req): Json<EscrowOpenRe
     })?
 }
 
+#[derive(Deserialize)]
+struct EscrowSettleReq {
+    /// Signed L2 `ExitQueue` transaction whose owner, destination and amount
+    /// are exactly this escrow's payer, payee and amount.
+    l2_tx_hex: String,
+}
+
+/// `POST /v1/escrow/{id}/settle` - bind a released escrow's coin move to a
+/// real L2 exit and queue it for the crank (SPEC §20.2 / Item 10). The node
+/// verifies the exit *is* this escrow's settlement: owner = payer,
+/// destination = payee, amount = the escrow amount, then dry-runs it exactly
+/// like any other L2 write. The coin actually moves when consensus releases
+/// the exit; only then does `advance_escrow_finality` write `Finalized` for
+/// this escrow.
+async fn escrow_settle(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<EscrowSettleReq>,
+) -> ApiResult {
+    // An exit queue is an L2 write: on a breached node it is refused at the
+    // same boundary /v1/l2/broadcast draws (Decision 17).
+    ensure_funding_allowed(&state, FundingPath::L2Write)?;
+    let id = decode_hash(&id)?;
+    let bytes = decode_hex_bytes(&req.l2_tx_hex, "l2_tx")?;
+    let tx = L2Transaction::deserialize(&bytes).map_err(|e| bad(format!("l2 tx decode: {e}")))?;
+    let txid = tx.txid();
+    // The payload identity, read once before `tx` is moved into the include queue.
+    let (exit_owner, exit_destination, exit_amount, exit_nonce) = match &tx.payload {
+        L2Payload::ExitQueue(exit) => (exit.owner, exit.destination, exit.amount_sat, exit.nonce),
+        _ => return Err(bad("settlement must carry an ExitQueue transaction")),
+    };
+    with_shared(&state, |sh| {
+        let (payer, payee, amount_sat) = {
+            let e = sh
+                .escrows
+                .get(&id)
+                .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such escrow"))?;
+            if !matches!(
+                e.state,
+                jnt_core::escrow::EscrowState::ReleasedMutual { .. }
+                    | jnt_core::escrow::EscrowState::ReleasedArbiter { .. }
+            ) {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "escrow_not_released",
+                    "the coin moves only after a release; this escrow is not released",
+                ));
+            }
+            (e.payer, e.payee, e.amount_sat)
+        };
+        if let Some(bound) = sh.escrow_exit.get(&id) {
+            if bound.txid == txid {
+                return Ok(Json(json!({
+                    "escrow_id": hash_to_hex(&id),
+                    "txid": hash512_to_hex(&txid),
+                    "duplicate": true,
+                })));
+            }
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "escrow_settled",
+                "this escrow's coin move is already bound to another exit",
+            ));
+        }
+        if exit_owner != payer {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "settlement_owner_mismatch",
+                "the exit's owner must be the escrow's payer",
+            ));
+        }
+        if exit_destination != payee {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "settlement_destination_mismatch",
+                "the exit's destination must be the escrow's payee",
+            ));
+        }
+        if exit_amount != amount_sat {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "settlement_amount_mismatch",
+                format!("the exit moves {exit_amount} sat; this escrow is for {amount_sat} sat"),
+            ));
+        }
+        if sh.l2_to_include.iter().any(|t| t.txid() == txid) {
+            return Ok(Json(json!({
+                "escrow_id": hash_to_hex(&id),
+                "txid": hash512_to_hex(&txid),
+                "already_queued": true,
+            })));
+        }
+        sh.l2
+            .check(&tx, sh.chain.height() + 1)
+            .map_err(|e| fail(StatusCode::CONFLICT, "l2_refused", format!("{e}")))?;
+        sh.l2_to_include.push(tx);
+        sh.escrow_exit.insert(
+            id,
+            EscrowExitBinding {
+                txid,
+                owner: exit_owner,
+                nonce: exit_nonce,
+            },
+        );
+        Ok(Json(json!({
+            "escrow_id": hash_to_hex(&id),
+            "txid": hash512_to_hex(&txid),
+            "queued": true,
+        })))
+    })?
+}
+
 /// `GET /v1/escrow/{id}` — escrow state, or 404.
 async fn escrow_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     let id = decode_hash(&id)?;
@@ -2725,6 +2893,21 @@ async fn escrow_get(State(state): State<ApiState>, Path(id): Path<String>) -> Ap
                     &e.release_signing_hash(jnt_core::escrow::EscrowVerdict::ReleasedToPayee)
                 ),
                 "state": escrow_state_name(&e.state),
+                // The bound coin move, re-resolved against consensus: queued
+                // exits report `exit_released: false` until the crank settles
+                // one, and only then does this escrow read as `finalized`.
+                "settlement": sh
+                    .escrow_exit
+                    .get(&id)
+                    .map(|b| {
+                        json!({
+                            "txid": hash512_to_hex(&b.txid),
+                            "exit_owner": address_to_hex(&b.owner),
+                            "exit_nonce": b.nonce,
+                            "exit_released": sh.chain.exit_released(&b.owner, b.nonce),
+                        })
+                    })
+                    .unwrap_or(Value::Null),
             }))),
             None => Err(fail(StatusCode::NOT_FOUND, "not_found", "no such escrow")),
         }
@@ -2754,7 +2937,7 @@ struct EscrowReleaseReq {
 /// `POST /v1/escrow/{id}/release` — release a live escrow. `arbiter` mode
 /// requires a signature from the designated arbitrator; `mutual` requires both
 /// parties. The released state is recorded but the coin move is deferred to
-/// settlement (§19.4).
+/// settlement (§19.4) — `POST /v1/escrow/{id}/settle` binds it to the exit.
 async fn escrow_release(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -3172,6 +3355,7 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/credit/balance/{address}", get(credit_balance))
         .route("/v1/escrow/open", post(escrow_open))
         .route("/v1/escrow/{id}/release", post(escrow_release))
+        .route("/v1/escrow/{id}/settle", post(escrow_settle))
         .route("/v1/escrow/{id}", get(escrow_get))
         .route("/v1/exit/crankable", get(exit_crankable));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a

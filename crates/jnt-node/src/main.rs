@@ -1645,9 +1645,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
             None => {}
         }
 
-        // Item 10 / §19.4: advance released escrows whose release has matured
-        // under the finality window to Finalized. Pure height math — no coin
-        // moves — so it is safe to run on every tick alongside the mine step.
+        // Item 10 / §20.2: advance released escrows to Finalized once their
+        // release has matured under finality — and, for an escrow bound to an
+        // exit via /v1/escrow/{id}/settle, only once consensus released that
+        // exit (the coin actually moved). Height math plus one release lookup:
+        // safe on every tick alongside the mine step.
         sh.advance_escrow_finality();
 
         // Drain the inclusion queue every tick, not only when mining. With

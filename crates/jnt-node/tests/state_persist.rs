@@ -147,6 +147,16 @@ fn populate(node: &mut SharedNode) {
     node.receipts
         .accept(&receipt, NET)
         .expect("receipt accepted");
+
+    // A released escrow bound to the exit that pays it (Gap 3 settlement).
+    node.escrow_exit.insert(
+        [8u8; 32],
+        jnt_node::api::EscrowExitBinding {
+            txid: [7u8; 64],
+            owner: [1u8; 20],
+            nonce: 5,
+        },
+    );
 }
 
 #[test]
@@ -173,6 +183,10 @@ fn node_books_survive_an_encode_decode_round_trip() {
     );
     assert_eq!(b.payment_store.len(), 1);
     assert_eq!(b.payment_tx, a.payment_tx, "settlement links round-trip");
+    assert_eq!(
+        b.escrow_exit, a.escrow_exit,
+        "escrow exit bindings round-trip"
+    );
     assert!(b.policy_registry.contains_key(&policy().hash()));
     assert!(b.revoked_policies.contains(&[3u8; 32]));
     assert_eq!(b.delegations.recorded().count(), 1);

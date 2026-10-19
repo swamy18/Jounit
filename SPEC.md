@@ -1,7 +1,7 @@
 # JOUNIT PROTOCOL SPECIFICATION
 
 **Version:** 0.1.0 (the workspace version in `Cargo.toml`)
-**Status:** Draft — §0–§12 normative for `jnt-core`; §13 normative for `jnt-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `jnt-l2`; §18 for `jnt-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `jnt-core::escrow` and `jnt-node::api`; coin settlement is Item 10.
+**Status:** Draft — §0–§12 normative for `jnt-core`; §13 normative for `jnt-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `jnt-l2`; §18 for `jnt-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `jnt-core::escrow` and `jnt-node::api`; coin settlement runs via `POST /v1/escrow/{id}/settle` (§20.2).
 **Scope:** Layer 1 (base layer, §0–§13), the M1–M5 protocol mechanisms (§14), Layer 2 and the worker SDK (§15–§18), and L1↔L2 integration including deposits and exits (§19). §13 covers block and transaction relay between nodes.
 
 This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
@@ -2986,5 +2986,8 @@ arbiter signature refused, non-party key refused for mutual, arity rule, round-t
 codec, zero-key/self-party refusal. The HTTP surface in `jnt-node::api` is covered by
 `crates/jnt-node/tests/api.rs` (open, unauthorized arbiter refused, authorized arbiter
 accept, replay of a decided escrow refused, mutual accept, one-sided sig refused,
-unknown-id 404, zero-key open refused). Coin settlement for this state machine is
-Item 10.
+unknown-id 404, zero-key open refused). Coin settlement runs through
+`POST /v1/escrow/{id}/settle`: the call binds a released escrow to the L2 exit
+that pays it (owner = payer, destination = payee, amount = escrow amount), and
+§20.2's `Finalized` is written only when `Chain::exit_released` confirms
+consensus actually paid that destination.
