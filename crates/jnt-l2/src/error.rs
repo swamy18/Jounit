@@ -105,6 +105,36 @@ pub enum L2Error {
     /// A reputation derivation refused a canonical artifact (roadmap item 9).
     /// The reason is the underlying ledger clause, stated.
     Reputation(String),
+    /// A spending-policy rule refused the transaction. The reason is stated, so
+    /// a caller learns *which* clause bound it rather than only that it did not.
+    Policy(String),
+    /// The transaction names the wrong grant, the wrong spender or the wrong
+    /// agent: a binding mismatch rather than a limit.
+    PolicyBinding(&'static str),
+    /// No published grant with this hash, or none for this agent.
+    UnknownPolicy,
+    /// The agent already has a live grant. An agent has exactly one grant at a
+    /// time, so a second one cannot be used to double the caps the first one
+    /// grants.
+    PolicyAlreadyPublished,
+    /// The grant is revoked, or it descends from a revoked grant. The owner's
+    /// kill switch reaches every descendant without a separate revocation per
+    /// link.
+    PolicyRevoked,
+    /// A cap bound the spend: per transaction, or cumulative inside the window.
+    PolicyLimit(&'static str),
+    /// The recipient is not on the grant's allow-list. An empty allow-list
+    /// allows nothing, which is the safe reading of an empty list.
+    PolicyRecipient,
+    /// The service tag is not on the grant's allow-list, or the grant names
+    /// services and the spend named none.
+    PolicyService,
+    /// The nonce repeats or rewinds the grant's last nonce. Nonces are strictly
+    /// increasing per grant.
+    PolicyNonce,
+    /// The grant is not usable at this height: not yet valid, expired, or the
+    /// height ran backwards inside the grant.
+    PolicyWindow(&'static str),
 }
 
 impl fmt::Display for L2Error {
@@ -170,6 +200,18 @@ impl fmt::Display for L2Error {
             L2Error::UnknownExit => write!(f, "no such queued exit"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),
             L2Error::Reputation(w) => write!(f, "reputation: {w}"),
+            L2Error::Policy(w) => write!(f, "policy refused: {w}"),
+            L2Error::PolicyBinding(w) => write!(f, "policy binding: {w}"),
+            L2Error::UnknownPolicy => write!(f, "no such published policy"),
+            L2Error::PolicyAlreadyPublished => {
+                write!(f, "the agent already has a live published policy")
+            }
+            L2Error::PolicyRevoked => write!(f, "the policy is revoked"),
+            L2Error::PolicyLimit(w) => write!(f, "policy limit: {w}"),
+            L2Error::PolicyRecipient => write!(f, "recipient is not on the policy allow-list"),
+            L2Error::PolicyService => write!(f, "service is not on the policy allow-list"),
+            L2Error::PolicyNonce => write!(f, "policy nonce repeats or rewinds"),
+            L2Error::PolicyWindow(w) => write!(f, "policy window: {w}"),
         }
     }
 }

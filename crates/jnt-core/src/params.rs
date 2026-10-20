@@ -55,6 +55,15 @@ pub const SETTLE_FEE_MIN_SAT: u64 = 1_000;
 /// exit implementation and recorded in `docs/decisions.md` (P1 record); it is a
 /// fee for a *new* type, not a change to any decided value.
 pub const FEE_TX_EXIT_QUEUE_SAT: u64 = 2_000;
+/// Publishing a spending policy on chain (SPEC.md §21.1). Same tier as
+/// claim/submit: a simple owner-signed record, not arbitration.
+pub const FEE_TX_POLICY_SAT: u64 = 2_000;
+/// Revoking a published policy (SPEC.md §21.2). Same tier as the publish it
+/// undoes.
+pub const FEE_TX_POLICY_REVOKE_SAT: u64 = 2_000;
+/// Spending under a published policy (SPEC.md §21.3). Same tier as the exit
+/// queue: a signed debit-and-credit with no arbitration.
+pub const FEE_TX_AGENT_SPEND_SAT: u64 = 2_000;
 /// The flat minimum fee floor for any L2 transaction (D3). Every L2 fee type
 /// must meet or exceed this value. The `fee_sat` function applies `max(fee,
 /// L2_FLAT_FEE_MINIMUM_SAT)` as a final floor so a future re-parameterization
@@ -74,6 +83,9 @@ pub const L2_FEE_SCHEDULE: &[(&str, u64)] = &[
     ("TxDispute", FEE_TX_DISPUTE_SAT),
     ("TxSettle", SETTLE_FEE_MIN_SAT),
     ("TxExitQueue", FEE_TX_EXIT_QUEUE_SAT),
+    ("TxPolicy", FEE_TX_POLICY_SAT),
+    ("TxPolicyRevoke", FEE_TX_POLICY_REVOKE_SAT),
+    ("TxAgentSpend", FEE_TX_AGENT_SPEND_SAT),
 ];
 
 /// One genesis-funded L2 balance (Decision 7, SPEC.md §19.4).
@@ -771,6 +783,9 @@ mod tests {
                 ("TxDispute", 10_000),
                 ("TxSettle", 1_000),
                 ("TxExitQueue", 2_000),
+                ("TxPolicy", 2_000),
+                ("TxPolicyRevoke", 2_000),
+                ("TxAgentSpend", 2_000),
             ]
         );
     }

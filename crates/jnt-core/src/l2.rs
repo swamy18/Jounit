@@ -3,13 +3,13 @@
 //! Jounit's L2 is the verified-work marketplace: a submitter posts a compute
 //! task with a locked payment, a worker claims and runs it, and settlement
 //! releases the payment against a verdict. A sixth type, `ExitQueue`, moves
-//! value the other way — out of L2 and back to L1 (Decision 19, SPEC.md §19.6).
+//! value the other way â€” out of L2 and back to L1 (Decision 19, SPEC.md Â§19.6).
 //! These six payload types are the protocol vocabulary for that loop.
 //!
 //! Scope, stated precisely because it is easy to over-read: these are *payload*
-//! types. They are validated and fee-routed here — the flat D3 schedule routes
-//! through `fees::split_flat_fee`, so the L1 `base_fee · gas_used` floor is
-//! untouched and no exemption is created. M1 (SPEC.md §19.1) carries them inside
+//! types. They are validated and fee-routed here â€” the flat D3 schedule routes
+//! through `fees::split_flat_fee`, so the L1 `base_fee Â· gas_used` floor is
+//! untouched and no exemption is created. M1 (SPEC.md Â§19.1) carries them inside
 //! L1 blocks as a length-prefixed trailer committed by
 //! `block::merkle_root_with_l2`.
 //!
@@ -33,12 +33,14 @@
 //! path of their own through `fees::split_flat_fee`, which keeps the M1 50/50
 //! burn/PSCB invariant and leaves the L1 `base_fee * gas_used` floor untouched.
 
+use crate::agent::AgentId;
 use crate::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512};
 use crate::params::{
-    FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_EXIT_QUEUE_SAT, FEE_TX_POST_TASK_SAT,
-    FEE_TX_SUBMIT_RESULT_SAT, L2_FLAT_FEE_MINIMUM_SAT, SETTLE_FEE_MIN_SAT,
+    FEE_TX_AGENT_SPEND_SAT, FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_EXIT_QUEUE_SAT,
+    FEE_TX_POLICY_REVOKE_SAT, FEE_TX_POLICY_SAT, FEE_TX_POST_TASK_SAT, FEE_TX_SUBMIT_RESULT_SAT,
+    L2_FLAT_FEE_MINIMUM_SAT, SETTLE_FEE_MIN_SAT,
 };
 use crate::ser::{Reader, Writer};
 use crate::sig::{Bundle, Component, SCHEME_SECP256K1_ECDSA, SCHEME_SECP256K1_SCHNORR};
@@ -59,14 +61,23 @@ pub const DOM_L2_TXID: &[u8] = b"jounit/l2/txid/v1";
 /// 512-bit L2 transaction id. An L2 txid is a transaction id, so it carries
 /// the widened width for the same reason the L1 one does.
 pub const DOM_L2_TXID512: &[u8] = b"jounit/l2/txid512/v1";
-/// Exit queue authorization (approved P1, E-1…E-3). Covers the owner, the
-/// per-owner nonce, the amount, the destination and the prepaid release fee —
+/// Exit queue authorization (approved P1, E-1â€¦E-3). Covers the owner, the
+/// per-owner nonce, the amount, the destination and the prepaid release fee â€”
 /// exactly the record the L1 release proof re-states, so a queue
 /// authorization cannot be reinterpreted as anything else.
 pub const DOM_L2_EXIT_QUEUE: &[u8] = b"jounit/l2/exit-queue/v1";
-/// Verified Work Certificate identity (SPEC.md §17.3). Derives a certificate id
+/// Verified Work Certificate identity (SPEC.md Â§17.3). Derives a certificate id
 /// from its canonical encoding; a different preimage needs a new tag.
 pub const DOM_L2_VWC: &[u8] = b"jounit/l2/vwc/v1";
+/// Policy publication (SPEC.md Â§21.1). Covers the owner's signature over the
+/// grant bytes, the spender the grant names and the agent identity it names.
+pub const DOM_L2_POLICY: &[u8] = b"jounit/l2/policy/v1";
+/// Policy revocation (SPEC.md Â§21.2). Covers the owner and the agent whose
+/// grant is being killed.
+pub const DOM_L2_POLICY_REVOKE: &[u8] = b"jounit/l2/policy-revoke/v1";
+/// Agent spend under a published policy (SPEC.md Â§21.3). Covers the spender,
+/// the policy it names, the nonce, the recipient, the amount and the service tag.
+pub const DOM_L2_AGENT_SPEND: &[u8] = b"jounit/l2/agent-spend/v1";
 
 /// Wire type codes. Deliberately `0x10`-based: L1 uses `0` and `1`, and leaving a
 /// clear gap means an L1 `tx_type` this build does not know is rejected as an
@@ -76,10 +87,24 @@ pub const L2_TX_CLAIM: u8 = 0x11;
 pub const L2_TX_SUBMIT: u8 = 0x12;
 pub const L2_TX_DISPUTE: u8 = 0x13;
 pub const L2_TX_SETTLE: u8 = 0x14;
-/// L2 → L1 exit queue (approved P1). Next free byte after the Phase-2 five;
+/// L2 â†’ L1 exit queue (approved P1). Next free byte after the Phase-2 five;
 /// an older node reads it as an unknown L2 type and skips the transaction,
 /// exactly as it does for any future type.
 pub const L2_TX_EXIT_QUEUE: u8 = 0x15;
+/// Publish a spending policy (SPEC.md Â§21.1). The owner's signed grant enters
+/// the chain here; every later spend under it is authorised by the policy.
+pub const L2_TX_POLICY: u8 = 0x16;
+/// Revoke a published policy (SPEC.md Â§21.2). The owner's kill switch.
+pub const L2_TX_POLICY_REVOKE: u8 = 0x17;
+/// Spend under a published policy (SPEC.md Â§21.3). Signed by the spender the
+/// grant names, bounded by the grant's own caps and allow-lists.
+pub const L2_TX_AGENT_SPEND: u8 = 0x18;
+
+/// Largest policy grant accepted in a publish transaction, in bytes. The policy
+/// encoding is bounded by its own field caps (64 recipients, 64 services), so
+/// this is a generous structural ceiling whose only job is to stop a length
+/// prefix from driving an allocation.
+pub const MAX_POLICY_BYTES: usize = 4_096;
 
 /// Largest settle signer bitmap accepted, in bytes (512 validators). `TopN = 21`
 /// is the decided committee size, so this is a generous structural cap whose only
@@ -99,6 +124,9 @@ pub enum L2TxType {
     Dispute,
     Settle,
     ExitQueue,
+    Policy,
+    PolicyRevoke,
+    AgentSpend,
 }
 
 impl L2TxType {
@@ -110,6 +138,9 @@ impl L2TxType {
             L2TxType::Dispute => L2_TX_DISPUTE,
             L2TxType::Settle => L2_TX_SETTLE,
             L2TxType::ExitQueue => L2_TX_EXIT_QUEUE,
+            L2TxType::Policy => L2_TX_POLICY,
+            L2TxType::PolicyRevoke => L2_TX_POLICY_REVOKE,
+            L2TxType::AgentSpend => L2_TX_AGENT_SPEND,
         }
     }
 
@@ -121,6 +152,9 @@ impl L2TxType {
             L2_TX_DISPUTE => Ok(L2TxType::Dispute),
             L2_TX_SETTLE => Ok(L2TxType::Settle),
             L2_TX_EXIT_QUEUE => Ok(L2TxType::ExitQueue),
+            L2_TX_POLICY => Ok(L2TxType::Policy),
+            L2_TX_POLICY_REVOKE => Ok(L2TxType::PolicyRevoke),
+            L2_TX_AGENT_SPEND => Ok(L2TxType::AgentSpend),
             _ => Err(Error::Malformed("unknown L2 transaction type")),
         }
     }
@@ -133,13 +167,16 @@ impl L2TxType {
             L2TxType::Dispute => "Dispute",
             L2TxType::Settle => "Settle",
             L2TxType::ExitQueue => "ExitQueue",
+            L2TxType::Policy => "Policy",
+            L2TxType::PolicyRevoke => "PolicyRevoke",
+            L2TxType::AgentSpend => "AgentSpend",
         }
     }
 
     /// The D3 flat fee for this type, in satoshis.
     ///
     /// `Settle` returns the anti-spam floor, not the fee: the actual settle
-    /// fee is proportional to task value — see [`settle_fee_sat`]. Callers
+    /// fee is proportional to task value â€” see [`settle_fee_sat`]. Callers
     /// estimating a settlement must use that function with the task's escrow;
     /// this floor is only the minimum every settle pays.
     ///
@@ -160,11 +197,14 @@ impl L2TxType {
             L2TxType::Dispute => FEE_TX_DISPUTE_SAT,
             L2TxType::Settle => SETTLE_FEE_MIN_SAT,
             L2TxType::ExitQueue => FEE_TX_EXIT_QUEUE_SAT,
+            L2TxType::Policy => FEE_TX_POLICY_SAT,
+            L2TxType::PolicyRevoke => FEE_TX_POLICY_REVOKE_SAT,
+            L2TxType::AgentSpend => FEE_TX_AGENT_SPEND_SAT,
         }
     }
 }
 
-/// Decision 23 (P5): the proportional settle fee — 0.1% of the task's escrow
+/// Decision 23 (P5): the proportional settle fee â€” 0.1% of the task's escrow
 /// value, minimum [`SETTLE_FEE_MIN_SAT`] sat. A task settles exactly when its
 /// escrow covers this: below the floor the fee exceeds the value (refused),
 /// at or above it the fee is always payable, since `payment/1000 <= payment`
@@ -183,7 +223,7 @@ pub enum Verdict {
     /// slashed through M2.
     Fraudulent,
     /// The task lapsed. The submitter is refunded; the worker's deposit, if any,
-    /// is burned in full (no vest — a smaller penalty than a fraud slash).
+    /// is burned in full (no vest â€” a smaller penalty than a fraud slash).
     Expired,
 }
 
@@ -671,7 +711,7 @@ pub const MAX_SETTLE_NETWORK_ID_BYTES: usize = 64;
 pub struct SettlePayload {
     pub task_id: Hash,
     pub verdict: Verdict,
-    /// The hash the verdict settles on — see [`VWC_HASH_EXPIRED`] for the
+    /// The hash the verdict settles on â€” see [`VWC_HASH_EXPIRED`] for the
     /// pre-VWC convention.
     pub vwc_hash: Hash,
     /// Chain the quorum signed for. Part of the signed message, and `apply`
@@ -681,8 +721,8 @@ pub struct SettlePayload {
     pub network_id: String,
     /// Height the quorum signed at. Part of the signed message; `apply`
     /// refuses a vote from the future (`height` above the applying height).
-    /// A quorum formed at `H` may still settle at `H+1` — votes are signed as
-    /// the chain moves — so the rule is "not from the future", with the
+    /// A quorum formed at `H` may still settle at `H+1` â€” votes are signed as
+    /// the chain moves â€” so the rule is "not from the future", with the
     /// dispute lifecycle (a task settles once) closing the replay window.
     pub height: u64,
     /// BLS12-381 G2 aggregate signature over [`SettlePayload::signing_hash`].
@@ -693,8 +733,8 @@ pub struct SettlePayload {
     pub signer_count: u32,
     /// Lattice sidecar: one ML-DSA-65 signature per bitmap signer that voted
     /// with a lattice signature, over the same signing hash the aggregate
-    /// covers. Collected, not verified, at tally time — the tally is not a
-    /// trust boundary (consensus re-verifies at apply) — and verified at
+    /// covers. Collected, not verified, at tally time â€” the tally is not a
+    /// trust boundary (consensus re-verifies at apply) â€” and verified at
     /// `apply_settle` against the epoch set's registered keys, exactly like
     /// checkpoint clause 7. Empty while no voter carries a lattice signature.
     pub pq_sidecar: Vec<crate::bls_checkpoint::PqSidecarEntry>,
@@ -803,17 +843,17 @@ impl SettlePayload {
 
 /// Smallest `exit_fee_sat` an exit may carry (SPEC.md exit rules).
 ///
-/// A zero-fee exit still gets confirmed — it debits the owner and encumbers
-/// the value — but nobody is paid to file the L1 release, so it would never
+/// A zero-fee exit still gets confirmed â€” it debits the owner and encumbers
+/// the value â€” but nobody is paid to file the L1 release, so it would never
 /// be claimed. The floor makes "the fee is zero" a refusal at queue time
 /// rather than an exit that stalls for free.
 pub const MIN_EXIT_FEE_SAT: u64 = 1_000;
 
-/// Queues an L2 → L1 exit (approved P1, E-1…E-3): debits `amount_sat` plus the
+/// Queues an L2 â†’ L1 exit (approved P1, E-1â€¦E-3): debits `amount_sat` plus the
 /// prepaid L1 release fee (`exit_fee_sat`) from the owner's L2 account and
 /// records the pending exit the release rule later pays out.
 ///
-/// The fee is what pays whoever later files the L1 release claim — an exit
+/// The fee is what pays whoever later files the L1 release claim â€” an exit
 /// queued with no fee earns its cranker nothing, so it would sit unclaimed
 /// forever. [`MIN_EXIT_FEE_SAT`] is the enforced floor (SPEC.md exit rules).
 ///
@@ -904,6 +944,303 @@ impl ExitQueuePayload {
 }
 
 // ---------------------------------------------------------------------------
+// Policy publication, revocation and spend (SPEC.md Â§21)
+// ---------------------------------------------------------------------------
+
+/// Publish a spending policy on chain (SPEC.md Â§21.1).
+///
+/// The owner signs once here, and the signature covers three things at once:
+/// the grant bytes themselves, the **spender** â€” the address whose signature
+/// will exercise the grant â€” and the **agent identity** the grant names. That
+/// binding is the point. A policy hash on its own is a capability, and a
+/// capability that anyone can exercise is worthless; here the owner's
+/// signature says *this* key may spend under *these* caps, and the chain
+/// remembers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyPayload {
+    pub owner: Address,
+    pub auth: Auth,
+    /// The canonical `SpendPolicy` bytes the owner signs.
+    pub policy: Vec<u8>,
+    /// The address whose signature may exercise the grant.
+    pub spender: Address,
+    /// The agent identity this grant names.
+    pub agent_id: AgentId,
+}
+
+impl PolicyPayload {
+    /// Build and sign a publication from raw grant bytes.
+    pub fn build(
+        wallet: &Wallet,
+        policy: Vec<u8>,
+        spender: Address,
+        agent_id: AgentId,
+    ) -> Result<Self> {
+        if policy.len() > MAX_POLICY_BYTES {
+            return Err(Error::Malformed("policy grant over the size cap"));
+        }
+        let mut p = PolicyPayload {
+            owner: wallet.address()?,
+            auth: Auth::default(),
+            policy,
+            spender,
+            agent_id,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    /// Build and sign a publication from a decoded policy.
+    pub fn build_from_policy(
+        wallet: &Wallet,
+        policy: &crate::agent::SpendPolicy,
+        spender: Address,
+    ) -> Result<Self> {
+        Self::build(wallet, policy.serialize(), spender, policy.agent_id)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_POLICY, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.owner, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.owner);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.u32le(self.policy.len() as u32)
+            .raw(&self.policy)
+            .fixed(&self.spender)
+            .fixed(&self.agent_id);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let owner: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let len = r.u32le()? as usize;
+        if len > MAX_POLICY_BYTES {
+            return Err(Error::Malformed("policy grant over the size cap"));
+        }
+        if len > r.remaining() {
+            return Err(Error::Malformed("policy grant longer than the input"));
+        }
+        let policy = r.fixed_slice(len)?.to_vec();
+        let spender: Address = r.fixed()?;
+        let agent_id: AgentId = r.fixed()?;
+        Ok(PolicyPayload {
+            owner,
+            auth,
+            policy,
+            spender,
+            agent_id,
+        })
+    }
+}
+
+/// Revoke a published policy (SPEC.md Â§21.2).
+///
+/// The owner's kill switch, on chain. A revoked policy authorises nothing, and
+/// so does any policy delegated from it: the chain walks the ancestry at spend
+/// time, so revocation reaches every descendant without a separate
+/// revocation transaction per link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRevokePayload {
+    pub owner: Address,
+    pub auth: Auth,
+    /// The agent whose grant is being killed.
+    pub agent_id: AgentId,
+}
+
+impl PolicyRevokePayload {
+    pub fn build(wallet: &Wallet, agent_id: AgentId) -> Result<Self> {
+        let mut p = PolicyRevokePayload {
+            owner: wallet.address()?,
+            auth: Auth::default(),
+            agent_id,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_POLICY_REVOKE, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.owner, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.owner);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.agent_id);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let owner: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let agent_id: AgentId = r.fixed()?;
+        Ok(PolicyRevokePayload {
+            owner,
+            auth,
+            agent_id,
+        })
+    }
+}
+
+/// Spend under a published policy (SPEC.md Â§21.3).
+///
+/// Signed by the **spender** the grant names, not by the owner: the owner
+/// signed once, at publication, and every later spend is authorised by the
+/// policy itself. The chain checks the grant's own rules â€” per-transaction cap,
+/// per-window cap, recipient allow-list, service allow-list, validity window,
+/// strictly increasing nonce â€” and enforces them against state it keeps, so
+/// the limits are rules rather than advice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpendPayload {
+    /// The spender's address: the actor whose signature authorises this spend.
+    pub agent: Address,
+    pub auth: Auth,
+    /// The published grant this spend is made under.
+    pub policy_hash: Hash,
+    /// Strictly increasing per policy: the anti-replay counter.
+    pub nonce: u64,
+    /// Who is paid.
+    pub recipient: Address,
+    /// How much is paid.
+    pub amount_sat: u64,
+    /// The service tag, when the grant restricts spending to named services.
+    pub service: Option<[u8; 32]>,
+}
+
+impl AgentSpendPayload {
+    pub fn build(
+        wallet: &Wallet,
+        policy_hash: Hash,
+        nonce: u64,
+        recipient: Address,
+        amount_sat: u64,
+        service: Option<[u8; 32]>,
+    ) -> Result<Self> {
+        let mut p = AgentSpendPayload {
+            agent: wallet.address()?,
+            auth: Auth::default(),
+            policy_hash,
+            nonce,
+            recipient,
+            amount_sat,
+            service,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_AGENT_SPEND, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.agent, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.agent);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.policy_hash)
+            .u64le(self.nonce)
+            .fixed(&self.recipient)
+            .u64le(self.amount_sat);
+        match &self.service {
+            Some(tag) => {
+                w.u8(1).fixed(tag);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let agent: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let policy_hash: Hash = r.fixed()?;
+        let nonce = r.u64le()?;
+        let recipient: Address = r.fixed()?;
+        let amount_sat = r.u64le()?;
+        let service = match r.u8()? {
+            0 => None,
+            1 => Some(r.fixed::<32>()?),
+            _ => return Err(Error::Malformed("service tag out of range")),
+        };
+        Ok(AgentSpendPayload {
+            agent,
+            auth,
+            policy_hash,
+            nonce,
+            recipient,
+            amount_sat,
+            service,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
@@ -915,6 +1252,9 @@ pub enum L2Payload {
     Dispute(DisputePayload),
     Settle(SettlePayload),
     ExitQueue(ExitQueuePayload),
+    Policy(PolicyPayload),
+    PolicyRevoke(PolicyRevokePayload),
+    AgentSpend(AgentSpendPayload),
 }
 
 impl L2Payload {
@@ -926,6 +1266,9 @@ impl L2Payload {
             L2Payload::Dispute(_) => L2TxType::Dispute,
             L2Payload::Settle(_) => L2TxType::Settle,
             L2Payload::ExitQueue(_) => L2TxType::ExitQueue,
+            L2Payload::Policy(_) => L2TxType::Policy,
+            L2Payload::PolicyRevoke(_) => L2TxType::PolicyRevoke,
+            L2Payload::AgentSpend(_) => L2TxType::AgentSpend,
         }
     }
 
@@ -939,6 +1282,9 @@ impl L2Payload {
             L2Payload::Dispute(p) => Some(p.challenger),
             L2Payload::Settle(_) => None,
             L2Payload::ExitQueue(p) => Some(p.owner),
+            L2Payload::Policy(p) => Some(p.owner),
+            L2Payload::PolicyRevoke(p) => Some(p.owner),
+            L2Payload::AgentSpend(p) => Some(p.agent),
         }
     }
 
@@ -950,6 +1296,9 @@ impl L2Payload {
             L2Payload::Dispute(p) => p.signing_hash(),
             L2Payload::Settle(p) => p.signing_hash(),
             L2Payload::ExitQueue(p) => p.signing_hash(),
+            L2Payload::Policy(p) => p.signing_hash(),
+            L2Payload::PolicyRevoke(p) => p.signing_hash(),
+            L2Payload::AgentSpend(p) => p.signing_hash(),
         }
     }
 
@@ -963,6 +1312,9 @@ impl L2Payload {
             L2Payload::Dispute(p) => p.verify_auth(),
             L2Payload::Settle(_) => Ok(()),
             L2Payload::ExitQueue(p) => p.verify_auth(),
+            L2Payload::Policy(p) => p.verify_auth(),
+            L2Payload::PolicyRevoke(p) => p.verify_auth(),
+            L2Payload::AgentSpend(p) => p.verify_auth(),
         }
     }
 
@@ -974,6 +1326,9 @@ impl L2Payload {
             L2Payload::Dispute(p) => p.serialize(),
             L2Payload::Settle(p) => p.serialize(),
             L2Payload::ExitQueue(p) => p.serialize(),
+            L2Payload::Policy(p) => p.serialize(),
+            L2Payload::PolicyRevoke(p) => p.serialize(),
+            L2Payload::AgentSpend(p) => p.serialize(),
         }
     }
 
@@ -985,6 +1340,9 @@ impl L2Payload {
             L2TxType::Dispute => L2Payload::Dispute(DisputePayload::from_reader(r)?),
             L2TxType::Settle => L2Payload::Settle(SettlePayload::from_reader(r)?),
             L2TxType::ExitQueue => L2Payload::ExitQueue(ExitQueuePayload::from_reader(r)?),
+            L2TxType::Policy => L2Payload::Policy(PolicyPayload::from_reader(r)?),
+            L2TxType::PolicyRevoke => L2Payload::PolicyRevoke(PolicyRevokePayload::from_reader(r)?),
+            L2TxType::AgentSpend => L2Payload::AgentSpend(AgentSpendPayload::from_reader(r)?),
         })
     }
 }
@@ -1045,7 +1403,7 @@ impl L2Transaction {
 /// single authority for what an L2 transaction is: the same encoding `txid`,
 /// the signing hashes and the block-commitment path already use. A
 /// field-by-field serde form would be a second encoding to keep in step with
-/// the first — exactly the drift §15's canonical-encoding rule exists to
+/// the first â€” exactly the drift Â§15's canonical-encoding rule exists to
 /// prevent. It also means an L2 payload stored in JSON is decoded through
 /// `L2Transaction::deserialize`, so its bounds and validation apply there too.
 impl serde::Serialize for L2Transaction {
@@ -1139,7 +1497,7 @@ mod tests {
 
     #[test]
     fn every_fee_meets_the_flat_minimum_floor() {
-        // D3: flat minimum fee floor — no L2 fee may fall below
+        // D3: flat minimum fee floor â€” no L2 fee may fall below
         // L2_FLAT_FEE_MINIMUM_SAT, even if a per-type constant were re-parameterized.
         for t in [
             L2TxType::PostTask,

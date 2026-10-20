@@ -58,6 +58,38 @@ pub const ACCOUNT_LEAF_TAG: u8 = 0x03;
 /// never be reinterpreted as an exit record and vice versa.
 pub const EXIT_LEAF_TAG: u8 = 0x04;
 
+/// Policy leaves (§21): a published spending policy, committed under the same
+/// state root as the accounts. A distinct tag so a policy leaf can never be
+/// reinterpreted as an account leaf or an exit record.
+pub const POLICY_LEAF_TAG: u8 = 0x05;
+
+/// The leaf for one published spending policy.
+///
+/// Commits to the policy's own hash (which commits to the owner's signed grant
+/// bytes), to the spender the grant names, to the agent identity, to the kill
+/// switch, and to the three counters that make a cap enforceable: the current
+/// window's start, the spend inside that window, and the highest nonce used.
+pub fn policy_leaf(
+    policy_hash: &Hash,
+    spender: &Address,
+    agent_id: &[u8; 20],
+    revoked: bool,
+    window_start_height: u64,
+    spent_in_window_sat: u64,
+    last_nonce: u64,
+) -> Hash {
+    sha256(&[
+        &[POLICY_LEAF_TAG],
+        policy_hash,
+        spender,
+        agent_id,
+        &[u8::from(revoked)],
+        &window_start_height.to_le_bytes(),
+        &spent_in_window_sat.to_le_bytes(),
+        &last_nonce.to_le_bytes(),
+    ])
+}
+
 /// The leaf for one queued exit: owner, per-owner nonce, amount, destination,
 /// prepaid release fee and the L1 height that queued it.
 ///

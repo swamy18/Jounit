@@ -173,12 +173,18 @@ There is **no** `config.toml` and **no** `policy/` directory in the data dir
 
 ## 4. Security disclosure
 
-- **Bug bounty:** not announced; plan is a GitHub Security Advisory.
+- **Policy:** [`SECURITY.md`](../SECURITY.md) at the repository root is the
+  normative disclosure policy — severity model, windows, and what counts as a
+  vulnerability.
+- **Intake:** GitHub Security Advisory (private) on this repository, or
+  `security@jounit.org`.
+- **Bug bounty:** not announced.
 - **Responsible disclosure window:** 90 days (documented).
 - **Severity:** chain-halting (invalid block accepted) = critical, immediate
   patch + coordinated disclosure; key-compromise = high, 7-day disclosure.
 - **Contact:** security@jounit.org. **PGP key is not yet published** — the
-  channel is therefore not yet operational.
+  channel is therefore not yet operational. The policy says so rather than
+  implying otherwise.
 
 ## 5. Genesis & bootstrapping
 

@@ -612,6 +612,122 @@ impl PolicyState {
     }
 }
 
+/// A published spending policy, as the chain holds it (SPEC.md §21).
+///
+/// Three things live here, and each of them earns its place:
+///
+/// - `policy` is the owner's signed grant. The owner signs it once; every
+///   later spend under it is authorised by the policy itself, not by a new
+///   owner signature. That is what makes delegation usable: an agent that may
+///   act for a week does not need the owner online for every payment.
+/// - `spender` is the address whose signature exercises the grant. The owner's
+///   signature over the publish transaction binds it, so a policy cannot be
+///   exercised by whoever happens to learn its hash.
+/// - the counters are consensus state. A per-window cap and a nonce are only
+///   enforceable if the chain remembers the spend inside the window and the
+///   highest nonce used; without them, "spend at most N per window" is advice
+///   rather than a rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEntry {
+    /// The owner's signed grant.
+    pub policy: SpendPolicy,
+    /// The address whose signature authorises a spend under this policy.
+    pub spender: Address,
+    /// The agent identity this grant names.
+    pub agent_id: AgentId,
+    /// The owner's kill switch. A revoked policy authorises nothing, and a
+    /// descendant of a revoked policy authorises nothing either.
+    pub revoked: bool,
+    /// Height the current tumbling window started at.
+    pub window_start_height: u64,
+    /// Spend inside the current window.
+    pub spent_in_window_sat: u64,
+    /// Lifetime spend, for audit only (not a limit).
+    pub total_spent_sat: u64,
+    /// Highest nonce used so far. `0` means none used yet.
+    pub last_nonce: u64,
+    /// How many spends this policy has authorised.
+    pub spends: u64,
+}
+
+impl PolicyEntry {
+    /// The policy hash this entry is keyed by.
+    pub fn hash(&self) -> Hash {
+        self.policy.hash()
+    }
+
+    /// The committed leaf for this entry.
+    pub fn leaf(&self) -> Hash {
+        crate::state_root::policy_leaf(
+            &self.hash(),
+            &self.spender,
+            &self.agent_id,
+            self.revoked,
+            self.window_start_height,
+            self.spent_in_window_sat,
+            self.last_nonce,
+        )
+    }
+
+    /// Canonical, bounded encoding. The policy bytes are length-prefixed so a
+    /// reader knows exactly how many bytes the grant occupies.
+    pub fn serialize(&self) -> Vec<u8> {
+        let policy = self.policy.serialize();
+        let mut w = Writer::with_capacity(policy.len() + 80);
+        w.u32le(policy.len() as u32)
+            .raw(&policy)
+            .fixed(&self.spender)
+            .fixed(&self.agent_id)
+            .u8(u8::from(self.revoked))
+            .u64le(self.window_start_height)
+            .u64le(self.spent_in_window_sat)
+            .u64le(self.total_spent_sat)
+            .u64le(self.last_nonce)
+            .u64le(self.spends);
+        w.into_vec()
+    }
+
+    /// Decode an entry. The policy bytes are decoded with the policy decoder,
+    /// so a malformed grant is refused here rather than by whoever reads the
+    /// entry later.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, PolicyError> {
+        let mut r = Reader::new(bytes);
+        let truncated = || PolicyError::Malformed("policy entry truncated");
+        let len = r.u32le().map_err(|_| truncated())? as usize;
+        if len > bytes.len() {
+            return Err(PolicyError::Malformed("policy entry length exceeds input"));
+        }
+        let policy_bytes = r.fixed_slice(len).map_err(|_| truncated())?;
+        let policy = SpendPolicy::deserialize(policy_bytes)?;
+        let spender: Address = r.fixed().map_err(|_| truncated())?;
+        let agent_id: AgentId = r.fixed().map_err(|_| truncated())?;
+        let revoked = match r.u8().map_err(|_| truncated())? {
+            0 => false,
+            1 => true,
+            _ => return Err(PolicyError::Malformed("revoked flag out of range")),
+        };
+        let window_start_height = r.u64le().map_err(|_| truncated())?;
+        let spent_in_window_sat = r.u64le().map_err(|_| truncated())?;
+        let total_spent_sat = r.u64le().map_err(|_| truncated())?;
+        let last_nonce = r.u64le().map_err(|_| truncated())?;
+        let spends = r.u64le().map_err(|_| truncated())?;
+        if r.remaining() != 0 {
+            return Err(PolicyError::Malformed("trailing bytes"));
+        }
+        Ok(PolicyEntry {
+            policy,
+            spender,
+            agent_id,
+            revoked,
+            window_start_height,
+            spent_in_window_sat,
+            total_spent_sat,
+            last_nonce,
+            spends,
+        })
+    }
+}
+
 /// What an agent asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationRequest {

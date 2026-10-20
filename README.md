@@ -888,5 +888,14 @@ person holds it.
 
 ---
 
+## Security
+
+[`SECURITY.md`](SECURITY.md) is the disclosure policy: what counts as a
+vulnerability, the severity model, the 90-day window, and the intake channel
+(GitHub Security Advisory, or `security@jounit.org`). Do not open a public
+issue for a security defect.
+
+---
+
 Full protocol specification: [`SPEC.md`](SPEC.md).
 Design decisions: [`docs/decisions.md`](docs/decisions.md).

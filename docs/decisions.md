@@ -1269,11 +1269,13 @@ left unbuilt.
    been **removed**: Jounit is permissionless. The committee is stake-weighted
    (TopN by stake), so smaller bonds simply rank lower and fail to make the top
    21. This is fixed in the consensus rules — not a tunable.
-2. **Committee: the first 21 eligible validators by valid bond-transaction
-   order.** Eligibility = a valid bond of any positive amount. No
-   genesis-fixed identities, no privileged or permanent founder seats: the
-   committee fills from bond order on a live chain, reproducibly from chain
-   state alone.
+2. **Committee: stake-weighted TopN, capped at 21.** Eligibility = a valid
+   bond of any positive amount, proof of possession included. The committee
+   fills from the highest bond amounts, reproducibly from chain state alone.
+   **Bond order is deliberately not part of the selection**: the earliest 21
+   bonds holding seats forever would be both a permanent incumbency and the
+   one property that could not be re-derived from stake. No genesis-fixed
+   identities, no privileged or permanent founder seats.
 3. **Unbonding: 7 days, fixed in the protocol rules** — 1008 blocks at the
    mainnet 10-minute block time — after a full finality window, keeping the
    checkpoint-signing duty until release.
@@ -1461,3 +1463,66 @@ decision the state machine already refuses by transition — paying a wire
 change for a refusal that already exists. What *is* load-bearing, and now
 covered by tests, is that a stale aggregate never blocks or corrupts the
 honest work around it.
+
+---
+
+## Decision 25 - Spending policy moves on chain (P1 resolved, partly)
+
+**Status: APPROVED 2026-10-20, IMPLEMENTED 2026-10-20 (policy types), credit pending.**
+
+The agent policy layer of SPEC 18 was node-local: a policy constrained a
+payment on the node that issued it, and the chain never saw it. That made
+"bounded authority for a machine fleet" true only of the node that happened to
+issue the policy. P1 asked for the payment layer to be usable by agents; the
+answer is that an agent cannot be given enforceable authority while the rule
+lives in one node's memory.
+
+**The decision: agent authority is Layer-2 consensus state.**
+
+1. **Three new Layer-2 transaction types.** `Policy` (`0x16`), `PolicyRevoke`
+   (`0x17`) and `AgentSpend` (`0x18`), carried in L1 blocks like every other
+   L2 payload (SPEC 19.1) and committed by the block's `l2_state_root`.
+   Layer 2 and not Layer 1 because the L2 state is already replayed by every
+   node and already committed, so the rule needs no new L1 header field, no
+   new Merkle leaf family and no L1 undo path. A rule that every node replays
+   is a rule; a rule one node checks is advice.
+2. **The owner's signature binds three things at once** - the grant bytes, the
+   **spender** (the key that may exercise the grant) and the **agent
+   identity**. A policy hash alone is a capability; a capability anyone can
+   exercise is worthless. The owner says "this key may spend under these
+   caps", and the chain remembers it.
+3. **The grant is the owner's signature, spent many times.** The owner signs
+   once, at publication. Every later spend is authorised by the grant itself,
+   signed by the spender. An agent that may act for a week does not need the
+   owner online for every payment - which is the difference between a usable
+   delegation scheme and a paper one.
+4. **One live grant per agent.** A second grant for the same agent is refused
+   while the first is live, so a second grant cannot be used to double the
+   first one's caps. A revoked grant may be replaced.
+5. **Revocation reaches every descendant.** A spend checks the whole
+   ancestry, so the owner's kill switch covers a delegated fleet without a
+   revocation transaction per link. The walk is bounded by the delegation
+   depth cap and fails closed.
+6. **The counters are consensus state.** `window_start_height`,
+   `spent_in_window_sat`, `total_spent_sat`, `last_nonce`. Without them a
+   per-window cap is a suggestion and a nonce is a formality.
+7. **The money comes out of the grant owner's balance.** A grant is an
+   allowance over the owner's own funds; the spender is the key that exercises
+   it. The fee comes out of the same balance on top.
+8. **Every rule the grant states is enforced against state the chain keeps** -
+   the same rule set the node-local engine applied (SPEC 18.2), byte for byte:
+   per-transaction cap, tumbling per-window cap, recipient allow-list (empty
+   allows nothing), service allow-list (a tagged grant authorises no untagged
+   spending), validity window, strictly increasing nonce, height may not run
+   backwards inside a grant.
+
+**What this does not change.** The node-local policy engine stays, because it
+is what the HTTP API and the MCP surface still use to *issue* authorizations
+offline; it is now a client of the chain's rules rather than the only place
+they exist. `SpendPolicy` itself is untouched - same encoding, same hash, same
+`validate` - so no existing grant byte changes meaning.
+
+**Consensus impact.** The Layer-2 state root now covers published grants, so
+the committed root changes: this is a protocol version bump (new state wire
+version, new genesis hash). It is shipped in the same version as the credit
+types below, because shipping a root change twice buys nothing.

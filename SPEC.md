@@ -32,7 +32,7 @@ This document is the **normative reference**. Any implementation in any language
 | `DOM_TX512` | `jounit/txid512/v1` |
 | `DOM_TXBODY` | `jounit/txbody/v1` |
 | `DOM_SIG` | `jounit/sig/v1` |
-| `DOM_ADDR` | `jounit/addr/v1` |
+| `DOM_ADDR` | `jounit/addr/v2` |
 | `DOM_S1` | `jounit/puzzle/stage1/v1` |
 | `DOM_S2` | `jounit/puzzle/stage2/v1` |
 | `DOM_S3` | `jounit/puzzle/stage3/v1` |
@@ -625,10 +625,10 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `network_id` | `jounit/mainnet` | `jounit/mini` | `jounit/testnet` |
 | `network_magic` | `6A 4E 54 01` | (distinct) | `6A 4E 54 03` |
 | `checkpoint_interval_blocks` | `100` | `10` | `10` |
-| `finality_activation_height` | `0` | `0` | `20` |
+| `finality_activation_height` | `100` | `0` | `20` |
 | `pq_activation_height` | `0` (**never**) | `0` | `0` |
 | `genesis_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
-| `exit_activation_height` | `0` (**never**) | `1` | `1` |
+| `exit_activation_height` | `1` | `1` | `1` |
 | `l2_genesis_escrow_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
 | `escrow_ceiling_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
 
@@ -639,9 +639,9 @@ activation height. No profile carries a stock supply cap (Decision 18).
 **`exit_activation_height` gates the whole exit rule of §19.6, and `0` means
 *never*, not *from genesis*.** A profile on `0` accepts neither a committed
 `l2_state_root` nor an exit claim, and an L2-bearing block on it must therefore
-carry no root. `mainnet` ships `0` deliberately: the rule is compiled and
-tested, but the profile has chosen no height, so mainnet user deposits stay
-closed by configuration rather than by a missing mechanism.
+carry no root. All three shipped profiles activate at height `1`, so deposits
+and exits are open from genesis on every profile: the rule is compiled,
+tested and live, and a profile that wants it closed sets `0`.
 
 ---
 
@@ -1207,12 +1207,14 @@ changes what counts as valid work. Guessing those rules in code rather than in
 this document would have been the wrong order, so the modules exist, are tested
 against their stated invariants, and are documented as inactive.
 
-**M5's missing rules arrived as Decisions 11 and 12.** Decision 11 (§14.7)
-named the committee — an explicit genesis list of BLS keys — and the relay
-message; Decision 12 (§14.8) named the activation condition under which a
-checkpoint stops being an observation and starts being finality. M5 is wired
-exactly as far as those decisions reach and no further: no stake ledger, no
-rotation, no stake-weighted quorum.
+**M5's missing rules arrived as Decisions 11 and 12, and the stake half later
+as Decision 20.** Decision 11 (§14.7) named the committee — an explicit genesis
+list of BLS keys — and the relay message; Decision 12 (§14.8) named the
+activation condition under which a checkpoint stops being an observation and
+starts being finality. Decision 20 then replaced the declared genesis list with
+a bond-ledger-derived, stake-weighted committee (§14.6, §14.7): bonds, a bond
+ledger, unbonding and equivocation slashing are all live. Rotation and rewards
+are not.
 
 ### 14.1 M2 — Anti-collusion slash vault
 
@@ -1268,15 +1270,14 @@ does not depend on insertion order. Quorum is `ceil(n × 2/3)`, and a signer set
 is carried as a bitmap of `n` bits. `BlsVerifier` is a trait so the pairing check
 can be swapped for a real implementation (`blst`) without touching the chain.
 
-**The pairing core is real; the gadget is not active.** Since §14.5, a
+**The pairing core is real, and the authority is now purchased.** Since §14.5, a
 `blst`-backed `RealBls` verifier performs actual pairing checks, and
 `verify_checkpoint` with `RealBls` rejects forgeries that `MockBls` (kept for
-CI-only structural tests) would accept. What is still missing for M5 to be
-**economic** consensus is §14.6: who the validators are is decided (Decision 11 —
-a declared genesis set, no stake ledger), but bonded stake, rotation, rewards and
-equivocation slashing are not. Until those land, treat §14.4 + §14.5 as a real
-cryptographic core attached to a gadget whose *authority* is declared rather
-than purchased.
+CI-only structural tests) would accept. Since Decision 20 (§14.6, §14.7) the
+committee is derived from the bond ledger by stake-weighted TopN rather than
+declared, and a proven equivocation burns the bond. Rotation and rewards are
+still missing: a checkpoint signer is paid nothing, so the security budget is
+currently entirely volunteer.
 
 ### 14.5 M5 — Real BLS signatures (blst): wire and protocol semantics
 
@@ -1699,7 +1700,7 @@ is refused as an L1 type rather than silently read as an L2 one.
 | `ClaimTask` | `0x11` | 2 000 | worker |
 | `SubmitResult` | `0x12` | 2 000 | worker |
 | `Dispute` | `0x13` | 10 000 | challenger |
-| `Settle` | `0x14` | 20 000 | validator quorum |
+| `Settle` | `0x14` | `max(0.1% of released value, 1 000)` | validator quorum |
 | `ExitQueue` | `0x15` | 2 000 | exit owner (§19.6) |
 
 The first four carry an explicit actor address and a signature bundle over a
@@ -2524,7 +2525,7 @@ folded in with the implemented parts.
 transaction list:
 
 ```
-serialize(block) = header(145) ‖ signature(64) ‖ signer_pubkey(33)
+serialize(block) = header(177) ‖ signature(64) ‖ signer_pubkey(33)
                    ‖ U4LE(tx_count) ‖ tx_0 … tx_{n-1}
                    ‖ U4LE(l2_count) ‖ (U4LE(len) ‖ l2_tx_bytes(len)) × l2_count
 ```
@@ -2991,3 +2992,165 @@ unknown-id 404, zero-key open refused). Coin settlement runs through
 that pays it (owner = payer, destination = payee, amount = escrow amount), and
 §20.2's `Finalized` is written only when `Chain::exit_released` confirms
 consensus actually paid that destination.
+
+---
+
+## 21. Agent authority on chain (Phase 7)
+
+### 21.1 Why this section exists
+
+The spending-policy layer of §18 was, until this section, a **node-local**
+mechanism: a policy constrained a payment *on the node that issued it*, and
+the chain never saw it. A machine fleet bound by policies was therefore bound
+by the goodwill of whichever node issued them, not by the protocol. Two nodes
+holding the same chain could disagree about whether a spend was permitted.
+
+This section moves that authority onto the chain, where a rule that every node
+replays is a rule and a rule that one node checks is advice. The three
+transaction types below are the whole vocabulary:
+
+| Type | Code | Actor | Purpose |
+|---|---:|---|---|
+| `Policy` | `0x16` | owner | publish a spending grant |
+| `PolicyRevoke` | `0x17` | owner | kill a published grant |
+| `AgentSpend` | `0x18` | spender | spend under a published grant |
+
+They are Layer-2 transactions (§15, §19.1): they are carried in L1 blocks and
+committed by the block's Merkle root, and the Layer-2 state they change is
+committed by the block's `l2_state_root`. A grant and its counters are therefore
+part of the state every node replays, and two nodes replaying the same chain
+hold the same authority.
+
+### 21.2 The grant
+
+A grant is the owner's signed `SpendPolicy` (§18.2), exactly the object the
+node-local engine already used - `per_tx_max_sat`, `window_blocks`,
+`cumulative_max_sat`, `allowed_recipients`, `allowed_services`,
+`not_before_height`, `expires_at_height`, `role`, `agent_id`, `owner`,
+`parent_agent_id`. The policy encoding, its hash, and its structural validation
+(`SpendPolicy::validate`) are unchanged.
+
+What the publication adds is the **binding**:
+
+```
+PolicyPayload = owner(20) ‖ auth ‖ u32le(len) ‖ grant_bytes(len) ‖ spender(20) ‖ agent_id(20)
+```
+
+The owner's signature covers the grant bytes, the **spender** and the **agent
+identity** together. That binding is the whole point: a policy hash on its own
+is a capability, and a capability anyone can exercise is worthless. Here the
+owner says *"this key may spend under these caps"*, and the chain remembers it.
+
+`len` is bounded by `MAX_POLICY_BYTES` (4096) and checked against the
+remaining buffer before any allocation.
+
+### 21.3 Publication rules
+
+A publication is refused unless **all** of the following hold:
+
+1. the grant decodes and passes `SpendPolicy::validate`;
+2. the grant's `owner` equals the signer's address;
+3. the grant's `network_id` equals the state's network;
+4. the grant is not itself revoked - a revoked grant is published by revoking,
+   not by publishing;
+5. the grant's `agent_id` equals the `agent_id` the transaction names;
+6. the agent has **no live grant** - one grant per agent at a time, so a second
+   grant cannot be used to double the first one's caps (a revoked grant may be
+   replaced);
+7. if the grant is delegated, its parent grant is on chain, is live, and
+   **dominates** it (§18.2.1): the child's caps are not wider than the parent's,
+   its allow-lists are not wider, and it does not outlive it.
+
+The fee is charged from the owner's balance, like every other L2 fee (§15.1).
+
+### 21.4 Revocation
+
+```
+PolicyRevokePayload = owner(20) ‖ auth ‖ agent_id(20)
+```
+
+The owner of the grant kills it. The grant stays in state with its `revoked`
+flag set, and **every descendant of it dies with it**: a spend checks the whole
+ancestry, so the kill switch reaches a delegated fleet without a revocation
+transaction per link. The walk is bounded by the delegation depth cap
+(`MAX_DELEGATION_DEPTH` = 8) and fails closed - a missing ancestor, a revoked
+one, or a chain deeper than the cap all mean "not live".
+
+### 21.5 Spending under a grant
+
+```
+AgentSpendPayload = agent(20) ‖ auth ‖ policy_hash(32) ‖ nonce(u64) ‖
+                    recipient(20) ‖ amount_sat(u64) ‖ service_tag(u8)[+32]
+```
+
+The spend is signed by the **spender**, not by the owner: the owner signed once,
+at publication, and the grant itself authorises every later spend. The chain
+checks, in this order:
+
+1. the grant is on chain, and the signer is the **spender** the grant names;
+2. the grant is live: not revoked, and no revoked ancestor;
+3. the grant is for this network;
+4. the height is inside the grant's validity window
+   (`not_before_height` inclusive, `expires_at_height` exclusive);
+5. `amount_sat` is positive and at most `per_tx_max_sat`;
+6. the recipient is on `allowed_recipients` - **an empty list allows nothing**;
+7. the service tag follows the grant: a tagged request must name a tag on
+   `allowed_services`, and a grant that names services authorises **no untagged
+   spending**;
+8. the nonce is **strictly greater** than the grant's last nonce;
+9. the height has not run backwards inside the grant;
+10. the spend inside the current tumbling window stays within
+    `cumulative_max_sat`.
+
+The money: the grant's **owner** balance pays the recipient the amount and the
+fee on top. A grant is an allowance over the owner's own funds; the spender is
+the key that exercises it.
+
+The counters the chain keeps are `window_start_height`, `spent_in_window_sat`,
+`total_spent_sat`, `last_nonce` and `spends`. Without them a per-window cap is
+a suggestion and a nonce is a formality.
+
+### 21.6 Commitment
+
+A published grant is a leaf under the Layer-2 state root, with its own domain
+tag (`POLICY_LEAF_TAG` = `0x05`), committing to the grant hash, the spender, the
+agent identity, the kill switch and the three counters that make a cap
+enforceable. The leaf list is: account leaves (address order), exit leaves
+(`(owner, nonce)` order), policy leaves (hash order).
+
+### 21.7 Failure model
+
+A malformed payload is skipped by the replayer, as any malformed Layer-2
+payload is (§19.1). A payload that is well-formed but **unauthorised** - a
+grant for another owner, a grant that widens its parent, a spend above a cap,
+a spend under a revoked grant - is refused by the state machine by name
+(`PolicyBinding`, `PolicyLimit`, `PolicyRecipient`, `PolicyService`,
+`PolicyNonce`, `PolicyRevoked`, `PolicyWindow`, `PolicyAlreadyPublished`,
+`UnknownPolicy`), and the refusal never moves value.
+
+### 21.8 Fees
+
+| Type | Code | Fee (sat) |
+|---|---:|---:|
+| `Policy` | `0x16` | 2 000 |
+| `PolicyRevoke` | `0x17` | 2 000 |
+| `AgentSpend` | `0x18` | 2 000 |
+
+Same tier as `ClaimTask` / `ExitQueue`: a signed record, no arbitration.
+
+### 21.9 Implemented surface
+
+`jnt-core::l2` carries the three payload types and their wire codes;
+`jnt-core::agent` carries `PolicyEntry` (the grant, the spender, the counters)
+and its leaf; `jnt-l2::state` applies them and commits them.
+`crates/jnt-l2/tests/policy_flow.rs` pins: publication changes the committed
+root; a grant naming another owner is refused; an agent has one live grant at a
+time; a spend moves value from the grant owner; the per-transaction cap binds;
+the window cap binds and the window rolls over; an empty allow-list allows
+nothing; a recipient outside the list is refused; the service rules refuse
+both an unknown tag and an untagged spend under a tagged grant; a repeated
+nonce is refused and the identical bytes are refused as a replay; only the
+named spender may exercise a grant; a revoked grant authorises nothing; a
+revoked parent kills its descendant; a widening grant is refused; the state
+encoding round-trips the grants; and two nodes replaying the same transactions
+agree on the root.

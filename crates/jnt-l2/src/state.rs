@@ -7,14 +7,14 @@
 //! Three rules define the model:
 //!
 //! 1. **Accounts, not UTXOs.** L2 carries a simple account balance per address.
-//!    Funding is genesis-explicit ([`L2State::apply_genesis`], SPEC.md §19.4):
-//!    the profile's escrow total is released once — grants to named accounts,
+//!    Funding is genesis-explicit ([`L2State::apply_genesis`], SPEC.md Â§19.4):
+//!    the profile's escrow total is released once â€” grants to named accounts,
 //!    remainder to the protocol escrow identity. Two later production credits
 //!    exist and both ride L1 blocks: matured deposits (Decision 10,
 //!    `apply_deposit`) and the exit debits that pair with them (Decision 19).
 //!    What is real today is the accounting below them.
 //! 2. **Every explicit transaction pays its D3 flat fee**, split 50/50
-//!    burned/PSCB through `fees::split_flat_fee` — the unchanged M1 rule. Implicit
+//!    burned/PSCB through `fees::split_flat_fee` â€” the unchanged M1 rule. Implicit
 //!    transitions (a deadline passing, a dispute window closing) cost nothing,
 //!    because nothing was transacted.
 //! 3. **Value is conserved.** An L2 fee or a slashed deposit is *moved*, never
@@ -23,19 +23,21 @@
 //!    is the check, and the integration tests assert it after every scenario.
 //!
 //! Replay is refused by transaction id, and a failed transaction is not marked
-//! applied — a transaction that was rejected for a transient reason (a task not
+//! applied â€” a transaction that was rejected for a transient reason (a task not
 //! yet posted) can be retried once the precondition holds, but it can never be
 //! applied twice.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use jnt_core::agent::{AgentId, PolicyEntry, SpendPolicy};
 use jnt_core::bls_checkpoint::{BlsSignature, BlsVerifier, ValidatorSet};
+use jnt_core::delegation;
 use jnt_core::fees::split_flat_fee;
 use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{
-    settle_fee_sat, ClaimTaskPayload, DisputePayload, ExitQueuePayload, L2Payload, L2Transaction,
-    PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT,
-    VWC_HASH_EXPIRED,
+    settle_fee_sat, AgentSpendPayload, ClaimTaskPayload, DisputePayload, ExitQueuePayload,
+    L2Payload, L2Transaction, PolicyPayload, PolicyRevokePayload, PostTaskPayload, SettlePayload,
+    SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT, VWC_HASH_EXPIRED,
 };
 use jnt_core::ser::{Reader, Writer};
 use jnt_core::slash::SlashVault;
@@ -80,7 +82,7 @@ pub enum L2Effect {
         challenger_bonus: u64,
         /// The Verified Work Certificate issued by this settlement (Phase 4).
         /// `Some` only for a `Correct` settlement of real work; `Fraudulent`
-        /// and `Expired` issue nothing (SPEC.md §17.4).
+        /// and `Expired` issue nothing (SPEC.md Â§17.4).
         vwc_id: Option<Hash>,
     },
     Expired {
@@ -100,13 +102,30 @@ pub enum L2Effect {
         amount_sat: u64,
         destination: Address,
     },
+    /// A spending policy was published (SPEC.md Â§21.1).
+    PolicyPublished {
+        policy_hash: Hash,
+        agent_id: AgentId,
+        spender: Address,
+    },
+    /// A spending policy was revoked by its owner (SPEC.md Â§21.2).
+    PolicyRevoked {
+        agent_id: AgentId,
+    },
+    /// A spend was made under a published policy (SPEC.md Â§21.3).
+    AgentSpent {
+        policy_hash: Hash,
+        agent: Address,
+        recipient: Address,
+        amount_sat: u64,
+    },
 }
 
 /// Equality here is *state* equality: two nodes that replayed the same
 /// canonical chain hold equal `L2State`s, which is what Phase 6's replay and
-/// cross-node agreement checks assert (SPEC.md §19.1). It is derived, so it
-/// compares every field — accounts, tasks, the applied-id set, the counters,
-/// the vault and the certificate registry — rather than a hand-picked subset
+/// cross-node agreement checks assert (SPEC.md Â§19.1). It is derived, so it
+/// compares every field â€” accounts, tasks, the applied-id set, the counters,
+/// the vault and the certificate registry â€” rather than a hand-picked subset
 /// that could silently stop covering a new one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct L2State {
@@ -117,7 +136,7 @@ pub struct L2State {
     applied: HashSet<Hash512>,
     /// Every satoshi ever released into L2: genesis allocation plus test
     /// credits. Append-only. `conservation_total() == funded_total()` is the
-    /// M2 invariant — value is moved, never created — and a production state
+    /// M2 invariant â€” value is moved, never created â€” and a production state
     /// whose `funded_total` exceeds its profile's escrow total proves an
     /// unauthorized funding happened.
     funded_total: u64,
@@ -127,13 +146,13 @@ pub struct L2State {
     /// double-funding every grant.
     genesis_applied: bool,
     /// Deposit `(txid, output_index)` identities already credited (Decision 10
-    /// item 5, SPEC.md §19.5). The same L1 bytes in a later block hit this set
-    /// and are refused — replay protection for value that arrives via blocks
+    /// item 5, SPEC.md Â§19.5). The same L1 bytes in a later block hit this set
+    /// and are refused â€” replay protection for value that arrives via blocks
     /// rather than via L2 transactions (which have the separate `applied` set).
     deposits: HashSet<(Hash512, u32)>,
     /// Satoshis credited through deposits, append-only. Feeds `funded_total`
     /// (every deposit credit counts there too) and lets `verify` prove
-    /// `funded == escrow + deposits` — i.e. no unauthorized funding — without
+    /// `funded == escrow + deposits` â€” i.e. no unauthorized funding â€” without
     /// re-scanning blocks.
     deposited_total: u64,
     /// Permanently destroyed satoshis (fees + failed-challenge and expiry burns).
@@ -142,10 +161,10 @@ pub struct L2State {
     pub pscb: u64,
     /// M2 slash vault. Fraud slashes vest here.
     pub slash_vault: SlashVault,
-    /// Verified Work Certificates, keyed by task id (Phase 4, SPEC.md §17.7).
+    /// Verified Work Certificates, keyed by task id (Phase 4, SPEC.md Â§17.7).
     /// Certificates hold no value, so they are outside the conservation sum.
     vwcs: HashMap<Hash, VerifiedWorkCertificate>,
-    /// Queued L2 → L1 exits, keyed by `(owner, nonce)` (approved P1). A record
+    /// Queued L2 â†’ L1 exits, keyed by `(owner, nonce)` (approved P1). A record
     /// exists from queue until release; release *removes* it rather than
     /// flagging it, so the map is exactly the outstanding-exit set and replay
     /// re-derives it from the winning chain with no persisted ledger.
@@ -159,11 +178,19 @@ pub struct L2State {
     /// account into this bucket, release moves it out of L2 entirely.
     exits_locked: u64,
     /// Value ever released to L1, append-only. `funded_total` equals genesis
-    /// plus deposits minus this — anything else is invented or vanished money.
+    /// plus deposits minus this â€” anything else is invented or vanished money.
     exited_total: u64,
+    /// Published spending policies, keyed by the grant's hash (SPEC.md Â§21.1).
+    /// A revoked grant stays in the map for the record; revocation is a flag on
+    /// the entry, and a descendant of a revoked grant is dead by ancestry
+    /// rather than by a second revocation transaction per link.
+    policies: BTreeMap<Hash, PolicyEntry>,
+    /// The live grant for each agent, by agent identity. One grant per agent at
+    /// a time, so a second grant cannot be used to double the first one's caps.
+    policy_by_agent: BTreeMap<AgentId, Hash>,
 }
 
-/// One queued L2 → L1 exit: the exact record the L1 release proof re-states.
+/// One queued L2 â†’ L1 exit: the exact record the L1 release proof re-states.
 ///
 /// The leaf committed under the L2 state root is computed from these fields
 /// only (see [`L2State::committed_root`]); maturity and release are judged by
@@ -241,11 +268,13 @@ impl L2State {
             exit_nonce: HashMap::new(),
             exits_locked: 0,
             exited_total: 0,
+            policies: BTreeMap::new(),
+            policy_by_agent: BTreeMap::new(),
         }
     }
 
     /// Release the genesis allocation into this state: grants to named
-    /// accounts, remainder to the protocol escrow identity (SPEC.md §19.4).
+    /// accounts, remainder to the protocol escrow identity (SPEC.md Â§19.4).
     ///
     /// Only for freshly constructed states, exactly once. Replay, restart and
     /// reorg all rebuild through constructors that call this once, which is
@@ -279,7 +308,7 @@ impl L2State {
     ///
     /// The caller (replay) guarantees maturity and detection; this enforces
     /// exactly-once per `(txid, index)` and conservation. A duplicate is
-    /// refused by name rather than double-credited — the second occurrence of
+    /// refused by name rather than double-credited â€” the second occurrence of
     /// the same L1 bytes is a replay, never a second deposit.
     pub fn apply_deposit(
         &mut self,
@@ -308,7 +337,7 @@ impl L2State {
     }
 
     /// Satoshis credited through deposits. `funded_total` equals the genesis
-    /// release plus this, minus `exited_total` — anything else is invented or
+    /// release plus this, minus `exited_total` â€” anything else is invented or
     /// vanished money.
     pub fn deposited_total(&self) -> u64 {
         self.deposited_total
@@ -324,7 +353,7 @@ impl L2State {
     ///
     /// Production calls this only through [`Self::apply_genesis`]: the
     /// Decision 7 bridge funds L2 exactly once, at genesis, and user deposits
-    /// are deferred — so any post-genesis production credit would be invented
+    /// are deferred â€” so any post-genesis production credit would be invented
     /// money. Direct calls are the unit-test seam (custom-funded states) and
     /// the future deposit mechanism's entry point, not a funding source the
     /// node may invoke on its own.
@@ -343,7 +372,7 @@ impl L2State {
 
     /// Every satoshi ever released into this state, minus what exits have
     /// taken out. In production this equals the profile's escrow total plus
-    /// credited deposits minus `exited_total` — anything else proves an
+    /// credited deposits minus `exited_total` â€” anything else proves an
     /// unauthorized funding happened.
     pub fn funded_total(&self) -> u64 {
         self.funded_total
@@ -383,7 +412,7 @@ impl L2State {
 
     /// Prove `addr`'s current balance against [`L2State::state_root`].
     ///
-    /// `None` for an address that holds no account — there is no leaf, so
+    /// `None` for an address that holds no account â€” there is no leaf, so
     /// there is nothing to prove. Proving a zero balance for an absent account
     /// would claim a fact the commitment does not contain.
     pub fn account_proof(&self, addr: &Address) -> Option<InclusionProof> {
@@ -409,12 +438,13 @@ impl L2State {
     // --- exits (approved P1) -------------------------------------------
 
     /// The consensus-committed root: account leaves in address order, then exit
-    /// leaves in `(owner, nonce)` order, under one tree.
+    /// leaves in `(owner, nonce)` order, then policy leaves in hash order, under
+    /// one tree.
     ///
-    /// With no queued exits the leaf list is the account list, so this equals
-    /// [`L2State::state_root`]: a pre-exit state commits identically under both
-    /// functions, and the block commitment never disagrees with the SDK root
-    /// for states that predate exits.
+    /// With no queued exits and no published policies the leaf list is the
+    /// account list, so this equals [`L2State::state_root`]: a pre-exit state
+    /// commits identically under both functions, and the block commitment never
+    /// disagrees with the SDK root for states that predate exits.
     pub fn committed_root(&self) -> Hash {
         let mut leaves: Vec<Hash> = self
             .account_leaves()
@@ -424,6 +454,9 @@ impl L2State {
         let mut exits: Vec<(&(Address, u64), &ExitRecord)> = self.exits.iter().collect();
         exits.sort_by_key(|(k, _)| **k);
         leaves.extend(exits.iter().map(|(_, r)| r.leaf()));
+        let mut policies: Vec<(&Hash, &PolicyEntry)> = self.policies.iter().collect();
+        policies.sort_by_key(|(h, _)| **h);
+        leaves.extend(policies.iter().map(|(_, e)| e.leaf()));
         state_root(&leaves)
     }
 
@@ -456,7 +489,7 @@ impl L2State {
 
     /// Prove a queued exit record against [`L2State::committed_root`].
     ///
-    /// `None` for an unknown or already-released record — there is no leaf, so
+    /// `None` for an unknown or already-released record â€” there is no leaf, so
     /// there is nothing to prove. Release *removes* the record precisely so a
     /// spent exit can never be proven again.
     pub fn exit_proof(&self, owner: &Address, nonce: u64) -> Option<InclusionProof> {
@@ -473,7 +506,7 @@ impl L2State {
     }
 
     /// Whether a queued exit may be released at `tip`: its queue block is
-    /// final under the stronger of the two Decision-15 rules — depth
+    /// final under the stronger of the two Decision-15 rules â€” depth
     /// `maturity_depth` **and**, once binding finality is active, the binding
     /// checkpoint height. The same rule that governs deposit maturity, never
     /// weaker for exits. `binding_finalized == 0` means binding finality has
@@ -491,7 +524,7 @@ impl L2State {
 
     /// Whether this profile accepts an exit queue at `height`.
     ///
-    /// `exit_activation_height == 0` means *never*, not *from genesis* — a
+    /// `exit_activation_height == 0` means *never*, not *from genesis* â€” a
     /// profile that has chosen no height must not encumber funds with no
     /// release. Exposed so callers can refuse before building a transaction
     /// rather than after broadcasting one.
@@ -499,12 +532,12 @@ impl L2State {
         self.config.exit_activation_height != 0 && height >= self.config.exit_activation_height
     }
 
-    /// Queue an L2 → L1 exit: debit `amount + exit_fee + queue fee` from the
+    /// Queue an L2 â†’ L1 exit: debit `amount + exit_fee + queue fee` from the
     /// owner and record the pending exit the release rule later pays out.
     ///
     /// Fail-closed: below the activation height, on a zero amount, on a fee
     /// below [`MIN_EXIT_FEE_SAT`], on a repeated or rewound nonce, or on
-    /// insufficient balance — the record is written only after every check
+    /// insufficient balance â€” the record is written only after every check
     /// passes, so a refused queue leaves no partial state.
     pub fn queue_exit(
         &mut self,
@@ -570,7 +603,7 @@ impl L2State {
     /// of L2 accounting entirely.
     ///
     /// Called by replay when it observes a consensus-valid release in an L1
-    /// block body — validity (proof, maturity, idempotency) is the L1 rule's
+    /// block body â€” validity (proof, maturity, idempotency) is the L1 rule's
     /// job; this enforces the L2 side effects exactly once. An unknown record
     /// (never queued, or already released and therefore removed) is refused by
     /// name rather than debited twice.
@@ -611,7 +644,7 @@ impl L2State {
 
     /// Debit a balance. The caller must have verified sufficiency first via
     /// [`ensure_balance`]; this is the debit that follows. Uses `checked_sub`
-    /// so an underflow is a protocol error rather than a silent wrap — with
+    /// so an underflow is a protocol error rather than a silent wrap â€” with
     /// `overflow-checks` on, a contract violation surfaces as `Overflow` and
     /// halts the transaction before it can corrupt consensus state.
     fn charge(&mut self, addr: &Address, amount: u64) -> L2Result<()> {
@@ -651,8 +684,8 @@ impl L2State {
 
     /// Every task, sorted by task id. Enumeration is never `HashMap` order, so
     /// two nodes holding the same state list the same contracts in the same
-    /// order — the property task discovery (Phase 5's worker SDK, SPEC.md
-    /// §18.4) is defined on.
+    /// order â€” the property task discovery (Phase 5's worker SDK, SPEC.md
+    /// Â§18.4) is defined on.
     pub fn tasks(&self) -> Vec<&TaskContract> {
         let mut ids: Vec<Hash> = self.tasks.keys().copied().collect();
         ids.sort_unstable();
@@ -661,9 +694,9 @@ impl L2State {
 
     /// Every task currently in the `Disputed` state, sorted by task id.
     ///
-    /// The arbitrator worklist (§16): these are the tasks whose result is under
+    /// The arbitrator worklist (Â§16): these are the tasks whose result is under
     /// challenge and whose canonical reference an arbitrator will run. Sorted
-    /// for the same reason `tasks()` is — two nodes holding the same state must
+    /// for the same reason `tasks()` is â€” two nodes holding the same state must
     /// enumerate disputes in the same order.
     pub fn disputed_tasks(&self) -> Vec<&TaskContract> {
         self.tasks()
@@ -706,13 +739,260 @@ impl L2State {
             L2Payload::Dispute(p) => self.apply_dispute(p, height, fee),
             L2Payload::Settle(p) => self.apply_settle(p, txid, height, validators, verifier),
             L2Payload::ExitQueue(p) => self.queue_exit(p, height, fee),
+            L2Payload::Policy(p) => self.apply_policy(p, height, fee),
+            L2Payload::PolicyRevoke(p) => self.apply_policy_revoke(p, height, fee),
+            L2Payload::AgentSpend(p) => self.apply_agent_spend(p, height, fee),
         }?;
 
         // Only a transaction that actually applied is marked applied. A
         // rejection leaves the id free, so a precondition that later holds lets
-        // the same bytes be retried — but it can never apply twice.
+        // the same bytes be retried â€” but it can never apply twice.
         self.applied.insert(txid);
         Ok(effect)
+    }
+
+    // --- spending policies (SPEC.md Â§21) --------------------------------
+
+    /// Publish a spending policy (SPEC.md Â§21.1).
+    ///
+    /// The owner's signature covers the grant bytes, the spender and the agent
+    /// identity together, so a grant cannot be published for a spender the
+    /// owner did not name. What lands in state is the grant, the spender, and
+    /// the counters that make the caps enforceable.
+    fn apply_policy(&mut self, p: &PolicyPayload, height: u64, fee: u64) -> L2Result<L2Effect> {
+        let policy = SpendPolicy::deserialize(&p.policy)
+            .map_err(|e| L2Error::Policy(format!("grant refused: {e}")))?;
+        policy
+            .validate()
+            .map_err(|e| L2Error::Policy(format!("grant refused: {e}")))?;
+        // The signer is the owner the grant names.
+        if policy.owner != p.owner {
+            return Err(L2Error::PolicyBinding("the grant names another owner"));
+        }
+        // The grant is for this network.
+        if policy.network_id != self.config.network_id {
+            return Err(L2Error::PolicyBinding("the grant is for another network"));
+        }
+        // A revoked grant is published by revoking, not by publishing.
+        if policy.revoked {
+            return Err(L2Error::PolicyBinding(
+                "a revoked grant cannot be published",
+            ));
+        }
+        // The grant names the agent the transaction names.
+        if policy.agent_id != p.agent_id {
+            return Err(L2Error::PolicyBinding("the grant names another agent"));
+        }
+        // One live grant per agent: a second grant cannot be used to double the
+        // caps the first one grants.
+        if let Some(existing) = self.policy_by_agent.get(&p.agent_id) {
+            let entry = self.policies.get(existing).ok_or(L2Error::UnknownPolicy)?;
+            if !entry.revoked {
+                return Err(L2Error::PolicyAlreadyPublished);
+            }
+        }
+        // A delegated grant must narrow a parent that is on chain and live.
+        if let Some(parent_id) = policy.parent_agent_id {
+            let parent_hash = self
+                .policy_by_agent
+                .get(&parent_id)
+                .copied()
+                .ok_or(L2Error::UnknownPolicy)?;
+            if !self.policy_is_live(&parent_hash) {
+                return Err(L2Error::PolicyRevoked);
+            }
+            let parent = self
+                .policies
+                .get(&parent_hash)
+                .ok_or(L2Error::UnknownPolicy)?;
+            delegation::dominates(&parent.policy, &policy)
+                .map_err(|e| L2Error::Policy(format!("grant widens its parent: {e:?}")))?;
+        }
+        // The fee comes out of the owner's balance, like every other L2 fee.
+        self.ensure_balance(&p.owner, fee)?;
+        self.charge(&p.owner, fee)?;
+        self.collect_fee(fee);
+
+        let hash = policy.hash();
+        let entry = PolicyEntry {
+            policy,
+            spender: p.spender,
+            agent_id: p.agent_id,
+            revoked: false,
+            window_start_height: height,
+            spent_in_window_sat: 0,
+            total_spent_sat: 0,
+            last_nonce: 0,
+            spends: 0,
+        };
+        self.policies.insert(hash, entry);
+        self.policy_by_agent.insert(p.agent_id, hash);
+        Ok(L2Effect::PolicyPublished {
+            policy_hash: hash,
+            agent_id: p.agent_id,
+            spender: p.spender,
+        })
+    }
+
+    /// Revoke a published policy (SPEC.md Â§21.2).
+    ///
+    /// The owner's kill switch, on chain. Revocation reaches every descendant
+    /// without a separate revocation transaction per link: a spend checks the
+    /// whole ancestry.
+    fn apply_policy_revoke(
+        &mut self,
+        p: &PolicyRevokePayload,
+        _height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        let hash = self
+            .policy_by_agent
+            .get(&p.agent_id)
+            .copied()
+            .ok_or(L2Error::UnknownPolicy)?;
+        let entry = self.policies.get(&hash).ok_or(L2Error::UnknownPolicy)?;
+        if entry.policy.owner != p.owner {
+            return Err(L2Error::PolicyBinding("the grant names another owner"));
+        }
+        self.ensure_balance(&p.owner, fee)?;
+        self.charge(&p.owner, fee)?;
+        self.collect_fee(fee);
+        let entry = self.policies.get_mut(&hash).ok_or(L2Error::UnknownPolicy)?;
+        entry.revoked = true;
+        Ok(L2Effect::PolicyRevoked {
+            agent_id: p.agent_id,
+        })
+    }
+
+    /// Spend under a published policy (SPEC.md Â§21.3).
+    ///
+    /// Every rule in the grant is checked against state the chain keeps, so a
+    /// per-window cap and a nonce are rules rather than advice. The money comes
+    /// out of the grant owner's balance â€” the grant is an allowance over the
+    /// owner's own funds â€” and the fee comes out of the same balance on top.
+    fn apply_agent_spend(
+        &mut self,
+        p: &AgentSpendPayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        let hash = p.policy_hash;
+        let entry = self
+            .policies
+            .get(&hash)
+            .cloned()
+            .ok_or(L2Error::UnknownPolicy)?;
+        // Only the spender the grant names may exercise it.
+        if entry.spender != p.agent {
+            return Err(L2Error::PolicyBinding(
+                "the spender is not the one the grant names",
+            ));
+        }
+        // The grant must be live: not revoked, and with no revoked ancestor.
+        if !self.policy_is_live(&hash) {
+            return Err(L2Error::PolicyRevoked);
+        }
+        let policy = &entry.policy;
+        if policy.network_id != self.config.network_id {
+            return Err(L2Error::PolicyBinding("the grant is for another network"));
+        }
+        if height < policy.not_before_height {
+            return Err(L2Error::PolicyWindow("the grant is not yet valid"));
+        }
+        if height >= policy.expires_at_height {
+            return Err(L2Error::PolicyWindow("the grant has expired"));
+        }
+        if p.amount_sat == 0 {
+            return Err(L2Error::ZeroAmount("agent spend"));
+        }
+        if p.amount_sat > policy.per_tx_max_sat {
+            return Err(L2Error::PolicyLimit("per-transaction cap exceeded"));
+        }
+        // An empty allow-list allows nothing. That is the safe reading of an
+        // empty list, and it is the same rule the node-local policy engine
+        // applies.
+        if !policy.allowed_recipients.contains(&p.recipient) {
+            return Err(L2Error::PolicyRecipient);
+        }
+        match &p.service {
+            None => {
+                if !policy.allowed_services.is_empty() {
+                    return Err(L2Error::PolicyService);
+                }
+            }
+            Some(tag) => {
+                if !policy.allowed_services.contains(tag) {
+                    return Err(L2Error::PolicyService);
+                }
+            }
+        }
+        if p.nonce <= entry.last_nonce {
+            return Err(L2Error::PolicyNonce);
+        }
+        if height < entry.window_start_height {
+            return Err(L2Error::PolicyWindow(
+                "the height ran backwards inside the grant",
+            ));
+        }
+        // Tumbling window, forward only, overflow-safe.
+        let window_end = entry
+            .window_start_height
+            .checked_add(policy.window_blocks)
+            .ok_or(L2Error::Overflow)?;
+        let (window_start, spent_in_window) = if height >= window_end {
+            (height, 0u64)
+        } else {
+            (entry.window_start_height, entry.spent_in_window_sat)
+        };
+        let requested = spent_in_window
+            .checked_add(p.amount_sat)
+            .ok_or(L2Error::Overflow)?;
+        if requested > policy.cumulative_max_sat {
+            return Err(L2Error::PolicyLimit("per-window cap exceeded"));
+        }
+        let owner = policy.owner;
+        let need = p.amount_sat.checked_add(fee).ok_or(L2Error::Overflow)?;
+        self.ensure_balance(&owner, need)?;
+        self.charge(&owner, need)?;
+        self.pay(&p.recipient, p.amount_sat)?;
+        self.collect_fee(fee);
+        let e = self.policies.get_mut(&hash).ok_or(L2Error::UnknownPolicy)?;
+        e.window_start_height = window_start;
+        e.spent_in_window_sat = requested;
+        e.total_spent_sat = e.total_spent_sat.saturating_add(p.amount_sat);
+        e.last_nonce = p.nonce;
+        e.spends = e.spends.saturating_add(1);
+        Ok(L2Effect::AgentSpent {
+            policy_hash: hash,
+            agent: p.agent,
+            recipient: p.recipient,
+            amount_sat: p.amount_sat,
+        })
+    }
+
+    /// Is this grant live â€” not revoked itself, and with no revoked ancestor?
+    ///
+    /// The walk is bounded by the delegation depth cap and fails closed: a
+    /// missing ancestor, a revoked one, or a chain deeper than the cap all
+    /// mean "not live".
+    fn policy_is_live(&self, hash: &Hash) -> bool {
+        let mut current = *hash;
+        for _ in 0..=delegation::MAX_DELEGATION_DEPTH {
+            let Some(entry) = self.policies.get(&current) else {
+                return false;
+            };
+            if entry.revoked {
+                return false;
+            }
+            match entry.policy.parent_agent_id {
+                Some(parent_id) => match self.policy_by_agent.get(&parent_id) {
+                    Some(parent_hash) => current = *parent_hash,
+                    None => return false,
+                },
+                None => return true,
+            }
+        }
+        false
     }
 
     fn apply_post(&mut self, p: &PostTaskPayload, height: u64, fee: u64) -> L2Result<L2Effect> {
@@ -798,7 +1078,7 @@ impl L2State {
     ) -> L2Result<L2Effect> {
         // The signed chain context first: a quorum aggregate binds the network
         // it was signed for and the height it was signed at, so a payload
-        // naming another network — or a vote from the future — is refused by
+        // naming another network â€” or a vote from the future â€” is refused by
         // name before any pairing runs.
         if p.network_id != self.config.network_id {
             return Err(L2Error::BadSettleNetwork);
@@ -823,7 +1103,7 @@ impl L2State {
         // Lattice sidecar, clause-7 shape: every bitmap signer holding a
         // registered lattice key in this set needs a valid entry over the
         // same decision hash. Sets without registered keys verify BLS-only,
-        // exactly as before — the rule tightens only where keys exist.
+        // exactly as before â€” the rule tightens only where keys exist.
         {
             let n = validators.keys.len();
             let mut seen = vec![false; n];
@@ -855,7 +1135,7 @@ impl L2State {
         // the state untouched (fail closed). Only a `Correct` settlement of real
         // work certifies: a `Fraudulent` verdict is a SlashRecord and an
         // `Expired` one is a refund, neither of which is a certificate
-        // (SPEC.md §17.4). The evidence is the payload's own quorum aggregate.
+        // (SPEC.md Â§17.4). The evidence is the payload's own quorum aggregate.
         let vwc_id = if p.verdict == Verdict::Correct {
             if p.vwc_hash == VWC_HASH_EXPIRED {
                 return Err(L2Error::VwcInvalid(
@@ -988,7 +1268,7 @@ impl L2State {
             // is which deposits move, and `settle_inner` accounts for that.
             let settled = {
                 // invariant: `ids` was collected from these keys, and `tasks`
-                // is insert-only, so the entry cannot be gone — a miss would
+                // is insert-only, so the entry cannot be gone â€” a miss would
                 // be a bug in this module, not an input to route around.
                 let t = self.tasks.get_mut(&id).expect("id came from the map");
                 let attrs = (t.submitter, t.worker, t.challenger());
@@ -1009,15 +1289,15 @@ impl L2State {
                     .apply_settlement(submitter, worker, challenger, outcome, [0u8; 64], height)
                     .unwrap_or(0);
                 // An implicit settlement carries no aggregate (nothing was
-                // transacted), so its certificate is `WindowElapsed` (§17.5).
+                // transacted), so its certificate is `WindowElapsed` (Â§17.5).
                 //
                 // That certificate is a receipt for an uncontested settlement
                 // and nothing more: the dispute window closing says nobody
                 // objected, not that the result is right. A worker who submits
                 // a wrong result and is never challenged reaches exactly here.
-                // The settlement and the payment are correct either way — the
+                // The settlement and the payment are correct either way â€” the
                 // timeout economics requires a challenge to overturn one, or a
-                // griefer could stall every task forever — so what must not
+                // griefer could stall every task forever â€” so what must not
                 // happen is the certificate reading as verification. It is
                 // registered as `WindowElapsed`, `asserts_correctness()` is
                 // false for it, and `validate_verified` refuses it by name.
@@ -1042,7 +1322,7 @@ impl L2State {
                     let cert_id = cert.id;
                     self.issue_vwc(cert)
                         // invariant: a task settles once, so issuance cannot
-                        // collide — a collision would be registry corruption.
+                        // collide â€” a collision would be registry corruption.
                         .expect("a task settles once, so issuance cannot collide");
                     cert_id
                 });
@@ -1084,7 +1364,7 @@ impl L2State {
         effects
     }
 
-    // --- verified work certificates (Phase 4, SPEC.md §17) -------------
+    // --- verified work certificates (Phase 4, SPEC.md Â§17) -------------
 
     /// The certificate issued for a task, if it settled as `Correct`.
     pub fn vwc(&self, task_id: &Hash) -> Option<&VerifiedWorkCertificate> {
@@ -1097,7 +1377,7 @@ impl L2State {
 
     /// Every certificate, sorted by task id. Enumeration is never `HashMap`
     /// order, so two nodes holding the same state list the same certificates in
-    /// the same order (§17.9).
+    /// the same order (Â§17.9).
     pub fn vwcs(&self) -> Vec<&VerifiedWorkCertificate> {
         let mut ids: Vec<Hash> = self.vwcs.keys().copied().collect();
         ids.sort_unstable();
@@ -1106,7 +1386,7 @@ impl L2State {
 
     /// Validate a certificate against live state: everything
     /// `VerifiedWorkCertificate::validate` checks, plus the registry comparison
-    /// (§17.6 check 4) — the certificate must be the one this state issued, byte
+    /// (Â§17.6 check 4) â€” the certificate must be the one this state issued, byte
     /// for byte. A structurally valid certificate that no state issued proves
     /// nothing.
     ///
@@ -1133,7 +1413,7 @@ impl L2State {
     /// A relying party that is about to pay for, publish, or otherwise act on a
     /// compute result must call this. The only difference from
     /// [`Self::validate_vwc`] is that a certificate resting on an unchallenged
-    /// dispute window is refused — see
+    /// dispute window is refused â€” see
     /// [`crate::vwc::VerifiedWorkCertificate::validate_verified`] for why that
     /// state is reachable and what it does and does not prove.
     pub fn validate_vwc_verified(
@@ -1148,7 +1428,7 @@ impl L2State {
 
     /// Record a certificate. Exactly one per task, ever: a second issuance for
     /// the same task is a protocol violation and is refused, never silently
-    /// overwritten (§17.7).
+    /// overwritten (Â§17.7).
     fn issue_vwc(&mut self, cert: VerifiedWorkCertificate) -> L2Result<Hash> {
         if self.vwcs.contains_key(&cert.task_id) {
             return Err(L2Error::VwcAlreadyIssued);
@@ -1203,7 +1483,7 @@ impl L2State {
 }
 
 // ---------------------------------------------------------------------------
-// Wire encoding (SPEC.md §19.2): the state a node serves a remote observer
+// Wire encoding (SPEC.md Â§19.2): the state a node serves a remote observer
 // ---------------------------------------------------------------------------
 
 /// The only state-transport version this build writes *and* reads. A blob
@@ -1212,15 +1492,15 @@ impl L2State {
 /// Version 2 adds the exit queue (approved P1): the activation height in the
 /// config area, the exit records and per-owner nonces after the deposits, and
 /// the two exit counters with the other counters. Version-1 blobs are refused
-/// rather than guessed at — a state without exits cannot describe a chain
+/// rather than guessed at â€” a state without exits cannot describe a chain
 /// that queued one.
 ///
 /// Version 3 adds the config `network_id` to the config area: the state now
 /// names the chain it belongs to, which is what lets `apply` refuse a settle
 /// aggregate signed for another network. Older blobs are refused rather than
-/// guessed at — a state without a network cannot verify a network-bound
+/// guessed at â€” a state without a network cannot verify a network-bound
 /// settlement.
-pub const L2_STATE_WIRE_VERSION: u8 = 3;
+pub const L2_STATE_WIRE_VERSION: u8 = 4;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
@@ -1235,6 +1515,8 @@ const WIRE_HASH_MIN: usize = 32;
 const WIRE_DEPOSIT_MIN: usize = 36;
 /// Smallest possible encoded length-prefixed entry.
 const WIRE_PREFIX_MIN: usize = 4;
+/// Minimum bytes one published policy entry occupies on the wire.
+const WIRE_POLICY_MIN: usize = 128;
 
 fn codec_err(what: &'static str) -> L2Error {
     L2Error::Codec(jnt_core::Error::Malformed(what))
@@ -1261,9 +1543,9 @@ impl L2State {
     ///
     /// Deterministic: every map is written in sorted key order, so two nodes
     /// holding equal states produce byte-identical blobs and a client can hash
-    /// one for comparison. Nothing here is signed — a state is derived data,
+    /// one for comparison. Nothing here is signed â€” a state is derived data,
     /// and the node's canonical blocks are what give it authority; this is only
-    /// a transport (SPEC.md §19.2).
+    /// a transport (SPEC.md Â§19.2).
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(
             128 + self.accounts.len() * WIRE_ACCOUNT_MIN + self.tasks.len() * 256,
@@ -1336,13 +1618,21 @@ impl L2State {
             w.fixed(task_id).u32le(bytes.len() as u32).raw(&bytes);
         }
 
+        let mut policies: Vec<(&Hash, &PolicyEntry)> = self.policies.iter().collect();
+        policies.sort_by_key(|(h, _)| **h);
+        w.u64le(policies.len() as u64);
+        for (hash, entry) in policies {
+            let bytes = entry.serialize();
+            w.fixed(hash).u32le(bytes.len() as u32).raw(&bytes);
+        }
+
         w.raw(&self.slash_vault.encode());
         w.into_vec()
     }
 
     /// Decode [`L2State::encode`]: bounded, self-validating, fail-closed.
     ///
-    /// A refusal yields no state at all — never a partially populated one. On
+    /// A refusal yields no state at all â€” never a partially populated one. On
     /// top of the structural checks (version, counts, duplicate keys, unknown
     /// tags, trailing bytes) this runs the protocol's own invariant
     /// ([`L2State::check_conservation`]), so a blob whose counters do not add
@@ -1529,6 +1819,47 @@ impl L2State {
             }
         }
 
+        let declared_policies = r.u64le().map_err(|_| codec_err("policy count"))?;
+        let n_policies = bounded_count(
+            &r,
+            declared_policies,
+            WIRE_POLICY_MIN,
+            "policy count exceeds buffer",
+        )?;
+        let mut policies: BTreeMap<Hash, PolicyEntry> = BTreeMap::new();
+        for _ in 0..n_policies {
+            let hash: Hash = r.fixed().map_err(|_| codec_err("policy hash"))?;
+            let len = r.u32le().map_err(|_| codec_err("policy length"))? as usize;
+            if len > r.remaining() {
+                return Err(codec_err("policy length exceeds buffer"));
+            }
+            let raw = r.fixed_slice(len).map_err(|_| codec_err("policy bytes"))?;
+            let entry =
+                PolicyEntry::deserialize(raw).map_err(|_| codec_err("policy entry refused"))?;
+            if entry.hash() != hash {
+                return Err(codec_err("policy names another hash"));
+            }
+            if policies.insert(hash, entry).is_some() {
+                return Err(codec_err("duplicate policy in state"));
+            }
+        }
+        // The agent index is derived, not stored: one grant per agent, and a
+        // live grant wins over a revoked one.
+        let mut policy_by_agent: BTreeMap<AgentId, Hash> = BTreeMap::new();
+        for (hash, entry) in policies.iter() {
+            match policy_by_agent.get(&entry.agent_id).copied() {
+                Some(existing) => {
+                    let previous = &policies[&existing];
+                    if previous.revoked && !entry.revoked {
+                        policy_by_agent.insert(entry.agent_id, *hash);
+                    }
+                }
+                None => {
+                    policy_by_agent.insert(entry.agent_id, *hash);
+                }
+            }
+        }
+
         let slash_vault = SlashVault::decode(&mut r)?;
         r.expect_end()
             .map_err(|_| codec_err("state has trailing bytes"))?;
@@ -1550,6 +1881,8 @@ impl L2State {
             exit_nonce,
             exits_locked,
             exited_total,
+            policies,
+            policy_by_agent,
         };
         // The protocol's own invariant. A state that does not conserve is not
         // a valid observation of the chain, whatever its structure said.
