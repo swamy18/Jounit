@@ -16,9 +16,10 @@ use jnt_core::error::Error;
 use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
     ClaimTaskPayload, ExitQueuePayload, L2Payload, L2Transaction, L2TxType, PostTaskPayload,
-    SettlePayload, SubmitResultPayload, Verdict, L2_TX_AGENT_SPEND, L2_TX_CLAIM, L2_TX_DISPUTE,
-    L2_TX_EXIT_QUEUE, L2_TX_POLICY, L2_TX_POLICY_REVOKE, L2_TX_POST, L2_TX_SETTLE, L2_TX_SUBMIT,
-    MIN_EXIT_FEE_SAT,
+    SettlePayload, SubmitResultPayload, Verdict, L2_TX_AGENT_SPEND, L2_TX_CLAIM,
+    L2_TX_CREDIT_COLLATERAL, L2_TX_CREDIT_DEFAULT, L2_TX_CREDIT_OPEN, L2_TX_CREDIT_REPAY,
+    L2_TX_DISPUTE, L2_TX_EXIT_QUEUE, L2_TX_POLICY, L2_TX_POLICY_REVOKE, L2_TX_POST, L2_TX_SETTLE,
+    L2_TX_SUBMIT, MIN_EXIT_FEE_SAT,
 };
 use jnt_core::state_root::verify_inclusion;
 use jnt_core::wallet::Wallet;
@@ -28,10 +29,10 @@ use jnt_l2::{L2Config, L2Error, L2State};
 // 1. The wire format admits six types and nothing else
 // ---------------------------------------------------------------------------
 
-/// Exhaustive over every possible type byte: exactly the nine known values are
-/// accepted, and every other byte is refused **by name**.
+/// Exhaustive over every possible type byte: exactly the thirteen known values
+/// are accepted, and every other byte is refused **by name**.
 #[test]
-fn nine_l2_transaction_types_exist_with_policy_types_after_exit_queue() {
+fn thirteen_l2_transaction_types_exist_with_the_credit_types_last() {
     let known = [
         L2_TX_POST,
         L2_TX_CLAIM,
@@ -42,6 +43,10 @@ fn nine_l2_transaction_types_exist_with_policy_types_after_exit_queue() {
         L2_TX_POLICY,
         L2_TX_POLICY_REVOKE,
         L2_TX_AGENT_SPEND,
+        L2_TX_CREDIT_OPEN,
+        L2_TX_CREDIT_COLLATERAL,
+        L2_TX_CREDIT_REPAY,
+        L2_TX_CREDIT_DEFAULT,
     ];
     let mut accepted = Vec::new();
     for byte in 0u8..=255 {
@@ -56,7 +61,7 @@ fn nine_l2_transaction_types_exist_with_policy_types_after_exit_queue() {
             }
         }
     }
-    assert_eq!(accepted.len(), 9, "exactly nine L2 transaction types exist");
+    assert_eq!(accepted.len(), 13, "exactly thirteen L2 transaction types exist");
     assert_eq!(
         accepted,
         vec![
@@ -69,10 +74,14 @@ fn nine_l2_transaction_types_exist_with_policy_types_after_exit_queue() {
             L2TxType::Policy,
             L2TxType::PolicyRevoke,
             L2TxType::AgentSpend,
+            L2TxType::CreditOpen,
+            L2TxType::CreditCollateral,
+            L2TxType::CreditRepay,
+            L2TxType::CreditDefault,
         ]
     );
     assert_eq!(L2TxType::ExitQueue.fee_sat(), 2_000);
-    assert_eq!(known.len(), 9);
+    assert_eq!(known.len(), 13);
 }
 
 /// An exit-queue payload round-trips through the envelope and its signature

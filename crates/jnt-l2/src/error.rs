@@ -135,6 +135,26 @@ pub enum L2Error {
     /// The grant is not usable at this height: not yet valid, expired, or the
     /// height ran backwards inside the grant.
     PolicyWindow(&'static str),
+    /// A credit term is out of range: a zero window, a rate above the cap, a
+    /// deadline in the past.
+    CreditTerms(&'static str),
+    /// The collateral posted does not meet the requirement. The requirement and
+    /// the amount posted are both stated, so a caller knows the gap.
+    CreditUndercollateralised { required: u64, posted: u64 },
+    /// A position with this id already exists.
+    CreditPositionExists,
+    /// No position with this id.
+    UnknownCreditPosition,
+    /// The position is not open: it was already repaid or already defaulted.
+    CreditPositionClosed,
+    /// The transaction names a position that belongs to somebody else.
+    CreditBinding(&'static str),
+    /// The position is not yet due, so it cannot be defaulted.
+    CreditNotDue,
+    /// The interest charged on a position overflowed the arithmetic the charge
+    /// schedule permits. Refused rather than wrapped: a wrapped charge would
+    /// under-charge the lender.
+    CreditInterestOverflow,
 }
 
 impl fmt::Display for L2Error {
@@ -212,6 +232,16 @@ impl fmt::Display for L2Error {
             L2Error::PolicyService => write!(f, "service is not on the policy allow-list"),
             L2Error::PolicyNonce => write!(f, "policy nonce repeats or rewinds"),
             L2Error::PolicyWindow(w) => write!(f, "policy window: {w}"),
+            L2Error::CreditTerms(w) => write!(f, "credit terms refused: {w}"),
+            L2Error::CreditUndercollateralised { required, posted } => {
+                write!(f, "collateral {posted} is below the required {required}")
+            }
+            L2Error::CreditPositionExists => write!(f, "the credit position already exists"),
+            L2Error::UnknownCreditPosition => write!(f, "no such credit position"),
+            L2Error::CreditPositionClosed => write!(f, "the credit position is closed"),
+            L2Error::CreditBinding(w) => write!(f, "credit binding: {w}"),
+            L2Error::CreditNotDue => write!(f, "the credit position is not yet due"),
+            L2Error::CreditInterestOverflow => write!(f, "credit interest overflowed"),
         }
     }
 }

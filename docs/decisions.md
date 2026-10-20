@@ -1526,3 +1526,53 @@ they exist. `SpendPolicy` itself is untouched - same encoding, same hash, same
 the committed root changes: this is a protocol version bump (new state wire
 version, new genesis hash). It is shipped in the same version as the credit
 types below, because shipping a root change twice buys nothing.
+---
+
+## Decision 26 - Credit becomes a chain fact (P1 resolved)
+
+**Status: APPROVED 2026-10-20, IMPLEMENTED 2026-10-20.**
+
+The credit facility was a node-local ledger of IOUs with three holes in it: no
+coin moved when a credit line was opened, the lender never signed anything, and
+no other node could see the debt. An agent could therefore "borrow" against a
+line that existed only on the node it asked, against a lender who had never
+agreed, and against value that was never committed to anyone.
+
+**The decision: a loan is a Layer-2 state fact with a lender signature.**
+
+1. **Four new Layer-2 transaction types.** `CreditOpen` (`0x19`),
+   `CreditCollateral` (`0x1A`), `CreditRepay` (`0x1B`) and `CreditDefault`
+   (`0x1C`), carried in L1 blocks and committed by the block's
+   `l2_state_root`, exactly as the policy types of Decision 25 are.
+2. **The lender signs the terms.** The lender's signature covers the
+   borrower, the principal, the collateral, the rate, the window and the
+   deadline. A position naming a lender who did not sign it is refused by name
+   before any state changes.
+3. **The principal actually moves.** The lender's balance pays the principal
+   and the fee; the borrower's balance receives the principal. This is the
+   difference between a credit line and a number in a spreadsheet.
+4. **The collateral is the borrower's own money.** It is checked before the
+   principal arrives, so the borrowed funds cannot secure the loan that
+   produced them. Without a bond the requirement is full collateralisation -
+   the same arithmetic the node-local book used, kept in one place.
+5. **Interest is charged once per period, and interest first.** The position
+   remembers the height up to which interest was charged, so two instalments
+   do not each pay for the whole elapsed time; and a repayment pays the
+   interest before the principal, as it always did.
+6. **A default is permissionless.** Anyone may settle an overdue position,
+   because a default only the lender could trigger is a default that could be
+   delayed. The collateral answers for the debt, the surplus returns to the
+   borrower, and the uncovered remainder is a shortfall the lender absorbs.
+7. **Collateral is a conservation bucket.** `credit_locked` is part of the
+   conservation sum: it is in the system, but not spendable, and the
+   invariant holds after every credit transition.
+
+**What this does not change.** The node-local credit book stays as the
+service-layer view and the admission gate; the arithmetic it owns (the
+collateral rule, the interest rule) is now shared with the chain rather than
+re-implemented, so there is one implementation of each.
+
+**Consensus impact.** The Layer-2 state root now covers credit positions as
+well as policies and exits, and the state wire version moves to 5. Shipped in
+the same protocol version as Decision 25, because a root change is a root
+change.

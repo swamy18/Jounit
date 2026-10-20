@@ -64,6 +64,21 @@ pub const FEE_TX_POLICY_REVOKE_SAT: u64 = 2_000;
 /// Spending under a published policy (SPEC.md §21.3). Same tier as the exit
 /// queue: a signed debit-and-credit with no arbitration.
 pub const FEE_TX_AGENT_SPEND_SAT: u64 = 2_000;
+/// Opening a credit position (SPEC.md §22.3). Same tier as the exit queue:
+/// a signed record with no arbitration.
+pub const FEE_TX_CREDIT_OPEN_SAT: u64 = 2_000;
+/// Adding collateral to a credit position (SPEC.md §22.4).
+pub const FEE_TX_CREDIT_COLLATERAL_SAT: u64 = 2_000;
+/// Repaying a credit position (SPEC.md §22.5).
+pub const FEE_TX_CREDIT_REPAY_SAT: u64 = 2_000;
+/// Settling an overdue credit position (SPEC.md §22.6).
+pub const FEE_TX_CREDIT_DEFAULT_SAT: u64 = 2_000;
+/// Highest interest a credit position may charge per window, in basis points
+/// of the outstanding principal (10%). A rate above this is refused rather
+/// than clamped: a lender who wanted 10 000 bps would be able to charge the
+/// principal back in a single window, and a cap that silently lowers the rate
+/// would hide that.
+pub const MAX_CREDIT_RATE_BPS_PER_WINDOW: u32 = 1_000;
 /// The flat minimum fee floor for any L2 transaction (D3). Every L2 fee type
 /// must meet or exceed this value. The `fee_sat` function applies `max(fee,
 /// L2_FLAT_FEE_MINIMUM_SAT)` as a final floor so a future re-parameterization
@@ -86,6 +101,10 @@ pub const L2_FEE_SCHEDULE: &[(&str, u64)] = &[
     ("TxPolicy", FEE_TX_POLICY_SAT),
     ("TxPolicyRevoke", FEE_TX_POLICY_REVOKE_SAT),
     ("TxAgentSpend", FEE_TX_AGENT_SPEND_SAT),
+    ("TxCreditOpen", FEE_TX_CREDIT_OPEN_SAT),
+    ("TxCreditCollateral", FEE_TX_CREDIT_COLLATERAL_SAT),
+    ("TxCreditRepay", FEE_TX_CREDIT_REPAY_SAT),
+    ("TxCreditDefault", FEE_TX_CREDIT_DEFAULT_SAT),
 ];
 
 /// One genesis-funded L2 balance (Decision 7, SPEC.md §19.4).
@@ -786,6 +805,10 @@ mod tests {
                 ("TxPolicy", 2_000),
                 ("TxPolicyRevoke", 2_000),
                 ("TxAgentSpend", 2_000),
+                ("TxCreditOpen", 2_000),
+                ("TxCreditCollateral", 2_000),
+                ("TxCreditRepay", 2_000),
+                ("TxCreditDefault", 2_000),
             ]
         );
     }

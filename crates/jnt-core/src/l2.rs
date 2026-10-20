@@ -38,9 +38,10 @@ use crate::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, sha512_dom, Address, Hash, Hash512};
 use crate::params::{
-    FEE_TX_AGENT_SPEND_SAT, FEE_TX_CLAIM_TASK_SAT, FEE_TX_DISPUTE_SAT, FEE_TX_EXIT_QUEUE_SAT,
-    FEE_TX_POLICY_REVOKE_SAT, FEE_TX_POLICY_SAT, FEE_TX_POST_TASK_SAT, FEE_TX_SUBMIT_RESULT_SAT,
-    L2_FLAT_FEE_MINIMUM_SAT, SETTLE_FEE_MIN_SAT,
+    FEE_TX_AGENT_SPEND_SAT, FEE_TX_CLAIM_TASK_SAT, FEE_TX_CREDIT_COLLATERAL_SAT,
+    FEE_TX_CREDIT_DEFAULT_SAT, FEE_TX_CREDIT_OPEN_SAT, FEE_TX_CREDIT_REPAY_SAT, FEE_TX_DISPUTE_SAT,
+    FEE_TX_EXIT_QUEUE_SAT, FEE_TX_POLICY_REVOKE_SAT, FEE_TX_POLICY_SAT, FEE_TX_POST_TASK_SAT,
+    FEE_TX_SUBMIT_RESULT_SAT, L2_FLAT_FEE_MINIMUM_SAT, SETTLE_FEE_MIN_SAT,
 };
 use crate::ser::{Reader, Writer};
 use crate::sig::{Bundle, Component, SCHEME_SECP256K1_ECDSA, SCHEME_SECP256K1_SCHNORR};
@@ -78,6 +79,18 @@ pub const DOM_L2_POLICY_REVOKE: &[u8] = b"jounit/l2/policy-revoke/v1";
 /// Agent spend under a published policy (SPEC.md §21.3). Covers the spender,
 /// the policy it names, the nonce, the recipient, the amount and the service tag.
 pub const DOM_L2_AGENT_SPEND: &[u8] = b"jounit/l2/agent-spend/v1";
+/// Credit position identity (SPEC.md §22.2). Derives a position id from its
+/// terms, so two positions that differ in any term are different positions.
+pub const DOM_L2_CREDIT_POSITION: &[u8] = b"jounit/l2/credit-position/v1";
+/// Credit opening (SPEC.md §22.3). Covers the lender's signature over the
+/// whole set of terms.
+pub const DOM_L2_CREDIT_OPEN: &[u8] = b"jounit/l2/credit-open/v1";
+/// Additional collateral (SPEC.md §22.4).
+pub const DOM_L2_CREDIT_COLLATERAL: &[u8] = b"jounit/l2/credit-collateral/v1";
+/// Credit repayment (SPEC.md §22.5).
+pub const DOM_L2_CREDIT_REPAY: &[u8] = b"jounit/l2/credit-repay/v1";
+/// Credit default (SPEC.md §22.6).
+pub const DOM_L2_CREDIT_DEFAULT: &[u8] = b"jounit/l2/credit-default/v1";
 
 /// Wire type codes. Deliberately `0x10`-based: L1 uses `0` and `1`, and leaving a
 /// clear gap means an L1 `tx_type` this build does not know is rejected as an
@@ -99,6 +112,16 @@ pub const L2_TX_POLICY_REVOKE: u8 = 0x17;
 /// Spend under a published policy (SPEC.md §21.3). Signed by the spender the
 /// grant names, bounded by the grant's own caps and allow-lists.
 pub const L2_TX_AGENT_SPEND: u8 = 0x18;
+/// Open a credit position (SPEC.md §22.3). Signed by the **lender**: without
+/// the lender's signature there is no loan, only a claim.
+pub const L2_TX_CREDIT_OPEN: u8 = 0x19;
+/// Add collateral to a credit position (SPEC.md §22.4).
+pub const L2_TX_CREDIT_COLLATERAL: u8 = 0x1A;
+/// Repay a credit position (SPEC.md §22.5).
+pub const L2_TX_CREDIT_REPAY: u8 = 0x1B;
+/// Settle a credit position that was not repaid by its deadline
+/// (SPEC.md §22.6). Permissionless: anyone may trigger it.
+pub const L2_TX_CREDIT_DEFAULT: u8 = 0x1C;
 
 /// Largest policy grant accepted in a publish transaction, in bytes. The policy
 /// encoding is bounded by its own field caps (64 recipients, 64 services), so
@@ -127,6 +150,10 @@ pub enum L2TxType {
     Policy,
     PolicyRevoke,
     AgentSpend,
+    CreditOpen,
+    CreditCollateral,
+    CreditRepay,
+    CreditDefault,
 }
 
 impl L2TxType {
@@ -141,6 +168,10 @@ impl L2TxType {
             L2TxType::Policy => L2_TX_POLICY,
             L2TxType::PolicyRevoke => L2_TX_POLICY_REVOKE,
             L2TxType::AgentSpend => L2_TX_AGENT_SPEND,
+            L2TxType::CreditOpen => L2_TX_CREDIT_OPEN,
+            L2TxType::CreditCollateral => L2_TX_CREDIT_COLLATERAL,
+            L2TxType::CreditRepay => L2_TX_CREDIT_REPAY,
+            L2TxType::CreditDefault => L2_TX_CREDIT_DEFAULT,
         }
     }
 
@@ -155,6 +186,10 @@ impl L2TxType {
             L2_TX_POLICY => Ok(L2TxType::Policy),
             L2_TX_POLICY_REVOKE => Ok(L2TxType::PolicyRevoke),
             L2_TX_AGENT_SPEND => Ok(L2TxType::AgentSpend),
+            L2_TX_CREDIT_OPEN => Ok(L2TxType::CreditOpen),
+            L2_TX_CREDIT_COLLATERAL => Ok(L2TxType::CreditCollateral),
+            L2_TX_CREDIT_REPAY => Ok(L2TxType::CreditRepay),
+            L2_TX_CREDIT_DEFAULT => Ok(L2TxType::CreditDefault),
             _ => Err(Error::Malformed("unknown L2 transaction type")),
         }
     }
@@ -170,6 +205,10 @@ impl L2TxType {
             L2TxType::Policy => "Policy",
             L2TxType::PolicyRevoke => "PolicyRevoke",
             L2TxType::AgentSpend => "AgentSpend",
+            L2TxType::CreditOpen => "CreditOpen",
+            L2TxType::CreditCollateral => "CreditCollateral",
+            L2TxType::CreditRepay => "CreditRepay",
+            L2TxType::CreditDefault => "CreditDefault",
         }
     }
 
@@ -200,6 +239,10 @@ impl L2TxType {
             L2TxType::Policy => FEE_TX_POLICY_SAT,
             L2TxType::PolicyRevoke => FEE_TX_POLICY_REVOKE_SAT,
             L2TxType::AgentSpend => FEE_TX_AGENT_SPEND_SAT,
+            L2TxType::CreditOpen => FEE_TX_CREDIT_OPEN_SAT,
+            L2TxType::CreditCollateral => FEE_TX_CREDIT_COLLATERAL_SAT,
+            L2TxType::CreditRepay => FEE_TX_CREDIT_REPAY_SAT,
+            L2TxType::CreditDefault => FEE_TX_CREDIT_DEFAULT_SAT,
         }
     }
 }
@@ -1241,6 +1284,348 @@ impl AgentSpendPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Credit positions (SPEC.md §22)
+// ---------------------------------------------------------------------------
+
+/// Open a credit position (SPEC.md §22.3).
+///
+/// The **lender** signs this one, and that signature is the whole difference
+/// between a loan and a claim: without it, anybody could name a lender and
+/// record a debt against them. The signature covers every term — the
+/// borrower, the amount, the collateral, the rate, the window and the deadline
+/// — so a lender cannot be shown terms they did not agree to.
+///
+/// The principal moves to the borrower when the position opens, and the
+/// borrower's collateral is locked for the life of the position. That is what
+/// makes this a loan rather than an accounting entry: the value is on chain,
+/// visible to every node, and the debt is settled by value moving back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditOpenPayload {
+    pub lender: Address,
+    pub auth: Auth,
+    /// Who the loan is for.
+    pub borrower: Address,
+    /// The principal lent, in satoshis.
+    pub amount_sat: u64,
+    /// The collateral the borrower locks against the principal.
+    pub collateral_sat: u64,
+    /// Interest per window, in basis points of the outstanding principal.
+    pub rate_bps_per_window: u32,
+    /// Length of a window, in blocks.
+    pub window_blocks: u64,
+    /// The height the debt is due by.
+    pub deadline_height: u64,
+    /// Per-lender sequence number, so two identical loans are two positions.
+    pub nonce: u64,
+}
+
+impl CreditOpenPayload {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        wallet: &Wallet,
+        borrower: Address,
+        amount_sat: u64,
+        collateral_sat: u64,
+        rate_bps_per_window: u32,
+        window_blocks: u64,
+        deadline_height: u64,
+        nonce: u64,
+    ) -> Result<Self> {
+        let mut p = CreditOpenPayload {
+            lender: wallet.address()?,
+            auth: Auth::default(),
+            borrower,
+            amount_sat,
+            collateral_sat,
+            rate_bps_per_window,
+            window_blocks,
+            deadline_height,
+            nonce,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    /// The position id: a hash over every term, so two positions that differ
+    /// in any term are different positions and one set of terms is one
+    /// position.
+    pub fn derived_position_id(&self) -> Hash {
+        let mut w = Writer::new();
+        w.fixed(&self.lender)
+            .fixed(&self.borrower)
+            .u64le(self.amount_sat)
+            .u64le(self.collateral_sat)
+            .u32le(self.rate_bps_per_window)
+            .u64le(self.window_blocks)
+            .u64le(self.deadline_height)
+            .u64le(self.nonce);
+        sha256_dom(DOM_L2_CREDIT_POSITION, &[w.as_slice()])
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_CREDIT_OPEN, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.lender, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.lender);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.borrower)
+            .u64le(self.amount_sat)
+            .u64le(self.collateral_sat)
+            .u32le(self.rate_bps_per_window)
+            .u64le(self.window_blocks)
+            .u64le(self.deadline_height)
+            .u64le(self.nonce);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let lender: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let borrower: Address = r.fixed()?;
+        let amount_sat = r.u64le()?;
+        let collateral_sat = r.u64le()?;
+        let rate_bps_per_window = r.u32le()?;
+        let window_blocks = r.u64le()?;
+        let deadline_height = r.u64le()?;
+        let nonce = r.u64le()?;
+        Ok(CreditOpenPayload {
+            lender,
+            auth,
+            borrower,
+            amount_sat,
+            collateral_sat,
+            rate_bps_per_window,
+            window_blocks,
+            deadline_height,
+            nonce,
+        })
+    }
+}
+
+/// Add collateral to a credit position (SPEC.md §22.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditCollateralPayload {
+    pub borrower: Address,
+    pub auth: Auth,
+    pub position_id: Hash,
+    pub amount_sat: u64,
+}
+
+impl CreditCollateralPayload {
+    pub fn build(wallet: &Wallet, position_id: Hash, amount_sat: u64) -> Result<Self> {
+        let mut p = CreditCollateralPayload {
+            borrower: wallet.address()?,
+            auth: Auth::default(),
+            position_id,
+            amount_sat,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_CREDIT_COLLATERAL, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.borrower, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.borrower);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.position_id).u64le(self.amount_sat);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let borrower: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let position_id: Hash = r.fixed()?;
+        let amount_sat = r.u64le()?;
+        Ok(CreditCollateralPayload {
+            borrower,
+            auth,
+            position_id,
+            amount_sat,
+        })
+    }
+}
+
+/// Repay a credit position (SPEC.md §22.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditRepayPayload {
+    pub borrower: Address,
+    pub auth: Auth,
+    pub position_id: Hash,
+    pub amount_sat: u64,
+}
+
+impl CreditRepayPayload {
+    pub fn build(wallet: &Wallet, position_id: Hash, amount_sat: u64) -> Result<Self> {
+        let mut p = CreditRepayPayload {
+            borrower: wallet.address()?,
+            auth: Auth::default(),
+            position_id,
+            amount_sat,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_CREDIT_REPAY, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.borrower, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.borrower);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.position_id).u64le(self.amount_sat);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let borrower: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let position_id: Hash = r.fixed()?;
+        let amount_sat = r.u64le()?;
+        Ok(CreditRepayPayload {
+            borrower,
+            auth,
+            position_id,
+            amount_sat,
+        })
+    }
+}
+
+/// Settle a credit position that was not repaid (SPEC.md §22.6).
+///
+/// Permissionless: anyone may trigger the settlement of an overdue position,
+/// because a default that only the lender can trigger is a default that can be
+/// delayed. The actor pays the fee; the collateral answers for the debt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditDefaultPayload {
+    pub actor: Address,
+    pub auth: Auth,
+    pub position_id: Hash,
+}
+
+impl CreditDefaultPayload {
+    pub fn build(wallet: &Wallet, position_id: Hash) -> Result<Self> {
+        let mut p = CreditDefaultPayload {
+            actor: wallet.address()?,
+            auth: Auth::default(),
+            position_id,
+        };
+        p.auth.keys = Auth::keys_for(wallet)?;
+        let msg = p.signing_hash();
+        p.auth.sigs = Auth::sigs_for(wallet, &msg)?;
+        Ok(p)
+    }
+
+    pub fn signing_hash(&self) -> Hash {
+        sha256_dom(DOM_L2_CREDIT_DEFAULT, &[&self.body()])
+    }
+
+    pub fn verify_auth(&self) -> Result<()> {
+        self.auth.verify_as(&self.actor, &self.signing_hash())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, false);
+        w.into_vec()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.encode(&mut w, true);
+        w.into_vec()
+    }
+
+    fn encode(&self, w: &mut Writer, with_sigs: bool) {
+        w.fixed(&self.actor);
+        if with_sigs {
+            self.auth.write_full(w);
+        } else {
+            self.auth.write_body(w);
+        }
+        w.fixed(&self.position_id);
+    }
+
+    pub fn from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        let actor: Address = r.fixed()?;
+        let auth = Auth::read(r)?;
+        let position_id: Hash = r.fixed()?;
+        Ok(CreditDefaultPayload {
+            actor,
+            auth,
+            position_id,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
@@ -1255,6 +1640,10 @@ pub enum L2Payload {
     Policy(PolicyPayload),
     PolicyRevoke(PolicyRevokePayload),
     AgentSpend(AgentSpendPayload),
+    CreditOpen(CreditOpenPayload),
+    CreditCollateral(CreditCollateralPayload),
+    CreditRepay(CreditRepayPayload),
+    CreditDefault(CreditDefaultPayload),
 }
 
 impl L2Payload {
@@ -1269,6 +1658,10 @@ impl L2Payload {
             L2Payload::Policy(_) => L2TxType::Policy,
             L2Payload::PolicyRevoke(_) => L2TxType::PolicyRevoke,
             L2Payload::AgentSpend(_) => L2TxType::AgentSpend,
+            L2Payload::CreditOpen(_) => L2TxType::CreditOpen,
+            L2Payload::CreditCollateral(_) => L2TxType::CreditCollateral,
+            L2Payload::CreditRepay(_) => L2TxType::CreditRepay,
+            L2Payload::CreditDefault(_) => L2TxType::CreditDefault,
         }
     }
 
@@ -1285,6 +1678,10 @@ impl L2Payload {
             L2Payload::Policy(p) => Some(p.owner),
             L2Payload::PolicyRevoke(p) => Some(p.owner),
             L2Payload::AgentSpend(p) => Some(p.agent),
+            L2Payload::CreditOpen(p) => Some(p.lender),
+            L2Payload::CreditCollateral(p) => Some(p.borrower),
+            L2Payload::CreditRepay(p) => Some(p.borrower),
+            L2Payload::CreditDefault(p) => Some(p.actor),
         }
     }
 
@@ -1299,6 +1696,10 @@ impl L2Payload {
             L2Payload::Policy(p) => p.signing_hash(),
             L2Payload::PolicyRevoke(p) => p.signing_hash(),
             L2Payload::AgentSpend(p) => p.signing_hash(),
+            L2Payload::CreditOpen(p) => p.signing_hash(),
+            L2Payload::CreditCollateral(p) => p.signing_hash(),
+            L2Payload::CreditRepay(p) => p.signing_hash(),
+            L2Payload::CreditDefault(p) => p.signing_hash(),
         }
     }
 
@@ -1315,6 +1716,10 @@ impl L2Payload {
             L2Payload::Policy(p) => p.verify_auth(),
             L2Payload::PolicyRevoke(p) => p.verify_auth(),
             L2Payload::AgentSpend(p) => p.verify_auth(),
+            L2Payload::CreditOpen(p) => p.verify_auth(),
+            L2Payload::CreditCollateral(p) => p.verify_auth(),
+            L2Payload::CreditRepay(p) => p.verify_auth(),
+            L2Payload::CreditDefault(p) => p.verify_auth(),
         }
     }
 
@@ -1329,6 +1734,10 @@ impl L2Payload {
             L2Payload::Policy(p) => p.serialize(),
             L2Payload::PolicyRevoke(p) => p.serialize(),
             L2Payload::AgentSpend(p) => p.serialize(),
+            L2Payload::CreditOpen(p) => p.serialize(),
+            L2Payload::CreditCollateral(p) => p.serialize(),
+            L2Payload::CreditRepay(p) => p.serialize(),
+            L2Payload::CreditDefault(p) => p.serialize(),
         }
     }
 
@@ -1343,6 +1752,14 @@ impl L2Payload {
             L2TxType::Policy => L2Payload::Policy(PolicyPayload::from_reader(r)?),
             L2TxType::PolicyRevoke => L2Payload::PolicyRevoke(PolicyRevokePayload::from_reader(r)?),
             L2TxType::AgentSpend => L2Payload::AgentSpend(AgentSpendPayload::from_reader(r)?),
+            L2TxType::CreditOpen => L2Payload::CreditOpen(CreditOpenPayload::from_reader(r)?),
+            L2TxType::CreditCollateral => {
+                L2Payload::CreditCollateral(CreditCollateralPayload::from_reader(r)?)
+            }
+            L2TxType::CreditRepay => L2Payload::CreditRepay(CreditRepayPayload::from_reader(r)?),
+            L2TxType::CreditDefault => {
+                L2Payload::CreditDefault(CreditDefaultPayload::from_reader(r)?)
+            }
         })
     }
 }

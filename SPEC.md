@@ -3154,3 +3154,149 @@ named spender may exercise a grant; a revoked grant authorises nothing; a
 revoked parent kills its descendant; a widening grant is refused; the state
 encoding round-trips the grants; and two nodes replaying the same transactions
 agree on the root.
+---
+
+## 22. Credit positions on chain (Phase 7)
+
+### 22.1 Why this section exists
+
+The credit facility of §18.4 was a **node-local** ledger of IOUs. Three
+things were wrong with it, and each was a hole rather than a limitation:
+
+1. **No coin moved.** `POST /v1/credit/deposit` credited a local balance and
+   the code said so itself: *"This credits the local book only - no coin
+   moves."* A credit line nobody can fund is a number.
+2. **No lender signature.** `POST /v1/credit/open` accepted a `spec_hex` whose
+   `lender` field was just a field. Anybody could open a position naming a
+   lender who had never agreed to lend, and the record would say the lender
+   owed the debt.
+3. **Nobody else could see it.** The book lived in one node's `state.bin`, so
+   a borrower with a line on one node had no line at all on another.
+
+This section makes a loan a chain fact. The vocabulary is four transaction
+types:
+
+| Type | Code | Actor | Purpose |
+|---|---:|---|---|
+| `CreditOpen` | `0x19` | **lender** | open a position; the principal moves to the borrower |
+| `CreditCollateral` | `0x1A` | borrower | add collateral to a position |
+| `CreditRepay` | `0x1B` | borrower | repay (interest first, then principal) |
+| `CreditDefault` | `0x1C` | anyone | settle a position that was not repaid by its deadline |
+
+### 22.2 The position
+
+```
+CreditOpenPayload = lender(20) ‖ auth ‖ borrower(20) ‖ amount_sat(u64) ‖
+                    collateral_sat(u64) ‖ rate_bps_per_window(u32) ‖
+                    window_blocks(u64) ‖ deadline_height(u64) ‖ nonce(u64)
+```
+
+The **lender** signs, and the signature covers every term. That is the whole
+difference between a loan and a claim: the lender agreed to these terms, and
+the chain holds the agreement.
+
+The position id is derived from the terms:
+
+```
+position_id = SHA256("jounit/l2/credit-position/v1" ‖
+                      lender ‖ borrower ‖ amount ‖ collateral ‖ rate ‖
+                      window ‖ deadline ‖ nonce)
+```
+
+so two positions differing in any term are different positions, and one set of
+terms is one position.
+
+### 22.3 Opening
+
+A position is refused unless **all** of the following hold:
+
+1. the principal and the collateral are both positive;
+2. the window is non-zero;
+3. the rate is at most `MAX_CREDIT_RATE_BPS_PER_WINDOW` (1 000 bps, i.e. 10 %
+   per window) - a rate above the cap is refused rather than clamped, because a
+   silent clamp would hide what the lender asked for;
+4. the deadline is above the current height;
+5. the collateral meets the requirement, which without a bond is
+   **full collateralisation** (`CreditTerms::default().required_collateral`,
+   the same arithmetic the node-local book used, with a zero bond);
+6. the position id is new;
+7. the lender can fund the principal and the fee, and the borrower can fund
+   the collateral **from its own balance** - the collateral is checked before
+   the principal arrives, so the borrowed money cannot secure itself.
+
+Then the value moves: the lender's balance pays the principal and the fee, the
+borrower's balance receives the principal, the borrower's balance locks the
+collateral, and the fee splits 50/50 into burn and reserve like every other L2
+fee.
+
+### 22.4 Repayment
+
+Repayment is signed by the borrower. Interest is charged first, then principal
+- the same order and the same reason as the node-local book. Interest is
+simple interest per whole window on the outstanding principal:
+
+```
+interest = principal x rate_bps x windows / 10 000
+windows  = (height - interest_settled_height) / window_blocks
+```
+
+The position remembers the height up to which interest has been charged, so
+two instalments do not each pay for the whole elapsed time.
+
+When the outstanding principal reaches zero the position is `Repaid` and the
+collateral returns to the borrower.
+
+### 22.5 Default
+
+A default is **permissionless**: anyone may trigger the settlement of an
+overdue position, because a default only the lender could trigger is a default
+that could be delayed. The triggerer pays the fee.
+
+At or after the deadline:
+
+- the debt is the outstanding principal plus the interest accrued to this
+  height;
+- the collateral answers for it: the lender receives `min(collateral, debt)`;
+- the surplus returns to the borrower - a default takes what is owed and no
+  more;
+- what the collateral does not cover is a **shortfall the lender absorbs**,
+  not a loss the protocol invents money to cover.
+
+The position becomes `Defaulted` and cannot be repaid or defaulted again.
+
+### 22.6 Commitment and conservation
+
+A position is a leaf under the Layer-2 state root with its own domain tag
+(`CREDIT_LEAF_TAG` = `0x06`), committing to the id, the two parties, the
+principal, the outstanding debt, the interest paid, the collateral, the charge
+schedule, the opening height, the deadline and the state.
+
+Collateral is held in a `credit_locked` bucket that is part of the
+conservation sum: it is in the system, but not spendable. The invariant
+`conservation_total() == funded_total()` holds after every credit transition.
+
+### 22.7 Fees
+
+| Type | Code | Fee (sat) |
+|---|---:|---:|
+| `CreditOpen` | `0x19` | 2 000 |
+| `CreditCollateral` | `0x1A` | 2 000 |
+| `CreditRepay` | `0x1B` | 2 000 |
+| `CreditDefault` | `0x1C` | 2 000 |
+
+### 22.8 Implemented surface
+
+`jnt-core::l2` carries the four payload types and their wire codes;
+`jnt-core::credit` keeps the arithmetic (the collateral rule and the interest
+rule) so there is one implementation of each; `jnt-l2::state` applies them,
+holds the positions and commits them.
+`crates/jnt-l2/tests/credit_flow.rs` pins: the principal moves to the borrower
+and the collateral locks; a loan the lender did not sign is refused; an
+undercollateralised loan is refused; an unusable term is refused; a repayment
+pays interest first and then principal; a fully repaid position returns the
+collateral; only the borrower may repay; collateral can be posted after the
+loan; a default before the deadline is refused; a default pays the lender from
+the collateral and reports the shortfall; a default returns the surplus to the
+borrower; a closed position cannot be settled twice; the state encoding
+round-trips the positions; and two nodes replaying the same loan agree on the
+root.

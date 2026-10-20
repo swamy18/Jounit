@@ -31,14 +31,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use jnt_core::agent::{AgentId, PolicyEntry, SpendPolicy};
 use jnt_core::bls_checkpoint::{BlsSignature, BlsVerifier, ValidatorSet};
+use jnt_core::credit::{ChargeSchedule, CreditTerms};
 use jnt_core::delegation;
 use jnt_core::fees::split_flat_fee;
 use jnt_core::hash::{Address, Hash, Hash512};
 use jnt_core::l2::{
-    settle_fee_sat, AgentSpendPayload, ClaimTaskPayload, DisputePayload, ExitQueuePayload,
+    settle_fee_sat, AgentSpendPayload, ClaimTaskPayload, CreditCollateralPayload,
+    CreditDefaultPayload, CreditOpenPayload, CreditRepayPayload, DisputePayload, ExitQueuePayload,
     L2Payload, L2Transaction, PolicyPayload, PolicyRevokePayload, PostTaskPayload, SettlePayload,
     SubmitResultPayload, Verdict, MIN_EXIT_FEE_SAT, VWC_HASH_EXPIRED,
 };
+use jnt_core::params::MAX_CREDIT_RATE_BPS_PER_WINDOW;
 use jnt_core::ser::{Reader, Writer};
 use jnt_core::slash::SlashVault;
 use jnt_core::state_root::{
@@ -119,6 +122,37 @@ pub enum L2Effect {
         recipient: Address,
         amount_sat: u64,
     },
+    /// A credit position was opened (SPEC.md §22.3).
+    CreditOpened {
+        position_id: Hash,
+        lender: Address,
+        borrower: Address,
+        amount_sat: u64,
+    },
+    /// Collateral was added to a credit position (SPEC.md §22.4).
+    CreditCollateralAdded {
+        position_id: Hash,
+        borrower: Address,
+        amount_sat: u64,
+    },
+    /// A credit position was repaid (SPEC.md §22.5).
+    CreditRepaid {
+        position_id: Hash,
+        borrower: Address,
+        amount_sat: u64,
+        interest_paid_sat: u64,
+        principal_paid_sat: u64,
+        remaining_debt_sat: u64,
+    },
+    /// A credit position was settled as a default (SPEC.md §22.6).
+    CreditDefaulted {
+        position_id: Hash,
+        lender: Address,
+        debt_sat: u64,
+        from_collateral_sat: u64,
+        shortfall_sat: u64,
+        excess_returned_sat: u64,
+    },
 }
 
 /// Equality here is *state* equality: two nodes that replayed the same
@@ -188,6 +222,13 @@ pub struct L2State {
     /// The live grant for each agent, by agent identity. One grant per agent at
     /// a time, so a second grant cannot be used to double the first one's caps.
     policy_by_agent: BTreeMap<AgentId, Hash>,
+    /// Credit positions, keyed by position id (SPEC.md §22). A position holds
+    /// no value of its own: the principal has already moved to the borrower,
+    /// and the collateral is held in the `credit_locked` bucket.
+    positions: BTreeMap<Hash, CreditPosition>,
+    /// Collateral locked against credit positions. Part of the conservation
+    /// sum: it is in the system, but not spendable.
+    credit_locked: u64,
 }
 
 /// One queued L2 → L1 exit: the exact record the L1 release proof re-states.
@@ -249,6 +290,150 @@ impl ExitRecord {
     }
 }
 
+/// Where a credit position stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditPositionState {
+    /// The debt is live.
+    Open,
+    /// The debt was repaid in full; the collateral came back to the borrower.
+    Repaid,
+    /// The debt was settled as a default at or after its deadline.
+    Defaulted,
+}
+
+impl CreditPositionState {
+    pub fn to_wire(self) -> u8 {
+        match self {
+            CreditPositionState::Open => 0,
+            CreditPositionState::Repaid => 1,
+            CreditPositionState::Defaulted => 2,
+        }
+    }
+
+    pub fn from_wire(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(CreditPositionState::Open),
+            1 => Some(CreditPositionState::Repaid),
+            2 => Some(CreditPositionState::Defaulted),
+            _ => None,
+        }
+    }
+}
+
+/// One credit position: a loan, as the chain holds it (SPEC.md §22).
+///
+/// The lender's signature created it, so the debt is one the lender agreed to.
+/// The principal has already moved to the borrower; what the chain holds here
+/// is the debt and the collateral that secures it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditPosition {
+    pub id: Hash,
+    pub lender: Address,
+    pub borrower: Address,
+    /// The principal lent.
+    pub principal_sat: u64,
+    /// Principal not yet repaid.
+    pub outstanding_sat: u64,
+    /// Interest already paid to the lender.
+    pub interest_paid_sat: u64,
+    /// Collateral the borrower has locked. Part of the conservation sum: it is
+    /// in the system, but not spendable.
+    pub collateral_sat: u64,
+    /// Interest per window, in basis points of the outstanding principal.
+    pub rate_bps_per_window: u32,
+    /// Length of a window, in blocks.
+    pub window_blocks: u64,
+    /// The height the position was opened at.
+    pub opened_height: u64,
+    /// The height the debt is due by.
+    pub deadline_height: u64,
+    /// The height up to which interest has been charged. Interest is charged
+    /// once per period on the balance that was outstanding, so two
+    /// instalments do not each pay for the whole elapsed time.
+    pub interest_settled_height: u64,
+    pub state: CreditPositionState,
+}
+
+impl CreditPosition {
+    /// Fixed-size encoding, so the wire count is bounded by the buffer with no
+    /// prefix to lie about.
+    pub const ENCODED_LEN: usize = 141;
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.fixed(&self.id)
+            .fixed(&self.lender)
+            .fixed(&self.borrower)
+            .u64le(self.principal_sat)
+            .u64le(self.outstanding_sat)
+            .u64le(self.interest_paid_sat)
+            .u64le(self.collateral_sat)
+            .u32le(self.rate_bps_per_window)
+            .u64le(self.window_blocks)
+            .u64le(self.opened_height)
+            .u64le(self.deadline_height)
+            .u64le(self.interest_settled_height)
+            .u8(self.state.to_wire());
+    }
+
+    pub fn decode(r: &mut Reader<'_>) -> L2Result<Self> {
+        let id: Hash = r.fixed().map_err(|_| codec_err("credit position id"))?;
+        let lender: Address = r.fixed().map_err(|_| codec_err("credit lender"))?;
+        let borrower: Address = r.fixed().map_err(|_| codec_err("credit borrower"))?;
+        let principal_sat = r.u64le().map_err(|_| codec_err("credit principal"))?;
+        let outstanding_sat = r.u64le().map_err(|_| codec_err("credit outstanding"))?;
+        let interest_paid_sat = r.u64le().map_err(|_| codec_err("credit interest"))?;
+        let collateral_sat = r.u64le().map_err(|_| codec_err("credit collateral"))?;
+        let rate_bps_per_window = r.u32le().map_err(|_| codec_err("credit rate"))?;
+        let window_blocks = r.u64le().map_err(|_| codec_err("credit window"))?;
+        let opened_height = r.u64le().map_err(|_| codec_err("credit opened height"))?;
+        let deadline_height = r.u64le().map_err(|_| codec_err("credit deadline"))?;
+        let interest_settled_height = r.u64le().map_err(|_| codec_err("credit interest height"))?;
+        let state = CreditPositionState::from_wire(r.u8().map_err(|_| codec_err("credit state"))?)
+            .ok_or_else(|| codec_err("credit state tag out of range"))?;
+        Ok(CreditPosition {
+            id,
+            lender,
+            borrower,
+            principal_sat,
+            outstanding_sat,
+            interest_paid_sat,
+            collateral_sat,
+            rate_bps_per_window,
+            window_blocks,
+            opened_height,
+            deadline_height,
+            interest_settled_height,
+            state,
+        })
+    }
+
+    /// The committed leaf for this position.
+    pub fn leaf(&self) -> Hash {
+        jnt_core::state_root::credit_position_leaf(
+            &self.id,
+            &self.lender,
+            &self.borrower,
+            self.principal_sat,
+            self.outstanding_sat,
+            self.interest_paid_sat,
+            self.collateral_sat,
+            self.rate_bps_per_window,
+            self.window_blocks,
+            self.opened_height,
+            self.deadline_height,
+            self.state.to_wire(),
+        )
+    }
+
+    /// The charge schedule, as the interest rule sees it.
+    pub fn schedule(&self) -> ChargeSchedule {
+        ChargeSchedule {
+            rate_bps_per_window: self.rate_bps_per_window,
+            window_blocks: self.window_blocks,
+        }
+    }
+}
+
 impl L2State {
     pub fn new(config: L2Config) -> Self {
         L2State {
@@ -270,6 +455,8 @@ impl L2State {
             exited_total: 0,
             policies: BTreeMap::new(),
             policy_by_agent: BTreeMap::new(),
+            positions: BTreeMap::new(),
+            credit_locked: 0,
         }
     }
 
@@ -457,6 +644,9 @@ impl L2State {
         let mut policies: Vec<(&Hash, &PolicyEntry)> = self.policies.iter().collect();
         policies.sort_by_key(|(h, _)| **h);
         leaves.extend(policies.iter().map(|(_, e)| e.leaf()));
+        let mut positions: Vec<(&Hash, &CreditPosition)> = self.positions.iter().collect();
+        positions.sort_by_key(|(h, _)| **h);
+        leaves.extend(positions.iter().map(|(_, p)| p.leaf()));
         state_root(&leaves)
     }
 
@@ -672,12 +862,32 @@ impl L2State {
         self.pscb = self.pscb.saturating_add(split.pscb);
     }
 
+    // --- credit view ----------------------------------------------------
+
+    /// One credit position, by id.
+    pub fn credit_position(&self, id: &Hash) -> Option<&CreditPosition> {
+        self.positions.get(id)
+    }
+
+    /// Every credit position, sorted by id. Deterministic enumeration, like
+    /// [`L2State::tasks`]: two nodes holding the same state list the same
+    /// positions in the same order.
+    pub fn credit_positions(&self) -> Vec<&CreditPosition> {
+        let mut ids: Vec<Hash> = self.positions.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|id| &self.positions[&id]).collect()
+    }
+
+    /// Total collateral locked against credit positions.
+    pub fn credit_locked(&self) -> u64 {
+        self.credit_locked
+    }
+
     // --- task view -----------------------------------------------------
 
     pub fn task(&self, task_id: &Hash) -> Option<&TaskContract> {
         self.tasks.get(task_id)
     }
-
     pub fn task_count(&self) -> usize {
         self.tasks.len()
     }
@@ -742,6 +952,10 @@ impl L2State {
             L2Payload::Policy(p) => self.apply_policy(p, height, fee),
             L2Payload::PolicyRevoke(p) => self.apply_policy_revoke(p, height, fee),
             L2Payload::AgentSpend(p) => self.apply_agent_spend(p, height, fee),
+            L2Payload::CreditOpen(p) => self.apply_credit_open(p, height, fee),
+            L2Payload::CreditCollateral(p) => self.apply_credit_collateral(p, height, fee),
+            L2Payload::CreditRepay(p) => self.apply_credit_repay(p, height, fee),
+            L2Payload::CreditDefault(p) => self.apply_credit_default(p, height, fee),
         }?;
 
         // Only a transaction that actually applied is marked applied. A
@@ -993,6 +1207,287 @@ impl L2State {
             }
         }
         false
+    }
+
+    // --- credit positions (SPEC.md §22) ----------------------------------
+
+    /// Open a credit position (SPEC.md §22.3).
+    ///
+    /// The lender's signature is what makes this a loan rather than a claim
+    /// somebody else made about the lender. The principal moves to the
+    /// borrower now, and the borrower's own funds are locked as collateral —
+    /// the collateral is checked *before* the principal arrives, so it cannot
+    /// be the borrowed money securing itself.
+    fn apply_credit_open(
+        &mut self,
+        p: &CreditOpenPayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        if p.amount_sat == 0 {
+            return Err(L2Error::ZeroAmount("credit principal"));
+        }
+        if p.collateral_sat == 0 {
+            return Err(L2Error::ZeroAmount("credit collateral"));
+        }
+        if p.window_blocks == 0 {
+            return Err(L2Error::CreditTerms("the window must be non-zero"));
+        }
+        if p.rate_bps_per_window > MAX_CREDIT_RATE_BPS_PER_WINDOW {
+            return Err(L2Error::CreditTerms("the rate is above the cap"));
+        }
+        if p.deadline_height <= height {
+            return Err(L2Error::CreditTerms("the deadline must be in the future"));
+        }
+        // Full collateralisation without a bond: the same arithmetic the
+        // node-local credit book uses, with a zero bond.
+        let required = CreditTerms::default()
+            .required_collateral(p.amount_sat, 0)
+            .map_err(|_| L2Error::CreditTerms("the collateral rule refused the amount"))?;
+        if p.collateral_sat < required {
+            return Err(L2Error::CreditUndercollateralised {
+                required,
+                posted: p.collateral_sat,
+            });
+        }
+        let id = p.derived_position_id();
+        if self.positions.contains_key(&id) {
+            return Err(L2Error::CreditPositionExists);
+        }
+        let lender_total = p.amount_sat.checked_add(fee).ok_or(L2Error::Overflow)?;
+        self.ensure_balance(&p.lender, lender_total)?;
+        // The collateral must be the borrower's own money, so it is checked
+        // before the principal arrives.
+        self.ensure_balance(&p.borrower, p.collateral_sat)?;
+        self.charge(&p.lender, lender_total)?;
+        self.pay(&p.borrower, p.amount_sat)?;
+        self.charge(&p.borrower, p.collateral_sat)?;
+        self.credit_locked = self
+            .credit_locked
+            .checked_add(p.collateral_sat)
+            .ok_or(L2Error::Overflow)?;
+        self.collect_fee(fee);
+        self.positions.insert(
+            id,
+            CreditPosition {
+                id,
+                lender: p.lender,
+                borrower: p.borrower,
+                principal_sat: p.amount_sat,
+                outstanding_sat: p.amount_sat,
+                interest_paid_sat: 0,
+                collateral_sat: p.collateral_sat,
+                rate_bps_per_window: p.rate_bps_per_window,
+                window_blocks: p.window_blocks,
+                opened_height: height,
+                deadline_height: p.deadline_height,
+                interest_settled_height: height,
+                state: CreditPositionState::Open,
+            },
+        );
+        Ok(L2Effect::CreditOpened {
+            position_id: id,
+            lender: p.lender,
+            borrower: p.borrower,
+            amount_sat: p.amount_sat,
+        })
+    }
+
+    /// Add collateral to a credit position (SPEC.md §22.4).
+    fn apply_credit_collateral(
+        &mut self,
+        p: &CreditCollateralPayload,
+        _height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        let position = self
+            .positions
+            .get(&p.position_id)
+            .cloned()
+            .ok_or(L2Error::UnknownCreditPosition)?;
+        if position.borrower != p.borrower {
+            return Err(L2Error::CreditBinding(
+                "the position names another borrower",
+            ));
+        }
+        if position.state != CreditPositionState::Open {
+            return Err(L2Error::CreditPositionClosed);
+        }
+        if p.amount_sat == 0 {
+            return Err(L2Error::ZeroAmount("credit collateral"));
+        }
+        let need = p.amount_sat.checked_add(fee).ok_or(L2Error::Overflow)?;
+        self.ensure_balance(&p.borrower, need)?;
+        self.charge(&p.borrower, need)?;
+        self.credit_locked = self
+            .credit_locked
+            .checked_add(p.amount_sat)
+            .ok_or(L2Error::Overflow)?;
+        self.collect_fee(fee);
+        let pos = self
+            .positions
+            .get_mut(&p.position_id)
+            .ok_or(L2Error::UnknownCreditPosition)?;
+        pos.collateral_sat = pos
+            .collateral_sat
+            .checked_add(p.amount_sat)
+            .ok_or(L2Error::Overflow)?;
+        Ok(L2Effect::CreditCollateralAdded {
+            position_id: p.position_id,
+            borrower: p.borrower,
+            amount_sat: p.amount_sat,
+        })
+    }
+
+    /// Repay a credit position (SPEC.md §22.5).
+    ///
+    /// Interest first, then principal: the same order the node-local credit
+    /// book uses, for the same reason. Interest is charged once per period on
+    /// the balance that was outstanding, so two instalments do not each pay
+    /// for the whole elapsed time.
+    fn apply_credit_repay(
+        &mut self,
+        p: &CreditRepayPayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        let position = self
+            .positions
+            .get(&p.position_id)
+            .cloned()
+            .ok_or(L2Error::UnknownCreditPosition)?;
+        if position.borrower != p.borrower {
+            return Err(L2Error::CreditBinding(
+                "the position names another borrower",
+            ));
+        }
+        if position.state != CreditPositionState::Open {
+            return Err(L2Error::CreditPositionClosed);
+        }
+        if p.amount_sat == 0 {
+            return Err(L2Error::ZeroAmount("credit repayment"));
+        }
+        let interest_due = position
+            .schedule()
+            .accrued_interest(
+                position.outstanding_sat,
+                position.interest_settled_height,
+                height,
+            )
+            .map_err(|_| L2Error::CreditInterestOverflow)?;
+        let interest_paid = p.amount_sat.min(interest_due);
+        let principal_paid = (p.amount_sat - interest_paid).min(position.outstanding_sat);
+        let need = p.amount_sat.checked_add(fee).ok_or(L2Error::Overflow)?;
+        self.ensure_balance(&p.borrower, need)?;
+        self.charge(&p.borrower, need)?;
+        self.pay(&position.lender, p.amount_sat)?;
+        self.collect_fee(fee);
+        let remaining = {
+            let pos = self
+                .positions
+                .get_mut(&p.position_id)
+                .ok_or(L2Error::UnknownCreditPosition)?;
+            pos.outstanding_sat -= principal_paid;
+            pos.interest_paid_sat += interest_paid;
+            pos.interest_settled_height = height;
+            if pos.outstanding_sat == 0 {
+                pos.state = CreditPositionState::Repaid;
+            }
+            pos.outstanding_sat
+        };
+        // A settled position releases the collateral back to the borrower.
+        if remaining == 0 {
+            let collateral = {
+                let pos = self
+                    .positions
+                    .get_mut(&p.position_id)
+                    .ok_or(L2Error::UnknownCreditPosition)?;
+                let c = pos.collateral_sat;
+                pos.collateral_sat = 0;
+                c
+            };
+            self.credit_locked = self
+                .credit_locked
+                .checked_sub(collateral)
+                .ok_or(L2Error::Overflow)?;
+            self.pay(&p.borrower, collateral)?;
+        }
+        Ok(L2Effect::CreditRepaid {
+            position_id: p.position_id,
+            borrower: p.borrower,
+            amount_sat: p.amount_sat,
+            interest_paid_sat: interest_paid,
+            principal_paid_sat: principal_paid,
+            remaining_debt_sat: remaining,
+        })
+    }
+
+    /// Settle an overdue credit position (SPEC.md §22.6).
+    ///
+    /// Permissionless: anyone may trigger it, because a default only the
+    /// lender could trigger is a default that could be delayed. The collateral
+    /// answers for the debt, any surplus returns to the borrower, and what is
+    /// left uncovered is a shortfall the lender absorbs rather than a loss the
+    /// protocol invents money to cover.
+    fn apply_credit_default(
+        &mut self,
+        p: &CreditDefaultPayload,
+        height: u64,
+        fee: u64,
+    ) -> L2Result<L2Effect> {
+        let position = self
+            .positions
+            .get(&p.position_id)
+            .cloned()
+            .ok_or(L2Error::UnknownCreditPosition)?;
+        if position.state != CreditPositionState::Open {
+            return Err(L2Error::CreditPositionClosed);
+        }
+        if height < position.deadline_height {
+            return Err(L2Error::CreditNotDue);
+        }
+        let interest_due = position
+            .schedule()
+            .accrued_interest(
+                position.outstanding_sat,
+                position.interest_settled_height,
+                height,
+            )
+            .map_err(|_| L2Error::CreditInterestOverflow)?;
+        let debt = position
+            .outstanding_sat
+            .checked_add(interest_due)
+            .ok_or(L2Error::Overflow)?;
+        let take = position.collateral_sat.min(debt);
+        let excess = position.collateral_sat - take;
+        self.ensure_balance(&p.actor, fee)?;
+        self.charge(&p.actor, fee)?;
+        self.collect_fee(fee);
+        self.credit_locked = self
+            .credit_locked
+            .checked_sub(position.collateral_sat)
+            .ok_or(L2Error::Overflow)?;
+        self.pay(&position.lender, take)?;
+        self.pay(&position.borrower, excess)?;
+        {
+            let pos = self
+                .positions
+                .get_mut(&p.position_id)
+                .ok_or(L2Error::UnknownCreditPosition)?;
+            let principal_covered = take.min(pos.outstanding_sat);
+            pos.outstanding_sat -= principal_covered;
+            pos.interest_paid_sat += take - principal_covered;
+            pos.collateral_sat = 0;
+            pos.state = CreditPositionState::Defaulted;
+        }
+        Ok(L2Effect::CreditDefaulted {
+            position_id: p.position_id,
+            lender: position.lender,
+            debt_sat: debt,
+            from_collateral_sat: take,
+            shortfall_sat: debt - take,
+            excess_returned_sat: excess,
+        })
     }
 
     fn apply_post(&mut self, p: &PostTaskPayload, height: u64, fee: u64) -> L2Result<L2Effect> {
@@ -1469,6 +1964,7 @@ impl L2State {
         self.total_accounts()
             .saturating_add(self.total_locked())
             .saturating_add(self.exits_locked)
+            .saturating_add(self.credit_locked)
             .saturating_add(self.total_burned())
             .saturating_add(self.pscb)
             .saturating_add(self.vault_remaining())
@@ -1500,7 +1996,7 @@ impl L2State {
 /// aggregate signed for another network. Older blobs are refused rather than
 /// guessed at — a state without a network cannot verify a network-bound
 /// settlement.
-pub const L2_STATE_WIRE_VERSION: u8 = 4;
+pub const L2_STATE_WIRE_VERSION: u8 = 5;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
@@ -1517,6 +2013,8 @@ const WIRE_DEPOSIT_MIN: usize = 36;
 const WIRE_PREFIX_MIN: usize = 4;
 /// Minimum bytes one published policy entry occupies on the wire.
 const WIRE_POLICY_MIN: usize = 128;
+/// Minimum bytes one credit position occupies on the wire.
+const WIRE_CREDIT_MIN: usize = 141;
 
 fn codec_err(what: &'static str) -> L2Error {
     L2Error::Codec(jnt_core::Error::Malformed(what))
@@ -1625,6 +2123,15 @@ impl L2State {
             let bytes = entry.serialize();
             w.fixed(hash).u32le(bytes.len() as u32).raw(&bytes);
         }
+
+        let mut positions: Vec<(&Hash, &CreditPosition)> = self.positions.iter().collect();
+        positions.sort_by_key(|(h, _)| **h);
+        w.u64le(positions.len() as u64);
+        for (hash, position) in positions {
+            w.fixed(hash);
+            position.encode(&mut w);
+        }
+        w.u64le(self.credit_locked);
 
         w.raw(&self.slash_vault.encode());
         w.into_vec()
@@ -1860,6 +2367,30 @@ impl L2State {
             }
         }
 
+        let declared_positions = r.u64le().map_err(|_| codec_err("credit position count"))?;
+        let n_positions = bounded_count(
+            &r,
+            declared_positions,
+            WIRE_CREDIT_MIN,
+            "credit position count exceeds buffer",
+        )?;
+        let mut positions: BTreeMap<Hash, CreditPosition> = BTreeMap::new();
+        for _ in 0..n_positions {
+            let hash: Hash = r.fixed().map_err(|_| codec_err("credit position id"))?;
+            let position = CreditPosition::decode(&mut r)?;
+            if position.id != hash {
+                return Err(codec_err("credit position names another id"));
+            }
+            if positions.insert(hash, position).is_some() {
+                return Err(codec_err("duplicate credit position in state"));
+            }
+        }
+        let decoded_credit_locked = r.u64le().map_err(|_| codec_err("locked credit"))?;
+        let credit_locked: u64 = positions.values().map(|p| p.collateral_sat).sum();
+        if decoded_credit_locked != credit_locked {
+            return Err(codec_err("locked credit disagrees with the positions"));
+        }
+
         let slash_vault = SlashVault::decode(&mut r)?;
         r.expect_end()
             .map_err(|_| codec_err("state has trailing bytes"))?;
@@ -1883,6 +2414,8 @@ impl L2State {
             exited_total,
             policies,
             policy_by_agent,
+            positions,
+            credit_locked,
         };
         // The protocol's own invariant. A state that does not conserve is not
         // a valid observation of the chain, whatever its structure said.

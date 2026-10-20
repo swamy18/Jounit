@@ -63,6 +63,49 @@ pub const EXIT_LEAF_TAG: u8 = 0x04;
 /// reinterpreted as an account leaf or an exit record.
 pub const POLICY_LEAF_TAG: u8 = 0x05;
 
+/// Credit-position leaves (§22): a loan, committed under the same state root as
+/// the accounts. A distinct tag so a position leaf can never be reinterpreted
+/// as anything else.
+pub const CREDIT_LEAF_TAG: u8 = 0x06;
+
+/// The leaf for one credit position.
+///
+/// Commits to the position id, the two parties, the principal, the outstanding
+/// debt, the interest already paid, the locked collateral, the charge schedule,
+/// the opening height, the deadline and the position's state. A loan that the
+/// chain does not commit to is a loan only its holder believes in.
+#[allow(clippy::too_many_arguments)]
+pub fn credit_position_leaf(
+    position_id: &Hash,
+    lender: &Address,
+    borrower: &Address,
+    principal_sat: u64,
+    outstanding_sat: u64,
+    interest_paid_sat: u64,
+    collateral_sat: u64,
+    rate_bps_per_window: u32,
+    window_blocks: u64,
+    opened_height: u64,
+    deadline_height: u64,
+    state: u8,
+) -> Hash {
+    sha256(&[
+        &[CREDIT_LEAF_TAG],
+        position_id,
+        lender,
+        borrower,
+        &principal_sat.to_le_bytes(),
+        &outstanding_sat.to_le_bytes(),
+        &interest_paid_sat.to_le_bytes(),
+        &collateral_sat.to_le_bytes(),
+        &rate_bps_per_window.to_le_bytes(),
+        &window_blocks.to_le_bytes(),
+        &opened_height.to_le_bytes(),
+        &deadline_height.to_le_bytes(),
+        &[state],
+    ])
+}
+
 /// The leaf for one published spending policy.
 ///
 /// Commits to the policy's own hash (which commits to the owner's signed grant
