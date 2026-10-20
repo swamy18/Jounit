@@ -1,9 +1,9 @@
-//! Spending policies on chain (SPEC.md Ã‚Â§21).
+//! Spending policies on chain (SPEC.md §21).
 //!
 //! The agent policy layer used to be node-local: a policy constrained a
 //! payment *on the node that issued it*, and the chain never saw it. This file
 //! pins the on-chain half: publication, revocation, and spending under a grant,
-//! with every rule the grant states enforced against state the chain keeps Ã¢â‚¬â€
+//! with every rule the grant states enforced against state the chain keeps —
 //! the per-transaction cap, the tumbling per-window cap, the recipient and
 //! service allow-lists, the validity window, and the strictly increasing
 //! nonce.
@@ -350,7 +350,7 @@ fn a_spend_above_the_window_cap_is_refused_and_the_window_rolls_over() {
         "refused by the window cap, got {err:?}"
     );
 
-    // The window rolls forward, so the same amount is spendable again Ã¢â‚¬â€ but
+    // The window rolls forward, so the same amount is spendable again — but
     // the nonce still has to increase.
     spend(
         &mut w.state,

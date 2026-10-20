@@ -1,9 +1,9 @@
-//! Joint L1 + L2 conservation accounting (SPEC.md Â§19.4â€“Â§19.5).
+//! Joint L1 + L2 conservation accounting (SPEC.md ?19.4??19.5).
 //!
 //! This is the arithmetic that says no JNT was created anywhere. It lived inline
 //! in the `jnt-node verify` command, where it could not be unit-tested and the
 //! deposit-sink term could not be exercised in isolation. It is extracted here
-//! because **the sink term is exactly what an L2 â†’ L1 exit has to get right**:
+//! because **the sink term is exactly what an L2 ? L1 exit has to get right**:
 //! today a deposit is counted on both sides (an unspendable L1 output and its L2
 //! twin), so the joint check subtracts the sink-held total; a release would have
 //! to reduce that outstanding claim by the same amount or it would double-count
@@ -11,14 +11,14 @@
 //!
 //! The three checks, in order, are:
 //!
-//! 1. **L2 is internally closed** â€” everything ever released into L2 is still in
+//! 1. **L2 is internally closed** ? everything ever released into L2 is still in
 //!    one of L2's buckets (`L2State::check_conservation`).
-//! 2. **L2 funding is exactly genesis plus matured deposits** â€” no unauthorized
+//! 2. **L2 funding is exactly genesis plus matured deposits** ? no unauthorized
 //!    funding path exists.
-//! 3. **Joint supply is under the cap** â€” L1 live plus L2 held, minus the value
+//! 3. **Joint supply is under the cap** ? L1 live plus L2 held, minus the value
 //!    sitting identifiably in the deposit sink.
 //!
-//! Since the approved tail (`docs/decisions.md` M-Aâ€¦M-E, 2026-10-09) the joint
+//! Since the approved tail (`docs/decisions.md` M-A?M-E, 2026-10-09) the joint
 //! ceiling is **`cumulative_issuance_sat(tip height) + escrow_ceiling_sat`**:
 //! L1 can never hold more than the integral of the reward function, and L2's
 //! genesis side is bounded by its own validated ceiling. The old stock cap
@@ -28,7 +28,7 @@
 //! All three are computed once in [`conservation_report`]. Two consumers
 //! render that report differently: `verify_conservation` stops at the first
 //! failure (the command-line verdict), while `GET /v1/conservation` and the
-//! `/metrics` gauges report every term at once (the operational view â€” a
+//! `/metrics` gauges report every term at once (the operational view ? a
 //! monitor wants to know *which* check moved). One implementation, so the
 //! endpoint, the exporter and `verify` can never disagree.
 //!
@@ -50,7 +50,7 @@ pub struct JointSupply {
     /// L1 value sitting in the deposit sink: counted by `l1_live_sat` and again
     /// by `l2_held_sat` as its credited twin, so it is subtracted once.
     pub sink_held_sat: u64,
-    /// `l1_live + l2_held âˆ’ sink_held`.
+    /// `l1_live + l2_held - sink_held`.
     pub joint_sat: u64,
     /// `cumulative_issuance_sat` at the tip height: the most L1 may hold, by
     /// the same function `Chain::apply_block` mints against.
@@ -119,7 +119,7 @@ impl std::fmt::Display for ConservationError {
             ),
             ConservationError::JointExceedsBound { joint, bound } => write!(
                 f,
-                "joint supply exceeds its bound: {joint} > {bound} (L1 live + L2 held âˆ’ sink is inflation)"
+                "joint supply exceeds its bound: {joint} > {bound} (L1 live + L2 held - sink is inflation)"
             ),
         }
     }
@@ -165,7 +165,7 @@ pub struct ConservationReport {
     pub l2_conservation_sat: u64,
     /// What was ever released into L2 (`funded_total`).
     pub l2_funded_sat: u64,
-    /// Genesis escrow plus matured deposits â€” what L2 was allowed to hold.
+    /// Genesis escrow plus matured deposits ? what L2 was allowed to hold.
     pub l2_expected_funded_sat: u64,
 }
 
@@ -215,7 +215,7 @@ pub fn conservation_report(chain: &Chain, l2: &NodeL2) -> ConservationReport {
         // An EXIT MOVES VALUE OUT OF L2, so what L2 was allowed to hold is
         // genesis plus matured deposits MINUS what exits have already taken.
         // Without the subtraction the check reports a funding breach after the
-        // first release â€” `verify` fails, the alarm fires and never clears, and
+        // first release ? `verify` fails, the alarm fires and never clears, and
         // the API refuses writes. The released value did not appear from
         // nowhere; it left.
         l2_expected_funded_sat: l2
@@ -254,8 +254,8 @@ pub fn breach_line(report: &ConservationReport) -> String {
         .map(|e| e.to_string())
         .unwrap_or_else(|| "conservation check failed".to_string());
     format!(
-        "CONSERVATION BREACH â€” joint {} of {} sat (l1 live {} + l2 held {} - sink {}), \
-         l2_closed {}, l2_funding_ok {}: {why} â€” funding writes refused, reads still served",
+        "CONSERVATION BREACH ? joint {} of {} sat (l1 live {} + l2 held {} - sink {}), \
+         l2_closed {}, l2_funding_ok {}: {why} ? funding writes refused, reads still served",
         report.supply.joint_sat,
         report.supply.bound_sat(),
         report.supply.l1_live_sat,
@@ -271,13 +271,13 @@ pub fn breach_line(report: &ConservationReport) -> String {
 ///
 /// The refusal half is in `api`. This half exists because a breached node that
 /// keeps running *quietly* is worse than one that stops: the condition has to
-/// be audible for as long as it lasts. Halt was rejected â€” a crash-loop turns a
+/// be audible for as long as it lasts. Halt was rejected ? a crash-loop turns a
 /// safety alarm into a liveness loss and destroys the diagnostics.
 ///
 /// This is a small state machine rather than inline logging so the timing rule
 /// is testable without sleeping: the clock and the (expensive, whole-UTXO)
 /// check both arrive as arguments. It also owns *whether* to run the check at
-/// all, which is the point of the rate limit â€” the serve loop can spin with
+/// all, which is the point of the rate limit ? the serve loop can spin with
 /// `--interval-ms 0`, and recomputing a whole-UTXO report on every spin would
 /// stall the very node the alarm is trying to save. A breach is therefore
 /// reported on discovery and then again every `period` until it clears; the
@@ -447,7 +447,7 @@ mod tests {
         assert!(line.contains("funding anomaly"), "{line}");
         assert!(line.contains("reads still served"), "{line}");
 
-        // Inside the period nothing is recomputed and nothing is printed â€” the
+        // Inside the period nothing is recomputed and nothing is printed ? the
         // check closure would panic if it ran, which pins the rate limit.
         for offset in [1u64, 500, 999] {
             let t = t0 + std::time::Duration::from_millis(offset);

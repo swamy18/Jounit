@@ -1,5 +1,5 @@
-//! Service API integration tests â€” roadmap items 16/17, Decision 9,
-//! SPEC.md Â§19.2.
+//! Service API integration tests ? roadmap items 16/17, Decision 9,
+//! SPEC.md ?19.2.
 //!
 //! These drive the real server: [`jnt_node::api::spawn`] binds a socket (port 0
 //! in every test, so they never race for a fixed port) and the requests below
@@ -15,7 +15,7 @@
 //!   idempotent rather than a second payment;
 //! - a receipt binds to its payment, and two contradicting receipts for one
 //!   payment are refused by name (fail closed);
-//! - authorization goes through the policy engine â€” a replayed nonce is a
+//! - authorization goes through the policy engine ? a replayed nonce is a
 //!   refusal, not a second grant;
 //! - malformed input is a client error (400/404), never a 500.
 //!
@@ -52,7 +52,7 @@ use serde_json::{json, Value};
 
 const NET: &str = "jounit/mini";
 const EXPIRES: u64 = 9_000;
-/// The amount `run_bridge` opens a grant for â€” the credit gate must cover this
+/// The amount `run_bridge` opens a grant for ? the credit gate must cover this
 /// for admission to succeed.
 const BRIDGE_AMOUNT_SAT: u64 = 400;
 
@@ -166,7 +166,7 @@ fn post(node: &Node, path: &str, body: &Value) -> (u16, Value) {
     (status, json(&text))
 }
 
-/// Like `post`, but for a refusal body â€” the server may emit an error JSON or a
+/// Like `post`, but for a refusal body ? the server may emit an error JSON or a
 /// bare string, so this keeps the raw text.
 fn post_text(node: &Node, path: &str, body: &Value) -> (u16, String) {
     http(node.addr, "POST", path, Some(&body.to_string()))
@@ -445,7 +445,7 @@ fn tx_build_refuses_an_unfunded_address_without_signing_anything() {
 fn a_local_transaction_is_built_signed_broadcast_then_looked_up() {
     let params = NetworkParams::mini();
     let miner = wallet(51, "api-miner");
-    // 12 blocks leaves the coinbases at heights 1â€“3 mature (maturity 10).
+    // 12 blocks leaves the coinbases at heights 1?3 mature (maturity 10).
     let chain = mine_to(&params, &miner, 12);
     let node = start_with(chain);
 
@@ -601,7 +601,7 @@ fn garbage_bytes_are_a_client_error_not_a_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// Authorization â†’ payment â†’ receipt
+// Authorization ? payment ? receipt
 // ---------------------------------------------------------------------------
 
 fn machine_policy(owner: &Wallet, provider_addr: &[u8; 20], service: [u8; 32]) -> SpendPolicy {
@@ -965,7 +965,7 @@ fn a_payment_without_its_authorization_is_refused() {
     let node = start();
     let (payment, _receipt, _auth, _sigs, _keys) = run_bridge(&node, 0);
     // Omitting the authorization material makes the request body malformed to
-    // the new handler â€” a missing required field is 422, and crucially the
+    // the new handler ? a missing required field is 422, and crucially the
     // payment is never recorded.
     let (s, _body) = post_text(
         &node,
@@ -1032,7 +1032,7 @@ fn a_payment_is_admitted_only_when_the_payers_credit_covers_it() {
     // Item 4 wiring: admission is gated on the payer's credit line. A payment
     // that names a valid policy and authorization is refused when the payer has
     // too little credit, and admitted once the line covers it. The coin itself
-    // does not move at admission â€” this is consensus-neutral bookkeeping.
+    // does not move at admission ? this is consensus-neutral bookkeeping.
     let node = start();
     let (payment, _receipt, auth, sigs, keys) = run_bridge(&node, 0);
     let payer_addr = wallet(61, "api-payer").address().unwrap();
@@ -1074,7 +1074,7 @@ fn a_payment_is_admitted_only_when_the_payers_credit_covers_it() {
 #[test]
 fn a_settled_receipt_commits_the_credit_debit() {
     // Admission encumbers the payer's line but does not move coins. Receipt
-    // acceptance is the settlement event (Â§19.4): that is when the credit debit
+    // acceptance is the settlement event (?19.4): that is when the credit debit
     // commits, so the encumbrance moves to settled and the spendable line is
     // already down.
     let node = start();
@@ -1095,7 +1095,7 @@ fn a_settled_receipt_commits_the_credit_debit() {
     );
     assert_eq!(b["available"], 0, "so the capacity is exact, not advisory");
 
-    // Accepting the receipt settles the reservation â†’ the debit commits.
+    // Accepting the receipt settles the reservation ? the debit commits.
     let (s, body) = post(
         &node,
         "/v1/receipt",
@@ -1184,7 +1184,7 @@ fn a_reserved_line_cannot_back_two_admitted_payments() {
 #[test]
 fn a_position_backed_payment_is_refused_up_front_not_locked_forever() {
     // A reservation that draws on position headroom can never settle through
-    // a receipt, and the node exposes no release for an admitted payment â€” so
+    // a receipt, and the node exposes no release for an admitted payment ? so
     // admission must refuse it up front rather than lock the payer's line
     // forever with no recourse.
     let node = start();
@@ -1228,7 +1228,7 @@ fn a_position_backed_payment_is_refused_up_front_not_locked_forever() {
     );
     assert_eq!(s, 200, "{b}");
 
-    // Free is now 0, so admission would draw headroom â€” refused, not stuck.
+    // Free is now 0, so admission would draw headroom ? refused, not stuck.
     let (s, body) = submit_payment(&node, &payment, &auth, &sigs, &keys);
     assert_eq!(s, 409, "position-backed admission must fail fast: {body}");
     assert_eq!(body["error"], "payment_refused");
@@ -1345,7 +1345,7 @@ fn the_credit_lifecycle_runs_through_the_node() {
 fn zero_amount_credit_requests_are_refused_not_a_node_kill() {
     // The whole-node crash, pinned end to end: a zero-amount bond request for
     // an address the book has never seen used to walk past both guards (a
-    // missing entry reads as `0`) and panic on a `get_mut` unwrap â€” which, with
+    // missing entry reads as `0`) and panic on a `get_mut` unwrap ? which, with
     // `panic = "abort"`, is every API request from then on failing to connect.
     let node = start();
     let stranger = wallet(93, "stranger").address().unwrap();
@@ -1377,7 +1377,7 @@ fn zero_amount_credit_requests_are_refused_not_a_node_kill() {
 }
 
 // ---------------------------------------------------------------------------
-// L2 broadcast (dry-run only â€” state changes only via canonical replay)
+// L2 broadcast (dry-run only ? state changes only via canonical replay)
 // ---------------------------------------------------------------------------
 
 fn post_payload(seed: u8) -> L2Transaction {
@@ -1466,13 +1466,13 @@ fn an_oversize_body_is_refused_before_it_is_parsed() {
 /// There is no L2 withdrawal transaction type (`jnt-l2/tests/exit_unavailable.rs`
 /// proves the wire admits exactly the defined set), so the withdrawal-shaped
 /// envelope below is the closest thing to a withdrawal request the API can
-/// receive. It must be a clean 400 that names the problem — never a 500, a
+/// receive. It must be a clean 400 that names the problem ? never a 500, a
 /// panic, or a value that gets queued for inclusion in a block.
 #[test]
 fn a_withdrawal_shaped_l2_payload_is_refused_by_name() {
     let node = start();
 
-    // Version 1 envelope, type byte 0x19 — the byte immediately after the
+    // Version 1 envelope, type byte 0x19 ? the byte immediately after the
     // highest defined L2 type (0x18 AgentSpend), which is where a withdrawal
     // would sit if one existed.
     let mut envelope = vec![1u8, 0, 0, 0, 0x19];
@@ -1522,7 +1522,7 @@ fn an_undefined_l2_type_byte_is_refused_by_the_decoder() {
 // Item 4: conditional escrow with contract-selected arbitrators.
 // These exercise the HTTP API end-to-end: open, authorize via arbiter, refuse
 // a non-designated signer, and accept a mutual release. The node only records
-// the state machine here â€” no coins move through this path.
+// the state machine here ? no coins move through this path.
 // ---------------------------------------------------------------------------
 use jnt_core::bls::SecretKey as BlsSecretKey;
 use jnt_core::bls_checkpoint::BlsSignature;
@@ -1739,7 +1739,7 @@ fn an_unknown_escrow_id_is_404_never_500() {
 fn a_released_escrow_advances_to_finalized_under_finality() {
     // The GET path and each serve-loop tick call `advance_escrow_finality`, so a
     // released escrow whose release has aged out of the finality window must read
-    // as `finalized` â€” the ledger-only Finalized commit (Item 10 / Â§19.4) â€”
+    // as `finalized` ? the ledger-only Finalized commit (Item 10 / ?19.4) ?
     // without any additional client call. We drive the node state directly to
     // isolate that transition from the (BLS-heavy) release-verification path,
     // which the prior test already covers end-to-end.
@@ -1889,7 +1889,7 @@ fn a_dominated_delegation_link_is_registered_and_a_widening_one_is_refused() {
     assert_eq!(b["depth"], 1);
 
     // Re-linking the identical (parent, child) pair is refused as AlreadyLinked:
-    // the book â€” not the client â€” is the authority on lineage, and a child may
+    // the book ? not the client ? is the authority on lineage, and a child may
     // not acquire a second ancestry.
     let (s, b) = post(
         &node,
@@ -2287,7 +2287,7 @@ fn post_authorization(
     hex::encode(authorization_from(node, owner, policy, chain, nonce).serialize())
 }
 /// Open an escrow through the node with real BLS keys. Returns the escrow id,
-/// the arbitrator's secret key, and the party keys ï¿½ everything a release needs.
+/// the arbitrator's secret key, and the party keys ? everything a release needs.
 fn open_escrow(
     node: &Node,
     nonce: u64,
@@ -2402,7 +2402,7 @@ fn an_escrow_release_refuses_forged_and_replayed_authorizations() {
     assert_eq!(s, 400, "{body}");
 
     // The escrow is released exactly once. The GET also advances finality, so a
-    // matured release reads as Finalized rather than ReleasedArbiter â€” the same
+    // matured release reads as Finalized rather than ReleasedArbiter ? the same
     // single release, and a second release was refused above.
     let (s, body) = get(&node, &format!("/v1/escrow/{id}"));
     assert_eq!(s, 200, "{body}");
@@ -2606,7 +2606,7 @@ fn a_settlement_link_survives_confirmation_and_refuses_a_second_tx() {
 }
 
 // ---------------------------------------------------------------------------
-// Escrow settlement: the release's coin move (SPEC Â§20.2 / Item 10)
+// Escrow settlement: the release's coin move (SPEC ?20.2 / Item 10)
 // ---------------------------------------------------------------------------
 
 const SINK_VALUE: u64 = 100_000_000; // 1 JNT deposited to the L2 sink
@@ -2914,7 +2914,7 @@ fn an_escrow_settle_binds_the_release_to_the_exit_that_pays_it() {
             "the exit moved value, it did not create it"
         );
 
-        // Finalized only now â€” when the coin actually left.
+        // Finalized only now ? when the coin actually left.
         sh.advance_escrow_finality();
     }
 

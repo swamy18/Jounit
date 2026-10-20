@@ -3,13 +3,13 @@
 //! Jounit's L2 is the verified-work marketplace: a submitter posts a compute
 //! task with a locked payment, a worker claims and runs it, and settlement
 //! releases the payment against a verdict. A sixth type, `ExitQueue`, moves
-//! value the other way â€” out of L2 and back to L1 (Decision 19, SPEC.md Â§19.6).
+//! value the other way — out of L2 and back to L1 (Decision 19, SPEC.md §19.6).
 //! These six payload types are the protocol vocabulary for that loop.
 //!
 //! Scope, stated precisely because it is easy to over-read: these are *payload*
-//! types. They are validated and fee-routed here â€” the flat D3 schedule routes
-//! through `fees::split_flat_fee`, so the L1 `base_fee Â· gas_used` floor is
-//! untouched and no exemption is created. M1 (SPEC.md Â§19.1) carries them inside
+//! types. They are validated and fee-routed here — the flat D3 schedule routes
+//! through `fees::split_flat_fee`, so the L1 `base_fee · gas_used` floor is
+//! untouched and no exemption is created. M1 (SPEC.md §19.1) carries them inside
 //! L1 blocks as a length-prefixed trailer committed by
 //! `block::merkle_root_with_l2`.
 //!
@@ -61,21 +61,21 @@ pub const DOM_L2_TXID: &[u8] = b"jounit/l2/txid/v1";
 /// 512-bit L2 transaction id. An L2 txid is a transaction id, so it carries
 /// the widened width for the same reason the L1 one does.
 pub const DOM_L2_TXID512: &[u8] = b"jounit/l2/txid512/v1";
-/// Exit queue authorization (approved P1, E-1â€¦E-3). Covers the owner, the
-/// per-owner nonce, the amount, the destination and the prepaid release fee â€”
+/// Exit queue authorization (approved P1, E-1…E-3). Covers the owner, the
+/// per-owner nonce, the amount, the destination and the prepaid release fee —
 /// exactly the record the L1 release proof re-states, so a queue
 /// authorization cannot be reinterpreted as anything else.
 pub const DOM_L2_EXIT_QUEUE: &[u8] = b"jounit/l2/exit-queue/v1";
-/// Verified Work Certificate identity (SPEC.md Â§17.3). Derives a certificate id
+/// Verified Work Certificate identity (SPEC.md §17.3). Derives a certificate id
 /// from its canonical encoding; a different preimage needs a new tag.
 pub const DOM_L2_VWC: &[u8] = b"jounit/l2/vwc/v1";
-/// Policy publication (SPEC.md Â§21.1). Covers the owner's signature over the
+/// Policy publication (SPEC.md §21.1). Covers the owner's signature over the
 /// grant bytes, the spender the grant names and the agent identity it names.
 pub const DOM_L2_POLICY: &[u8] = b"jounit/l2/policy/v1";
-/// Policy revocation (SPEC.md Â§21.2). Covers the owner and the agent whose
+/// Policy revocation (SPEC.md §21.2). Covers the owner and the agent whose
 /// grant is being killed.
 pub const DOM_L2_POLICY_REVOKE: &[u8] = b"jounit/l2/policy-revoke/v1";
-/// Agent spend under a published policy (SPEC.md Â§21.3). Covers the spender,
+/// Agent spend under a published policy (SPEC.md §21.3). Covers the spender,
 /// the policy it names, the nonce, the recipient, the amount and the service tag.
 pub const DOM_L2_AGENT_SPEND: &[u8] = b"jounit/l2/agent-spend/v1";
 
@@ -87,16 +87,16 @@ pub const L2_TX_CLAIM: u8 = 0x11;
 pub const L2_TX_SUBMIT: u8 = 0x12;
 pub const L2_TX_DISPUTE: u8 = 0x13;
 pub const L2_TX_SETTLE: u8 = 0x14;
-/// L2 â†’ L1 exit queue (approved P1). Next free byte after the Phase-2 five;
+/// L2 → L1 exit queue (approved P1). Next free byte after the Phase-2 five;
 /// an older node reads it as an unknown L2 type and skips the transaction,
 /// exactly as it does for any future type.
 pub const L2_TX_EXIT_QUEUE: u8 = 0x15;
-/// Publish a spending policy (SPEC.md Â§21.1). The owner's signed grant enters
+/// Publish a spending policy (SPEC.md §21.1). The owner's signed grant enters
 /// the chain here; every later spend under it is authorised by the policy.
 pub const L2_TX_POLICY: u8 = 0x16;
-/// Revoke a published policy (SPEC.md Â§21.2). The owner's kill switch.
+/// Revoke a published policy (SPEC.md §21.2). The owner's kill switch.
 pub const L2_TX_POLICY_REVOKE: u8 = 0x17;
-/// Spend under a published policy (SPEC.md Â§21.3). Signed by the spender the
+/// Spend under a published policy (SPEC.md §21.3). Signed by the spender the
 /// grant names, bounded by the grant's own caps and allow-lists.
 pub const L2_TX_AGENT_SPEND: u8 = 0x18;
 
@@ -176,7 +176,7 @@ impl L2TxType {
     /// The D3 flat fee for this type, in satoshis.
     ///
     /// `Settle` returns the anti-spam floor, not the fee: the actual settle
-    /// fee is proportional to task value â€” see [`settle_fee_sat`]. Callers
+    /// fee is proportional to task value — see [`settle_fee_sat`]. Callers
     /// estimating a settlement must use that function with the task's escrow;
     /// this floor is only the minimum every settle pays.
     ///
@@ -204,7 +204,7 @@ impl L2TxType {
     }
 }
 
-/// Decision 23 (P5): the proportional settle fee â€” 0.1% of the task's escrow
+/// Decision 23 (P5): the proportional settle fee — 0.1% of the task's escrow
 /// value, minimum [`SETTLE_FEE_MIN_SAT`] sat. A task settles exactly when its
 /// escrow covers this: below the floor the fee exceeds the value (refused),
 /// at or above it the fee is always payable, since `payment/1000 <= payment`
@@ -223,7 +223,7 @@ pub enum Verdict {
     /// slashed through M2.
     Fraudulent,
     /// The task lapsed. The submitter is refunded; the worker's deposit, if any,
-    /// is burned in full (no vest â€” a smaller penalty than a fraud slash).
+    /// is burned in full (no vest — a smaller penalty than a fraud slash).
     Expired,
 }
 
@@ -711,7 +711,7 @@ pub const MAX_SETTLE_NETWORK_ID_BYTES: usize = 64;
 pub struct SettlePayload {
     pub task_id: Hash,
     pub verdict: Verdict,
-    /// The hash the verdict settles on â€” see [`VWC_HASH_EXPIRED`] for the
+    /// The hash the verdict settles on — see [`VWC_HASH_EXPIRED`] for the
     /// pre-VWC convention.
     pub vwc_hash: Hash,
     /// Chain the quorum signed for. Part of the signed message, and `apply`
@@ -721,8 +721,8 @@ pub struct SettlePayload {
     pub network_id: String,
     /// Height the quorum signed at. Part of the signed message; `apply`
     /// refuses a vote from the future (`height` above the applying height).
-    /// A quorum formed at `H` may still settle at `H+1` â€” votes are signed as
-    /// the chain moves â€” so the rule is "not from the future", with the
+    /// A quorum formed at `H` may still settle at `H+1` — votes are signed as
+    /// the chain moves — so the rule is "not from the future", with the
     /// dispute lifecycle (a task settles once) closing the replay window.
     pub height: u64,
     /// BLS12-381 G2 aggregate signature over [`SettlePayload::signing_hash`].
@@ -733,8 +733,8 @@ pub struct SettlePayload {
     pub signer_count: u32,
     /// Lattice sidecar: one ML-DSA-65 signature per bitmap signer that voted
     /// with a lattice signature, over the same signing hash the aggregate
-    /// covers. Collected, not verified, at tally time â€” the tally is not a
-    /// trust boundary (consensus re-verifies at apply) â€” and verified at
+    /// covers. Collected, not verified, at tally time — the tally is not a
+    /// trust boundary (consensus re-verifies at apply) — and verified at
     /// `apply_settle` against the epoch set's registered keys, exactly like
     /// checkpoint clause 7. Empty while no voter carries a lattice signature.
     pub pq_sidecar: Vec<crate::bls_checkpoint::PqSidecarEntry>,
@@ -843,17 +843,17 @@ impl SettlePayload {
 
 /// Smallest `exit_fee_sat` an exit may carry (SPEC.md exit rules).
 ///
-/// A zero-fee exit still gets confirmed â€” it debits the owner and encumbers
-/// the value â€” but nobody is paid to file the L1 release, so it would never
+/// A zero-fee exit still gets confirmed — it debits the owner and encumbers
+/// the value — but nobody is paid to file the L1 release, so it would never
 /// be claimed. The floor makes "the fee is zero" a refusal at queue time
 /// rather than an exit that stalls for free.
 pub const MIN_EXIT_FEE_SAT: u64 = 1_000;
 
-/// Queues an L2 â†’ L1 exit (approved P1, E-1â€¦E-3): debits `amount_sat` plus the
+/// Queues an L2 → L1 exit (approved P1, E-1…E-3): debits `amount_sat` plus the
 /// prepaid L1 release fee (`exit_fee_sat`) from the owner's L2 account and
 /// records the pending exit the release rule later pays out.
 ///
-/// The fee is what pays whoever later files the L1 release claim â€” an exit
+/// The fee is what pays whoever later files the L1 release claim — an exit
 /// queued with no fee earns its cranker nothing, so it would sit unclaimed
 /// forever. [`MIN_EXIT_FEE_SAT`] is the enforced floor (SPEC.md exit rules).
 ///
@@ -944,14 +944,14 @@ impl ExitQueuePayload {
 }
 
 // ---------------------------------------------------------------------------
-// Policy publication, revocation and spend (SPEC.md Â§21)
+// Policy publication, revocation and spend (SPEC.md §21)
 // ---------------------------------------------------------------------------
 
-/// Publish a spending policy on chain (SPEC.md Â§21.1).
+/// Publish a spending policy on chain (SPEC.md §21.1).
 ///
 /// The owner signs once here, and the signature covers three things at once:
-/// the grant bytes themselves, the **spender** â€” the address whose signature
-/// will exercise the grant â€” and the **agent identity** the grant names. That
+/// the grant bytes themselves, the **spender** — the address whose signature
+/// will exercise the grant — and the **agent identity** the grant names. That
 /// binding is the point. A policy hash on its own is a capability, and a
 /// capability that anyone can exercise is worthless; here the owner's
 /// signature says *this* key may spend under *these* caps, and the chain
@@ -1057,7 +1057,7 @@ impl PolicyPayload {
     }
 }
 
-/// Revoke a published policy (SPEC.md Â§21.2).
+/// Revoke a published policy (SPEC.md §21.2).
 ///
 /// The owner's kill switch, on chain. A revoked policy authorises nothing, and
 /// so does any policy delegated from it: the chain walks the ancestry at spend
@@ -1126,13 +1126,13 @@ impl PolicyRevokePayload {
     }
 }
 
-/// Spend under a published policy (SPEC.md Â§21.3).
+/// Spend under a published policy (SPEC.md §21.3).
 ///
 /// Signed by the **spender** the grant names, not by the owner: the owner
 /// signed once, at publication, and every later spend is authorised by the
-/// policy itself. The chain checks the grant's own rules â€” per-transaction cap,
+/// policy itself. The chain checks the grant's own rules — per-transaction cap,
 /// per-window cap, recipient allow-list, service allow-list, validity window,
-/// strictly increasing nonce â€” and enforces them against state it keeps, so
+/// strictly increasing nonce — and enforces them against state it keeps, so
 /// the limits are rules rather than advice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpendPayload {
@@ -1403,7 +1403,7 @@ impl L2Transaction {
 /// single authority for what an L2 transaction is: the same encoding `txid`,
 /// the signing hashes and the block-commitment path already use. A
 /// field-by-field serde form would be a second encoding to keep in step with
-/// the first â€” exactly the drift Â§15's canonical-encoding rule exists to
+/// the first — exactly the drift §15's canonical-encoding rule exists to
 /// prevent. It also means an L2 payload stored in JSON is decoded through
 /// `L2Transaction::deserialize`, so its bounds and validation apply there too.
 impl serde::Serialize for L2Transaction {
@@ -1497,7 +1497,7 @@ mod tests {
 
     #[test]
     fn every_fee_meets_the_flat_minimum_floor() {
-        // D3: flat minimum fee floor â€” no L2 fee may fall below
+        // D3: flat minimum fee floor — no L2 fee may fall below
         // L2_FLAT_FEE_MINIMUM_SAT, even if a per-type constant were re-parameterized.
         for t in [
             L2TxType::PostTask,
