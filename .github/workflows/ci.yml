@@ -67,6 +67,7 @@ jobs:
         python sim/puzzle_crosscheck.py
         python sim/verify_vectors.py --check
         python sim/l2_authority_reference.py --check
+        python sim/check_fuzz_targets.py
 
       - name: Difficulty attack containment
         # Guards the claim in SPEC.md 6.1: the future-timestamp allowance
