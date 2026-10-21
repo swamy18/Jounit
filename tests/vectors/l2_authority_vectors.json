@@ -1,0 +1,713 @@
+{
+  "version": 1,
+  "description": "Layer-2 authority and credit scenarios, derived from SPEC.md sections 21 and 22 by sim/l2_authority_reference.py. The Rust suite reads this file and asserts the same outcomes, so the two implementations are compared rather than merely coexisting.",
+  "addresses": {
+    "agent": "94e08448c61edd21820bdb90a1a247907033a4df",
+    "borrower": "41de0680f5932e7b25de513c9bb02b7de03f36ab",
+    "lender": "e19244e2cc6bc175fc6cdac43b7e64e5f78d0a4f",
+    "owner": "1c8341416262a909d391ddb0aad5d2bf496b2028",
+    "recipient": "719cc23b5787dda593907008a1c0aa59707773bf",
+    "stranger": "8f1804a0f005c3d31ede1e707a0d2174a78ea899",
+    "trigger": "3895ed8048c9ffb109150135a703fbb42788ecfe"
+  },
+  "scenarios": [
+    {
+      "name": "caps_and_counters",
+      "funding": {
+        "owner": 100000000,
+        "recipient": 100000000,
+        "agent": 100000000
+      },
+      "steps": [
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "jounit/mini",
+            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 10000,
+            "window_blocks": 10,
+            "cumulative_max_sat": 20000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 0,
+            "expires_at_height": 1000000,
+            "revoked": false,
+            "parent_agent_id": null
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 5000,
+          "service": null,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "spender": "agent",
+          "nonce": 2,
+          "recipient": "recipient",
+          "amount": 6000,
+          "service": null,
+          "outcome": {
+            "ok": true
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "owner": 99983000,
+          "recipient": 100011000,
+          "agent": 100000000
+        },
+        "funded_total": 300000000,
+        "burned": 3000,
+        "pscb": 3000,
+        "credit_locked": 0,
+        "conserved": true,
+        "policies": [
+          {
+            "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "spender": "agent",
+            "revoked": false,
+            "window_start_height": 1,
+            "spent_in_window_sat": 11000,
+            "total_spent_sat": 11000,
+            "last_nonce": 2,
+            "spends": 2
+          }
+        ],
+        "positions": []
+      }
+    },
+    {
+      "name": "authority_refusals",
+      "funding": {
+        "owner": 100000000,
+        "recipient": 100000000,
+        "stranger": 100000000,
+        "agent": 100000000
+      },
+      "steps": [
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "jounit/mini",
+            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 10000,
+            "window_blocks": 10,
+            "cumulative_max_sat": 20000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 0,
+            "expires_at_height": 1000000,
+            "revoked": false,
+            "parent_agent_id": null
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 10001,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "PolicyLimit"
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "stranger",
+          "amount": 1000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "PolicyRecipient"
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "spender": "stranger",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 1000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "PolicyBinding"
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 1000,
+          "service": null,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 2000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "PolicyNonce"
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "spender": "agent",
+          "nonce": 5,
+          "recipient": "recipient",
+          "amount": 1000,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "UnknownPolicy"
+          }
+        },
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "jounit/mini",
+            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 10000,
+            "window_blocks": 10,
+            "cumulative_max_sat": 20000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [
+              "7777777777777777777777777777777777777777777777777777777777777777"
+            ],
+            "not_before_height": 0,
+            "expires_at_height": 1000000,
+            "revoked": false,
+            "parent_agent_id": null
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": false,
+            "error": "PolicyAlreadyPublished"
+          }
+        },
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "jounit/mini",
+            "agent_id": "f686cd39712f4d6777ec9839cb925ebe29130e31",
+            "owner": "stranger",
+            "role": 1,
+            "per_tx_max_sat": 10000,
+            "window_blocks": 10,
+            "cumulative_max_sat": 20000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 0,
+            "expires_at_height": 1000000,
+            "revoked": false,
+            "parent_agent_id": null
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": false,
+            "error": "PolicyBinding"
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "owner": 99995000,
+          "recipient": 100001000,
+          "stranger": 100000000,
+          "agent": 100000000
+        },
+        "funded_total": 400000000,
+        "burned": 2000,
+        "pscb": 2000,
+        "credit_locked": 0,
+        "conserved": true,
+        "policies": [
+          {
+            "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "spender": "agent",
+            "revoked": false,
+            "window_start_height": 1,
+            "spent_in_window_sat": 1000,
+            "total_spent_sat": 1000,
+            "last_nonce": 1,
+            "spends": 1
+          }
+        ],
+        "positions": []
+      }
+    },
+    {
+      "name": "revocation_reaches_descendants",
+      "funding": {
+        "owner": 100000000,
+        "recipient": 100000000,
+        "agent": 100000000
+      },
+      "steps": [
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "jounit/mini",
+            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 100000,
+            "window_blocks": 100,
+            "cumulative_max_sat": 1000000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 0,
+            "expires_at_height": 1000000,
+            "revoked": false,
+            "parent_agent_id": null
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "jounit/mini",
+            "agent_id": "cd4aa993a9cfe9100b9c706677aa1f788db64296",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 100001,
+            "window_blocks": 50,
+            "cumulative_max_sat": 10000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 0,
+            "expires_at_height": 1000000,
+            "revoked": false,
+            "parent_agent_id": "3ab105423189b67089258596d6a8b9e37a25b096"
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": false,
+            "error": "Policy"
+          }
+        },
+        {
+          "op": "policy",
+          "policy": {
+            "network_id": "jounit/mini",
+            "agent_id": "cd4aa993a9cfe9100b9c706677aa1f788db64296",
+            "owner": "owner",
+            "role": 1,
+            "per_tx_max_sat": 1000,
+            "window_blocks": 50,
+            "cumulative_max_sat": 10000,
+            "allowed_recipients": [
+              "recipient"
+            ],
+            "allowed_services": [],
+            "not_before_height": 0,
+            "expires_at_height": 1000000,
+            "revoked": false,
+            "parent_agent_id": "3ab105423189b67089258596d6a8b9e37a25b096"
+          },
+          "spender": "agent",
+          "owner": "owner",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "584087c54715b8d6cab3a996ab240659112e966240e19b36300687df290bcd85",
+          "spender": "agent",
+          "nonce": 1,
+          "recipient": "recipient",
+          "amount": 500,
+          "service": null,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "revoke",
+          "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+          "owner": "owner",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "spend",
+          "policy_hash": "584087c54715b8d6cab3a996ab240659112e966240e19b36300687df290bcd85",
+          "spender": "agent",
+          "nonce": 2,
+          "recipient": "recipient",
+          "amount": 500,
+          "service": null,
+          "outcome": {
+            "ok": false,
+            "error": "PolicyRevoked"
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "owner": 99991500,
+          "recipient": 100000500,
+          "agent": 100000000
+        },
+        "funded_total": 300000000,
+        "burned": 4000,
+        "pscb": 4000,
+        "credit_locked": 0,
+        "conserved": true,
+        "policies": [
+          {
+            "policy_hash": "584087c54715b8d6cab3a996ab240659112e966240e19b36300687df290bcd85",
+            "agent_id": "cd4aa993a9cfe9100b9c706677aa1f788db64296",
+            "spender": "agent",
+            "revoked": false,
+            "window_start_height": 3,
+            "spent_in_window_sat": 500,
+            "total_spent_sat": 500,
+            "last_nonce": 1,
+            "spends": 1
+          },
+          {
+            "policy_hash": "aa8c73107e6709428f15be8b6b49bfbb9a09b7f32959963e24e4b9902f79fece",
+            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "spender": "agent",
+            "revoked": true,
+            "window_start_height": 1,
+            "spent_in_window_sat": 0,
+            "total_spent_sat": 0,
+            "last_nonce": 0,
+            "spends": 0
+          }
+        ],
+        "positions": []
+      }
+    },
+    {
+      "name": "credit_open_collateralise_repay",
+      "funding": {
+        "trigger": 100000000,
+        "borrower": 100000000,
+        "lender": 100000000
+      },
+      "steps": [
+        {
+          "op": "credit_open",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 1000,
+          "nonce": 1,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "credit_collateral",
+          "position": 0,
+          "borrower": "borrower",
+          "amount": 500000,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "credit_repay",
+          "position": 0,
+          "borrower": "borrower",
+          "amount": 400000,
+          "outcome": {
+            "ok": true
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "trigger": 100000000,
+          "borrower": 99096000,
+          "lender": 99398000
+        },
+        "funded_total": 300000000,
+        "burned": 3000,
+        "pscb": 3000,
+        "credit_locked": 1500000,
+        "conserved": true,
+        "policies": [],
+        "positions": [
+          {
+            "position_id": "46a5cd31536ceb6e8e6bd857dcdc99de6cd996ac0b58b33e32f730784d83fad9",
+            "lender": "lender",
+            "borrower": "borrower",
+            "principal_sat": 1000000,
+            "outstanding_sat": 600000,
+            "interest_paid_sat": 0,
+            "collateral_sat": 1500000,
+            "state": "Open"
+          }
+        ]
+      }
+    },
+    {
+      "name": "credit_refusals",
+      "funding": {
+        "trigger": 100000000,
+        "borrower": 100000000,
+        "lender": 100000000
+      },
+      "steps": [
+        {
+          "op": "credit_open",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 999999,
+          "rate": 100,
+          "window": 10,
+          "deadline": 1000,
+          "nonce": 1,
+          "outcome": {
+            "ok": false,
+            "error": "CreditUndercollateralised"
+          }
+        },
+        {
+          "op": "credit_open",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 10001,
+          "window": 10,
+          "deadline": 1000,
+          "nonce": 2,
+          "outcome": {
+            "ok": false,
+            "error": "CreditTerms"
+          }
+        },
+        {
+          "op": "credit_open",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 1,
+          "nonce": 3,
+          "outcome": {
+            "ok": false,
+            "error": "CreditTerms"
+          }
+        },
+        {
+          "op": "credit_open",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 1000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 1000,
+          "nonce": 4,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "credit_repay",
+          "position": 0,
+          "borrower": "trigger",
+          "amount": 1000,
+          "outcome": {
+            "ok": false,
+            "error": "CreditBinding"
+          }
+        },
+        {
+          "op": "credit_default",
+          "position": 0,
+          "actor": "trigger",
+          "outcome": {
+            "ok": false,
+            "error": "CreditNotDue"
+          }
+        },
+        {
+          "op": "credit_repay",
+          "position": 0,
+          "borrower": "borrower",
+          "amount": 0,
+          "outcome": {
+            "ok": false,
+            "error": "ZeroAmount"
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "trigger": 100000000,
+          "borrower": 100000000,
+          "lender": 98998000
+        },
+        "funded_total": 300000000,
+        "burned": 1000,
+        "pscb": 1000,
+        "credit_locked": 1000000,
+        "conserved": true,
+        "policies": [],
+        "positions": [
+          {
+            "position_id": "4448e2b55629657244c244dd194f9509fb623a9d3b0547518b7f234751f0d70c",
+            "lender": "lender",
+            "borrower": "borrower",
+            "principal_sat": 1000000,
+            "outstanding_sat": 1000000,
+            "interest_paid_sat": 0,
+            "collateral_sat": 1000000,
+            "state": "Open"
+          }
+        ]
+      }
+    },
+    {
+      "name": "credit_default_after_deadline",
+      "funding": {
+        "trigger": 100000000,
+        "borrower": 100000000,
+        "lender": 100000000
+      },
+      "steps": [
+        {
+          "op": "credit_open",
+          "lender": "lender",
+          "borrower": "borrower",
+          "amount": 1000000,
+          "collateral": 2000000,
+          "rate": 100,
+          "window": 10,
+          "deadline": 100,
+          "nonce": 1,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "advance",
+          "to": 100,
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "credit_default",
+          "position": 0,
+          "actor": "trigger",
+          "outcome": {
+            "ok": true
+          }
+        },
+        {
+          "op": "credit_default",
+          "position": 0,
+          "actor": "trigger",
+          "outcome": {
+            "ok": false,
+            "error": "Replay"
+          }
+        }
+      ],
+      "final": {
+        "balances": {
+          "trigger": 99998000,
+          "borrower": 99910000,
+          "lender": 100088000
+        },
+        "funded_total": 300000000,
+        "burned": 2000,
+        "pscb": 2000,
+        "credit_locked": 0,
+        "conserved": true,
+        "policies": [],
+        "positions": [
+          {
+            "position_id": "90bd760aff48ac989b142b9a81e20c6508fe906cd719e017d8d265eece441202",
+            "lender": "lender",
+            "borrower": "borrower",
+            "principal_sat": 1000000,
+            "outstanding_sat": 0,
+            "interest_paid_sat": 90000,
+            "collateral_sat": 0,
+            "state": "Defaulted"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -139,3 +139,17 @@ path = "fuzz_targets/deliverable_codec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "l2_policy_apply"
+path = "fuzz_targets/l2_policy_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "l2_credit_apply"
+path = "fuzz_targets/l2_credit_apply.rs"
+test = false
+doc = false
+bench = false

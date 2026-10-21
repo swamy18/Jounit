@@ -34,6 +34,10 @@ EXPECTED = {
     "supply_vectors.json": "reward ladder, cumulative supply, rate-anchor invariant",
     "difficulty_vectors.json": "LWMA next-difficulty, timestamp clamp",
     "net_vectors.json": "frame envelope, every msg_type payload, VERSION, bounds",
+    "l2_authority_vectors.json": (
+        "L2 policy + credit scenarios, verdicts and final state "
+        "(SPEC.md 21, 22)"
+    ),
 }
 
 problems: list[str] = []
