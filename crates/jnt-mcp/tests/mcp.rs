@@ -359,3 +359,106 @@ fn a_bad_endpoint_is_a_transport_error_not_a_panic() {
         .expect_err("an unreachable node is a transport error");
     assert_eq!(err.code, "transport");
 }
+
+// ---------------------------------------------------------------------------
+// Agent authority and credit, read side
+// ---------------------------------------------------------------------------
+
+/// The surface can read a published-grant payload: the terms, the spender
+/// the grant names, and the hash the owner signs. It cannot sign it.
+#[test]
+fn it_reads_a_published_grant_without_signing_it() {
+    let mut mcp = JounitMcp::new();
+    let owner = wallet(1);
+    let agent = wallet(2);
+    let grant = policy([0x11u8; 32], wallet(3).address().unwrap());
+    let payload =
+        jnt_core::l2::PolicyPayload::build_from_policy(&owner, &grant, agent.address().unwrap())
+            .unwrap();
+    let out = mcp
+        .handle(&json!({
+            "op": "inspect.policy",
+            "payload_hex": hex::encode(payload.serialize()),
+        }))
+        .expect("the grant is readable");
+    assert_eq!(out["owner"], hex::encode(owner.address().unwrap()));
+    assert_eq!(out["spender"], hex::encode(agent.address().unwrap()));
+    assert_eq!(out["per_tx_max_sat"], 600);
+    assert_eq!(out["cumulative_max_sat"], 1_000);
+    assert!(!out["signing_hash"].as_str().unwrap_or_default().is_empty());
+    // The hash is the owner's to sign, not the surface's.
+    assert!(out.get("signature").is_none());
+}
+
+/// The surface can read a spend under a grant, and a credit opening: the
+/// terms, the derived position id, and the hash the lender signs.
+#[test]
+fn it_reads_a_spend_and_a_credit_opening() {
+    let mut mcp = JounitMcp::new();
+    let agent = wallet(2);
+    let spend = jnt_core::l2::AgentSpendPayload::build(
+        &agent,
+        [0x33u8; 32],
+        7,
+        wallet(3).address().unwrap(),
+        400,
+        None,
+    )
+    .unwrap();
+    let out = mcp
+        .handle(&json!({
+            "op": "inspect.agent_spend",
+            "payload_hex": hex::encode(spend.serialize()),
+        }))
+        .expect("the spend is readable");
+    assert_eq!(out["agent"], hex::encode(agent.address().unwrap()));
+    assert_eq!(out["amount_sat"], 400);
+    assert_eq!(out["nonce"], 7);
+
+    let lender = wallet(1);
+    let credit = jnt_core::l2::CreditOpenPayload::build(
+        &lender,
+        wallet(2).address().unwrap(),
+        1_000,
+        1_000,
+        100,
+        100,
+        9_000,
+        1,
+    )
+    .unwrap();
+    let out = mcp
+        .handle(&json!({
+            "op": "inspect.credit",
+            "payload_hex": hex::encode(credit.serialize()),
+        }))
+        .expect("the credit opening is readable");
+    assert_eq!(out["lender"], hex::encode(lender.address().unwrap()));
+    assert_eq!(out["amount_sat"], 1_000);
+    assert_eq!(out["collateral_sat"], 1_000);
+    assert_eq!(
+        out["position_id"],
+        hash_to_hex(&credit.derived_position_id())
+    );
+}
+
+/// The new operations are advertised, so an agent never guesses a name.
+#[test]
+fn the_authority_operations_are_advertised() {
+    let mcp = JounitMcp::new();
+    let caps = mcp.capabilities();
+    for expected in ["inspect.policy", "inspect.agent_spend", "inspect.credit"] {
+        assert!(caps.contains(&expected), "{expected} must be advertised");
+    }
+}
+
+/// Malformed input is a named refusal, never a panic and never a partial
+/// action - the same discipline every other operation follows.
+#[test]
+fn a_malformed_grant_is_refused_by_name() {
+    let mut mcp = JounitMcp::new();
+    let err = mcp
+        .handle(&json!({ "op": "inspect.policy", "payload_hex": "00ff" }))
+        .expect_err("garbage is refused");
+    assert_eq!(err.code, "bad_request");
+}

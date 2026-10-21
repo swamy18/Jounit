@@ -112,6 +112,9 @@ impl JounitMcp {
             "inspect.request",
             "inspect.payment",
             "inspect.receipt",
+            "inspect.policy",
+            "inspect.agent_spend",
+            "inspect.credit",
             "verify.authorization",
             "node.status",
             "payment.submit",
@@ -131,6 +134,9 @@ impl JounitMcp {
             "inspect.request" => self.inspect_request(request),
             "inspect.payment" => self.inspect_payment(request),
             "inspect.receipt" => self.inspect_receipt(request),
+            "inspect.policy" => self.inspect_policy(request),
+            "inspect.agent_spend" => self.inspect_agent_spend(request),
+            "inspect.credit" => self.inspect_credit(request),
             "verify.authorization" => self.verify_authorization(request),
             "node.status" => self.node_status(request),
             "payment.submit" => self.payment_submit(request),
@@ -177,6 +183,77 @@ impl JounitMcp {
             "nonce": auth.nonce,
             "height": auth.height,
             "note": "the policy owner signs `signing_hash`; this layer holds no key",
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent authority and credit, read side
+    // -----------------------------------------------------------------------
+
+    /// `inspect.policy` — read a published-grant payload: the terms, the
+    /// spender the grant names, and the hash the owner signs.
+    ///
+    /// Pure inspection. This layer holds no key, so it cannot sign a
+    /// publication; it tells an agent what it is signing.
+    fn inspect_policy(&self, request: &Value) -> Result<Value, McpError> {
+        let bytes = hex_field(request, "payload_hex")?;
+        let payload =
+            jnt_core::l2::PolicyPayload::from_reader(&mut jnt_core::ser::Reader::new(&bytes))
+                .map_err(|e| McpError::bad(format!("policy payload: {e}")))?;
+        let grant = jnt_core::agent::SpendPolicy::deserialize(&payload.policy)
+            .map_err(|e| McpError::bad(format!("grant: {e}")))?;
+        Ok(json!({
+            "owner": hex::encode(payload.owner),
+            "spender": hex::encode(payload.spender),
+            "agent_id": hex::encode(payload.agent_id),
+            "policy_hash": hash_to_hex(&grant.hash()),
+            "signing_hash": hash_to_hex(&payload.signing_hash()),
+            "network_id": grant.network_id,
+            "role": role_name(grant.role),
+            "per_tx_max_sat": grant.per_tx_max_sat,
+            "window_blocks": grant.window_blocks,
+            "cumulative_max_sat": grant.cumulative_max_sat,
+            "allowed_recipients": grant.allowed_recipients.iter().map(hex::encode).collect::<Vec<_>>(),
+            "not_before_height": grant.not_before_height,
+            "expires_at_height": grant.expires_at_height,
+        }))
+    }
+
+    /// `inspect.agent_spend` — read a spend under a published grant.
+    fn inspect_agent_spend(&self, request: &Value) -> Result<Value, McpError> {
+        let bytes = hex_field(request, "payload_hex")?;
+        let payload =
+            jnt_core::l2::AgentSpendPayload::from_reader(&mut jnt_core::ser::Reader::new(&bytes))
+                .map_err(|e| McpError::bad(format!("spend payload: {e}")))?;
+        Ok(json!({
+            "agent": hex::encode(payload.agent),
+            "policy_hash": hash_to_hex(&payload.policy_hash),
+            "signing_hash": hash_to_hex(&payload.signing_hash()),
+            "recipient": hex::encode(payload.recipient),
+            "amount_sat": payload.amount_sat,
+            "nonce": payload.nonce,
+            "service": payload.service.map(hex::encode),
+        }))
+    }
+
+    /// `inspect.credit` — read a credit-position opening: the terms, the
+    /// derived position id, and the hash the **lender** signs.
+    fn inspect_credit(&self, request: &Value) -> Result<Value, McpError> {
+        let bytes = hex_field(request, "payload_hex")?;
+        let payload =
+            jnt_core::l2::CreditOpenPayload::from_reader(&mut jnt_core::ser::Reader::new(&bytes))
+                .map_err(|e| McpError::bad(format!("credit payload: {e}")))?;
+        Ok(json!({
+            "lender": hex::encode(payload.lender),
+            "borrower": hex::encode(payload.borrower),
+            "amount_sat": payload.amount_sat,
+            "collateral_sat": payload.collateral_sat,
+            "rate_bps_per_window": payload.rate_bps_per_window,
+            "window_blocks": payload.window_blocks,
+            "deadline_height": payload.deadline_height,
+            "nonce": payload.nonce,
+            "position_id": hash_to_hex(&payload.derived_position_id()),
+            "signing_hash": hash_to_hex(&payload.signing_hash()),
         }))
     }
 

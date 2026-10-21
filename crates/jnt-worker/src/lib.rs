@@ -20,6 +20,7 @@
 //! - [`config`] — operator-supplied configuration (§18.12)
 //! - [`error`] — the error taxonomy and its retry classification (§18.10)
 
+pub mod authority;
 pub mod claim;
 pub mod client;
 pub mod config;
@@ -33,6 +34,13 @@ pub mod node;
 pub mod submit;
 pub mod vwc;
 
+pub use authority::{
+    add_credit_collateral, add_credit_collateral_plan, agent_spend, agent_spend_plan,
+    default_credit, default_credit_plan, open_credit, open_credit_plan, publish_policy,
+    publish_policy_plan, repay_credit, repay_credit_plan, revoke_policy, revoke_policy_plan,
+    AgentSpendPlan, CreditCollateralPlan, CreditDefaultPlan, CreditOpenPlan, CreditRepayPlan,
+    PolicyPlan,
+};
 pub use claim::{claim_plan, claim_task, reconcile_claimed, ClaimPlan, ClaimedState};
 pub use client::{earnings_of, Earnings, WorkerClient};
 pub use config::{Filter, WorkerConfig};
