@@ -1396,6 +1396,17 @@ impl L2State {
                 height,
             )
             .map_err(|_| L2Error::CreditInterestOverflow)?;
+        // A repayment may not exceed the debt. The lender is paid the debt and
+        // not a satoshi more, and the borrower's excess is not silently taken
+        // - the node-local credit book refuses the same shape, and the two
+        // implementations of the same rule must agree.
+        let debt = position
+            .outstanding_sat
+            .checked_add(interest_due)
+            .ok_or(L2Error::Overflow)?;
+        if p.amount_sat > debt {
+            return Err(L2Error::CreditRepaymentExceedsDebt { debt });
+        }
         let interest_paid = p.amount_sat.min(interest_due);
         let principal_paid = (p.amount_sat - interest_paid).min(position.outstanding_sat);
         let need = p.amount_sat.checked_add(fee).ok_or(L2Error::Overflow)?;

@@ -485,6 +485,16 @@
           "outcome": {
             "ok": true
           }
+        },
+        {
+          "op": "credit_repay",
+          "position": 0,
+          "borrower": "borrower",
+          "amount": 2000000,
+          "outcome": {
+            "ok": false,
+            "error": "CreditRepaymentExceedsDebt"
+          }
         }
       ],
       "final": {

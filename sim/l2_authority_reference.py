@@ -527,6 +527,11 @@ class State:
             pos.rate_bps_per_window,
             pos.window_blocks,
         )
+        # A repayment may not exceed the debt: the lender is paid the debt and
+        # not a satoshi more, and the borrower's excess is not silently taken.
+        debt = pos.outstanding_sat + interest_due
+        if amount > debt:
+            refuse("CreditRepaymentExceedsDebt")
         interest_paid = min(amount, interest_due)
         principal_paid = min(amount - interest_paid, pos.outstanding_sat)
         fee = FEE_CREDIT_REPAY
@@ -945,6 +950,14 @@ def run_scenarios() -> list:
             "position": 0,
             "borrower": ADDR["borrower"],
             "amount": 400_000,
+        },
+        # A repayment larger than the debt is refused: the lender is paid the
+        # debt and not a satoshi more.
+        {
+            "op": "credit_repay",
+            "position": 0,
+            "borrower": ADDR["borrower"],
+            "amount": 2_000_000,
         },
     ]
     scenarios.append(("credit_open_collateralise_repay", state, steps))

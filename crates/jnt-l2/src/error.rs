@@ -155,6 +155,11 @@ pub enum L2Error {
     /// schedule permits. Refused rather than wrapped: a wrapped charge would
     /// under-charge the lender.
     CreditInterestOverflow,
+    /// A repayment larger than the debt owed. Refused rather than trimmed: the
+    /// lender is paid the debt and not a satoshi more, and the borrower's
+    /// excess is not silently taken. The node-local credit book refuses the
+    /// same shape (SPEC.md §22.5).
+    CreditRepaymentExceedsDebt { debt: u64 },
 }
 
 impl fmt::Display for L2Error {
@@ -242,6 +247,9 @@ impl fmt::Display for L2Error {
             L2Error::CreditBinding(w) => write!(f, "credit binding: {w}"),
             L2Error::CreditNotDue => write!(f, "the credit position is not yet due"),
             L2Error::CreditInterestOverflow => write!(f, "credit interest overflowed"),
+            L2Error::CreditRepaymentExceedsDebt { debt } => {
+                write!(f, "the repayment exceeds the debt owed ({debt} sat)")
+            }
         }
     }
 }

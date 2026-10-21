@@ -267,6 +267,66 @@ fn an_open_credit_position_is_visible_over_http() {
 }
 
 #[test]
+fn a_restart_rebuilds_the_same_authority_state() {
+    // A restart does not restore a ledger: the Layer-2 state is *derived* from
+    // the canonical blocks, so what a restart has to reproduce is the replay.
+    // This test publishes a grant in a block and then rebuilds the state from
+    // the chain, the way a node that restarts would.
+    let node = start();
+    let owner = operator(1);
+    let agent = operator(2);
+    let recipient = operator(3);
+
+    let policy = SpendPolicy {
+        version: POLICY_VERSION,
+        network_id: "jounit/mini".to_string(),
+        agent_id: derive_agent_id("jounit/mini", AgentRole::Machine, &owner.address().unwrap()),
+        owner: owner.address().unwrap(),
+        role: AgentRole::Machine,
+        per_tx_max_sat: 10_000,
+        window_blocks: 100,
+        cumulative_max_sat: 100_000,
+        allowed_recipients: vec![recipient.address().unwrap()],
+        allowed_services: vec![],
+        not_before_height: 0,
+        expires_at_height: 1_000_000,
+        revoked: false,
+        parent_agent_id: None,
+    };
+    let payload =
+        PolicyPayload::build_from_policy(&owner, &policy, agent.address().unwrap()).unwrap();
+    let tx = L2Transaction::new(L2Payload::Policy(payload));
+    mine_with_l2(&node, vec![tx]);
+
+    // What the node holds now.
+    let live = {
+        let sh = node.shared.lock().unwrap();
+        let l2 = sh.l2.state();
+        (
+            l2.committed_root(),
+            l2.policies().len(),
+            l2.policies()[0].spender,
+        )
+    };
+
+    // What a restart would rebuild from the same chain.
+    let rebuilt = {
+        let sh = node.shared.lock().unwrap();
+        let fresh = NodeL2::replay_from(&sh.chain, &NetworkParams::mini()).unwrap();
+        let state = fresh.state();
+        (
+            state.committed_root(),
+            state.policies().len(),
+            state.policies()[0].spender,
+        )
+    };
+    assert_eq!(
+        live, rebuilt,
+        "a restart must rebuild exactly the state the node was holding"
+    );
+}
+
+#[test]
 fn the_fee_schedule_lists_the_new_transaction_types() {
     let node = start();
     let (status, body) = get(&node, "/v1/fees");

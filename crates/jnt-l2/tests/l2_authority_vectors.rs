@@ -109,6 +109,7 @@ fn error_name(e: &L2Error) -> &'static str {
         L2Error::CreditBinding(_) => "CreditBinding",
         L2Error::CreditNotDue => "CreditNotDue",
         L2Error::CreditInterestOverflow => "CreditInterestOverflow",
+        L2Error::CreditRepaymentExceedsDebt { .. } => "CreditRepaymentExceedsDebt",
     }
 }
 
@@ -250,7 +251,9 @@ fn the_authority_and_credit_rules_match_the_independent_implementation() {
             .and_then(Value::as_object)
             .expect("the funding");
         for (role, amount) in funding {
-            state.credit(addr_for(role), amount.as_u64().expect("a funding amount"));
+            state
+                .credit(addr_for(role), amount.as_u64().expect("a funding amount"))
+                .expect("a credit cannot overflow a fresh state");
         }
         let mut height = 1u64;
         let mut positions: Vec<Hash> = Vec::new();
