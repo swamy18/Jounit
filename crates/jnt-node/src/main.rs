@@ -28,9 +28,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use jnt_core::agent::{derive_agent_id, derive_sub_agent_id, AgentId, AgentRole, SpendPolicy};
 use jnt_core::block::Block;
 use jnt_core::chain::Chain;
-use jnt_core::hash::{address_from_hex, address_to_hex, hash512_to_hex, hash_to_hex, Hash512};
+use jnt_core::hash::{
+    address_from_hex, address_to_hex, hash512_to_hex, hash_from_hex, hash_to_hex, Hash512,
+};
+use jnt_core::l2::{
+    AgentSpendPayload, CreditDefaultPayload, CreditOpenPayload, CreditRepayPayload, L2Payload,
+    L2Transaction, PolicyPayload, PolicyRevokePayload,
+};
 use jnt_core::params::{NetworkParams, SAT_PER_JNT};
 use jnt_core::supply::{block_reward_sat, cumulative_supply_sat, halvings, max_issuance_sat};
 use jnt_core::tx::{OutPoint, Output, Transaction};
@@ -61,6 +68,10 @@ COMMANDS:
   show-block  Print one block
   balance   List the unspent outputs of an address
   wallet    Create or list wallets
+  policy    Publish, revoke or list spending grants (agent authority)
+  agent-spend  Spend under a published grant
+  credit    Open, repay, default or list credit positions
+  l2        Layer-2 summary, and the deposit address
   export    Write the canonical chain to JSON
   serve     Run a P2P node (block relay, multi-peer sync)
   validator Manage checkpoint-signing keys (M5 binding finality)
@@ -82,6 +93,35 @@ COMMON OPTIONS:
                               (default: refuse; set JNT_WALLET_PASSPHRASE to
                               encrypt the file with Argon2id + ChaCha20-Poly1305
                               and 0600 permissions instead)
+
+POLICY OPTIONS (agent authority, SPEC 21):
+  --spender <address>        The key that may exercise the grant (required)
+  --per-tx <sat>             Largest single spend the grant allows (required)
+  --cumulative <sat>         Largest total spend per window (required)
+  --window <blocks>          Length of the tumbling window (default: 100)
+  --expires <height>         Height the grant stops being usable
+  --recipients <a,b,c>       Comma-separated allow-list; empty allows nothing
+  --role <human|machine|service>  The role the grant names (default: machine)
+  --parent <agent-id>        Delegate from this agent instead of being a root
+  --agent-id <hex>           The agent to revoke (with --revoke)
+  --list                     List what is published instead of changing it
+
+AGENT-SPEND OPTIONS:
+  --policy <hash>            The grant to spend under (required)
+  --to <address>             Recipient (required)
+  --amount <jnt>             Amount to spend (required)
+  --nonce <n>                Strictly increasing per grant (required)
+
+CREDIT OPTIONS (SPEC 22):
+  --to <address>             The borrower (with --open)
+  --amount <jnt>             Principal, or the repayment amount
+  --collateral <sat>         Collateral the borrower locks (default: --amount)
+  --rate-bps <bps>           Interest per window (default: 100)
+  --window <blocks>          Length of an interest window (default: 100)
+  --deadline <height>        Height the debt is due by
+  --position <hash>          The position to repay or default
+  --nonce <n>                Per-lender sequence number
+  --list                     List the positions instead of changing one
 
 VALIDATOR KEY OPTIONS:
   (no flag; environment only)  Validator keys are encrypted under
@@ -179,6 +219,22 @@ impl Args {
                         | "peers"
                         | "relay"
                         | "bootnodes"
+                        | "grant-hex"
+                        | "spender"
+                        | "agent-id"
+                        | "parent"
+                        | "policy"
+                        | "nonce"
+                        | "recipients"
+                        | "role"
+                        | "per-tx"
+                        | "window"
+                        | "cumulative"
+                        | "expires"
+                        | "collateral"
+                        | "rate-bps"
+                        | "deadline"
+                        | "position"
                 );
                 if takes_value {
                     let value = raw
@@ -526,7 +582,13 @@ fn parse_jnt_sat(v: &str) -> Result<u64, String> {
         if frac.len() > 8 {
             return Err("--amount has more than 8 decimal places".into());
         }
-        let padded = format!("{frac:<0width$}", width = 8);
+        // Zero-pad on the right: `1.5` is one JNT and fifty million satoshis.
+        // The fill character has to come *before* the alignment in the format
+        // spec, so this is `{frac:0<8}` and not `{frac:<0width$}` — the
+        // latter left-aligns with spaces, and "5       " does not parse as a
+        // number, which is why every fractional amount used to be refused
+        // with "--amount must be a number".
+        let padded = format!("{frac:0<8}");
         padded
             .parse::<u64>()
             .map_err(|_| "--amount must be a number".to_string())?
@@ -587,6 +649,10 @@ fn run(raw: &[String]) -> Result<(), String> {
         "wallet" => cmd_wallet(&args),
         "export" => cmd_export(&args),
         "validator" => cmd_validator(&args),
+        "policy" => cmd_policy(&args),
+        "agent-spend" => cmd_agent_spend(&args),
+        "credit" => cmd_credit(&args),
+        "l2" => cmd_l2(&args),
         "serve" => cmd_serve(&args),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     }
@@ -878,6 +944,393 @@ fn relay_transaction(
     std::thread::sleep(std::time::Duration::from_millis(300));
     let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
+}
+
+/// Mine a block carrying one Layer-2 transaction, and report what happened.
+///
+/// The L2 state root is computed by the node's own replay, so the block commits
+/// to exactly the state the node believes — the same rule a miner follows.
+fn mine_l2_tx(
+    store: &mut Store,
+    chain: &mut Chain,
+    l2: &NodeL2,
+    miner: jnt_core::hash::Address,
+    tx: L2Transaction,
+) -> Result<u64, String> {
+    let height = chain.height() + 1;
+    // Check it against the state the chain will replay. A transaction the
+    // state machine refuses is *skipped* by the replay, so mining it would
+    // produce a block that says nothing happened — and the command would
+    // report a height for work that never took effect. Refuse here, with the
+    // reason the chain gave.
+    l2.check(&tx, height)
+        .map_err(|e| format!("the chain would skip this transaction: {e}"))?;
+    let root = l2.simulate_root(height, std::slice::from_ref(&tx));
+    let block = chain
+        .mine_block_with_l2_root(
+            miner,
+            Vec::new(),
+            vec![tx],
+            root,
+            now_ms(),
+            None,
+            200_000_000,
+        )
+        .map_err(|e| e.to_string())?;
+    let mined = block.header.height;
+    chain.submit(block).map_err(|e| e.to_string())?;
+    store.save_chain(chain)?;
+    store.write_meta(chain)?;
+    Ok(mined)
+}
+
+/// The wallet the command acts as, and the address it acts from.
+fn acting_wallet(args: &Args, store: &Store) -> Result<(Wallet, jnt_core::hash::Address), String> {
+    let wallets = store.load_wallets()?;
+    if wallets.is_empty() {
+        return Err("no wallet in this data dir".into());
+    }
+    let label = args.str_or("wallet", &wallets[0].label.clone());
+    let wallet = wallets
+        .iter()
+        .find(|w| w.label == label)
+        .ok_or_else(|| format!("no wallet labelled `{label}`"))?;
+    let address = wallet.address().map_err(|e| e.to_string())?;
+    Ok((wallet.clone(), address))
+}
+
+/// The Layer-2 state as this node sees it, rebuilt from the canonical chain.
+fn l2_state_of(store: &Store, chain: &Chain) -> Result<NodeL2, String> {
+    NodeL2::replay_from(chain, &store.params).map_err(|e| e.to_string())
+}
+
+/// `jnt-node policy` — publish, revoke or list spending grants (SPEC.md §21).
+///
+/// A grant is the owner's signed authority for a named spender, bounded by
+/// caps and allow-lists. Publishing it puts it on chain, where every node
+/// enforces it.
+fn cmd_policy(args: &Args) -> Result<(), String> {
+    let mut store = Store::open(args)?;
+    let mut chain = store.load_chain()?;
+    let (wallet, owner) = acting_wallet(args, &store)?;
+
+    if args.has("list") {
+        let l2 = l2_state_of(&store, &chain)?;
+        let state = l2.state();
+        let policies = state.policies();
+        if policies.is_empty() {
+            println!("no published grants");
+        }
+        for p in policies {
+            println!(
+                "{}  agent {}  spender {}  per-tx {}  window {}  cumulative {}  spent {}  spends {}  revoked {}",
+                hash_to_hex(&p.hash()),
+                address_to_hex(&p.agent_id),
+                address_to_hex(&p.spender),
+                jnt(p.policy.per_tx_max_sat),
+                p.policy.window_blocks,
+                jnt(p.policy.cumulative_max_sat),
+                jnt(p.spent_in_window_sat),
+                p.spends,
+                p.revoked,
+            );
+        }
+        return Ok(());
+    }
+
+    if args.has("revoke") {
+        let agent_id = args.str("agent-id").ok_or("--agent-id <hex> is required")?;
+        let agent_id = decode_agent_id(agent_id)?;
+        let payload = PolicyRevokePayload::build(&wallet, agent_id).map_err(|e| e.to_string())?;
+        let tx = L2Transaction::new(L2Payload::PolicyRevoke(payload));
+        let l2 = l2_state_of(&store, &chain)?;
+        let height = mine_l2_tx(&mut store, &mut chain, &l2, owner, tx)?;
+        println!("height  {height}");
+        println!("revoked agent {}", address_to_hex(&agent_id));
+        return Ok(());
+    }
+
+    // Publish.
+    let spender = address_from_hex(
+        args.str("spender")
+            .ok_or("--spender <address> is required")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let network_id = store.params.network_id.clone();
+    let role = match args.str_or("role", "machine").as_str() {
+        "human" => AgentRole::Human,
+        "machine" => AgentRole::Machine,
+        "service" => AgentRole::Service,
+        other => {
+            return Err(format!(
+                "--role must be human, machine or service, got `{other}`"
+            ))
+        }
+    };
+    let parent = match args.str("parent") {
+        Some(hex) => Some(decode_agent_id(hex)?),
+        None => None,
+    };
+    let agent_id = match parent {
+        Some(p) => derive_sub_agent_id(&network_id, &p, role),
+        None => derive_agent_id(&network_id, role, &owner),
+    };
+    let recipients = match args.str("recipients") {
+        Some(list) => {
+            let mut out = Vec::new();
+            for part in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                out.push(address_from_hex(part).map_err(|e| e.to_string())?);
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+    let per_tx = args.num("per-tx", 0)?;
+    let window = args.num("window", 100)?;
+    let cumulative = args.num("cumulative", 0)?;
+    if per_tx == 0 {
+        return Err("--per-tx <sat> is required".into());
+    }
+    if cumulative == 0 {
+        return Err("--cumulative <sat> is required".into());
+    }
+    let expires = args.num("expires", 0)?;
+    let expires_at_height = if expires == 0 {
+        chain.height() + 1_000_000
+    } else {
+        expires
+    };
+
+    let policy = SpendPolicy {
+        version: jnt_core::agent::POLICY_VERSION,
+        network_id,
+        agent_id,
+        owner,
+        role,
+        per_tx_max_sat: per_tx,
+        window_blocks: window,
+        cumulative_max_sat: cumulative,
+        allowed_recipients: recipients,
+        allowed_services: Vec::new(),
+        not_before_height: 0,
+        expires_at_height,
+        revoked: false,
+        parent_agent_id: parent,
+    };
+    policy
+        .validate()
+        .map_err(|e| format!("grant refused: {e}"))?;
+
+    let payload =
+        PolicyPayload::build_from_policy(&wallet, &policy, spender).map_err(|e| e.to_string())?;
+    let tx = L2Transaction::new(L2Payload::Policy(payload));
+    let l2 = l2_state_of(&store, &chain)?;
+    let height = mine_l2_tx(&mut store, &mut chain, &l2, owner, tx)?;
+    println!("height      {height}");
+    println!("policy      {}", hash_to_hex(&policy.hash()));
+    println!("agent       {}", address_to_hex(&agent_id));
+    println!("spender     {}", address_to_hex(&spender));
+    println!("per-tx      {}", jnt(per_tx));
+    println!("cumulative  {}", jnt(cumulative));
+    println!("window      {window} blocks");
+    Ok(())
+}
+
+/// `jnt-node agent-spend` — spend under a published grant (SPEC.md §21).
+fn cmd_agent_spend(args: &Args) -> Result<(), String> {
+    let mut store = Store::open(args)?;
+    let mut chain = store.load_chain()?;
+    let (wallet, agent) = acting_wallet(args, &store)?;
+
+    let policy_hash = hash_from_hex(args.str("policy").ok_or("--policy <hash> is required")?)
+        .map_err(|e| e.to_string())?;
+    let to = address_from_hex(args.str("to").ok_or("--to <address> is required")?)
+        .map_err(|e| e.to_string())?;
+    let amount_sat = if let Some(sat) = args.str("amount-sat") {
+        sat.parse::<u64>()
+            .map_err(|_| "--amount-sat must be a number")?
+    } else {
+        match args.jnt("amount")? {
+            Some(sat) => sat,
+            None => return Err("--amount is required".into()),
+        }
+    };
+    if amount_sat == 0 {
+        return Err("--amount must be greater than zero".into());
+    }
+    let nonce = args.num("nonce", 0)?;
+
+    let payload = AgentSpendPayload::build(&wallet, policy_hash, nonce, to, amount_sat, None)
+        .map_err(|e| e.to_string())?;
+    let tx = L2Transaction::new(L2Payload::AgentSpend(payload));
+    let l2 = l2_state_of(&store, &chain)?;
+    let height = mine_l2_tx(&mut store, &mut chain, &l2, agent, tx)?;
+    println!("height  {height}");
+    println!("spent   {} JNT to {}", jnt(amount_sat), address_to_hex(&to));
+    println!("policy  {}", hash_to_hex(&policy_hash));
+    Ok(())
+}
+
+/// `jnt-node credit` — open, repay or default a credit position (SPEC.md §22).
+fn cmd_credit(args: &Args) -> Result<(), String> {
+    let mut store = Store::open(args)?;
+    let mut chain = store.load_chain()?;
+    let (wallet, actor) = acting_wallet(args, &store)?;
+
+    if args.has("list") {
+        let l2 = l2_state_of(&store, &chain)?;
+        let state = l2.state();
+        let positions = state.credit_positions();
+        if positions.is_empty() {
+            println!("no credit positions");
+        }
+        for p in positions {
+            println!(
+                "{}  lender {}  borrower {}  principal {}  outstanding {}  collateral {}  state {:?}",
+                hash_to_hex(&p.id),
+                address_to_hex(&p.lender),
+                address_to_hex(&p.borrower),
+                jnt(p.principal_sat),
+                jnt(p.outstanding_sat),
+                jnt(p.collateral_sat),
+                p.state,
+            );
+        }
+        return Ok(());
+    }
+
+    if args.has("default") {
+        let position_id = hash_from_hex(
+            args.str("position")
+                .ok_or("--position <hash> is required")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let payload =
+            CreditDefaultPayload::build(&wallet, position_id).map_err(|e| e.to_string())?;
+        let tx = L2Transaction::new(L2Payload::CreditDefault(payload));
+        let l2 = l2_state_of(&store, &chain)?;
+        let height = mine_l2_tx(&mut store, &mut chain, &l2, actor, tx)?;
+        println!("height    {height}");
+        println!("defaulted position {}", hash_to_hex(&position_id));
+        return Ok(());
+    }
+
+    if args.has("repay") {
+        let position_id = hash_from_hex(
+            args.str("position")
+                .ok_or("--position <hash> is required")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let amount_sat = if let Some(sat) = args.str("amount-sat") {
+            sat.parse::<u64>()
+                .map_err(|_| "--amount-sat must be a number")?
+        } else {
+            match args.jnt("amount")? {
+                Some(sat) => sat,
+                None => return Err("--amount is required".into()),
+            }
+        };
+        let payload = CreditRepayPayload::build(&wallet, position_id, amount_sat)
+            .map_err(|e| e.to_string())?;
+        let tx = L2Transaction::new(L2Payload::CreditRepay(payload));
+        let l2 = l2_state_of(&store, &chain)?;
+        let height = mine_l2_tx(&mut store, &mut chain, &l2, actor, tx)?;
+        println!("height  {height}");
+        println!("repaid  {} JNT", jnt(amount_sat));
+        println!("position {}", hash_to_hex(&position_id));
+        return Ok(());
+    }
+
+    // Open.
+    let borrower = address_from_hex(args.str("to").ok_or("--to <address> is required")?)
+        .map_err(|e| e.to_string())?;
+    let amount_sat = if let Some(sat) = args.str("amount-sat") {
+        sat.parse::<u64>()
+            .map_err(|_| "--amount-sat must be a number")?
+    } else {
+        match args.jnt("amount")? {
+            Some(sat) => sat,
+            None => return Err("--amount is required".into()),
+        }
+    };
+    let collateral_sat = match args.str("collateral") {
+        Some(sat) => sat
+            .parse::<u64>()
+            .map_err(|_| "--collateral must be a number")?,
+        None => amount_sat,
+    };
+    let rate_bps = args.num("rate-bps", 100)? as u32;
+    let window = args.num("window", 100)?;
+    let deadline = args.num("deadline", chain.height() + 100_000)?;
+    let nonce = args.num("nonce", 0)?;
+
+    let payload = CreditOpenPayload::build(
+        &wallet,
+        borrower,
+        amount_sat,
+        collateral_sat,
+        rate_bps,
+        window,
+        deadline,
+        nonce,
+    )
+    .map_err(|e| e.to_string())?;
+    let position_id = payload.derived_position_id();
+    let tx = L2Transaction::new(L2Payload::CreditOpen(payload));
+    let l2 = l2_state_of(&store, &chain)?;
+    let height = mine_l2_tx(&mut store, &mut chain, &l2, actor, tx)?;
+    println!("height     {height}");
+    println!("position   {}", hash_to_hex(&position_id));
+    println!("borrower   {}", address_to_hex(&borrower));
+    println!("principal  {} JNT", jnt(amount_sat));
+    println!("collateral {} JNT", jnt(collateral_sat));
+    Ok(())
+}
+
+/// `jnt-node l2` — the Layer-2 deposit address and balance helpers.
+///
+/// A deposit is an ordinary Layer-1 payment to the profile's sink address; the
+/// node credits it once the transaction is final.
+fn cmd_l2(args: &Args) -> Result<(), String> {
+    let mut store = Store::open(args)?;
+    let chain = store.load_chain()?;
+
+    if args.has("deposit-address") {
+        println!("{}", address_to_hex(&store.params.l2_deposit_sink()));
+        println!();
+        println!("deposit with: jnt-node send --to <address> --amount <jnt>");
+        println!("the credit appears after the transaction is final");
+        return Ok(());
+    }
+
+    let l2 = l2_state_of(&store, &chain)?;
+    let state = l2.state();
+    println!("height        {}", l2.height());
+    println!("accounts      {}", state.total_accounts());
+    println!("locked        {}", state.total_locked());
+    println!("deposits      {}", state.deposited_total());
+    println!("exited        {}", state.exited_total());
+    println!("burned        {}", state.total_burned());
+    println!("pscb          {}", state.pscb);
+    println!("applied       {}", state.applied_count());
+    println!("conserved     {}", state.check_conservation());
+    Ok(())
+}
+
+/// Parse a 20-byte agent id from hex.
+///
+/// Accepts the `jt1` display form as well as raw hex, because that is how
+/// the id is printed everywhere else - a caller should be able to copy it
+/// straight out of `policy --list`.
+fn decode_agent_id(s: &str) -> Result<AgentId, String> {
+    let raw = s.trim().trim_start_matches("0x").trim_start_matches("jt1");
+    let bytes = hex::decode(raw).map_err(|e| format!("agent id hex: {e}"))?;
+    if bytes.len() != 20 {
+        return Err(format!("an agent id is 20 bytes, got {}", bytes.len()));
+    }
+    let mut id = [0u8; 20];
+    id.copy_from_slice(&bytes);
+    Ok(id)
 }
 
 fn cmd_status(args: &Args) -> Result<(), String> {
@@ -1987,4 +2440,41 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     node.stop();
     println!("shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A decimal amount is the documented way to say how much to send, so the
+    /// parser has to accept one. This pins the zero-padding: `1.5` is one
+    /// JNT and fifty million satoshis, and a space-padded "5" would not
+    /// parse at all.
+    #[test]
+    fn a_decimal_amount_parses_to_satoshis() {
+        assert_eq!(parse_jnt_sat("1").unwrap(), 100_000_000);
+        assert_eq!(parse_jnt_sat("1.5").unwrap(), 150_000_000);
+        assert_eq!(parse_jnt_sat("0.5").unwrap(), 50_000_000);
+        assert_eq!(parse_jnt_sat("10.25").unwrap(), 1_025_000_000);
+        assert_eq!(parse_jnt_sat("0.00000001").unwrap(), 1);
+        // The trailing zeros of a whole number are the same amount.
+        assert_eq!(parse_jnt_sat("1.00000000").unwrap(), 100_000_000);
+    }
+
+    #[test]
+    fn a_bad_amount_is_refused_by_name() {
+        assert!(parse_jnt_sat("abc").is_err());
+        assert!(parse_jnt_sat("1.123456789").is_err());
+        assert!(parse_jnt_sat("-1").is_err());
+    }
+
+    /// An agent id is twenty bytes; anything else is a caller error, not a
+    /// truncated id.
+    #[test]
+    fn an_agent_id_is_twenty_bytes() {
+        let id = decode_agent_id(&"11".repeat(20)).unwrap();
+        assert_eq!(id, [0x11u8; 20]);
+        assert!(decode_agent_id("1111").is_err());
+        assert!(decode_agent_id("zz").is_err());
+    }
 }

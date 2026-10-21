@@ -372,7 +372,12 @@ static CHAOS_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn chaos_store_dir() -> std::path::PathBuf {
     let id = CHAOS_STORE_COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("jnt-chaos-{}-{id}", std::process::id()))
+    let dir = std::env::temp_dir().join(format!("jnt-chaos-{}-{id}", std::process::id()));
+    // The name is process-scoped, and a process id is reused: a directory left
+    // behind by an earlier run would be opened as if it were this run's, and
+    // the store would refuse a chain that does not match it. Start clean.
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 #[test]
