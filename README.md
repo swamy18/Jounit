@@ -237,19 +237,20 @@ stamp alone no longer finalizes a bound escrow.
 **What it supports:** any task where one party can produce a result that another
 can check without re-running it.
 
-### Attenuated delegation chains — _in development_
+### Attenuated delegation chains — _on chain (SPEC.md §21, Decision 25)_
 
 Multi-agent systems need an owner to grant an agent a subset of their own
 spending authority, and that agent to do the same downward. Each level inherits a
 **strict subset** of its parent's spend policy — never a wider one — so authority
 narrows as it travels.
 
-A spend under a chain carries the chain, signed: a payment names its own
-agent id, which is derived from the ancestry it presents rather than from the
-payer's address. The node records the links (so it can prove the lineage later),
-verifies the owner's signature on every policy it grants under, and propagates a
-revocation down to every recorded descendant. Consent, key custody and the
-existence of a committee are organisational choices this document does not make.
+A delegated grant names the parent it comes from, and the chain refuses a grant
+that widens its parent's caps, allow-lists or lifetime. The parent's bytes are
+on chain, so the domination rule is checked against the real parent rather than
+against a claim. Revocation reaches every descendant: a spend walks the whole
+ancestry, so the owner's kill switch covers a delegated fleet without a
+revocation transaction per link. Consent, key custody and the existence of a
+committee are organisational choices this document does not make.
 
 **What it supports:** machine fleets and agent hierarchies where the operator
 must bound what any single agent can spend, without re-authorizing each
@@ -271,11 +272,21 @@ hold value forever.
 **What it supports:** pay-as-you-use and outcome-based pricing that settles
 itself, without a human in the loop to release funds.
 
-### Undercollateralized agent credit — _in development_
+### Undercollateralized agent credit — _on chain (SPEC.md §22, Decision 26)_
 
 **Built:** the collateral arithmetic, the position lifecycle with a repayment
 deadline, and a credit book that holds bonds, balances and locked collateral
-under a conservation invariant.
+under a conservation invariant — and, on top of that, **credit positions that
+are chain facts**.
+
+A loan is now four Layer-2 transaction types: `CreditOpen` (the **lender**
+signs the terms), `CreditCollateral`, `CreditRepay` and `CreditDefault`
+(permissionless). The principal moves to the borrower when the position
+opens, the borrower's own funds are locked as collateral, interest is charged
+once per period and paid before the principal, and a default pays the lender
+from the collateral, hands the surplus back to the borrower and reports the
+uncovered remainder as a shortfall the lender absorbs. The lender's signature
+is what makes it a loan rather than a claim somebody else made about them.
 
 **Issuance is attested, not open.** New credit for real backing enters only
 through `POST /v1/credit/mint`, which requires an attestation signed by a key
@@ -468,12 +479,24 @@ checked for wraparound. Settlement rides the ordinary payment path with the
 stream id as the reference, so there is no new transaction type.
 
 **MCP.** `jnt-mcp` is a keyless MCP surface over agent identity, payments,
-receipts and reputation.
+receipts and reputation, and over the agent authority and credit layer:
+`inspect.policy`, `inspect.agent_spend` and `inspect.credit` read the terms an
+agent is about to sign and the hash to sign.
 
-> **Scope limit worth stating.** This layer changes no consensus rule. It is a
-> library the node, wallet and worker SDK all call. Until a decision wires it into
-> `submit_at`, it cannot by itself move a coin — a policy constrains spending, it
-> does not create spending authority.
+> **What changed.** The spending-policy layer used to be node-local: a policy
+> constrained a payment *on the node that issued it*, and the chain never saw
+> it. It is now **consensus state** (SPEC.md §21, Decision 25). A grant is
+> published on chain, the owner's signature binds it to a named spender and a
+> named agent, the caps and allow-lists and the nonce are enforced against
+> state the chain keeps, and revoking a grant kills every descendant of it. The
+> same is true of credit (SPEC.md §22, Decision 26): a loan is a chain fact
+> with the lender's signature over its terms, the principal really moves, and
+> the collateral answers for the debt.
+>
+> What is still node-local is the *service layer* around them: the payment
+> book, the receipt book, the credit gate used for admission and the
+> authorisation helper the API issues offline. Those are operational
+> bookkeeping, not sources of spendable balance.
 
 ---
 
