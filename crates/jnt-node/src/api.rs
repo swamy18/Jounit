@@ -1405,6 +1405,113 @@ async fn vwc_by_task(State(state): State<ApiState>, Path(id): Path<String>) -> A
     })?
 }
 
+/// One published spending policy, in JSON.
+///
+/// The whole grant, plus the counters the chain keeps. A caller that wants to
+/// know what an agent may spend, and how much of it is left, reads it here
+/// rather than re-deriving the rules.
+fn policy_json(p: &jnt_core::agent::PolicyEntry) -> Value {
+    json!({
+        "policy_hash": hash_to_hex(&p.hash()),
+        "agent_id": address_to_hex(&p.agent_id),
+        "owner": address_to_hex(&p.policy.owner),
+        "spender": address_to_hex(&p.spender),
+        "role": format!("{:?}", p.policy.role),
+        "revoked": p.revoked,
+        "network_id": p.policy.network_id,
+        "per_tx_max_sat": p.policy.per_tx_max_sat,
+        "window_blocks": p.policy.window_blocks,
+        "cumulative_max_sat": p.policy.cumulative_max_sat,
+        "allowed_recipients": p.policy.allowed_recipients.iter().map(address_to_hex).collect::<Vec<_>>(),
+        "allowed_services": p.policy.allowed_services.iter().map(hex::encode).collect::<Vec<_>>(),
+        "not_before_height": p.policy.not_before_height,
+        "expires_at_height": p.policy.expires_at_height,
+        "parent_agent_id": p.policy.parent_agent_id.map(|a| address_to_hex(&a)),
+        "window_start_height": p.window_start_height,
+        "spent_in_window_sat": p.spent_in_window_sat,
+        "total_spent_sat": p.total_spent_sat,
+        "last_nonce": p.last_nonce,
+        "spends": p.spends,
+    })
+}
+
+/// One credit position, in JSON.
+fn credit_position_json(p: &jnt_l2::CreditPosition) -> Value {
+    json!({
+        "position_id": hash_to_hex(&p.id),
+        "lender": address_to_hex(&p.lender),
+        "borrower": address_to_hex(&p.borrower),
+        "principal_sat": p.principal_sat,
+        "outstanding_sat": p.outstanding_sat,
+        "interest_paid_sat": p.interest_paid_sat,
+        "collateral_sat": p.collateral_sat,
+        "rate_bps_per_window": p.rate_bps_per_window,
+        "window_blocks": p.window_blocks,
+        "opened_height": p.opened_height,
+        "deadline_height": p.deadline_height,
+        "state": format!("{:?}", p.state),
+    })
+}
+
+/// Every published spending policy, paginated.
+async fn policies(State(state): State<ApiState>, Query(page): Query<PageParams>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let all: Vec<Value> = sh
+            .l2
+            .state()
+            .policies()
+            .into_iter()
+            .map(policy_json)
+            .collect();
+        let (items, total, next) = take_page(all, &page);
+        Json(json!({ "count": total, "policies": items, "next_cursor": next }))
+    })
+}
+
+/// The live grant for one agent.
+async fn policy_by_agent(State(state): State<ApiState>, Path(agent_id): Path<String>) -> ApiResult {
+    let agent_id = decode_address(&agent_id)?;
+    with_shared(&state, |sh| {
+        let policy = sh
+            .l2
+            .state()
+            .policy_for_agent(&agent_id)
+            .ok_or_else(|| not_found("no published policy for this agent"))?;
+        Ok(Json(policy_json(policy)))
+    })?
+}
+
+/// Every credit position, paginated.
+async fn credit_positions(
+    State(state): State<ApiState>,
+    Query(page): Query<PageParams>,
+) -> ApiResult {
+    with_shared(&state, |sh| {
+        let all: Vec<Value> = sh
+            .l2
+            .state()
+            .credit_positions()
+            .into_iter()
+            .map(credit_position_json)
+            .collect();
+        let (items, total, next) = take_page(all, &page);
+        Json(json!({ "count": total, "positions": items, "next_cursor": next }))
+    })
+}
+
+/// One credit position, by id.
+async fn credit_position_by_id(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    let id = decode_hash(&id)?;
+    with_shared(&state, |sh| {
+        let position = sh
+            .l2
+            .state()
+            .credit_position(&id)
+            .ok_or_else(|| not_found("no such credit position"))?;
+        Ok(Json(credit_position_json(position)))
+    })?
+}
+
 /// The canonical L2 state, in the §19.2 wire encoding.
 ///
 /// This is the one endpoint a worker SDK needs that a task-shaped summary
@@ -3492,6 +3599,10 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/task/{task_id}", get(task_by_id))
         .route("/v1/l2/state", get(l2_state))
         .route("/v1/vwc/{task_id}", get(vwc_by_task))
+        .route("/v1/policies", get(policies))
+        .route("/v1/policies/{agent_id}", get(policy_by_agent))
+        .route("/v1/credit/positions", get(credit_positions))
+        .route("/v1/credit/positions/{id}", get(credit_position_by_id))
         .route("/v1/reputation/{id}", get(reputation_get))
         .route("/v1/authorize", post(authorize))
         .route("/v1/delegation/link", post(delegation_link))

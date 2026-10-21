@@ -862,6 +862,27 @@ impl L2State {
         self.pscb = self.pscb.saturating_add(split.pscb);
     }
 
+    // --- policy view ----------------------------------------------------
+
+    /// One published policy, by its grant hash.
+    pub fn policy(&self, policy_hash: &Hash) -> Option<&PolicyEntry> {
+        self.policies.get(policy_hash)
+    }
+
+    /// The live grant for an agent, by agent identity.
+    pub fn policy_for_agent(&self, agent_id: &AgentId) -> Option<&PolicyEntry> {
+        let hash = self.policy_by_agent.get(agent_id)?;
+        self.policies.get(hash)
+    }
+
+    /// Every published policy, sorted by grant hash. Deterministic
+    /// enumeration, like [`L2State::tasks`].
+    pub fn policies(&self) -> Vec<&PolicyEntry> {
+        let mut ids: Vec<Hash> = self.policies.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|id| &self.policies[&id]).collect()
+    }
+
     // --- credit view ----------------------------------------------------
 
     /// One credit position, by id.

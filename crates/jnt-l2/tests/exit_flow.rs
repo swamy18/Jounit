@@ -61,7 +61,11 @@ fn thirteen_l2_transaction_types_exist_with_the_credit_types_last() {
             }
         }
     }
-    assert_eq!(accepted.len(), 13, "exactly thirteen L2 transaction types exist");
+    assert_eq!(
+        accepted.len(),
+        13,
+        "exactly thirteen L2 transaction types exist"
+    );
     assert_eq!(
         accepted,
         vec![
