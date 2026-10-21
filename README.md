@@ -775,10 +775,50 @@ jnt-node <COMMAND> [OPTIONS]
   show-block  Print one block
   balance     List the unspent outputs of an address
   wallet      Create or list wallets
+  policy      Publish, revoke or list spending grants (agent authority)
+  agent-spend Spend under a published grant
+  credit      Open, repay, default or list credit positions
+  l2          Layer-2 summary, and the deposit address
   validator   Add or list checkpoint-signing keys
   export      Write the canonical chain to JSON
   serve       Run a P2P node: relay, sync, opt-in REST API, exit crank, signing
 ```
+
+### Agent authority and credit, from the terminal
+
+A grant is the owner's signed authority for a named spender. It is published
+on chain, so every node enforces it:
+
+```sh
+# The deposit address: an ordinary L1 payment to it credits your L2 balance.
+jnt-node l2 --deposit-address
+jnt-node send --to <deposit-address> --amount 5
+
+# Publish a grant: this key may spend up to 0.01 JNT per payment and
+# 0.05 JNT per window, to this recipient only.
+jnt-node policy --spender <spender> --per-tx 1000000 --cumulative 5000000 \
+                --recipients <recipient>
+
+# The agent spends under it.
+jnt-node agent-spend --policy <policy-hash> --to <recipient> --amount 0.002 --nonce 1
+
+# The owner kills it; every descendant of the grant dies with it.
+jnt-node policy --revoke --agent-id <agent-id>
+jnt-node policy --list
+```
+
+Credit works the same way — the **lender** signs, the principal really moves,
+and the collateral answers for the debt:
+
+```sh
+jnt-node credit --to <borrower> --amount 1 --collateral 100000000
+jnt-node credit --repay --position <position-hash> --amount 1
+jnt-node credit --list
+```
+
+Every one of these commands checks the transaction against the state the chain
+will replay and refuses with the chain's own reason, rather than mining a
+block the replay would skip.
 
 Common options: `--network <mainnet|testnet|mini>` (default `mini`) and
 `--data-dir <path>` (default `./chain`).
