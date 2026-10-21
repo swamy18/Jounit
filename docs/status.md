@@ -457,6 +457,10 @@ socket found all of the following.
 - `--amount` on `send` is denominated in satoshis while every other printed
   figure is in JNT. This bit me during verification and is documented in the
   command's error message, but it should probably gain a unit suffix.
+  (**Fixed in Phase 7:** a fractional `--amount` - the form the README
+  documents - was refused outright, because the fraction was padded with
+  spaces instead of zeros. `parse_jnt_sat` now zero-pads, and
+  `cargo test -p jnt-node --bin jnt-node` pins it.)
 
 ## Reproducing the difficulty work
 
@@ -1555,3 +1559,117 @@ exist, and a later one still listed it as pending. (was: The exit design is
 **blocked on a decision not yet recorded** — the exit deferral
 in Decision 10 (`docs/decisions.md` *Pending* P1); an earlier revision of this
 line cited a "Decision 21" that does not exist in the repository.
+
+---
+
+## Phase 7 - On-chain agent authority and credit: SHIPPED (2026-10-21)
+
+The last phase changed what the *chain* knows, not just what a node remembers.
+Two capabilities that used to be node-local are now consensus state, replayed by
+every node and committed by the block's `l2_state_root`.
+
+### What moved on chain
+
+**Agent authority** (SPEC.md §21, Decision 25). The spending-policy layer was a
+policy on the node that issued it: `chain.rs`, `ledger.rs`, `mempool.rs` and
+`tx.rs` contained no reference to a policy, an agent, a delegation or a credit,
+so a machine fleet was bound by the goodwill of whichever node had issued the
+policy. Three Layer-2 transaction types now carry it:
+
+| Code | Type | Actor | What it does |
+|---|---|---|---|
+| `0x16` | `Policy` | owner | publish a grant |
+| `0x17` | `PolicyRevoke` | owner | kill a grant |
+| `0x18` | `AgentSpend` | spender | spend under a grant |
+
+The owner's signature binds three things at once - the grant bytes, the
+**spender** and the **agent identity** - because a policy hash on its own is a
+capability, and a capability anybody can exercise is worthless. The chain
+enforces the per-transaction cap, the tumbling per-window cap, the recipient
+and service allow-lists, the validity window and the strictly increasing nonce
+against state it keeps, refuses a delegated grant that widens its parent, and
+kills every descendant when the owner revokes the grant.
+
+**Credit** (SPEC.md §22, Decision 26). The credit book was a ledger of IOUs:
+`POST /v1/credit/deposit` credited a local balance *without moving a coin*
+(the code said so), `POST /v1/credit/open` accepted a `spec_hex` whose `lender`
+field was just a field anybody could write, and no other node could see the
+debt. Four transaction types now carry it:
+
+| Code | Type | Actor | What it does |
+|---|---|---|---|
+| `0x19` | `CreditOpen` | **lender** | open a position; the principal moves to the borrower |
+| `0x1A` | `CreditCollateral` | borrower | add collateral |
+| `0x1B` | `CreditRepay` | borrower | repay (interest first, then principal) |
+| `0x1C` | `CreditDefault` | anyone | settle a position that was not repaid by its deadline |
+
+The lender signs the terms, the principal really moves, the collateral is the
+borrower's own money (checked before the principal arrives, so the borrowed
+funds cannot secure themselves), and a default is permissionless: the
+collateral answers for the debt, the surplus returns to the borrower, and what
+is left uncovered is a shortfall the lender absorbs rather than money the
+protocol invents.
+
+Both live in the Layer-2 state (`policies`, `positions`, `credit_locked`) and
+are committed under the state root with their own leaf tags (`0x05`, `0x06`).
+The state wire version moved 3 → 5.
+
+### The bugs this found
+
+- **A repayment larger than the debt was silently overpaying the lender.** The
+  borrower paid the whole amount, the debt dropped by less, and the reported
+  interest and principal did not add up to what moved. The node-local credit
+  book refused that shape, so the chain now refuses it too
+  (`CreditRepaymentExceedsDebt`).
+- **The CLI's `--amount 10.5` - the form the README documents - had never
+  worked.** The fraction was padded with spaces instead of zeros, so every
+  fractional amount was refused with "must be a number". Found by running the
+  documented command.
+- **Six specification/code drifts** (the `DOM_ADDR` version, the header
+  length, the mainnet finality and exit activation heights, the settle fee,
+  the committee selection rule) and a `chaos` test that was flaky because a
+  reused process id could inherit a store directory from an earlier run.
+- **Mojibake in five files**, from an earlier editing round-trip.
+
+### How it is verified
+
+- **An independent implementation.** `sim/l2_authority_reference.py` is a second
+  implementation of the same rules, written from SPEC.md §21-§22 in Python: it
+  derives secp256k1 addresses, the agent identities, the grant hashes and the
+  position ids itself. It emits `tests/vectors/l2_authority_vectors.json`, and
+  `crates/jnt-l2/tests/l2_authority_vectors.rs` replays those scenarios and
+  asserts the same verdict, the same reason and the same final state. Building
+  it found two divergences in the *reference* (the replay guard has to come
+  before the state checks; the height an advance step leaves behind is the
+  height the next step is judged at) and confirmed the chain's behaviour in
+  both.
+- **Two fuzz targets.** `l2_policy_apply` asserts value conservation, that a
+  spend never exceeds its grant, that revocation is absolute, that authority
+  narrows and that a replay is refused. `l2_credit_apply` asserts conservation,
+  that collateral is locked rather than spent, that debt only goes one way,
+  that a default is not early, and that interest is charged once per period.
+  Every registered target is now in the CI smoke loop - `deliverable_codec`
+  had been registered but never run.
+- **A hardening suite** (`crates/jnt-l2/tests/authority_hardening.rs`): replay,
+  forged and tampered signatures, duplicate publication, duplicate opening,
+  double revocation, malformed grants, overflowing amounts, the validity
+  window, a height running backwards, overpayment, and the two restart cases.
+- **A terminal suite** (`crates/jnt-node/tests/cli_authority.rs`): the whole
+  flow against a real chain - deposit, publish, spend, revoke, the refusal of a
+  spend under a revoked grant, and the credit flow - plus the property that a
+  command the chain would skip mines nothing.
+
+### What is still not done
+
+- **No validator yield.** The decision is recorded (Option B: the reward comes
+  from the Layer-2 fee pool, the Layer-1 coinbase is untouched) but it is not
+  implemented: paying it means the committee has to be reachable from the
+  Layer-2 state, and the checkpoint a committee signs is not part of a block, so
+  the reward cannot be a function of chain state alone without a rule that says
+  which checkpoint counts.
+- **No exchange.** No second asset, no order book, no price oracle. JNT's
+  economic usage is meant to come from JNT network usage.
+- **The service-layer books** (the payment book, the receipt book, the credit
+  admission gate) are still node-local. They are gates, not sources of
+  spendable balance - a settlement still needs a real transaction - but they
+  are a second kind of state, and the honest thing is to say so.

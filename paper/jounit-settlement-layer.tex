@@ -65,11 +65,18 @@ it sits a Layer-2 task economy in which submitters escrow payment, workers claim
 and execute, anyone may challenge a result, and a stake-weighted committee of
 BLS-signing validators adjudicates disputes; a second Layer-2 mechanism moves
 value back to Layer 1 through an inclusion-proof-authorised, permissionlessly
-crankable exit. The paper documents the trust boundaries explicitly (what is
-trusted, what is not, and why reputation is deliberately excluded from consensus),
+crankable exit. Above both sits the layer this paper's later sections are
+about: agent authority and credit as \emph{consensus} state rather than as
+node-local bookkeeping --- a grant published on chain that binds its owner to a
+named spender and a named agent, whose caps, allow-lists, window and nonce the
+chain enforces, and a loan whose lender signs the terms, whose principal
+really moves, and whose collateral answers for the debt. The paper documents the
+trust boundaries explicitly (what is trusted, what is not, and why reputation is
+deliberately excluded from consensus),
 the concrete security mechanisms that were built and the audit-driven improvements
 that followed them, the wallet and key-management design, the operational tooling
-(HTTP API, keyless MCP surface, worker SDK), the open-source and governance
+(HTTP API, keyless MCP surface, worker SDK, command line), the open-source and
+governance
 posture, and the limitations that remain before mainnet deployment.
 \end{abstract}
 
@@ -146,10 +153,18 @@ trivedi2017sok}.
 \item \textbf{A trust-minimal bridge.} Layer-2 deposits and exits are authorised
 by on-chain inclusion proofs rather than by a privileged operator, and the exit
 crank is permissionless \cite{wood2014decentralized}.
-\item \textbf{An agent-first authorisation layer.} Deterministic spending
-policies, attenuated delegation chains, replay-guarded machine payments and
-streaming micro-payments, all expressed over the same UTXO set as human
-balances --- there is no second currency \cite{yao2023survey}.
+\item \textbf{An agent-first authorisation layer, enforced by the chain.} A grant
+published on chain binds its owner to a named spender and a named agent, and
+the chain enforces the per-transaction cap, the tumbling per-window cap, the
+allow-lists, the validity window and the nonce; a delegated grant that widens
+its parent is refused, and revocation reaches every descendant. The same
+applies to credit: the lender signs, the principal moves, the collateral
+answers for the debt \cite{yao2023survey}.
+\item \textbf{A second implementation of those rules.} The authority and credit
+rules are written twice --- once in the protocol, once in an independent
+reference derived from the specification --- and the two are compared scenario
+by scenario, so a rule that refuses for a different reason is a defect rather
+than a matter of taste.
 \item \textbf{A documented security programme.} An explicit threat model, a
 concrete list of implemented mechanisms, an audit-driven remediation history, a
 fuzzing campaign, and an honest statement of the gaps that remain.
@@ -191,10 +206,24 @@ task economy. A \emph{submitter} posts an escrow for a described computation; a
 \emph{challenge} that result; a committee then decides whether the work was
 correct, and settlement moves the money accordingly.
 
+\paragraph{Layer 2 also carries the authority and the credit.} A \emph{grant}
+is the owner's signed permission for a named agent to spend the owner's money
+within stated limits; a \emph{position} is a loan one agent made to another.
+Both are consensus state, committed by the block's Layer-2 state root, so every
+node enforces the same limits rather than each node deciding for itself. This
+is the part of the design that makes the paper's central claim usable rather
+than merely stated: a fleet of agents can be given bounded spending authority
+that the network itself checks, and one agent can lend to another with a
+signature, a collateral and a deadline that every node can see.
+
 \begin{figure}[t]
 \centering
 \fbox{\parbox{0.93\textwidth}{
 \centering
+\textbf{Layer 2 --- authority and credit}\\[2pt]
+\textit{grant $\rightarrow$ spend $\rightarrow$ revoke; loan $\rightarrow$
+collateral $\rightarrow$ repay $\rightarrow$ default}\\[6pt]
+\rule{0.9\textwidth}{0.4pt}\\[6pt]
 \textbf{Layer 2 --- task economy}\\[2pt]
 \textit{post $\rightarrow$ claim $\rightarrow$ submit $\rightarrow$
 (dispute?) $\rightarrow$ settle $\rightarrow$ exit}\\[6pt]
@@ -206,7 +235,7 @@ hybrid proof of work $\rightarrow$ fees, burn, issuance}\\[6pt]
 \textbf{Peer-to-peer layer}\\[2pt]
 \textit{framing, handshake, relay, synchronisation, bans}
 }}
-\caption{The two-layer structure of Jounit. Layer-2 transactions are carried
+\caption{The three-layer structure of Jounit. Layer-2 transactions are carried
 inside Layer-1 blocks and committed by the block's Merkle root; Layer-2 state is
 rebuilt by deterministic replay, so no second consensus protocol exists.}
 \label{fig:layers}
@@ -852,6 +881,128 @@ accepts a score at all: the guarantee is the type system refusing the call,
 not the code declining it.
 
 
+\section{Agent authority and credit on chain}
+\label{sec:authority}
+
+\subsection{Why it had to move}
+
+The spending-policy layer of an earlier revision of this protocol was
+\emph{node-local}. A policy constrained a payment on the node that issued it,
+and the chain never saw it: the consensus core contained no reference to a
+policy, an agent, a delegation or a credit at all. A machine fleet bound by
+policies was therefore bound by the goodwill of whichever node had issued them,
+and two nodes holding the same chain could disagree about whether a spend was
+permitted.
+
+The credit facility had the same shape and two further problems. Depositing
+credited a local balance without moving a coin, and opening a position accepted
+a \emph{lender} field that anybody could write: a loan the lender had never
+agreed to, on money that did not exist, visible only to the node that recorded
+it.
+
+Both are now Layer-2 consensus state. The distinction that matters is not
+where the code lives but what a node is \emph{required} to do with it: a rule
+that every node replays is a rule, and a rule one node checks is advice.
+
+\subsection{The grant}
+
+A grant is the owner's signed permission. It is published with a Layer-2
+transaction, and the owner's signature covers three things at once --- the grant
+bytes, the \emph{spender} (the key that may exercise the grant) and the
+\emph{agent identity} the grant names. That binding is the whole point: a grant
+hash on its own is a capability, and a capability anybody can exercise is
+worthless. Here the owner says \emph{this key may spend under these limits},
+and the chain remembers it.
+
+The grant carries the limits the owner stated: a per-transaction cap, a
+tumbling per-window cap, an exhaustive recipient allow-list, an exhaustive
+service allow-list, a validity window, and a parent link for a delegated grant.
+The chain enforces all of them against state it keeps:
+
+\begin{enumerate}
+\item the per-transaction cap: $a \leq C_{\mathrm{tx}}$;
+\item the per-window cap, over a tumbling window that starts at the first spend
+  and rolls over after $W$ blocks:
+  \begin{equation}
+  \sum_{\text{spends in the window}} a \;\leq\; C_{\mathrm{window}} ;
+  \end{equation}
+\item the recipient allow-list, where an \emph{empty} list allows nothing;
+\item the service allow-list, where a grant that names services authorises no
+  untagged spending;
+\item the validity window, which is inclusive at its start and exclusive at its
+  end;
+\item a strictly increasing nonce, which is what makes an authorisation
+  unreplayable;
+\item and the rule that a height inside a grant never runs backwards.
+\end{enumerate}
+
+One grant is live per agent. A second publication for the same agent is
+refused, so a second grant cannot be used to double the caps the first one
+grants. A delegated grant must \emph{narrow} its parent --- the child's caps are
+not wider, its allow-lists are not wider, and it does not outlive it --- and the
+narrowing is checked against the parent's bytes as they are held on chain, not
+against a claim about them.
+
+\subsection{Revocation, and what it reaches}
+
+The owner can kill a grant, and the kill switch reaches every descendant: a
+spend checks the whole ancestry, so a delegated fleet dies with the grant it
+descends from, without a revocation transaction per link. The walk is bounded
+by the delegation depth cap and fails closed --- a missing ancestor, a revoked
+one, or a chain deeper than the cap all mean \emph{not live}.
+
+\subsection{Spending}
+
+A spend is signed by the spender, not by the owner. The owner signed once, at
+publication; the grant itself authorises every later spend. The money comes
+out of the grant owner's balance --- a grant is an allowance over the owner's
+own funds --- and the fee comes out of the same balance on top.
+
+\subsection{Credit}
+
+A loan is four transaction types. The \emph{lender} signs the terms; the
+principal moves to the borrower's balance when the position opens; the
+borrower's own funds are locked as collateral, and they are checked
+\emph{before} the principal arrives, so the borrowed money cannot secure
+itself. Interest is simple interest per whole window on the outstanding
+principal,
+\begin{equation}
+\text{interest} \;=\; \frac{\text{principal} \times r_{\mathrm{bps}} \times
+\text{windows}}{10\,000} ,
+\end{equation}
+charged once per period rather than once per repayment, and a repayment pays the
+interest before the principal. A repayment larger than the debt is refused: the
+lender is paid the debt and not a satoshi more.
+
+A default is permissionless --- anyone may trigger the settlement of an overdue
+position, because a default only the lender could trigger is a default that
+could be delayed. The collateral answers for the debt, the surplus returns to
+the borrower, and what the collateral does not cover is a shortfall the lender
+absorbs rather than money the protocol invents.
+
+\subsection{The state commitment, and the invariant}
+
+Both families live in the Layer-2 state, under their own leaf tags, and are
+committed by the block's Layer-2 state root. The conservation invariant that
+already covered the task economy now covers them too:
+\begin{equation}
+\sum \text{accounts} + \sum \text{locked} + \sum \text{exits locked}
++ \sum \text{collateral locked} + \text{burned} + \text{reserve}
++ \text{vault remaining} \;=\; \sum \text{credited} ,
+\end{equation}
+asserted after every single transition, including every refusal.
+
+\subsection{How this is checked}
+
+The rules of this section are implemented twice: once in the protocol, and once
+in an independent reference written from the specification in a different
+language. The reference derives the addresses, the agent identities, the grant
+hashes and the position identifiers itself, and emits a vector file of
+scenarios; the protocol's test suite replays those scenarios and asserts the
+same verdict, the same reason and the same final state. A rule that refuses for
+a different reason is a different rule, and the two implementations have to
+agree on which reason it was.
+
 \section{Value, wallets and market operations}
 \label{sec:wallets}
 
@@ -910,6 +1061,13 @@ check worth running after any change to the protocol.
 \subsection{Buying and selling: the payment path}
 \label{sec:payments}
 
+There are two payment paths, and it is worth being precise about which is which.
+The \emph{authority} path --- the one this paper's Section~\ref{sec:authority}
+is about --- moves real value under a limit the chain enforces. The
+\emph{service} path below is the operational bookkeeping around it: a request, an
+authorisation, a receipt and a settlement link. The service path never invents
+balance: a settlement still needs a transaction that actually pays.
+
 For a machine-to-machine transaction, Jounit separates \emph{authorisation}
 from \emph{payment}. The separation is what allows an agent to act without
 holding a spending key in the general case.
@@ -923,7 +1081,9 @@ empty service list authorises no service-tagged payment; a nonce must strictly
 increase, so an authorisation cannot be replayed; a height below the policy's
 own window start refuses, so time does not run backwards inside a policy; and
 cumulative spend is bounded per window, with the window rolling over rather
-than accumulating forever.
+than accumulating forever. The same rules are the ones the chain enforces for
+an on-chain grant, so an operator can reason about one set of limits rather
+than two.
 
 \paragraph{Attenuated delegation.} Delegation chains let an agent grant a
 subset of its own authority downward. Each level inherits a strict subset of
@@ -932,9 +1092,12 @@ travels. A payment under a chain names its own agent identifier, which is
 derived from the ancestry it presents rather than from the payer's address;
 the node records the links so that the lineage can be proved later, verifies
 the owner's signature on every policy it grants under, and propagates a
-revocation down to every recorded descendant. The practical result is a fleet
-of agents whose operator can bound what any single agent can spend without
-re-authorising each transaction by hand.
+revocation down to every recorded descendant. On chain, the same rule is
+checked against the parent's bytes as the chain holds them
+(Section~\ref{sec:authority}), so a delegated fleet's authority narrows for
+every node, not only for the one that issued the grants. The practical result
+is a fleet of agents whose operator can bound what any single agent can spend
+without re-authorising each transaction by hand.
 
 \paragraph{Payment.} A machine payment carries the authorisation, the
 recipient, the amount and the reference. A receipt book records deterministic
@@ -964,7 +1127,12 @@ no new transaction type is introduced.
 
 An agent with a demonstrated track record should not have to pre-fund every
 transaction. The credit facility allows an agent to borrow against future
-work, and it is built under two deliberate constraints.
+work. The loan itself is the on-chain facility of
+Section~\ref{sec:authority}: the lender signs, the principal moves, the
+collateral is the borrower's own money, and the interest and the default rules
+are the chain's. What remains here is the service layer around it, and it is
+worth being explicit that it is a \emph{gate}, not a source of spendable
+balance.
 
 \paragraph{Issuance is attested, not open.} New credit enters only through an
 attestation signed by a key the operator listed as trusted. With no key
@@ -977,7 +1145,8 @@ restarts, so one attestation mints exactly once, ever.
 
 \paragraph{Credit is always collateralised.} The required collateral is a
 function of the amount, discounted by a posted bond but never replaced by it,
-with a minimum collateral ratio enforced. Settlement takes the position's own
+with a minimum collateral ratio enforced. On chain, where no bond is posted,
+the requirement is full collateralisation. Settlement takes the position's own
 collateral first, then the bond, and \emph{never} reputation. Collateral in
 excess of the debt returns to the borrower: a default takes what it is owed
 and no more. Any residual debt is a reported shortfall that the lender absorbs,
@@ -985,6 +1154,11 @@ rather than the protocol inventing funds. A position runs to a deadline, and
 before that deadline a default is refused --- a lender cannot settle a merely
 late position on a whim --- and the bond must be posted before the position
 opens, so no discount is ever unbacked.
+
+\paragraph{One implementation of each rule.} The collateral arithmetic and the
+interest arithmetic live in one place, and the on-chain facility and the
+service-layer book both use them. Two implementations of the same rule would
+be two rules.
 
 \subsection{Conditional escrow}
 \label{sec:escrow}
@@ -1091,9 +1265,12 @@ Model Context Protocol surface & No & It verifies with the same public
 Worker SDK & No & Every privileged transition is a signed Layer-2 transaction
   the protocol verifies \\
 Reputation & No & Not a consensus input, by construction \\
-Delegation policy layer & No & Constrains spending; cannot by itself move a coin \\
+Delegation service layer & No & The lineage book is the node's own record; the
+  narrowing rule itself is a consensus rule (Section~\ref{sec:authority}) \\
 Credit issuer key & Yes, locally & An explicitly configured operator-level
-  trust anchor \\
+  trust anchor, and only for the service-layer book \\
+Grant owner & Yes, by construction & A grant is the owner's own signature, and
+  the chain enforces only what that signature says \\
 \bottomrule
 \end{tabular}
 \caption{Trust boundaries. Note that the two ``yes'' entries are narrow: one is
@@ -1264,16 +1441,35 @@ and ledger rules directly --- twenty-one tests exercising attempted
 misbehaviour against the chain, the credit path, the delegation path and a
 second round of edge cases.
 
-\paragraph{Fuzzing.} Fourteen cargo-fuzz targets cover the attacker-controlled
+\paragraph{Fuzzing.} Seventeen cargo-fuzz targets cover the attacker-controlled
 boundaries: transaction decoding, block decoding, wire-message decoding,
 mempool admission, storage recovery, checkpoint validation and codec, metadata
 parsing, Layer-2 payload decoding, Layer-2 state application, the dispute
 arbitration engine, verified work certificate decoding, the machine-readable
-task readers, and the worker decision flows. A reported campaign of 9\,352\,161
+task readers, the deliverable codec, the worker decision flows, and two
+harnesses written for the authority and credit layers: one that drives grants,
+delegations, revocations and spends, and one that drives loans, collateral,
+repayments and defaults. The last two assert the properties those layers
+depend on --- value conservation, that a spend never exceeds its grant, that
+revocation is absolute, that authority narrows, that debt only goes one way,
+that a default is not early, and that a replay is refused. A reported campaign
+of 9\,352\,161
 executions produced no crashes and no sanitizer findings
-\cite{jounit-fuzz}. Every fuzz target has a deterministic counterpart in the
-ordinary test suite, so the properties the fuzzer checks are also checked on
+\cite{jounit-fuzz}; every registered target is now run in the continuous
+integration smoke loop, and every fuzz target has a deterministic counterpart in
+the ordinary test suite, so the properties the fuzzer checks are also checked on
 every CI run.
+
+\paragraph{An independent implementation of the authority and credit rules.}
+The rules of Section~\ref{sec:authority} are implemented a second time, in a
+different language, written from the specification rather than from the
+protocol's source. It derives the addresses, the agent identities, the grant
+hashes and the position identifiers itself, and emits a vector file of
+scenarios; the protocol's test suite replays those scenarios and asserts the
+same verdict, the same reason and the same final state. This is the same
+discipline the proof-of-work reference uses, applied to the part of the
+protocol where a rule --- rather than a digest --- is the thing that has to
+agree.
 
 \paragraph{Attack simulation.} Independent Python simulations reproduce the
 difficulty-adjustment behaviour under adversarial timing, the tail-emission
@@ -1298,8 +1494,6 @@ readiness record says so, and the recommendation stands: a third-party review
 should precede any deployment carrying real value \cite{jounit-readiness}.
 \item The disclosure contact exists but its public key is unpublished, so the
 channel is not yet operational.
-\item One fuzz target present in the source tree is not registered in the fuzz
-manifest, and is therefore neither built nor run by the campaign or by CI.
 \item The specification and the code are not in perfect agreement everywhere;
 several drifted sections were corrected, but the specification remains a
 living document and the code is authoritative where they disagree in
@@ -1309,6 +1503,13 @@ authentication, and the Layer-2 dispute window admits a payment of an
 unchallenged result that happens to be incorrect.
 \item The network has not been subjected to load, eclipse or economic testing
 at mainnet scale.
+\item There is no validator yield yet. The decision is recorded --- the reward
+comes from the Layer-2 fee pool, so the Layer-1 coinbase is untouched --- but
+it is not implemented, because paying it means deciding which checkpoint a
+committee's work counts for, and the checkpoint a committee signs is not part
+of a block.
+\item There is no exchange: no second asset, no order book, no price oracle.
+The intent is that JNT's economic usage comes from JNT network usage.
 \end{itemize}
 
 
@@ -1327,11 +1528,13 @@ accumulated against on one chain and redeemed on another.
 
 \subsection{What an agent may do}
 
-An agent can hold value, receive value, spend value under a written policy,
+An agent can hold value, receive value, spend value under a written grant,
+publish and revoke grants of its own, lend to another agent and be lent to,
 post and claim tasks, execute work, submit attested results, challenge
-results, and settle or be settled. What an agent cannot do is exceed the
-policy it was given, replay an authorisation, act without an owner signature
-somewhere in its ancestry, or cause the protocol to create value. There is no
+results, and settle or be settled. What an agent cannot do is exceed the grant
+it was given, replay an authorisation, act without an owner signature
+somewhere in its ancestry, borrow without a lender's signature, or cause the
+protocol to create value. There is no
 second currency: the owner field is an ordinary address, so machine and human
 balances live in the same output set under the same issuance schedule.
 
@@ -1343,10 +1546,15 @@ results, raises disputes and requests exits, and its decision functions are
 deterministic --- no clock, no randomness --- so the same inputs always produce
 the same plan. A dedicated security suite asserts that an actor starting with
 zero privilege cannot, through any path in the SDK, become an authorised
-worker, claimant, verifier, settler or payment recipient.
+worker, claimant, verifier, settler or payment recipient. A second module covers
+the authority and credit flows: publish a grant, spend under it, revoke it,
+open a loan, add collateral, repay, and settle a default --- each one planned
+locally and then broadcast, like every other path in the SDK.
 
 \paragraph{Model Context Protocol surface.} The MCP crate is a keyless
-dispatcher over agent identity, payments, receipts and reputation. It is
+dispatcher over agent identity, payments, receipts and reputation, and over the
+authority and credit layer: an operation reads a published grant, a spend under
+a grant, or a loan, and returns the terms and the hash to sign. It is
 explicitly \emph{not} a trust authority: it verifies using the same public
 functions every other verifier uses, and it cannot mint an authorisation, a
 payment or a receipt. It is explicitly \emph{not} a key holder: no operation
@@ -1355,6 +1563,13 @@ returns the bytes and the signing hash, and the client signs. It holds an
 authorisation book so that anti-replay counters survive across calls, because
 a fresh book per call would silently reset every counter. Its transport is a
 small dependency-free HTTP client.
+
+\paragraph{The command line.} The node's own command line carries the same
+flows, because an operator should not have to write a program to grant an
+agent a budget: a deposit address and a Layer-2 summary, a grant publication,
+a spend, a revocation, and the credit operations --- each of which checks the
+transaction against the state the chain will replay and refuses with the
+chain's own reason, rather than mining a block the replay would skip.
 
 \subsection{Concrete scenarios}
 
@@ -1365,11 +1580,11 @@ result within the dispute window, the task settles correct and the worker is
 paid from the escrow; a verified work certificate is issued, and a relying
 party may insist on the quorum-backed kind if it needs independent proof.
 
-\paragraph{A robot fleet operates under a budget.} An operator grants an agent
-a policy bounded per transaction, bounded per window, restricted to named
+\paragraph{A robot fleet operates under a budget.} An operator publishes a grant
+bounding an agent per transaction, bounded per window, restricted to named
 recipients and named services, with an increasing nonce. The fleet spends
-within that envelope. The operator revokes the policy and every descendant
-policy is disabled at payment time.
+within that envelope, and every node enforces it, not only the one that issued
+it. The operator revokes the grant, and every descendant grant dies with it.
 
 \paragraph{A machine buys a service from another machine.} A service identity
 publishes a receipt; the payer records the payment; the payment is settled
@@ -1442,14 +1657,18 @@ Ledger, transactions, task
 Task results and attestations & On chain & Nobody individually \\
 Exit records & Layer-2 state, committed by
   Layer-1 root & Nobody individually \\
+Published grants, their counters & Layer-2 state, committed by
+  the Layer-1 root & The owner, within the limits the grant states \\
+Credit positions and their collateral & Layer-2 state, committed by
+  the Layer-1 root & The lender and the borrower, by agreement \\
 Wallet private keys & The holder's file, encrypted & The holder alone \\
 Validator signing keys & The validator's encrypted file & The validator
   alone \\
 Credit issuer key & The operator's configuration & The operator \\
-Receipts, payment links, credit,
-  escrow books & Node-local state file & The node operator, per node \\
+Receipts, payment links, service-layer
+  credit and escrow books & Node-local state file & The node operator, per node \\
 Reputation & Derived view of chain events & Nobody; derived, not owned \\
-Policy and delegation records & Node-local, signed by the owner & The owner,
+Delegation lineage records & Node-local, signed by the owner & The owner,
   subject to revocation \\
 \bottomrule
 \end{tabular}
@@ -1471,11 +1690,13 @@ none. This is the same asymmetry that makes an open ledger useful for audit
 and a private wallet file useful for safety.
 
 The node-local boundary is enforced by construction rather than by policy: the
-credit, escrow, delegation, receipt and policy modules are not reachable from
+receipt, payment, service-layer credit and escrow books are not reachable from
 the consensus path, and the documented rule is that these books must never be
 treated as an alternative source of truth for global ownership or for a
 spendable balance. Coin movement happens only through Layer-1 outputs and
-Layer-2 account balances.
+Layer-2 account balances. The spending grants and the credit positions are on
+the other side of that line: they are consensus state, every node holds them,
+and they are covered by the state root.
 
 
 \section{Using Jounit}
@@ -1532,6 +1753,10 @@ jnt-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080
 \texttt{show-block} & Print one block \\
 \texttt{balance} & List unspent outputs of an address \\
 \texttt{wallet} & Create or list wallets \\
+\texttt{policy} & Publish, revoke or list spending grants \\
+\texttt{agent-spend} & Spend under a published grant \\
+\texttt{credit} & Open, repay, default or list credit positions \\
+\texttt{l2} & Layer-2 summary, and the deposit address \\
 \texttt{validator} & Add or list checkpoint-signing keys \\
 \texttt{export} & Write the canonical chain to JSON \\
 \texttt{serve} & Run the node: relay, sync, API, exit crank, signing \\
@@ -1541,6 +1766,43 @@ jnt-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080
 every command accepts a network profile and a data directory.}
 \label{tab:cli}
 \end{table}
+
+\subsection{Authority and credit, from the terminal}
+
+A grant is the owner's signed authority for a named spender; it is published on
+chain, so every node enforces it. A loan is the same idea for value.
+
+\begin{verbatim}
+# The deposit address: an ordinary Layer-1 payment to it credits a
+# Layer-2 balance, which is what the grants and the loans spend from.
+jnt-node l2 --deposit-address
+jnt-node send --to <deposit-address> --amount 5
+
+# Publish a grant: this key may spend up to 0.01 JNT per payment and
+# 0.05 JNT per window, to this recipient only.
+jnt-node policy --spender <spender> --per-tx 1000000 \
+                --cumulative 5000000 --recipients <recipient>
+
+# The agent spends under it.
+jnt-node agent-spend --policy <policy-hash> --to <recipient> \
+             --amount 0.002 --nonce 1
+
+# The owner kills it; every descendant of the grant dies with it.
+jnt-node policy --revoke --agent-id <agent-id>
+jnt-node policy --list
+\end{verbatim}
+
+\begin{verbatim}
+# A loan: the lender signs, the principal moves, the collateral answers
+# for the debt.
+jnt-node credit --to <borrower> --amount 1 --collateral 100000000
+jnt-node credit --repay --position <position-hash> --amount 1
+jnt-node credit --list
+\end{verbatim}
+
+Every one of these commands checks the transaction against the state the chain
+will replay and refuses with the chain's own reason, rather than mining a block
+the replay would skip.
 
 \subsection{Profiles}
 
@@ -1646,6 +1908,16 @@ presence-only rule for Layer-2 roots that converts a dishonest producer's
 power to steal into a power to stall, and a wallet file that is encrypted,
 atomically written and zeroised.
 
+The newest part of the design is the least exotic and, we would argue, the most
+consequential: a machine's authority to spend, and a machine's ability to
+borrow, are stated as \emph{rules the chain checks} rather than as records one
+node keeps. The grant binds an owner to a named spender and a named agent; the
+loan binds a lender to a borrower, a principal, a collateral, a rate and a
+deadline. Neither is novel as an idea. What is new is that they were
+node-local, and that closing that gap was mostly a matter of writing the rules
+down twice --- once in a specification, once in a second implementation --- and
+letting the two disagree until they did not.
+
 The honest summary of the security posture is that the engineering is
 disciplined and the evidence is unusually well documented for a pre-launch
 project --- a measured fuzzing campaign, red-team suites, independent
@@ -1690,6 +1962,8 @@ jounit-fuzz}.
 Block header size & block & 177 bytes \\
 Transaction output size & block & 28 bytes \\
 Address size & hash & 20 bytes \\
+Agent identity size & agent & 20 bytes \\
+Grant hash size & agent & 32 bytes \\
 Gas per transaction & transaction & 16\,000 \\
 Gas per input & transaction & 1\,000 \\
 Gas per output & transaction & 250 \\
@@ -1709,6 +1983,15 @@ Layer-2 deposit minimum & parameters & 1\,000\,000 subunits \\
 Layer-2 flat fee minimum & parameters & 1\,000 subunits \\
 Exit fee minimum & exit & 1\,000 subunits \\
 Whistleblower bounty & task contract & 25\,\% \\
+Layer-2 transaction codes & layer 2 & \texttt{0x10}--\texttt{0x1C} \\
+Grant / credit leaf tags & state root & \texttt{0x05} / \texttt{0x06} \\
+Delegation depth cap & delegation & 8 \\
+Grant publication fee & parameters & 2\,000 \\
+Grant revocation fee & parameters & 2\,000 \\
+Agent spend fee & parameters & 2\,000 \\
+Credit open / collateral / repay / default fee & parameters & 2\,000 each \\
+Maximum credit rate per window & parameters & 1\,000 bps \\
+Maximum frame payload & network & 4\,100\,000 bytes \\
 Maximum frame payload & network & 4\,100\,000 bytes \\
 Maximum peers (total / inbound) & network & 125 / 32 \\
 Maximum API connections / concurrency & API & 128 / 64 \\
