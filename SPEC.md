@@ -1668,7 +1668,7 @@ refuses every settlement by name.
 
 ---
 
-## 15. Layer 2: task contracts and the six L2 transaction types
+## 15. Layer 2: task contracts and the L2 transaction types
 
 Layer 2 is the verified-work marketplace: a submitter posts a compute task with
 a locked payment, a worker claims and runs it, and settlement releases the
@@ -1690,7 +1690,7 @@ consensus:
 
 ### 15.1 Transaction types and wire codes
 
-Six payload types, each with an explicit wire code. The `0x10` base is
+Thirteen payload types, each with an explicit wire code. The `0x10` base is
 deliberate: L1 uses `0` (`STANDARD`) and `1` (`COINBASE`), so an unknown L1 type
 is refused as an L1 type rather than silently read as an L2 one.
 
@@ -1702,12 +1702,22 @@ is refused as an L1 type rather than silently read as an L2 one.
 | `Dispute` | `0x13` | 10 000 | challenger |
 | `Settle` | `0x14` | `max(0.1% of released value, 1 000)` | validator quorum |
 | `ExitQueue` | `0x15` | 2 000 | exit owner (§19.6) |
+| `Policy` | `0x16` | 2 000 | grant owner (§21.1) |
+| `PolicyRevoke` | `0x17` | 2 000 | grant owner (§21.2) |
+| `AgentSpend` | `0x18` | 2 000 | the grant's spender (§21.3) |
+| `CreditOpen` | `0x19` | 2 000 | lender (§22.3) |
+| `CreditCollateral` | `0x1A` | 2 000 | borrower (§22.4) |
+| `CreditRepay` | `0x1B` | 2 000 | borrower (§22.5) |
+| `CreditDefault` | `0x1C` | 2 000 | anyone, once due (§22.6) |
 
 The first four carry an explicit actor address and a signature bundle over a
 domain-separated signing hash. The signing hash covers the payload **including
 the key bundle but excluding the signature bundle**, so re-signing does not
 change the message and swapping keys does. This is the same discipline as the L1
-`Transaction::sighash`.
+`Transaction::sighash`. The seven types added by §21 and §22 follow the same
+discipline: a domain-separated signing hash over the payload, the key bundle
+included and the signature bundle excluded, and the actor's address checked
+against the key bundle's own address.
 
 `Settle` has no single signer. Its authorization is a validator-quorum
 BLS12-381 aggregate (the M5 structure: bitmap + signer count + 96-byte
@@ -2196,7 +2206,7 @@ protocol effect that the L2 state machine did not authorize.
   reused from `jnt-core` and `jnt-l2` verbatim. The SDK MUST NOT reimplement,
   re-derive or relax any of them.
 - **No new transaction type, fee, or authorization path.** Every wire artifact
-  the SDK produces is one of the six L2 payloads of §15.1, signed by the
+  the SDK produces is one of the L2 payloads of §15.1, signed by the
   §15.2 hybrid `Auth`.
 - **Not a consensus participant.** The SDK never arbitrates, never settles
   (`Settle` has no single signer, §15.1) and never certifies (§17.4).

@@ -181,7 +181,8 @@ claims it, runs it and submits a result hash, and anyone may **challenge** that
 result. A committee then decides whether the work was correct, and settlement
 moves the money accordingly.
 
-The six L2 transaction types are the whole vocabulary:
+The L2 transaction types are the whole vocabulary — six for the task economy,
+four for the exits, and seven for the authority and credit layers:
 
 | Type | Value | Purpose |
 |---|---|---|
@@ -191,6 +192,13 @@ The six L2 transaction types are the whole vocabulary:
 | `0x13` Dispute | Anyone | Challenge the result with a counter-result and a deposit |
 | `0x14` Settle | Committee | Apply the decision: pay, refund, slash |
 | `0x15` ExitQueue | Owner | Start withdrawing back to Layer 1 |
+| `0x16` Policy | Owner | Publish a spending grant (agent authority) |
+| `0x17` PolicyRevoke | Owner | Kill a grant — every descendant dies with it |
+| `0x18` AgentSpend | Spender | Spend under a published grant |
+| `0x19` CreditOpen | Lender | Open a loan; the principal moves to the borrower |
+| `0x1A` CreditCollateral | Borrower | Add collateral to a position |
+| `0x1B` CreditRepay | Borrower | Repay (interest first, then principal) |
+| `0x1C` CreditDefault | Anyone | Settle a position that was not repaid by its deadline |
 
 A task moves through six states: `Open → InProgress → ResultSubmitted →
 Disputed? → Settled`, with `Expired` as the timeout branch.
