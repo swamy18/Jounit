@@ -413,7 +413,9 @@ impl NetworkParams {
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
             require_hybrid_signatures: false,
-            network_magic: [0x6A, 0x4E, 0x54, 0x01],
+            // Protocol version bump: 01 -> 02. A pre-bump node carries 01 and
+            // is refused at the framing layer, so it cannot join this network.
+            network_magic: [0x6A, 0x4E, 0x54, 0x02],
             network_id: "jounit/mainnet".into(),
             // The L2 genesis escrow (Decision 7): 100,000 JNT held entirely by
             // the protocol escrow identity, bounded by the explicit
@@ -481,7 +483,7 @@ impl NetworkParams {
             // mainnet at the framing layer (§13.3). Genesis cannot do that job:
             // both profiles have genesis_difficulty=1, so genesis_block() is
             // identical, hence the identical genesis hash.
-            network_magic: [0x6A, 0x4E, 0x54, 0x02],
+            network_magic: [0x6A, 0x4E, 0x54, 0x03],
             network_id: "jounit/mini".into(),
             // 10 JNT of L2 genesis escrow, all of it bounded by
             // `escrow_ceiling_sat`: 3 × 1 JNT to deterministic operator
@@ -565,7 +567,7 @@ impl NetworkParams {
             max_tx_count: 5_000,
             max_block_bytes: 4_000_000,
             require_hybrid_signatures: false,
-            network_magic: [0x6A, 0x4E, 0x54, 0x03],
+            network_magic: [0x6A, 0x4E, 0x54, 0x04],
             network_id: "jounit/testnet".into(),
             // Testnet carries no user grants yet (deposits/exits remain
             // deferred); the escrow is a real, accountable genesis reserve.
@@ -769,12 +771,27 @@ mod tests {
     fn network_magic_is_distinct_and_nonzero() {
         let m = NetworkParams::mainnet();
         let n = NetworkParams::mini();
+        let t = NetworkParams::testnet();
+        // Literal values, not derived: this is the protocol identity, and a typo
+        // in a constant is exactly the mistake a self-referential test agrees
+        // with. The bump moved mainnet 01 -> 02; mini/testnet shifted so every
+        // profile still has a unique discriminator.
+        assert_eq!(m.network_magic, [0x6A, 0x4E, 0x54, 0x02]);
+        assert_eq!(n.network_magic, [0x6A, 0x4E, 0x54, 0x03]);
+        assert_eq!(t.network_magic, [0x6A, 0x4E, 0x54, 0x04]);
+        // The pre-bump mainnet magic must not name any live profile.
+        let old_mainnet = [0x6A, 0x4E, 0x54, 0x01];
+        assert_ne!(m.network_magic, old_mainnet);
+        assert_ne!(n.network_magic, old_mainnet);
+        assert_ne!(t.network_magic, old_mainnet);
         // Non-zero, lest a default profile silently pass for any network.
         assert_ne!(m.network_magic, [0, 0, 0, 0]);
         assert_ne!(n.network_magic, [0, 0, 0, 0]);
         // Distinct across profiles: the whole reason it exists (§13.3). Genesis
         // cannot do this job because both profiles have genesis_difficulty = 1.
         assert_ne!(m.network_magic, n.network_magic);
+        assert_ne!(m.network_magic, t.network_magic);
+        assert_ne!(n.network_magic, t.network_magic);
         assert_ne!(m.network_id, n.network_id);
         assert!(m.network_id.starts_with("jounit/"));
     }
@@ -786,6 +803,21 @@ mod tests {
         let g = crate::block::genesis_block(NetworkParams::mainnet().genesis_difficulty);
         let h = crate::block::genesis_block(NetworkParams::mini().genesis_difficulty);
         assert_eq!(g.block_hash(), h.block_hash());
+    }
+
+    #[test]
+    fn mainnet_genesis_is_frozen_for_the_version_bump() {
+        // Re-freeze the mainnet genesis value for this protocol version. The
+        // bump changes the network magic and the state wire format, neither of
+        // which is a header field, so the genesis bytes stay byte-identical;
+        // pinning the hash makes any accidental future drift fail here first.
+        let g = crate::block::genesis_block(NetworkParams::mainnet().genesis_difficulty);
+        let got: String = g.block_hash().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            got,
+            "fae560773696a29ef3340ae13d46a4596a51be91c549265fb04a5ed1af0a596b\
+             1b90d3bd022d90e6efddc2f0425c0f44c676dfee466c114ed7683bf6e49f5234"
+        );
     }
 
     #[test]

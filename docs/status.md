@@ -1614,6 +1614,14 @@ Both live in the Layer-2 state (`policies`, `positions`, `credit_locked`) and
 are committed under the state root with their own leaf tags (`0x05`, `0x06`).
 The state wire version moved 3 → 5.
 
+The same protocol bump moved the mainnet network magic from `6A 4E 54 01` to
+`6A 4E 54 02`; `mini` and `testnet` moved to `03` and `04` so every profile
+keeps a unique discriminator. A pre-bump node presents `01` and is refused at
+the framing layer (which re-checks the magic on every frame) and again at the
+handshake, so it cannot join or relay into the new mainnet. The mainnet genesis
+block itself is unchanged by the bump (magic and wire version are not header
+fields) and is pinned by `mainnet_genesis_is_frozen_for_the_version_bump`.
+
 ### The bugs this found
 
 - **A repayment larger than the debt was silently overpaying the lender.** The

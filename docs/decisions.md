@@ -1524,8 +1524,10 @@ they exist. `SpendPolicy` itself is untouched - same encoding, same hash, same
 
 **Consensus impact.** The Layer-2 state root now covers published grants, so
 the committed root changes: this is a protocol version bump (new state wire
-version, new genesis hash). It is shipped in the same version as the credit
-types below, because shipping a root change twice buys nothing.
+version). The L1 genesis block carries no L2 state root, so its bytes and hash
+stay unchanged; the network identity is bumped instead (mainnet magic
+`6A 4E 54 01` -> `6A 4E 54 02`). It is shipped in the same version as the
+credit types below, because shipping a root change twice buys nothing.
 ---
 
 ## Decision 26 - Credit becomes a chain fact (P1 resolved)

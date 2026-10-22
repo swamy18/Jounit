@@ -49,8 +49,8 @@ MSG_CHECKPOINT = 11
 # --- SPEC.md section 13.3: per-profile identity ---------------------------
 # A new profile MUST pick a magic no existing profile uses.
 NETWORK_MAGIC = {
-    "mainnet": bytes([0x6A, 0x4E, 0x54, 0x01]),
-    "mini": bytes([0x6A, 0x4E, 0x54, 0x02]),
+    "mainnet": bytes([0x6A, 0x4E, 0x54, 0x02]),
+    "mini": bytes([0x6A, 0x4E, 0x54, 0x03]),
 }
 NETWORK_ID = {
     "mainnet": b"jounit/mainnet",

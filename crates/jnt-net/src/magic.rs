@@ -53,4 +53,18 @@ mod tests {
         assert!(check_network(&m, magic_of(&n), &n.network_id).is_err());
         assert!(check_network(&n, magic_of(&m), &m.network_id).is_err());
     }
+
+    #[test]
+    fn pre_bump_mainnet_magic_is_refused() {
+        // The protocol bump moved mainnet 6A4E5401 -> 6A4E5402. An old node
+        // still presenting 01 must be refused even with the right network id,
+        // so a stale peer can never silently join the new mainnet.
+        let m = NetworkParams::mainnet();
+        let old_mainnet = [0x6A, 0x4E, 0x54, 0x01];
+        assert!(check_network(&m, old_mainnet, &m.network_id).is_err());
+        // And the new mainnet magic is not accepted by any other profile.
+        for p in [NetworkParams::mini(), NetworkParams::testnet()] {
+            assert!(check_network(&p, magic_of(&m), &p.network_id).is_err());
+        }
+    }
 }

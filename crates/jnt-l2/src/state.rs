@@ -2028,6 +2028,12 @@ impl L2State {
 /// aggregate signed for another network. Older blobs are refused rather than
 /// guessed at — a state without a network cannot verify a network-bound
 /// settlement.
+///
+/// Version 4 adds the published spending policies and grants (Decision 25);
+/// version 5 adds credit positions, `credit_locked` and the credit transaction
+/// state (Decision 26). Pre-bump blobs are refused rather than guessed at,
+/// because a state that cannot describe a committed policy or credit position
+/// would silently diverge from the chain.
 pub const L2_STATE_WIRE_VERSION: u8 = 5;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.

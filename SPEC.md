@@ -623,7 +623,7 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `nn_epoch_blocks` | `50 000` | `2 000` | `2 000` |
 | `puzzle_id` | `1` | `1` | `1` |
 | `network_id` | `jounit/mainnet` | `jounit/mini` | `jounit/testnet` |
-| `network_magic` | `6A 4E 54 01` | (distinct) | `6A 4E 54 03` |
+| `network_magic` | `6A 4E 54 02` | `6A 4E 54 03` | `6A 4E 54 04` |
 | `checkpoint_interval_blocks` | `100` | `10` | `10` |
 | `finality_activation_height` | `100` | `0` | `20` |
 | `pq_activation_height` | `0` (**never**) | `0` | `0` |
@@ -781,7 +781,8 @@ set `genesis_difficulty = 1`, so `mainnet` and `mini` produce the **identical**
 genesis block:
 
 ```
-2317ec84903140e2cd72be6f3c9dfd2ff36d9f8642293a5152279b4ad7a5196b
+fae560773696a29ef3340ae13d46a4596a51be91c549265fb04a5ed1af0a596b
+1b90d3bd022d90e6efddc2f0425c0f44c676dfee466c114ed7683bf6e49f5234
 ```
 
 A handshake that compared genesis hashes would consider a mainnet node and a mini
@@ -796,11 +797,17 @@ Each profile therefore declares a `network_magic` and a `network_id` string.
 
 | Parameter | `mainnet` | `mini` |
 |---|---|---|
-| `network_magic` | `0x6A 0x4E 0x54 0x01` | `0x6A 0x4E 0x54 0x02` |
+| `network_magic` | `0x6A 0x4E 0x54 0x02` | `0x6A 0x4E 0x54 0x03` |
 | `network_id` | `jounit/mainnet` | `jounit/mini` |
 
 A new profile MUST pick a magic no existing profile uses. Magic reuse across two
 live networks is the failure this rule exists to prevent.
+
+The protocol version bump moved mainnet from `6A 4E 54 01` to `6A 4E 54 02`;
+`mini` and `testnet` moved to `6A 4E 54 03` and `6A 4E 54 04` so every live
+profile still owns exactly one magic. A pre-bump node presents `01`, which does
+not match the mainnet profile, so it is refused at framing and again at the
+handshake. It cannot join or relay blocks into the new mainnet.
 
 **Long-term fix, not in v0.2:** give the genesis coinbase an `extra_nonce`
 derived from `network_id`, which would make the genesis hash discriminating and
@@ -1643,7 +1650,7 @@ in-memory (diagnostic until slashing exists).
 | Property | Value |
 |---|---|
 | network id | `jounit/testnet` (unique) |
-| network magic | `6A 4E 54 03` (unique) |
+| network magic | `6A 4E 54 04` (unique) |
 | genesis validator committee | 4 deterministic keys (public test material, distinct derivation from `mini`'s), canonically sorted |
 | quorum | `ceil(4 × 6667 / 10000) = 3` |
 | `checkpoint_interval_blocks` | `10` (epoch = height / 10) |
@@ -2641,7 +2648,7 @@ it before its first pass, recomputing the verdict from the terms rather than
 trusting the node's `ok` flag. `jnt-worker::HttpNode` is a client of the API
 that implements both §18.3 seams, `L2NodeView` (reads) and `L2Broadcaster`
 (writes). The state a node hands a remote observer is a **versioned,
-deterministic encoding** (`L2_STATE_WIRE_VERSION = 1`): sorted maps so two
+deterministic encoding** (`L2_STATE_WIRE_VERSION = 5`): sorted maps so two
 nodes agree byte-for-byte, each declared count bounded by the bytes actually
 remaining before anything is allocated, duplicate keys and trailing bytes
 refused, and `check_conservation` re-run on decode, so a peer cannot hand the

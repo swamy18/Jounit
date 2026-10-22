@@ -403,12 +403,22 @@ fn trailing_bytes_are_refused_not_ignored() {
 
 #[test]
 fn an_unsupported_version_is_refused_by_name() {
+    use jnt_l2::state::L2_STATE_WIRE_VERSION;
+
     let (state, _) = fully_populated_state();
     let mut bytes = state.encode();
-    bytes[0] = 9;
-    assert!(L2State::decode(&bytes).is_err());
-    bytes[0] = 0;
-    assert!(L2State::decode(&bytes).is_err());
+    assert_eq!(bytes[0], L2_STATE_WIRE_VERSION);
+    // Current protocol bump: the wire format is version 5.
+    assert_eq!(L2_STATE_WIRE_VERSION, 5);
+    // Pre-bump blobs (versions 3 and 4) and a future version are all refused;
+    // a stale node cannot hand over state the new chain would silently trust.
+    for v in [0u8, 3, 4, 9] {
+        bytes[0] = v;
+        assert!(
+            L2State::decode(&bytes).is_err(),
+            "state version {v} must be refused"
+        );
+    }
 }
 
 #[test]

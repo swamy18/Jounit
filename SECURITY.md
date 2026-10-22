@@ -85,9 +85,9 @@ branch: the chain has not launched, so there is no deployed history to keep
 compatible.
 
 Any fix that changes a consensus rule, a serialization format or a fee
-schedule is a **protocol version bump**: it changes the genesis hash, the
-network magic and the state format, and it is announced as such in the release
-notes before it ships.
+schedule is a **protocol version bump**: it changes the network magic, the
+state format and, when the serialized genesis block changes, the genesis hash.
+It is announced as such in the release notes before it ships.
 
 ## Scope of this policy
 

@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn version_round_trips_and_bounds_strings() {
         let v = Version {
-            network_magic: [0x6A, 0x4E, 0x54, 0x02],
+            network_magic: [0x6A, 0x4E, 0x54, 0x03],
             network_id: "jounit/mini".into(),
             protocol_version: PROTOCOL_VERSION,
             services: 0,
