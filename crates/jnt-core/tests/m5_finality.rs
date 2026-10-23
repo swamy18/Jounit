@@ -25,7 +25,9 @@ use jnt_core::chain::Chain;
 use jnt_core::error::Error;
 use jnt_core::finality::{FinalityError, FinalityManager, MAX_EQUIVOCATION_EVIDENCE};
 use jnt_core::hash::Hash512;
-use jnt_core::params::{mini_committee_secrets, testnet_committee_secrets, NetworkParams};
+use jnt_core::params::{
+    mainnet_committee_secrets, mini_committee_secrets, testnet_committee_secrets, NetworkParams,
+};
 use jnt_core::validators::{equivocation_evidence, ValidatorError};
 use jnt_core::wallet::Wallet;
 use jnt_core::Address;
@@ -42,6 +44,19 @@ fn ts(height: u64, bump: u64) -> u64 {
 /// same order `genesis_validators` and therefore every bitmap uses.
 fn committee() -> Vec<(SecretKey, BlsPublicKey)> {
     let mut pairs: Vec<(SecretKey, BlsPublicKey)> = testnet_committee_secrets()
+        .into_iter()
+        .map(|sk| {
+            let pk = sk.public_key();
+            (sk, pk)
+        })
+        .collect();
+    pairs.sort_by_key(|a| a.1 .0);
+    pairs
+}
+
+/// The mainnet bootstrap committee as (secret, key) pairs in canonical order.
+fn mainnet_committee() -> Vec<(SecretKey, BlsPublicKey)> {
+    let mut pairs: Vec<(SecretKey, BlsPublicKey)> = mainnet_committee_secrets()
         .into_iter()
         .map(|sk| {
             let pk = sk.public_key();
@@ -222,8 +237,18 @@ fn testnet_declares_a_four_key_committee_quorum_three_interval_ten_and_activatio
 
     // Depth-only profiles stay depth-only.
     assert_eq!(NetworkParams::mini().finality_activation_height, 0);
-    assert_eq!(NetworkParams::mainnet().finality_activation_height, 100);
-    assert_eq!(NetworkParams::mainnet().genesis_validators.len(), 0);
+    let mainnet = NetworkParams::mainnet();
+    assert_eq!(mainnet.finality_activation_height, 100);
+    assert_eq!(
+        mainnet.genesis_validators.len(),
+        21,
+        "mainnet carries the Decision 27 bootstrap committee"
+    );
+    assert_eq!(
+        ValidatorSet::new(mainnet.genesis_validators.clone()).quorum_size(),
+        15
+    );
+    assert!(mainnet.l2_settlement_validators.is_empty());
 
     // Config-time guards: an activation that could never fire is refused
     // rather than silently inert.
@@ -279,6 +304,46 @@ fn a_valid_certificate_binds_at_and_after_the_activation_height() {
     assert!(chain.finality().is_finalized(20));
     assert!(chain.finality().is_finalized(19));
     assert!(!chain.finality().is_finalized(21));
+}
+
+#[test]
+fn fresh_mainnet_activates_finality_with_the_bootstrap_committee_at_height_100() {
+    let params = NetworkParams::mainnet();
+    assert_eq!(params.genesis_validators.len(), 21);
+    assert_eq!(
+        ValidatorSet::new(params.genesis_validators.clone()).quorum_size(),
+        15
+    );
+
+    let mut chain = Chain::new(params.clone()).unwrap();
+    let addr = miner();
+    for h in 1..=100u64 {
+        let b = chain
+            .mine_block(
+                addr,
+                vec![],
+                jnt_core::block::GENESIS_TIMESTAMP_MS + h * 600_000,
+            )
+            .unwrap();
+        chain.submit(b).unwrap();
+    }
+
+    let h100 = chain.block_hash_at(100).unwrap();
+    let cp = signed_with(
+        &mainnet_committee(),
+        CheckpointPayload {
+            height: 100,
+            block_hash: h100,
+            network_id: "jounit/mainnet".into(),
+            epoch: 1,
+        },
+        &(0usize..15).collect::<Vec<_>>(),
+    );
+    apply(&mut chain, &cp).unwrap();
+
+    assert_eq!(chain.finality().binding_finalized_height(), 100);
+    assert_eq!(chain.finalized_point(), Some((100, h100)));
+    assert!(chain.finality().is_finalized(100));
 }
 
 // ---------------------------------------------------------------------------

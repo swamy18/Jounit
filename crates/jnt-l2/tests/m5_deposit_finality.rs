@@ -151,7 +151,7 @@ fn replay(chain: &Chain) -> ChainL2 {
         config,
         &L2Genesis::for_params(&params),
         DepositParams::for_params(&params),
-        &ValidatorSet::new(params.genesis_validators.clone()),
+        &ValidatorSet::new(params.l2_settlement_validators.clone()),
         &RealBls,
     )
     .unwrap()
@@ -290,7 +290,7 @@ fn case_b_binding_satisfied_but_depth_not_is_not_spendable() {
     .unwrap();
     let tip = chain.height();
     let binding = chain.finality().binding_finalized_height();
-    let validators = ValidatorSet::new(params.genesis_validators.clone());
+    let validators = ValidatorSet::new(params.l2_settlement_validators.clone());
     for h in 1..=tip {
         inc.apply_block(
             chain.block_at(h).unwrap(),

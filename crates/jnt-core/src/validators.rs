@@ -4,14 +4,15 @@
 //! validates a certificate through this module, and once a profile's
 //! `finality_activation_height` is reached, `Chain::adopt()` refuses any branch
 //! forking at or below the binding-finalized height
-//! (`Error::ReorgWouldCrossFinality`). That makes the machinery live on
-//! `testnet` (activation height 20) and observation-only on `mini`/`mainnet`,
-//! which carry `0`.
+//! (`Error::ReorgWouldCrossFinality`). Binding finality activates on
+//! `testnet` at height 20 and on `mainnet` at height 100; `mini` remains
+//! observation-only with activation height `0`.
 //!
-//! The committee is **declared, not bonded**: Decision 11 fixed the genesis set
-//! and deliberately built no stake ledger, so the keys carry authority by
-//! declaration. The remaining §14.6 questions are economic (bonded stake,
-//! rotation, rewards, equivocation slashing) and are tracked as P2.
+//! The committee is a **bootstrap** set until stake exists: Decision 27 gives
+//! mainnet 21 deterministic public keys, and Decision 20's bond ledger replaces
+//! them with the TopN staked committee as soon as a bond exists. mini/testnet
+//! carry four declared test keys. The remaining §14.6 questions are economic
+//! (rewards, rotation, equivocation slashing) and are tracked as P2.
 //!
 //! Semantics implemented here, exactly as §14.6 specifies:
 //!

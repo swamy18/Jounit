@@ -18,7 +18,7 @@ finality is consensus-active on activated profiles** (Decisions 11–12, §14.7�
 | M2 | Time-Locked Compute Reserve & 50/50 Anti-Collusion Slash Vault | No — no rule creates a slash record yet | `slash.rs` |
 | M3 | Universal Hardware-Agnostic Canonical Compute IR | No — envelopes only | `compute_ir.rs` |
 | M4 | Memory-bound HBM scratchpad PoW puzzle | No — not a registered `puzzle_id` | `hbm_pow.rs` |
-| M5 | Sovereign BLS aggregate finality gadget checkpoints | **Conditional** — real `blst` verification; **binding** on profiles with a non-zero `finality_activation_height` (`testnet`, Decision 12/§14.8), observation-only on `mini`, unreachable on `mainnet` (empty committee fails closed) | `bls_checkpoint.rs`, `bls.rs`, `finality.rs` |
+| M5 | Sovereign BLS aggregate finality gadget checkpoints | **Conditional** — real `blst` verification; **binding** on profiles with a non-zero `finality_activation_height` (`testnet` at 20, `mainnet` at 100 with its 21-key bootstrap committee per Decision 27), observation-only on `mini` | `bls_checkpoint.rs`, `bls.rs`, `finality.rs` |
 
 SPEC.md §14 carries the same table. M5's missing rules arrived as Decisions 11
 (committee + relay, §14.7) and 12 (binding activation, §14.8); M2–M4 remain
@@ -29,7 +29,7 @@ rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — **870 tests pass, 0 failures** across the workspace.
+- `cargo test --workspace` — **1,304 tests pass, 0 failures, 1 ignored** across the workspace.
   this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):**
   - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite,, the 30-test real-BLS suite in
@@ -1397,8 +1397,8 @@ applies; `finality_m4::a_reorg_crossing_an_observed_checkpoint_still_applies`
 pins that, so binding can never slip in silently. L2 `Settle` quorums are
 untouched — task arbitration, not the L1 checkpoint committee.
 
-**Tests:** 13 new (`finality_m4`): committee determinism/hash, mainnet empty
-fail-closed, full-quorum observe, sub-quorum/forged/other-network refusal,
+**Tests:** 13 new (`finality_m4`): committee determinism/hash, mainnet 21-key
+bootstrap + empty-L2 fail-closed, full-quorum observe, sub-quorum/forged/other-network refusal,
 monotonicity, bounded-codec round-trip and three oversize/count lies, and the
 non-binding reorg proof. Plus a new `checkpoint_codec` fuzz target (14 targets).
 
@@ -1483,14 +1483,14 @@ moves the floor **without moving the tip** — otherwise a finality-held deposit
 would sit pending until some unrelated block arrived.
 
 **L2 settlement seam (Decision 15, SPEC §15.1).** `jnt_node::l2::validator_set`
-now returns the profile's declared active committee — the same
-`genesis_validators` list the finality layer verifies checkpoints against —
-replacing the M1 empty-set dead end. `Settle` payloads signed by that committee
-apply through the real node path (task lifecycle → disputed → explicit Correct
-settle → VWC issued); foreign keys are refused by name (`BadBlsSignature`);
-`mainnet`'s intentionally empty committee still refuses everything
-(`BadQuorum`). `WindowElapsed` semantics and all existing VWC verification are
-untouched.
+returns the profile's declared active committee. Decision 27 later split this
+into the separate `l2_settlement_validators` field: mini/testnet use the same
+four keys as their L1 committee, while mainnet leaves the settlement set empty
+and refuses everything (`BadQuorum`). `Settle` payloads signed by the declared
+set apply through the real node path (task lifecycle → disputed → explicit
+Correct settle → VWC issued); foreign keys are refused by name
+(`BadBlsSignature`). `WindowElapsed` semantics and all existing VWC
+verification are untouched.
 
 **Tests:** 37 new, all M5-scoped — 25 in `jnt-core/tests/m5_finality.rs`
 (profile matrix, activation, the nine-case conflict matrix, the critical reorg

@@ -134,9 +134,9 @@ fn client(addr: SocketAddr) -> WorkerClient<HttpNode, HttpNode, CpuExecutor> {
         Host::new(reader(addr), writer(addr)),
         w.clone(),
         CpuExecutor::default(),
-        // The mini committee, so certificate observation is configured for the
-        // node it is talking to rather than defaulted.
-        jnt_core::bls_checkpoint::ValidatorSet::new(NetworkParams::mini().genesis_validators),
+        // The mini settlement committee, so certificate observation is
+        // configured for the node it is talking to rather than defaulted.
+        jnt_core::bls_checkpoint::ValidatorSet::new(NetworkParams::mini().l2_settlement_validators),
         &jnt_core::bls::RealBls,
     )
     .with_config(WorkerConfig::from_wallet(&w).with_deposit(100_000))
@@ -314,7 +314,7 @@ fn an_unreachable_node_is_a_named_error_and_never_hangs() {
         ),
         wallet(2, "transport-worker"),
         CpuExecutor::default(),
-        jnt_core::bls_checkpoint::ValidatorSet::new(NetworkParams::mini().genesis_validators),
+        jnt_core::bls_checkpoint::ValidatorSet::new(NetworkParams::mini().l2_settlement_validators),
         &jnt_core::bls::RealBls,
     );
     assert!(client.discover().is_err(), "no state ⇒ no tasks ⇒ an error");

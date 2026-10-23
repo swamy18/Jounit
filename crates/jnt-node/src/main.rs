@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -124,6 +124,11 @@ CREDIT OPTIONS (SPEC 22):
   --list                     List the positions instead of changing one
 
 VALIDATOR KEY OPTIONS:
+  --add                       Create one random validator key
+  --bootstrap                 Create all 21 deterministic mainnet bootstrap
+                              keys (mainnet only; quorum is 15). A fresh
+                              mainnet node needs a quorum locally to produce
+                              the first checkpoint.
   (no flag; environment only)  Validator keys are encrypted under
                               JNT_VALIDATOR_PASSPHRASE, falling back to
                               JNT_WALLET_PASSPHRASE with a one-time warning
@@ -1662,11 +1667,46 @@ fn load_validator_committee(
 /// to `JNT_WALLET_PASSPHRASE`) with Argon2id + ChaCha20-Poly1305, mode 0600
 /// where the platform supports it, because the file *is* the key — creation
 /// without a passphrase is refused rather than writing plaintext.
+/// `validator --bootstrap` writes the 21 declared mainnet bootstrap keys, which
+/// a fresh chain needs locally to reach quorum before any bond exists.
 /// `validator list` prints public keys only.
 fn cmd_validator(args: &Args) -> Result<(), String> {
     let store = Store::open(args)?;
     let params = store.params.clone();
     let dir = store.validator_keys_path();
+
+    if args.has("bootstrap") {
+        if args.has("add") {
+            return Err("`validator --bootstrap` and `--add` are mutually exclusive".into());
+        }
+        if params.name != "mainnet" {
+            return Err(format!(
+                "`validator --bootstrap` is mainnet-only; {} has its own declared test keys",
+                params.name
+            ));
+        }
+        let Some(passphrase) = validator_passphrase() else {
+            return Err(format!(
+                "refusing to write unencrypted validator keys: set {} and retry",
+                VALIDATOR_PASSPHRASE_ENV
+            ));
+        };
+        for (index, secret) in jnt_core::params::mainnet_committee_secrets()
+            .into_iter()
+            .enumerate()
+        {
+            let label = format!("bootstrap-{:02}", index + 1);
+            let key = jnt_core::signing::ValidatorKey::new(secret, params.network_id.clone());
+            write_validator_key(&dir, &label, &key, &passphrase)?;
+        }
+        println!(
+            "created 21 mainnet bootstrap validator keys in {}",
+            dir.display()
+        );
+        println!("  quorum     15 of 21");
+        println!("  warning    public cold-start keys; remove them after the first bond");
+        return Ok(());
+    }
 
     if !args.has("add") {
         // List: public keys only, never scalars, never the file contents.
@@ -1702,9 +1742,6 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed[..]);
     let sk = jnt_core::bls::SecretKey::derive(&seed).map_err(|e| e.to_string())?;
     let key = jnt_core::signing::ValidatorKey::new(sk, params.network_id.clone());
-    let file = key.to_file();
-    let bytes =
-        zeroize::Zeroizing::new(serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?);
     // New keys are never written plaintext: without a passphrase there is no
     // key to encrypt under, so creation is refused rather than writing a
     // 0600 JSON scalar. Existing plaintext keys still load (with a loud
@@ -1716,10 +1753,33 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
             VALIDATOR_PASSPHRASE_ENV
         ));
     };
-    let bytes = wallet_store::encrypt(&passphrase, &bytes)
+    let path = write_validator_key(&dir, &label, &key, &passphrase)?;
+
+    println!("created validator `{label}`");
+    println!("  file       {}", path.display());
+    println!("  network    {}", params.network_id);
+    println!("  public key {}", hex::encode(key.public_key().as_bytes()));
+    println!("  committee  public key must be bonded on chain before its signature counts");
+    Ok(())
+}
+
+/// Encrypt one validator key and write it as `validators/<label>.json`.
+///
+/// `create_new` refuses to overwrite an existing key file: a silent replace
+/// would orphan the public key an operator may already have bonded.
+fn write_validator_key(
+    dir: &Path,
+    label: &str,
+    key: &jnt_core::signing::ValidatorKey,
+    passphrase: &str,
+) -> Result<PathBuf, String> {
+    let file = key.to_file();
+    let bytes =
+        zeroize::Zeroizing::new(serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?);
+    let bytes = wallet_store::encrypt(passphrase, &bytes)
         .map_err(|e| format!("validator key encryption: {e}"))?;
 
-    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{label}.json"));
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -1732,13 +1792,7 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
         .open(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     f.write_all(&bytes).map_err(|e| e.to_string())?;
-
-    println!("created validator `{label}`");
-    println!("  file       {}", path.display());
-    println!("  network    {}", params.network_id);
-    println!("  public key {}", hex::encode(key.public_key().as_bytes()));
-    println!("  committee  public key must be bonded on chain before its signature counts");
-    Ok(())
+    Ok(path)
 }
 
 /// Passphrase validator keys are encrypted under: `JNT_VALIDATOR_PASSPHRASE`,

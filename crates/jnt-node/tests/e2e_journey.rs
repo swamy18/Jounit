@@ -242,7 +242,7 @@ impl L2Broadcaster for Net {
 // ---------------------------------------------------------------------------
 
 fn mini_validators() -> ValidatorSet {
-    ValidatorSet::new(NetworkParams::mini().genesis_validators)
+    ValidatorSet::new(NetworkParams::mini().l2_settlement_validators)
 }
 
 /// A quorum settle transaction signed by the profile's real committee, i.e.

@@ -3,8 +3,8 @@
 //! These tests pin the properties that make the *committee machinery* real
 //! before binding activation: the genesis committee is a pure function of
 //! `NetworkParams`; a full-quorum certificate is accepted and a sub-quorum one
-//! is not; `mainnet`'s empty committee fails closed; a certificate for another
-//! network is refused; and on a profile with no activation height (`mini`),
+//! is not; an empty committee fails closed; a certificate for another network
+//! is refused; and on a profile with no activation height (`mini`),
 //! finality stays **non-binding** — a reorg crossing an accepted checkpoint
 //! still applies.
 //!
@@ -12,7 +12,9 @@
 //! proves the M4 base is unchanged when `finality_activation_height == 0`.
 
 use jnt_core::bls::{RealBls, SecretKey};
-use jnt_core::bls_checkpoint::{BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload};
+use jnt_core::bls_checkpoint::{
+    BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload, ValidatorSet,
+};
 use jnt_core::chain::Chain;
 use jnt_core::finality::FinalityManager;
 use jnt_core::params::{mini_committee_secrets, NetworkParams};
@@ -74,7 +76,7 @@ fn accept(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mini_carries_a_four_key_committee_and_mainnet_none() {
+fn mini_has_four_keys_and_mainnet_has_a_21_key_bootstrap_committee() {
     let mini = NetworkParams::mini();
     mini.validate().unwrap();
     assert_eq!(mini.genesis_validators.len(), 4);
@@ -83,10 +85,13 @@ fn mini_carries_a_four_key_committee_and_mainnet_none() {
 
     let main = NetworkParams::mainnet();
     main.validate().unwrap();
-    assert!(
-        main.genesis_validators.is_empty(),
-        "mainnet has no committee yet; an empty set is the honest pre-committee state"
+    assert_eq!(main.genesis_validators.len(), 21);
+    assert!(main.genesis_validators.windows(2).all(|w| w[0].0 < w[1].0));
+    assert_eq!(
+        ValidatorSet::new(main.genesis_validators.clone()).quorum_size(),
+        15
     );
+    assert!(main.l2_settlement_validators.is_empty());
     assert_eq!(main.checkpoint_interval_blocks, 100);
     assert_eq!(main.finality_activation_height, 100);
 }
@@ -168,8 +173,9 @@ fn observation_never_moves_backwards() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mainnet_with_no_committee_accepts_nothing() {
-    let params = NetworkParams::mainnet();
+fn an_empty_committee_accepts_nothing() {
+    let mut params = NetworkParams::mainnet();
+    params.genesis_validators.clear();
     let mut fm = FinalityManager::new(&params);
     assert_eq!(fm.committee_len(), 0);
     // Even a structurally perfect certificate cannot verify against no keys.

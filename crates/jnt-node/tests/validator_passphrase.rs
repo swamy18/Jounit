@@ -41,9 +41,13 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// is cleared unless the caller names it, so a value inherited from the
 /// running test process cannot leak into a case.
 fn node(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    node_on("mini", dir, args, envs)
+}
+
+fn node_on(network: &str, dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(bin());
     cmd.args(args);
-    cmd.arg("--network").arg("mini");
+    cmd.arg("--network").arg(network);
     cmd.arg("--data-dir").arg(dir);
     cmd.env_remove(WALLET_ENV);
     cmd.env_remove(VALIDATOR_ENV);
@@ -96,6 +100,72 @@ fn the_dedicated_passphrase_writes_an_encrypted_key() {
     // The wrong passphrase is refused, not silently ignored.
     let out = node(&dir, &["validator"], &[(VALIDATOR_ENV, "wrong")]);
     assert!(!out.status.success(), "a wrong passphrase must refuse");
+}
+
+#[test]
+fn mainnet_bootstrap_writes_the_declared_quorum_committee() {
+    let dir = temp_dir("mainnet-bootstrap");
+    let out = node_on(
+        "mainnet",
+        &dir,
+        &["validator", "--bootstrap"],
+        &[(VALIDATOR_ENV, "bootstrap-pass")],
+    );
+    assert!(out.status.success(), "bootstrap failed: {}", stderr(&out));
+
+    let key_count = std::fs::read_dir(dir.join("validators")).unwrap().count();
+    assert_eq!(key_count, 21, "one file per bootstrap key");
+
+    let out = node_on(
+        "mainnet",
+        &dir,
+        &["validator"],
+        &[(VALIDATOR_ENV, "bootstrap-pass")],
+    );
+    assert!(out.status.success(), "list failed: {}", stderr(&out));
+    let listed = stdout(&out);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 22, "21 public keys and one count");
+
+    let mut expected = (1u8..=21)
+        .map(jnt_core::params::mainnet_validator_key)
+        .collect::<Vec<_>>();
+    expected.sort_by_key(|key| key.0);
+    let expected = expected
+        .iter()
+        .map(|key| hex::encode(key.as_bytes()))
+        .collect::<Vec<_>>();
+    let actual = lines[..21]
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual, expected,
+        "loaded keys must match the declared committee"
+    );
+    assert_eq!(lines[21], "21 validator(s)");
+}
+
+#[test]
+fn bootstrap_is_mainnet_only_and_never_writes_plaintext_keys() {
+    let mini = temp_dir("bootstrap-mini");
+    let out = node_on(
+        "mini",
+        &mini,
+        &["validator", "--bootstrap"],
+        &[(VALIDATOR_ENV, "bootstrap-pass")],
+    );
+    assert!(
+        !out.status.success(),
+        "mini must refuse mainnet bootstrap keys"
+    );
+    assert!(stderr(&out).contains("mainnet-only"));
+
+    let mainnet = temp_dir("bootstrap-no-passphrase");
+    let out = node_on("mainnet", &mainnet, &["validator", "--bootstrap"], &[]);
+    assert!(!out.status.success(), "bootstrap must require a passphrase");
+    assert!(stderr(&out).contains(VALIDATOR_ENV));
+    assert!(!mainnet.join("validators").exists());
 }
 
 #[test]

@@ -38,13 +38,13 @@
 //!   (Decision 10), applied by `ChainL2::apply_block` during replay — never
 //!   `credit`. Payloads from genuinely unfunded accounts are still refused with
 //!   `InsufficientBalance` and recorded as skipped.
-//! - **The declared committee only.** `Settle` payloads are checked against
-//!   the active validator committee the network profile declares (Decision 15,
-//!   the same `genesis_validators` list the L1 finality layer verifies
-//!   checkpoints against — not keys pulled from the finality machinery by
-//!   convenience). A profile that intentionally declares no committee
-//!   (`mainnet`) keeps the empty set, so every settlement fails closed with
-//!   `BadQuorum` deterministically rather than applying without authority.
+//! - **The declared settlement committee only.** `Settle` payloads are checked
+//!   against `l2_settlement_validators` (Decision 15, amended by Decision 27),
+//!   not keys pulled from the finality machinery by convenience. It is
+//!   deliberately separate from `genesis_validators`: the mainnet L1 bootstrap
+//!   committee must not become a permanent L2 settlement authority. Mainnet
+//!   keeps this empty, so every settlement fails closed with `BadQuorum`
+//!   deterministically rather than applying without authority.
 //! - **No new consensus rule.** A block the L1 layer rejects never reaches
 //!   `sync` with a moved tip, so L2 state cannot be mutated by a block the node
 //!   did not accept. L2 failures never reject a block either: they are recorded
@@ -216,17 +216,16 @@ pub fn config_for(params: &NetworkParams) -> L2Config {
 
 /// The validator set the node checks `Settle` payloads against (Decision 15).
 ///
-/// The profile's *declared active committee* — the same `genesis_validators`
-/// list the L1 finality layer verifies checkpoint certificates against, in its
-/// canonical order. Not a convenience alias for checkpoint-signing state: this
-/// reads the profile declaration, so L1 and L2 agree on who the validators are
-/// by construction rather than by shared plumbing.
+/// The profile's *declared settlement committee*, in canonical order. It is
+/// separate from the L1 checkpoint committee (`genesis_validators`) so the
+/// mainnet bootstrap keys cannot permanently authorize L2 settlements.
 ///
-/// `mainnet` intentionally declares no committee, so this stays empty there
+/// `mini` and `testnet` carry the same four declared keys as before. `mainnet`
+/// intentionally declares no settlement committee, so this stays empty there
 /// and every settlement fails deterministically with `BadQuorum` — fail closed,
 /// never fail open.
 pub fn validator_set(params: &NetworkParams) -> ValidatorSet {
-    ValidatorSet::new(params.genesis_validators.clone())
+    ValidatorSet::new(params.l2_settlement_validators.clone())
 }
 
 /// How a [`NodeL2::sync`] call ended.

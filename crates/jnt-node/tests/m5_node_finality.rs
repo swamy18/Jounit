@@ -223,20 +223,20 @@ fn mine_and_submit(chain: &mut Chain, l2: Vec<L2Transaction>) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_declared_committee_is_the_settlement_set_on_every_profile() {
+fn the_declared_settlement_committee_is_separate_from_the_l1_bootstrap_committee() {
     let mini = NetworkParams::mini();
     let testnet = NetworkParams::testnet();
     let mainnet = NetworkParams::mainnet();
 
-    // The seam reads the profile declaration — the same list the finality
-    // layer verifies checkpoints against.
+    // The seam reads the L2 declaration, which matches the L1 committee on
+    // mini/testnet but is deliberately empty on mainnet.
     for params in [&mini, &testnet] {
         let set = jnt_node::l2::validator_set(params);
         assert_eq!(set.quorum_size(), 3, "{}: quorum is 3 of 4", params.name);
         let all = set.signers_from_bitmap(&[0b0000_1111]);
         assert_eq!(
-            all, params.genesis_validators,
-            "{}: L2 settles against the declared active committee, byte for byte",
+            all, params.l2_settlement_validators,
+            "{}: L2 settles against the declared settlement committee, byte for byte",
             params.name
         );
         // Deterministic: two calls name the same set.
@@ -244,7 +244,10 @@ fn the_declared_committee_is_the_settlement_set_on_every_profile() {
         assert_eq!(again.signers_from_bitmap(&[0b0000_1111]), all);
     }
 
-    // Mainnet intentionally declares none: empty means nothing verifies.
+    // Mainnet has a 21-key L1 bootstrap committee, but the separate L2
+    // settlement set stays empty: empty means nothing verifies.
+    assert_eq!(mainnet.genesis_validators.len(), 21);
+    assert!(mainnet.l2_settlement_validators.is_empty());
     assert!(jnt_node::l2::validator_set(&mainnet)
         .signers_from_bitmap(&[0xFF, 0xFF])
         .is_empty());
@@ -340,9 +343,9 @@ fn a_settlement_signed_by_a_foreign_committee_is_refused() {
 
 #[test]
 fn a_profile_without_a_committee_fails_closed_on_settlements() {
-    // Mainnet is the honest pre-committee state: an empty set means a
-    // plausible-looking quorum verifies against nothing and is refused by
-    // name, through the real node path.
+    // Mainnet's L1 bootstrap keys do not authorize L2: the separate settlement
+    // set is empty, so a plausible-looking quorum verifies against nothing and
+    // is refused by name through the real node path.
     let params = NetworkParams::mainnet();
     let mut chain = Chain::new(params.clone()).unwrap();
 

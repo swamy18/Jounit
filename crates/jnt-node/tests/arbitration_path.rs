@@ -91,7 +91,7 @@ fn attestation(w: &Wallet, task_id: Hash, result: Hash) -> ComputeAttestation {
 /// member instead of as a stranger.
 fn committee_and_secrets() -> (Vec<BlsPublicKey>, Vec<SecretKey>) {
     let params = NetworkParams::mini();
-    let committee = params.genesis_validators.clone();
+    let committee = params.l2_settlement_validators.clone();
     let secrets = (1u8..=32)
         .map(mini_validator_secret)
         .filter(|sk| committee.contains(&sk.public_key()))

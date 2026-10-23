@@ -54,7 +54,7 @@ also exists now, with a conservation gate before its first pass.)
   |---|---|---|
   | 1 | `cargo fmt --all --check` | clean |
   | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
-  | 3 | `cargo test --workspace` | 1230 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
+  | 3 | `cargo test --workspace` | 1304 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
   | 4 | `cargo build --workspace --release` | succeeds |
   | 5 | vector cross-check: `python sim/verify_vectors.py --check` | see `docs/status.md` |
   | 6 | confirm the only `#[ignore]`d test is the manual `vwc_perf_probe` | confirmed |
@@ -207,6 +207,22 @@ There is **no** `config.toml` and **no** `policy/` directory in the data dir
   `NetworkParams::validate` refuses any escrow above its own
   `escrow_ceiling_sat`. `mini` allocates 10 JNT (3 grant accounts of 1 JNT
   each); `mainnet` allocates 100,000 JNT and grants nothing.
+- **Mainnet bootstrap committee** is 21 deterministic public keys (quorum 15),
+  active at height 100 until the first bond (Decision 27). These keys are public
+  material: any node can sign for the committee before a bond exists. That is a
+  cold-start property, not decentralisation.
+- **Bootstrap key provisioning:** before `serve`, the node that will produce the
+  first mainnet checkpoint runs `jnt-node validator --bootstrap --network mainnet
+  --data-dir <dir>` with `JNT_VALIDATOR_PASSPHRASE` set. This writes all 21
+  declared keys as encrypted files. A node needs at least 15 keys locally
+  because checkpoint signatures are not gossiped as partial shares; the command
+  deliberately provisions the complete committee. Normal `validator --add`
+  keys remain available for bonded validator committees. After the first bond,
+  remove the `bootstrap-*.json` files and add the bonded key: stale keys that
+  are no longer committee members make signing fail closed.
+- **L2 settlement authority** is the separate `l2_settlement_validators`
+  declaration. Mainnet leaves it empty, so settlements fail closed; mini and
+  testnet reuse their four L1 keys.
 - **Testnet** uses the dedicated `testnet` profile with four deterministic
   genesis validators (Decision 13).
 - **Bootnodes:** none are published on the public internet yet. A bootnode is a
@@ -226,7 +242,7 @@ epoch:
 | M2 (Anti-Collusion Slash Vault) | **No** — no rule creates a slash record | `slash.rs` |
 | M3 (Canonical Compute IR) | **No** — envelopes only | `compute_ir.rs` |
 | M4 (HBM scratchpad PoW) | **No** — registered as `puzzle_id = 2` but not the active mining puzzle | `hbm_pow.rs` |
-| M5 (BLS aggregate finality) | **Conditional** — binding where `finality_activation_height > 0` (`testnet` = 20); observation-only on `mini`; unreachable on `mainnet` (empty committee fails closed) | Decisions 11–12, SPEC §14.7–§14.8 |
+| M5 (BLS aggregate finality) | **Conditional** — binding where `finality_activation_height > 0` (`testnet` = 20, `mainnet` = 100 with its 21-key public bootstrap committee); observation-only on `mini` | Decisions 11–12, 27, SPEC §14.7–§14.8 |
 
 A node running pre-activation software rejects post-activation blocks per the
 new rules (fail-closed). Operators must upgrade before an activation height is
@@ -238,7 +254,7 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 1230 passed, 0 failed, 1 ignored |
+| `cargo test --workspace` passes | ✅ 1304 passed, 0 failed, 1 ignored |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
 | Fuzz: 14 targets executed, real campaigns | ✅ see `docs/fuzz.md` |

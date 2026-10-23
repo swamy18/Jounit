@@ -594,8 +594,8 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 | `finality_activation_height` | height from which a valid canonical checkpoint certificate becomes binding finality on top of the depth rule (§14.8); `0` = never |
 | `pq_activation_height` | height from which a bundle without an ML-DSA-65 component is refused when spending outputs created at or after it (§1, Decision 24); `0` = never. Age-gated, so outputs predating the height stay spendable under their original bundle — history is never stranded |
 
-Mainnet: maturity `100`, finality `100`, activation `0`. Mini: `10`, `20`, `0`.
-Testnet: `10`, `20`, activation `20` (§14.8).
+Mainnet: maturity `100`, finality `100`, activation `100`. Mini: `10`, `20`,
+`0`. Testnet: `10`, `20`, activation `20` (§14.8).
 
 ---
 
@@ -627,14 +627,19 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `checkpoint_interval_blocks` | `100` | `10` | `10` |
 | `finality_activation_height` | `100` | `0` | `20` |
 | `pq_activation_height` | `0` (**never**) | `0` | `0` |
-| `genesis_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
+| `genesis_validators` | `21` (bootstrap, quorum 15) | `4` (quorum 3) | `4` (quorum 3) |
+| `l2_settlement_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
 | `exit_activation_height` | `1` | `1` | `1` |
 | `l2_genesis_escrow_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
 | `escrow_ceiling_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
 
 `testnet` shares the mini ladder and block schedule but has its own magic/id,
 its own deterministic committee (distinct derivation), and the §14.8
-activation height. No profile carries a stock supply cap (Decision 18).
+activation height. `mainnet` carries a 21-key public deterministic bootstrap
+committee (Decision 27) so binding finality can activate at height 100 on a
+fresh chain; the first bond replaces it under the TopN rule. Mainnet's separate
+`l2_settlement_validators` set is empty, so L2 settlements stay fail-closed. No
+profile carries a stock supply cap (Decision 18).
 
 **`exit_activation_height` gates the whole exit rule of §19.6, and `0` means
 *never*, not *from genesis*.** A profile on `0` accepts neither a committed
@@ -1203,7 +1208,7 @@ model.
 | M2 | Anti-collusion slash vault (50% burn + 50% linear vesting) | `slash.rs` | No — defined and tested, nothing creates a slash record yet | this section |
 | M3 | Hardware-agnostic compute IR + attestation envelope | `compute_ir.rs` | No — serialization and signing hashes only | this section |
 | M4 | Memory-bound HBM scratchpad PoW | `hbm_pow.rs` | No — an alternative puzzle body, not registered in the §5.1 registry | this section |
-| M5 | BLS12-381 aggregate finality gadget | `bls_checkpoint.rs`, `finality.rs` | **Conditional** — pairing-checked since §14.5; binding only on profiles with a non-zero `finality_activation_height` (Decision 12): active on `testnet` (§14.8), observation-only on `mini`, unreachable on `mainnet` (empty committee fails closed) | §14.5–§14.8 |
+| M5 | BLS12-381 aggregate finality gadget | `bls_checkpoint.rs`, `finality.rs` | **Conditional** — pairing-checked since §14.5; binding only on profiles with a non-zero `finality_activation_height` (Decision 12): active on `testnet` at 20 and on `mainnet` at 100 with its 21-key bootstrap committee (Decision 27), observation-only on `mini` | §14.5–§14.8 |
 
 **Why M2–M4 are not wired in.** Each needs a rule that no spec currently
 states: what evidence proves a compute result fraudulent (M2), who is allowed to
@@ -1545,16 +1550,17 @@ every clause; none of it is reachable from consensus.
 Decision 11 resolves the §14.6 open items for Phase 6 by **scoping, not
 inventing**: the economics (bonded stake, rewards, slashing) remain open and
 mainnet-gated, exactly as Decision 8 set out, and M4 builds only what Decisions
-2 (bootstrap mode) and 8 authorized. Binding finality is explicitly NOT
-activated; a future milestone that wants it needs its own decision.
+2 (bootstrap mode) and 8 authorized. Binding finality activation is governed by
+§14.8 (Decision 12): `testnet` at height 20, `mainnet` at height 100, and
+`mini` observation-only.
 
 - **Committee.** The genesis committee is an explicit list of BLS keys in
   `NetworkParams` (`genesis_validators`), canonically sorted by key bytes.
-  `mini` declares four deterministic test keys; `mainnet` declares none, so
-  every checkpoint fails closed until a committee is decided. There is no stake
-  ledger behind these keys in Phase 6 — they carry authority by genesis
-  declaration, not by bond. `checkpoint_interval_blocks` is `10` on `mini` and
-  `100` on `mainnet`.
+  `mini` and `testnet` declare four deterministic test keys; `mainnet` declares
+  21 deterministic public bootstrap keys (Decision 27), quorum 15. Until a bond
+  exists these keys carry authority by declaration; the first bond replaces
+  them under Decision 20's TopN rule. `checkpoint_interval_blocks` is `10` on
+  `mini`/`testnet` and `100` on `mainnet`.
 - **One authority.** `validators::validate_checkpoint_against_set` is the single
   checkpoint authority (the six clauses above). `bls_checkpoint::verify_checkpoint`
   remains its inner signature primitive, not a rival authority.
@@ -1590,8 +1596,9 @@ certificate is an observation — it never gates `Chain::adopt()`, never
 persists as finality, and never matures an L2 deposit (§19.5). The value must
 be a multiple of `checkpoint_interval_blocks` and require a non-empty
 committee, or `NetworkParams::validate` refuses the profile at config time —
-a rule that could never fire is refused rather than silently inert. `mini` and
-`mainnet` carry `0`; `testnet` carries `20`.
+a rule that could never fire is refused rather than silently inert. `mini`
+carries `0` (observation only); `testnet` carries `20`; `mainnet` carries `100`
+with its 21-key bootstrap committee (Decision 27).
 
 **The finalized checkpoint.** A certificate over height `H` becomes the
 binding finalized point only if all five hold:
@@ -1665,13 +1672,23 @@ profile required to test binding finality, **not** a public testnet launch;
 validator staking, rotation, rewards and slashing remain deferred (§14.6 open
 items).
 
+**Mainnet bootstrap (Decision 27).** `NetworkParams::mainnet()` declares 21
+deterministic public keys derived under
+`jounit/mainnet-validator-seed/v1`, canonically sorted, with quorum
+`ceil(21 × 6667 / 10000) = 15`. Binding finality activates at height `100` on
+the `100`-block grid. The keys are public material: any node can produce a
+valid certificate before a bond exists. That is the accepted cold-start
+property. With a non-empty bond ledger the existing stake-weighted TopN rule
+selects the epoch committee and the bootstrap list is no longer used; with an
+empty ledger it remains the fallback.
+
 **L2 consumes this finality, it does not duplicate it.** Deposit maturity
 requires both the depth rule and this binding rule (§19.5), read from the L1
-chain's own finality layer; L2 settlement verifies against the profile's
-declared active committee — the same `genesis_validators` list this section
-verifies checkpoints against — never against ad-hoc keys (§15.1). A profile
-that intentionally declares no committee (mainnet) keeps an empty set and
-refuses every settlement by name.
+chain's own finality layer; L2 settlement verifies against the separate
+`l2_settlement_validators` declaration — never ad-hoc keys, and never the L1
+bootstrap committee by convenience (§15.1). `mini` and `testnet` carry the same
+four keys as their L1 committee; `mainnet` keeps this set empty and refuses
+every settlement by name.
 
 ---
 
@@ -1732,11 +1749,11 @@ aggregate) **plus the lattice sidecar**: one ML-DSA-65 signature per bitmap
 signer holding a registered lattice key, over the same decision hash, carried
 in the payload and in the issued VWC. Both halves verify through the existing
 `BlsVerifier` trait and the epoch set's registered keys **against the
-profile's declared active committee** — the same `genesis_validators` list the
-L1 finality layer verifies checkpoints against (§14.8), never keys pulled from
-finality machinery by convenience. A profile with an intentionally empty
-committee (mainnet) verifies against nothing and therefore refuses every
-settlement by name (`BadQuorum`) — fail closed, never fail open. A bitmap
+profile's declared `l2_settlement_validators`** — separate from the L1
+`genesis_validators` committee used at §14.8, never keys pulled from finality
+machinery by convenience. Mainnet declares an empty settlement set, verifies
+against nothing, and therefore refuses every settlement by name (`BadQuorum`)
+— fail closed, never fail open. A bitmap
 signer with a registered key and no valid sidecar entry is refused by name
 (`BadPqSidecar`) — fail closed, never silently downgraded. The aggregate
 message is the domain-separated hash of
@@ -1907,8 +1924,8 @@ challenge earns nothing and burns the deposit.
   arbitrator set, distributing the IR and input bytes) — the off-chain
   arbitration path, still unspecified.
 - *Nothing outstanding:* §14.8 (Decision 12) defines the binding-finality
-  activation rule, and `testnet` carries `finality_activation_height = 20`.
-  `mainnet` carries `0` with an empty committee, so it fails closed.
+  activation rule. `testnet` activates at 20; `mainnet` activates at 100 with
+  its 21-key bootstrap committee (Decision 27).
 
 ---
 
@@ -2604,7 +2621,7 @@ summary.
 L2), `jnt_l2::replay::{ChainL2, SkippedL2}` (replay and the incremental path),
 `jnt_node::l2::NodeL2` (the node's view: replay on startup, incremental while
 the tip extends, full replay when history is rewritten; settlements verified
-against the profile's declared `genesis_validators` committee with the
+against the profile's declared `l2_settlement_validators` committee with the
 production BLS verifier — empty on `mainnet`, which therefore refuses every
 settlement by name, see §15.1). `jnt-node status` reports L2 height/applied/skipped;
 `jnt-node verify` asserts replay determinism (two replays agree, incremental
@@ -2680,8 +2697,8 @@ parts are now decided, specified and built:
 - **The single authoritative validator** — `validators::validate_checkpoint_against_set`.
 
 Binding finality is activated per §14.8: `testnet` carries
-`finality_activation_height = 20` and enforces it, while `mainnet` (empty
-committee, `0`) fails closed. Nothing is outstanding here.
+`finality_activation_height = 20`, and `mainnet` carries `100` with its 21-key
+bootstrap committee (Decision 27). Nothing is outstanding here.
 
 ### 19.4 L2 genesis funding (Decision 7) — IMPLEMENTED, normative
 

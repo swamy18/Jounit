@@ -286,7 +286,7 @@ fn worker_lifecycle_over_real_http() {
     let worker_wallet = worker();
     let http_view = HttpNode::for_network(&serving.url, "jounit/mini").expect("HttpNode view");
     let http_bc = HttpNode::for_network(&serving.url, "jounit/mini").expect("HttpNode broadcaster");
-    let validators = ValidatorSet::new(NetworkParams::mini().genesis_validators.clone());
+    let validators = ValidatorSet::new(NetworkParams::mini().l2_settlement_validators.clone());
     let host = Host::new(http_view, http_bc);
     let mut client = WorkerClient::new(
         host,

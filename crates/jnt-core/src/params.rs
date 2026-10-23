@@ -134,12 +134,35 @@ fn l2_operator_address(seed: u8) -> Address {
         .expect("a wallet always has an address")
 }
 
+/// Domain tag for the mainnet bootstrap committee's deterministic seed
+/// derivation. Distinct from the mini and testnet seed layouts.
+const DOM_MAINNET_VALIDATOR_SEED: &[u8] = b"jounit/mainnet-validator-seed/v1";
+
+/// Canonical committee order: key bytes, duplicate-free.
+fn canonical_committee(keys: impl IntoIterator<Item = BlsPublicKey>) -> Vec<BlsPublicKey> {
+    let mut keys: Vec<BlsPublicKey> = keys.into_iter().collect();
+    keys.sort_by_key(|a| a.0);
+    keys.dedup();
+    keys
+}
+
+fn mini_committee_keys() -> Vec<BlsPublicKey> {
+    canonical_committee((1u8..=4).map(mini_validator_key))
+}
+
+fn testnet_committee_keys() -> Vec<BlsPublicKey> {
+    canonical_committee((1u8..=4).map(testnet_validator_key))
+}
+
+fn mainnet_committee_keys() -> Vec<BlsPublicKey> {
+    canonical_committee((1u8..=21).map(mainnet_validator_key))
+}
+
 /// Deterministic `mini` validator key for `seed`.
 ///
 /// Derives a real BLS12-381 public key from the same public test seeds, so
 /// the mini committee is a valid committee and checkpoint verification is
-/// exercisable. The seeds are public test values; `mainnet` carries no
-/// committee. Panics only if `min_pk` rejects a constant seed, which is a
+/// exercisable. Panics only if `min_pk` rejects a constant seed, which is a
 /// build-time property, not a runtime input.
 fn mini_validator_key(seed: u8) -> BlsPublicKey {
     mini_validator_secret(seed).public_key()
@@ -151,7 +174,8 @@ fn mini_validator_key(seed: u8) -> BlsPublicKey {
 /// are in the source, so anyone can sign as a mini validator — which is
 /// exactly what a permissionless testnet committee means. Exposed so tests
 /// (and mini validator nodes) can produce real checkpoint certificates.
-/// `mainnet` has no committee and therefore no corresponding secrets.
+/// `mainnet` has its own bootstrap committee and derives secrets through
+/// `mainnet_validator_secret`.
 pub fn mini_validator_secret(seed: u8) -> crate::bls::SecretKey {
     let mut s = [0u8; 32];
     s[0] = seed;
@@ -164,10 +188,39 @@ pub fn mini_committee_secrets() -> Vec<crate::bls::SecretKey> {
     (1u8..=4).map(mini_validator_secret).collect()
 }
 
+/// Deterministic `mainnet` bootstrap validator key for `seed` (Decision 27).
+///
+/// A domain-separated derivation distinct from mini and testnet, so the
+/// mainnet bootstrap committee shares no keys with either test profile while
+/// every independently constructed `mainnet` profile remains byte-identical.
+/// This is public bootstrap material, not a secret: any node can sign for it
+/// until a bond-derived committee takes over. The value is a pure function of
+/// the seed, with no runtime entropy.
+pub fn mainnet_validator_key(seed: u8) -> BlsPublicKey {
+    mainnet_validator_secret(seed).public_key()
+}
+
+/// The deterministic `mainnet` bootstrap secret for `seed`.
+///
+/// Public material by construction (the seed is in source), matching the mini
+/// and testnet committees' status. It exists so a fresh mainnet node can
+/// produce the certificate that activates binding finality at height 100
+/// before any validator has bonded. Bonding replaces this committee through
+/// `Chain::committee_keys`; it is not a permanent authority.
+pub fn mainnet_validator_secret(seed: u8) -> crate::bls::SecretKey {
+    let seed = crate::hash::sha256_dom(DOM_MAINNET_VALIDATOR_SEED, &[&[seed]]);
+    crate::bls::SecretKey::derive(&seed).expect("constant seeds are valid scalars")
+}
+
+/// The 21 `mainnet` bootstrap committee secrets, in seed order.
+pub fn mainnet_committee_secrets() -> Vec<crate::bls::SecretKey> {
+    (1u8..=21).map(mainnet_validator_secret).collect()
+}
+
 /// Deterministic `testnet` validator key for `seed` (Decision 13).
 ///
 /// A distinct seed domain from `mini`'s, so testnet and mini committees never
-/// coincide, while staying a pure function of the seed — no runtime entropy,
+/// coincide, while staying a pure function of the seed - no runtime entropy,
 /// two independently constructed `testnet` profiles are identical.
 pub fn testnet_validator_key(seed: u8) -> BlsPublicKey {
     testnet_validator_secret(seed).public_key()
@@ -279,17 +332,26 @@ pub struct NetworkParams {
     /// future network can price its own dust floor without touching code —
     /// but both shipped profiles carry the constant's value.
     pub l2_deposit_minimum_sat: u64,
-    /// Fixed genesis validator committee (Decisions 8 and 11, SPEC.md §14).
+    /// Fixed genesis validator committee (Decisions 11 and 27, SPEC.md §14).
     /// Explicit BLS keys. Decision 20 added bonded stake, so this is a
     /// *bootstrap* list rather than the source of authority: `Chain::
     /// committee_keys` derives the committee from the bond ledger whenever any
-    /// bond exists and falls back to these keys only while none does. `mini` and
-    /// `testnet` carry deterministic keys so the finality path is exercisable;
-    /// `mainnet` carries an empty list, meaning checkpoints verify against
-    /// nothing until a validator actually bonds and therefore fail closed.
-    /// Canonically sorted by key bytes at construction; every node holding these
-    /// params derives the same set.
+    /// bond exists and falls back to these keys only while none does.
+    ///
+    /// `mainnet` carries 21 deterministic public bootstrap keys, so a fresh
+    /// chain can produce a valid quorum-15 checkpoint at activation height 100.
+    /// The first bond replaces them under the existing TopN rule; they are not
+    /// a permanent seat. `mini` and `testnet` carry four deterministic test
+    /// keys. Canonically sorted by key bytes at construction; every node holding
+    /// these params derives the same set.
     pub genesis_validators: Vec<BlsPublicKey>,
+    /// Validator set that authorizes L2 `Settle` payloads (Decision 15).
+    ///
+    /// Kept separate from `genesis_validators` so the mainnet L1 bootstrap
+    /// committee cannot silently become the L2 settlement authority. `mainnet`
+    /// stays empty and therefore fails closed with `BadQuorum`; `mini` and
+    /// `testnet` carry their four declared keys, preserving existing behaviour.
+    pub l2_settlement_validators: Vec<BlsPublicKey>,
     /// Blocks per checkpoint epoch (Decision 11). `mini` uses 10 so finality
     /// observation is exercisable in tests; `mainnet` uses 100.
     pub checkpoint_interval_blocks: u64,
@@ -301,9 +363,8 @@ pub struct NetworkParams {
     /// First L1 height at which an L2 → L1 exit may be queued and released
     /// (approved P1). `0` means never — the same convention as
     /// `finality_activation_height`: queueing is refused below activation so
-    /// funds can never be encumbered with no release. `mini`/`testnet` carry
-    /// `1` (active from the first block, so exits are exercisable in tests);
-    /// `mainnet` carries `0` until the launch decision sets a height.
+    /// funds can never be encumbered with no release. All shipped profiles
+    /// carry `1` (active from the first block).
     pub exit_activation_height: u64,
     /// Height at which the network begins enforcing post-quantum (ML-DSA-65,
     /// scheme 3) spends. `0` means never: the rule is inert and every profile
@@ -432,10 +493,13 @@ impl NetworkParams {
             },
             l2_genesis_grants: Vec::new(),
             l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
-            // No committee yet: mainnet finality observation arrives with the
-            // testnet standup, not as placeholder keys. Empty verifies nothing
-            // (fail closed), which is the honest pre-committee state.
-            genesis_validators: Vec::new(),
+            // Decision 27: 21 deterministic public bootstrap keys, sorted, so a
+            // fresh chain has a live committee from genesis. Quorum is 15.
+            // The first bond replaces this set under the existing TopN rule.
+            genesis_validators: mainnet_committee_keys(),
+            // L2 settlement authority stays fail-closed on mainnet until a
+            // separate settlement committee is decided (Decision 27).
+            l2_settlement_validators: Vec::new(),
             checkpoint_interval_blocks: 100,
             // Binding finality active from height 100 on mainnet — checkpoints
             // become binding once the committee signs them; depth-based
@@ -511,12 +575,9 @@ impl NetworkParams {
             l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
             // Test committee (Decision 11, SPEC.md §14): deterministic
             // BLS keys so mini exercises checkpoint finality end to end.
-            genesis_validators: {
-                let mut v: Vec<BlsPublicKey> = (1u8..=4).map(mini_validator_key).collect();
-                v.sort_by_key(|a| a.0);
-                v.dedup();
-                v
-            },
+            genesis_validators: mini_committee_keys(),
+            // L2 settlements keep the existing four-key declared committee.
+            l2_settlement_validators: mini_committee_keys(),
             checkpoint_interval_blocks: 10,
             // M4 built the machinery; M5 does not activate binding finality on
             // mini either (that is the dedicated `testnet` profile's job), so
@@ -578,12 +639,9 @@ impl NetworkParams {
             l2_deposit_minimum_sat: L2_DEPOSIT_MINIMUM_SAT,
             // Four deterministic testnet keys (distinct derivation from mini),
             // canonically sorted. Quorum for n=4 is ceil(4×6667/10000)=3.
-            genesis_validators: {
-                let mut v: Vec<BlsPublicKey> = (1u8..=4).map(testnet_validator_key).collect();
-                v.sort_by_key(|a| a.0);
-                v.dedup();
-                v
-            },
+            genesis_validators: testnet_committee_keys(),
+            // L2 settlements keep the existing four-key declared committee.
+            l2_settlement_validators: testnet_committee_keys(),
             checkpoint_interval_blocks: 10,
             // Binding finality turns on at height 20 (Decision 13): an explicit,
             // deterministic activation condition. Below it, observed
@@ -701,6 +759,21 @@ impl NetworkParams {
             }
             seen_keys.push(*k);
         }
+        let mut seen_l2_keys: Vec<BlsPublicKey> =
+            Vec::with_capacity(self.l2_settlement_validators.len());
+        for k in &self.l2_settlement_validators {
+            if k.is_zero() {
+                return Err(Error::Malformed(
+                    "l2_settlement_validators contains a zero key",
+                ));
+            }
+            if seen_l2_keys.contains(k) {
+                return Err(Error::Malformed(
+                    "l2_settlement_validators contains duplicate keys",
+                ));
+            }
+            seen_l2_keys.push(*k);
+        }
         if self.checkpoint_interval_blocks == 0 {
             return Err(Error::Malformed("checkpoint_interval_blocks must be > 0"));
         }
@@ -740,6 +813,31 @@ mod tests {
             p.genesis_difficulty, 1,
             "genesis must be trivially mineable"
         );
+    }
+
+    #[test]
+    fn mainnet_bootstrap_committee_is_21_sorted_keys_with_quorum_15_and_fail_closed_l2() {
+        let p = NetworkParams::mainnet();
+        p.validate().unwrap();
+        assert_eq!(p.genesis_validators.len(), 21);
+        assert!(p.genesis_validators.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(
+            crate::bls_checkpoint::ValidatorSet::new(p.genesis_validators.clone()).quorum_size(),
+            15
+        );
+        assert!(
+            p.l2_settlement_validators.is_empty(),
+            "the L1 bootstrap committee must not authorize L2 settlements"
+        );
+
+        // The bootstrap secrets are a pure function of their seeds and match
+        // the declared keys after canonical sorting.
+        let mut from_secrets: Vec<BlsPublicKey> = mainnet_committee_secrets()
+            .iter()
+            .map(|sk| sk.public_key())
+            .collect();
+        from_secrets.sort_by_key(|a| a.0);
+        assert_eq!(from_secrets, p.genesis_validators);
     }
 
     #[test]

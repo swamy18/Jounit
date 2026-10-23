@@ -204,7 +204,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let broadcaster =
         HttpNode::for_network(node_url, &params.network_id).map_err(|e| e.to_string())?;
     let host = Host::new(view, broadcaster);
-    let validators = ValidatorSet::new(params.genesis_validators.clone());
+    let validators = ValidatorSet::new(params.l2_settlement_validators.clone());
     let mut client = WorkerClient::new(host, wallet, CpuExecutor::default(), validators, &RealBls)
         .with_config(config)
         .map_err(|e| format!("worker config: {e}"))?;

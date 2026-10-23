@@ -977,9 +977,10 @@ impl Chain {
     /// Active checkpoint committee (Decision 20 item 2): the 21
     /// highest-staked bonds, per [`BondLedger::committee`] — the one
     /// definition shared with slashing and with the epoch set. An empty ledger
-    /// falls back to the profile's declared committee (the Decision 8/13 test
-    /// bootstrap); mainnet declares none, so its committee is purely
-    /// bond-derived from the first bond on.
+    /// falls back to the profile's declared bootstrap committee: 21 public
+    /// deterministic keys on mainnet (Decision 27), four test keys on mini and
+    /// testnet. The first bond replaces the bootstrap set under the existing
+    /// TopN rule.
     pub fn committee_keys(&self) -> Vec<BlsPublicKey> {
         let bonded = self.bonds.committee();
         if bonded.is_empty() {

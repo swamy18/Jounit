@@ -5,7 +5,7 @@ Recorded as the protocol owner's standing decisions.
 > **Reading order.** This file is chronological. Decisions 1–2 sit at the top,
 > then a **dated gap audit** (a snapshot that says Phases 2–5 are NOT STARTED —
 > true when it was written, superseded by the per-phase "Implementation status
-> — Phase N SHIPPED" addenda further down the same file), then Decisions 3–19.
+> — Phase N SHIPPED" addenda further down the same file), then Decisions 3–27.
 > The **authoritative** record of what is built is the Decision 17 / 18 / 19
 > sections and the M1–M5 and SA-1…SA-6 implementation records. The per-phase
 > addenda and the P2–P6 sections are historical where they disagree with those.
@@ -597,7 +597,7 @@ discriminators.
 | 3 — Dispute engine + M2/M1 | DONE |
 | 4 — Verified Work Certificates | DONE |
 | 5 — Worker SDK | DONE |
-| 6 — Testnet + finality activation | **IN PROGRESS** — D6–D9 shipped: L2 transactions in L1 blocks, genesis escrow funding, the REST service API, and the fixed genesis committee. Binding finality is live on `testnet` (`finality_activation_height = 20`); `mini` keeps `0` (observation only) and `mainnet` was later set to `100` (fails closed until a stake-derived committee exists). Deposits (§19.5) and the exits of §19.6 have since shipped too |
+| 6 — Testnet + finality activation | **IN PROGRESS** — D6–D9 shipped: L2 transactions in L1 blocks, genesis escrow funding, the REST service API, and the fixed genesis committee. Binding finality is live on `testnet` (`finality_activation_height = 20`); `mini` keeps `0` (observation only) and `mainnet` activates at `100` with its 21-key public bootstrap committee (Decision 27). Deposits (§19.5) and the exits of §19.6 have since shipped too |
 
 ---
 
@@ -703,9 +703,9 @@ observation without activation.**
    21, fixed per profile, not selected. (6) No ties: the committee is an
    explicit key list, canonically sorted by key bytes. (7) Active from genesis,
    no rotation in M4. (8) The committee is explicit BLS keys in
-   `NetworkParams` (`mini`: four deterministic test keys; `mainnet`: empty,
-   meaning no committee yet — checkpoints verify against nothing and therefore
-   fail closed). (9) Every node derives the identical `EpochSet` (epoch 0,
+   `NetworkParams` (`mini`: four deterministic test keys; `mainnet`: empty at
+   the time, meaning no committee yet — Decision 27 later added 21 bootstrap
+   keys). (9) Every node derives the identical `EpochSet` (epoch 0,
    set-hash bound) as a pure function of params.
 3. **Canonical authority (STEP 5 verdict).** `validators::
    validate_checkpoint_against_set` (six clauses: epoch, set, bitmap, count,
@@ -735,8 +735,8 @@ observation without activation.**
    replay is untouched.
 7. **Testnet profile (STEP 11 verdict).** No new `NetworkParams` profile in
    M4 (that is M5's P1 proposal). `mini` carries the test committee and a
-   10-block checkpoint interval; `mainnet` carries an empty committee and a
-   100-block interval. No public testnet starts in M4.
+   10-block checkpoint interval; `mainnet` carried an empty committee and a
+   100-block interval until Decision 27. No public testnet starts in M4.
 
 ---
 
@@ -799,8 +799,9 @@ Before binding finality activates, the M3 depth rule still governs, so M3 is
 never made less safe. After activation, a deposit is not spendable merely
 because depth is satisfied if the canonical history at that height is not
 finalized. L2 does not grow a second finality system. `Settle`/VWC keep their
-existing verification semantics but use the declared committee; a profile with
-an intentionally empty committee (mainnet) continues to fail closed.
+existing verification semantics but use the declared committee. Decision 27
+later split this into `l2_settlement_validators`; mainnet keeps that set empty
+and continues to fail closed.
 
 ---
 
@@ -1025,10 +1026,9 @@ that remain unbuilt:
    item 3). Adding any is a monetary decision and is explicitly out of scope.
 5. **Equivocation slashing** — evidence exists (`EquivocationEvidence`) but no
    bond exists to burn, so punishment is deferred.
-6. **A mainnet committee.** `NetworkParams::mainnet()` carries an **empty**
-   `genesis_validators`, so checkpoint verification fails closed and binding
-   finality is untestable on mainnet. Choosing the bootstrap committee is a
-   decision.
+6. **A mainnet committee.** `NetworkParams::mainnet()` originally carried an
+   **empty** `genesis_validators`; Decision 27 resolved this with a 21-key
+   public bootstrap committee active at height 100.
 
 None of 1–6 may be invented by implementation; each needs a recorded decision.
 
@@ -1283,10 +1283,9 @@ left unbuilt.
    (`EquivocationEvidence`, Decision 14) already exists; punishment was
    deferred only for lack of a bond. Adding validator rewards of any kind stays
    a monetary decision and out of scope (Decision 2 item 3 stands).
-5. **A mainnet committee.** `NetworkParams::mainnet()` carries an **empty**
-   `genesis_validators`, so checkpoint verification fails closed and binding
-   finality is untestable on mainnet. Choosing the bootstrap committee is a
-   decision.
+5. **A mainnet committee.** Resolved by Decision 27: mainnet carries 21 public
+   deterministic bootstrap keys (quorum 15) and activates binding finality at
+   height 100. The first bond replaces them with the stake-weighted TopN set.
 
 **Status: APPROVED 2026-10-10, IMPLEMENTED 2026-10-10.** A compute result is
 fraudulent if and only if deterministic CPU re-execution over the identical
@@ -1578,3 +1577,51 @@ re-implemented, so there is one implementation of each.
 well as policies and exits, and the state wire version moves to 5. Shipped in
 the same protocol version as Decision 25, because a root change is a root
 change.
+
+---
+
+## Decision 27 - Mainnet bootstrap committee + separate L2 settlement committee
+
+**Status: APPROVED 2026-10-23, IMPLEMENTED 2026-10-23.** Resolves the mainnet
+cold-start gap left by Decision 20 item 5.
+
+**The decision: mainnet starts with a deterministic public 21-key committee,
+and L2 settlement keeps its own fail-closed set.**
+
+1. **Twenty-one bootstrap keys.** `NetworkParams::mainnet().genesis_validators`
+   carries 21 keys derived from seeds 1..=21 under
+   `jounit/mainnet-validator-seed/v1`, canonically sorted by BLS public-key
+   bytes. Quorum is `ceil(21 * 6667 / 10000) = 15`.
+2. **Active at height 100.** Mainnet keeps `finality_activation_height = 100`
+   and `checkpoint_interval_blocks = 100`, so a fresh chain can bind finality at
+   its first legal checkpoint.
+3. **The first bond replaces it.** With a non-empty bond ledger, committee
+   selection remains the existing stake-weighted TopN 21 rule at the epoch seed
+   block. With an empty ledger, the bootstrap list is the fallback. No new
+   transition rule is added.
+4. **The keys are public, by design.** Deterministic derivation means any node
+   can sign for the bootstrap committee before a bond exists. That is accepted
+   only for the bonded-stake cold start; it is not a claim of decentralisation,
+   and the first bond ends it.
+5. **L2 settlement is separate.** `NetworkParams::l2_settlement_validators` is a
+   distinct declaration consumed by `jnt_node::l2::validator_set` and the
+   worker. Mainnet leaves it empty and therefore refuses every settlement by
+   name. Mini/testnet use the same four keys for both sets.
+6. **Genesis bytes do not change.** The committee is not part of the genesis
+   block, so populating it does not alter the genesis hash.
+
+**Operational path.** `jnt-node validator --bootstrap` writes the 21 declared
+keys as encrypted files on a fresh mainnet node. Checkpoint signatures are not
+gossiped as partial shares, so a node needs quorum 15 locally to produce the
+first certificate; the command provisions the complete committee. The keys are
+public by design. After the first bond, the operator removes the bootstrap key
+files because stale non-members make signing fail closed.
+
+**What this does not change.** No bond economics, rewards, fee share or
+unbonding rules; no new consensus transaction type; no validator-yield change.
+The only wire-visible effect is that mainnet checkpoints become verifiable at
+height 100.
+
+**Supersedes.** Decision 20 item 5 and P2 item 6 ("choosing the bootstrap
+committee is a decision"); Decision 15's "declared active committee" for L2 is
+now the separate `l2_settlement_validators` field.

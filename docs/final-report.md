@@ -1,5 +1,10 @@
 # Final Verification Report — 2026-10-09
 
+> **Historical snapshot.** Later decisions supersede parts of this report:
+> Decisions 25–26 moved policy and credit on chain, and Decision 27 added the
+> 21-key mainnet bootstrap committee while keeping L2 settlement fail-closed.
+> Current status lives in `docs/status.md`.
+
 Scope: finish the genuinely remaining work, resolve or isolate the documented
 protocol blockers, verify everything, and leave the repository in a defensible
 public-testnet / mainnet-candidate state — **without** inventing protocol

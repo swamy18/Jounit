@@ -331,7 +331,7 @@ everything deposited: value is moved, never created.
 **What it supports:** an agent earning from work it has not yet performed, with
 the risk carried by a bond instead of by trust in a stranger.
 
-### Compute-backed validator staking — _implemented, empty on mainnet_
+### Compute-backed validator staking — _implemented, no bonds yet_
 
 Validators that also serve verified work earn more, which ties the protocol's
 security budget and its utility budget into one budget. The condition is that
@@ -709,8 +709,8 @@ payload without one does not decode.
 
 **Finality.** Binding finality activates at `finality_activation_height = 100`
 on mainnet from genesis. Depth-based finality (100 blocks) secures the chain
-before that — the same Bitcoin-style rule. Checkpoint verification is
-stake-bound.
+before that — the same Bitcoin-style rule. The 21-key bootstrap committee signs
+until the first bond, then the stake-weighted TopN set replaces it.
 
 ---
 
@@ -754,15 +754,16 @@ Same code, different numbers.
 | Start reward | 76 JNT | 76 JNT | 76 JNT |
 | Finality depth | 100 | 20 | 20 |
 | Coinbase maturity | 100 | 10 | 10 |
-| Genesis validators | **none** | 4 deterministic | 4 deterministic |
+| Genesis validators | 21 public bootstrap (quorum 15) | 4 deterministic | 4 deterministic |
+| L2 settlement validators | **none** (fail closed) | 4 deterministic | 4 deterministic |
 | Binding finality | on at height 100 | on at height 20 | off |
 | Exits | on at height 1 | on at height 1 | on at height 1 |
 | PQ spend requirement | **off** | off | off |
 
-`mainnet` deliberately ships with no genesis committee, so every checkpoint
-fails closed until the stake-weighted committee derives from the bond ledger
-— never verifying against nothing. Exits and binding finality are already
-parameterized on (heights 1 and 100). The PQ row is the
+`mainnet` ships with 21 public deterministic bootstrap keys (quorum 15) so
+finality can bind before any stake exists; the first bond replaces them with
+the stake-weighted TopN committee. Its separate L2 settlement set stays empty,
+so settlements fail closed. Exits are active from height 1. The PQ row is the
 `pq_activation_height` of Decision 24: `0` means no input is refused for
 lacking an ML-DSA-65 component, and the rule is age-gated when it is flipped —
 only outputs created at or after the height must carry the component, so
@@ -876,7 +877,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1230 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1304 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
