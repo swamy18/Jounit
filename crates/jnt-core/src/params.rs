@@ -913,8 +913,8 @@ mod tests {
         let got: String = g.block_hash().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             got,
-            "fae560773696a29ef3340ae13d46a4596a51be91c549265fb04a5ed1af0a596b\
-             1b90d3bd022d90e6efddc2f0425c0f44c676dfee466c114ed7683bf6e49f5234"
+            "ccc9db9181e91c52bc4f9d7639a00add3f6b8c5a214a8d2319fdfcabe6276953\
+             f1c392ea9aa6b308a357d360b49a2167893254f6ac85745818cd0a2299fa1a5a"
         );
     }
 

@@ -430,15 +430,39 @@ fn merkle_from_leaves(mut level: Vec<Hash>) -> Hash {
     level[0]
 }
 
+/// The canonical inscription embedded in the genesis block, carried in the
+/// coinbase output address — the Jounit analogue of Bitcoin's genesis headline
+/// (SPEC.md §2.3, "The Times 03/Jan/2009…" precedent).
+///
+/// The protocol is scriptless (tx.rs §3.1), so there is no `OP_RETURN`. The
+/// genesis coinbase output carries zero value, making its 20-byte address
+/// unreachable as a spend target (`Chain::apply_block` never records zero-value
+/// coinbases into the UTXO set). That leaves the address field free to carry
+/// arbitrary permanent data without a protocol change or a new consensus rule.
+///
+/// "One Consciousness." is 18 bytes; the field is 20, so it is zero-padded on
+/// the right. The padding is deterministic and recoverable.
+pub const GENESIS_INSCRIPTION: &str = "One Consciousness.";
+
+/// Build the 20-byte genesis output address from the inscription, right-padded
+/// with zero bytes. Deterministic: every profile produces the identical address.
+fn genesis_inscription_address() -> [u8; 20] {
+    let mut addr = [0u8; 20];
+    addr[..GENESIS_INSCRIPTION.len()].copy_from_slice(GENESIS_INSCRIPTION.as_bytes());
+    addr
+}
+
 /// The canonical genesis block. Contains zero value and no spendable output:
 /// the 0% premine promised in the design doc (Section 16) is enforced by code.
+/// The coinbase output address carries [`GENESIS_INSCRIPTION`] as a permanent
+/// on-chain message (SPEC.md §2.3).
 pub fn genesis_block(difficulty: u128) -> Block {
     let coinbase = Transaction::coinbase(
         ZERO_HASH512,
         0,
         Output {
             value: 0,
-            address: [0u8; 20],
+            address: genesis_inscription_address(),
         },
     );
     debug_assert!(coinbase.is_coinbase());
@@ -554,6 +578,60 @@ mod tests {
         assert_eq!(g.header.difficulty, 1);
         assert_eq!(g.header.prev_hash, [0u8; 64]);
         assert_eq!(g.header.merkle_root, g.merkle_root());
+    }
+
+    #[test]
+    fn genesis_carries_the_canonical_inscription() {
+        let g = genesis_block(1);
+        // The exact text is recoverable from the genesis coinbase output address
+        // (SPEC.md §2.3): the address is right-padded with zero bytes.
+        let addr = g.txs[0].outputs[0].address;
+        let trimmed: Vec<u8> = addr.iter().copied().take_while(|&b| b != 0).collect();
+        assert_eq!(
+            String::from_utf8(trimmed).unwrap(),
+            GENESIS_INSCRIPTION,
+            "the genesis inscription must round-trip exactly"
+        );
+        assert!(
+            is_genesis_shape_ok(&g),
+            "the inscription must not break the genesis shape check"
+        );
+    }
+
+    #[test]
+    fn genesis_inscription_is_zero_padded_and_deterministic() {
+        let addr = crate::block::genesis_block(1).txs[0].outputs[0].address;
+        // Exactly the message bytes, followed by zero padding to 20.
+        assert_eq!(
+            &addr[..GENESIS_INSCRIPTION.len()],
+            GENESIS_INSCRIPTION.as_bytes()
+        );
+        assert_eq!(&addr[GENESIS_INSCRIPTION.len()..], &[0u8; 2]);
+        // Identical across profiles (both call genesis_block with difficulty 1).
+        let mainnet =
+            crate::block::genesis_block(crate::params::NetworkParams::mainnet().genesis_difficulty)
+                .txs[0]
+                .outputs[0]
+                .address;
+        let mini =
+            crate::block::genesis_block(crate::params::NetworkParams::mini().genesis_difficulty)
+                .txs[0]
+                .outputs[0]
+                .address;
+        assert_eq!(addr, mainnet, "mainnet genesis inscription must match");
+        assert_eq!(addr, mini, "mini genesis inscription must match");
+    }
+
+    #[test]
+    fn genesis_block_serializes_deserializes_with_inscription() {
+        let g = genesis_block(1);
+        let bytes = g.serialize();
+        let back = Block::deserialize(&bytes).unwrap();
+        assert_eq!(back, g, "genesis must round-trip through serialize");
+        assert_eq!(
+            back.txs[0].outputs[0].address, g.txs[0].outputs[0].address,
+            "inscription must survive serialization"
+        );
     }
 
     #[test]

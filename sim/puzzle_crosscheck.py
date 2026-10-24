@@ -72,7 +72,7 @@ def reference_header(height: int, nonce: int, epoch_id: int):
         + bytes([0])
         + u32le(1)  # output_count
         + u64le(0)  # value
-        + (b"\x00" * 20)  # address
+        + b"One Consciousness.\x00\x00"  # address (genesis inscription, SPEC.md \u00a72.3)
     )
     merkle_root = hashlib.sha256(b"\x00" + coinbase).digest()
 
