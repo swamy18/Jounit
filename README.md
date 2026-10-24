@@ -296,20 +296,20 @@ receipts and reputation, and over the agent authority and credit layer:
 `inspect.policy`, `inspect.agent_spend` and `inspect.credit` read the terms an
 agent is about to sign and the hash to sign.
 
-> **What changed.** The spending-policy layer used to be node-local: a policy
-> constrained a payment *on the node that issued it*, and the chain never saw
-> it. It is now **consensus state** (SPEC.md §21, Decision 25). A grant is
-> published on chain, the owner's signature binds it to a named spender and a
-> named agent, the caps and allow-lists and the nonce are enforced against
-> state the chain keeps, and revoking a grant kills every descendant of it. The
-> same is true of credit (SPEC.md §22, Decision 26): a loan is a chain fact
-> with the lender's signature over its terms, the principal really moves, and
-> the collateral answers for the debt.
->
-> What is still node-local is the *service layer* around them: the payment
-> book, the receipt book, the credit gate used for admission and the
-> authorisation helper the API issues offline. Those are operational
-> bookkeeping, not sources of spendable balance.
+### Consensus state vs. service layer
+
+The spending-policy layer is consensus state (SPEC.md §21). A grant is published
+on chain, the owner's signature binds it to a named spender and a named agent,
+the caps, allow-lists and nonce are enforced against state the chain keeps, and
+revoking a grant kills every descendant of it. The same is true of credit
+(SPEC.md §22): a loan is a chain fact with the lender's signature over its terms,
+the principal really moves, and the collateral answers for the debt.
+
+The *service layer* surrounding them is still node-local: the payment book, the
+receipt book, the credit gate used for admission and the authorisation helper the
+API issues offline. Those are operational bookkeeping, not sources of spendable
+balance — they persist to disk so they survive restart, but consensus never
+depends on them.
 
 ---
 
@@ -356,14 +356,14 @@ parameter — taking it as an argument would let any caller dictate the verdict.
 **"No match is not guilt."** An inconclusive arbitration settles nothing. A
 malformed or unexecutable task cannot become a fraud conviction by accident.
 
-### The vote transport
+### Vote binding and replay protection
 
-A committee member signs one vote per held key — four keys is four committee
+Each committee member signs one vote per held key — four keys is four committee
 members, not one member with four signatures, because a quorum counts *distinct*
 signers.
 
-A vote binds the task, the verdict, the reference result, the network, the height
-and the signer, under its own domain separation tag. It signs exactly
+A vote binds the task, the verdict, the reference result, the network, the
+height and the signer, under its own domain separation tag. It signs exactly
 `SettlePayload::signing_hash`, which is what lets a quorum of votes aggregate
 into the aggregate the settlement transaction carries — and lets the settlement
 path re-verify it from scratch with real BLS pairings.
@@ -377,13 +377,11 @@ recorded as equivocation — blaming an honest signer for the committee's
 disagreement is exactly the kind of thing that gets turned into a slash. A genuine
 double-sign is recorded as `ArbitrationEquivocation`.
 
-> **Fixed before mainnet.** A vote used to sign the settle *decision* only, so
-> its signature verified on any chain carrying that decision. Network and
-> height are now part of the signed message: `SettlePayload` carries both,
-> `SettlePayload::signing_hash` covers them, and `apply` refuses a payload
-> naming another network or a vote from the future. The tally still re-checks
-> that every counted vote names one network and one height, and the quorum
-> certificate carries the same chain context so it stays re-verifiable.
+The signed message includes the network and height: `SettlePayload` carries both,
+`SettlePayload::signing_hash` covers them, and `apply` refuses a payload naming
+another network or a vote from the future. The tally re-checks that every counted
+vote names one network and one height, and the quorum certificate carries the same
+chain context so it stays re-verifiable.
 
 ### What a fraud verdict does
 
