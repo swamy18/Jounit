@@ -64,6 +64,7 @@ fuzz_target!(|data: &[u8]| {
     let verifier = MockBls;
 
     let mut position: Option<Hash> = None;
+    let mut last_repay: Option<L2Transaction> = None;
     let mut height = 1u64;
     let mut i = 96usize;
     let mut nonce = 0u64;
@@ -137,6 +138,7 @@ fuzz_target!(|data: &[u8]| {
                 let before = state.committed_root();
                 match state.apply(&tx, height, &validators, &verifier) {
                     Ok(_) => {
+                        last_repay = Some(tx.clone());
                         let p = state
                             .credit_position(&id)
                             .expect("the position is in the state");
@@ -199,18 +201,13 @@ fuzz_target!(|data: &[u8]| {
             }
             // The same transaction again: the replay guard.
             4 => {
-                let Some(id) = position else { break };
-                let payload = match CreditRepayPayload::build(&borrower, id, amount) {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-                let tx = L2Transaction::new(L2Payload::CreditRepay(payload));
+                let Some(tx) = last_repay.clone() else { break };
                 let before = state.committed_root();
                 let err = state
                     .apply(&tx, height, &validators, &verifier)
                     .expect_err("a repeated transaction must be refused");
                 assert!(
-                    matches!(err, L2Error::Replay) || !matches!(err, L2Error::UnknownCreditPosition),
+                    matches!(err, L2Error::Replay),
                     "unexpected refusal for a repeated transaction: {err:?}"
                 );
                 assert_eq!(
