@@ -2,11 +2,6 @@
 
 AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
-> **Status: ready to launch.** All three protocol blockers are resolved: the
-> 5,000 JNT minimum stake has been removed, the L2 fee path has a flat minimum
-> floor, and the credit/escrow node-local boundary is explicit. See
-> [Mainnet Operational Readiness](docs/mainnet-readiness.md).
-
 **Author and copyright:** Community-owned. The code is open source — no single
 person holds it, like Bitcoin. The *Jounit* name, `JNT` ticker and logos are
 community marks — see [License and trademark](#license-and-trademark).
@@ -22,11 +17,8 @@ and redistribute — no single person owns it.
 - [Quick start](#quick-start)
 - [Supply](#supply)
 - [What the chain is for](#what-the-chain-is-for)
-- [Capabilities the project is building](#capabilities-the-project-is-building)
-- [What makes this different](#what-makes-this-different)
 - [Use cases](#use-cases)
 - [Machines, agents and robots](#machines-agents-and-robots)
-- [Verified Work Certificates](#verified-work-certificates)
 - [How fraud is detected](#how-fraud-is-detected)
 - [How withdrawals work](#how-withdrawals-work)
 - [Validators and finality](#validators-and-finality)
@@ -181,214 +173,27 @@ claims it, runs it and submits a result hash, and anyone may **challenge** that
 result. A committee then decides whether the work was correct, and settlement
 moves the money accordingly.
 
-The L2 transaction types are the whole vocabulary — six for the task economy,
-four for the exits, and seven for the authority and credit layers:
+The L2 transaction types are the whole vocabulary — six for the task economy and
+the exit mechanism, seven for the authority and credit layers (thirteen total):
 
 | Type | Value | Purpose |
 |---|---|---|
-| `0x10` Post | Submitter | Open a task, lock the escrow, publish the compute spec |
-| `0x11` Claim | Worker | Take the task, post a deposit |
-| `0x12` Submit | Worker | Submit the result hash with a signed attestation |
-| `0x13` Dispute | Anyone | Challenge the result with a counter-result and a deposit |
-| `0x14` Settle | Committee | Apply the decision: pay, refund, slash |
-| `0x15` ExitQueue | Owner | Start withdrawing back to Layer 1 |
-| `0x16` Policy | Owner | Publish a spending grant (agent authority) |
-| `0x17` PolicyRevoke | Owner | Kill a grant — every descendant dies with it |
-| `0x18` AgentSpend | Spender | Spend under a published grant |
-| `0x19` CreditOpen | Lender | Open a loan; the principal moves to the borrower |
-| `0x1A` CreditCollateral | Borrower | Add collateral to a position |
-| `0x1B` CreditRepay | Borrower | Repay (interest first, then principal) |
-| `0x1C` CreditDefault | Anyone | Settle a position that was not repaid by its deadline |
+| `PostTask` | `0x10` | Submitter: open a task, lock the escrow, publish the compute spec |
+| `ClaimTask` | `0x11` | Worker: take the task, post a deposit |
+| `SubmitResult` | `0x12` | Worker: submit the result hash with a signed attestation |
+| `Dispute` | `0x13` | Anyone: challenge the result with a counter-result and a deposit |
+| `Settle` | `0x14` | Committee: apply the decision — pay, refund, slash |
+| `ExitQueue` | `0x15` | Owner: start withdrawing back to Layer 1 |
+| `Policy` | `0x16` | Owner: publish a spending grant (agent authority) |
+| `PolicyRevoke` | `0x17` | Owner: kill a grant — every descendant dies with it |
+| `AgentSpend` | `0x18` | Spender: spend under a published grant |
+| `CreditOpen` | `0x19` | Lender: open a loan; the principal moves to the borrower |
+| `CreditCollateral` | `0x1A` | Borrower: add collateral to a position |
+| `CreditRepay` | `0x1B` | Borrower: repay (interest first, then principal) |
+| `CreditDefault` | `0x1C` | Anyone: settle a position that was not repaid by its deadline |
 
 A task moves through six states: `Open → InProgress → ResultSubmitted →
 Disputed? → Settled`, with `Expired` as the timeout branch.
-
----
-
-## Capabilities the project is building
-
-The base layer above is complete and running. What follows is where it is going,
-listed in dependency order because several of these are only meaningful once the
-first exists.
-
-Each section says what the capability is and what it supports. **What is actually
-built differs per item, and the status is stated in each heading rather than
-implied by being on the same page.** Two of the five are held on decisions that
-are organisational rather than technical, and are marked as such instead of being
-started to look further along.
-
-### Escrowed service contracts — _in development_
-
-**Built:** the general `ServiceContract`, its transitions, a validated
-`ServiceContract::open` constructor for non-compute deliverables, and a
-non-compute deliverable that drives them.
-
-The task economy above is a *specific case* of a general primitive: party A
-commits to a deliverable and bonds against it, party B escrows payment,
-settlement fires when the deliverable is verified. Refactoring that into a
-standalone **ServiceContract** means the same escrow, bonding and dispute
-machinery serves any computation with an admissible verifier — not only a neural
-network task.
-
-The design constraint is what makes it work: the verifier must be a
-deterministic function of committed inputs, free of height, clock and randomness.
-Work already covers the general form, and the compute task is one instantiation
-of it rather than the only one.
-
-**Settlement is wired end to end.** A release no longer stops at the book: `POST
-/v1/escrow/{id}/settle` binds it to the Layer 1 exit that pays the payee (owner
-is the payer, the destination is the payee, the amount is the escrow's) and
-queues that exit through the ordinary withdrawal crank, and the escrow reads
-`Finalized` only once consensus actually released the bound exit — the height
-stamp alone no longer finalizes a bound escrow.
-
-**What it supports:** any task where one party can produce a result that another
-can check without re-running it.
-
-### Attenuated delegation chains — _on chain (SPEC.md §21, Decision 25)_
-
-Multi-agent systems need an owner to grant an agent a subset of their own
-spending authority, and that agent to do the same downward. Each level inherits a
-**strict subset** of its parent's spend policy — never a wider one — so authority
-narrows as it travels.
-
-A delegated grant names the parent it comes from, and the chain refuses a grant
-that widens its parent's caps, allow-lists or lifetime. The parent's bytes are
-on chain, so the domination rule is checked against the real parent rather than
-against a claim. Revocation reaches every descendant: a spend walks the whole
-ancestry, so the owner's kill switch covers a delegated fleet without a
-revocation transaction per link. Consent, key custody and the existence of a
-committee are organisational choices this document does not make.
-
-**What it supports:** machine fleets and agent hierarchies where the operator
-must bound what any single agent can spend, without re-authorizing each
-transaction by hand.
-
-### Conditional and oracle-gated payments — _in development_
-
-Payment that releases against a stated condition rather than a manual approval:
-"release when the result matches," "release when latency stayed under a
-threshold." This is designed so that only conditions a third party can evaluate
-deterministically are admitted, which is the discipline that keeps the escrow from
-acquiring a trusted party. Conditions that genuinely require an oracle are
-refused when the escrow opens: this codebase implements no oracle verifier, so
-an oracle-gated escrow would be a contract nobody could ever satisfy. Every
-escrow also expires `ESCROW_EXPIRY_BLOCKS` (1 008 blocks, seven days) after it
-opens and refunds its payer, so a lost key or a silent arbitrator can no longer
-hold value forever.
-
-**What it supports:** pay-as-you-use and outcome-based pricing that settles
-itself, without a human in the loop to release funds.
-
-### Undercollateralized agent credit — _on chain (SPEC.md §22, Decision 26)_
-
-**Built:** the collateral arithmetic, the position lifecycle with a repayment
-deadline, and a credit book that holds bonds, balances and locked collateral
-under a conservation invariant — and, on top of that, **credit positions that
-are chain facts**.
-
-A loan is now four Layer-2 transaction types: `CreditOpen` (the **lender**
-signs the terms), `CreditCollateral`, `CreditRepay` and `CreditDefault`
-(permissionless). The principal moves to the borrower when the position
-opens, the borrower's own funds are locked as collateral, interest is charged
-once per period and paid before the principal, and a default pays the lender
-from the collateral, hands the surplus back to the borrower and reports the
-uncovered remainder as a shortfall the lender absorbs. The lender's signature
-is what makes it a loan rather than a claim somebody else made about them.
-
-**Issuance is attested, not open.** New credit for real backing enters only
-through `POST /v1/credit/mint`, which requires an attestation signed by a key
-the operator listed with `--credit-issuer` — with no key listed, every mint is
-refused — and a consumed attestation is recorded so it can never mint twice,
-even across a restart.
-
-An agent with a demonstrated track record can borrow against future work rather
-than pre-funding every transaction. This is deliberately built on two
-constraints: reputation is published as a deterministic **view** read off
-on-chain events, and credit is **always collateralized** — a posted bond
-discounts the requirement, never replaces it.
-
-The design is explicit that reputation is not a consensus input. A credit limit
-computed on-chain from a mutable score would make every reputation update a
-consensus event and make fresh identities farmable, which is the cheapest attack
-against the gate. So `credit.rs` has no signature that accepts a score at all —
-the guarantee is the type system refusing the call, not the code declining it.
-
-**If a position defaults**, settlement takes the position's own collateral first,
-then the bond, and **never reputation**. Collateral in excess of the debt returns
-to the borrower: a default takes what it is owed and no more, so an
-overcollateralized position that went bad still belongs to its borrower outside
-the debt. Any debt left after both is a reported shortfall, which the lender
-absorbs rather than the protocol inventing funds to cover.
-
-**A position runs to a deadline.** Before it, a default is refused — a lender
-cannot settle a merely late position on a whim — and the bond a position is
-priced with must be posted before it opens, so no discount is ever unbacked.
-The credit book holds free balances, posted bonds and collateral locked inside
-live positions, and asserts after every mutation that their sum equals
-everything deposited: value is moved, never created.
-
-**What it supports:** an agent earning from work it has not yet performed, with
-the risk carried by a bond instead of by trust in a stranger.
-
-### Compute-backed validator staking — _implemented, no bonds yet_
-
-Validators that also serve verified work earn more, which ties the protocol's
-security budget and its utility budget into one budget. The condition is that
-what a validator is paid for is *verified* work, where verified means a quorum
-proved it — not work that was merely submitted and left unchallenged. The
-committee is derived **by bonded stake** (TopN), see [Validators and
-finality](#validators-and-finality).
-
-**What it supports:** making the neural stage of mining economically useful
-rather than merely elegant, and aligning the interests that secure the chain with
-the work the chain exists to sell.
-
----
-
-## What makes this different
-
-These are properties verifiable in this repository, not aspirations.
-
-### A verifier that cannot be talked out of its answer
-
-The canonical reference that decides fraud is computed by the arbitration engine
-from the task's own committed fields. It is never accepted as an argument, so no
-caller can dictate the verdict. This is a structural property rather than a
-policy — see
-[How fraud is detected](#how-fraud-is-detected).
-
-### A receipt that is not mistaken for verification
-
-When a result goes unchallenged, the protocol pays it and issues a certificate —
-and that certificate states plainly that it proves nothing. A `WindowElapsed`
-certificate is a record that nobody objected; `validate_verified()` refuses it by
-name, and `asserts_correctness()` returns `false`. Relying parties that need
-independent proof must demand the quorum basis, and there is no argument by which
-the weak one satisfies it.
-
-The distinction is structural rather than documented, which is the point: the
-weak basis is unmissable rather than a convention a caller can forget.
-
-### Consensus with no floating point anywhere
-
-The consensus core computes in integers end to end: weights derive from the epoch
-id by SHA-256, forward passes accumulate in `i64` and wrap to `i32`, difficulty
-and supply use explicit arithmetic with every overflow refused rather than
-wrapped. A wrapped sum would compare small and pass a bound — this is a security
-property, not a style preference.
-
-Two separate implementations, in two languages, produce identical digests. The
-Python reference under `sim/` was written from the specification rather than from
-the Rust, and reproduces the puzzle digests the chain uses. That agreement is
-evidence the specification is unambiguous rather than merely self-consistent.
-
-### Work that cannot be precomputed
-
-Mining weights derive from the epoch id, so no miner can compute them before an
-epoch starts. The neural stage is a cost model with a bounded contribution rather
-than the load-bearing part of the proof — the SHA-256 chain carries the security,
-so the neural work can never become the weak link it is meant to make useful.
 
 ---
 
@@ -505,62 +310,6 @@ agent is about to sign and the hash to sign.
 > book, the receipt book, the credit gate used for admission and the
 > authorisation helper the API issues offline. Those are operational
 > bookkeeping, not sources of spendable balance.
-
----
-
-## Verified Work Certificates
-
-A **VWC** is the protocol's receipt for work that settled as correct: task `T`
-settled `Correct` with result `R`, worker `W` paid `P` satoshi at height `H`. It
-is a *derived consequence* of a settlement, never a claim an actor makes — there
-is no issuance transaction and no issuer key, because the settlement path already
-did all the authorizing.
-
-**What makes it trustworthy.** Its `id` is derived from every other field, so a
-tampered certificate cannot carry a matching id, and its encoding is byte-unique.
-
-**There are two kinds, and the difference is load-bearing:**
-
-| Kind | What backs it | Offline-verifiable? |
-|---|---|---|
-| `Quorum` | The settle payload's own BLS aggregate over the decision | **Yes** — against the validator set |
-| `WindowElapsed` | Nothing but the on-chain record that nobody objected in time | **No** |
-
-### The unchallenged-result rule
-
-This is the most important thing to understand about VWC certificates.
-
-A worker submits a result, and if nobody challenges it inside the dispute window,
-the task auto-settles `Correct` and the worker is paid. **That is correct
-protocol behaviour.** The timeout economics require a challenge to overturn a
-settlement, because otherwise anyone could file a dispute and never resolve it,
-stalling every task forever.
-
-So a wrong result that nobody challenges in time *is* paid. What must never
-happen is that payment being mistaken for verification. Three things prevent it:
-
-- `asserts_correctness()` returns `false` for a `WindowElapsed` certificate;
-- `validate_verified()` refuses it by name;
-- `is_offline_verifiable()` returns `false`.
-
-A relying party that needs independent proof must call `validate_verified`, and
-there is no argument by which the weak basis satisfies it. The distinction is
-structural, not a doc comment you can forget.
-
-The residual risk is economic, not cryptographic: an unchallenged wrong result
-earns its payment, and the only correction is a challenger who posts a deposit
-and acts in time.
-
-### What a VWC is used for
-
-- **Reputation.** A `VerifiedWork` event carries weight +2.
-- **Offline settlement.** A party that will not trust an on-chain record can
-  check a `Quorum` certificate's aggregate against the validator set directly.
-- **Earnings.** `jnt-worker` derives earnings from protocol state rather than
-  from anything a server tells it.
-
-A `Fraudulent` or `Expired` settlement issues **no** certificate — those are a
-slash record and a refund respectively, not evidence of correct work.
 
 ---
 
@@ -719,6 +468,7 @@ until the first bond, then the stake-weighted TopN set replaces it.
 | Path | What it is |
 |---|---|
 | [`SPEC.md`](SPEC.md) | **Normative.** Where a disagreement exists, this wins. |
+| [`AGENTS.md`](AGENTS.md) | Lint, type-check and test commands for this session. |
 | `crates/jnt-core/` | Protocol implementation. All consensus logic. |
 | `crates/jnt-net/` | P2P wire protocol, sync and relay. |
 | `crates/jnt-store/` | Append-only checksummed block log, crash recovery. |
@@ -726,10 +476,11 @@ until the first bond, then the stake-weighted TopN set replaces it.
 | `crates/jnt-node/` | CLI and node daemon. |
 | `crates/jnt-worker/` | Worker-side SDK. Client only, no consensus. |
 | `crates/jnt-mcp/` | Keyless MCP surface over agent identity and payments. |
-| `fuzz/` | 14 cargo-fuzz targets over the attacker-controlled boundaries. |
+| `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `sim/` | Independent Python reference and attack simulations. |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records and readiness reports. |
+| `docs/` | Design records, verification status and readiness reports. |
+| `paper/` | The Jounit protocol paper (LaTeX + PDF). |
 
 Seven crates in one workspace. **All consensus logic lives in `jnt-core`**, which
 has no I/O, no clock and no network. The `mini` profile is the same code with
@@ -768,6 +519,11 @@ so settlements fail closed. Exits are active from height 1. The PQ row is the
 lacking an ML-DSA-65 component, and the rule is age-gated when it is flipped —
 only outputs created at or after the height must carry the component, so
 history is never stranded.
+
+Network magic bytes (§13.3): `mainnet` = `6A4E5402`, `mini` = `6A4E5403`,
+`testnet` = `6A4E5404`. These move with each protocol version that changes the
+wire format or state root, so pre-bump peers are refused at framing before they
+can join.
 
 ---
 
@@ -833,8 +589,8 @@ Common options: `--network <mainnet|testnet|mini>` (default `mini`) and
 `--data-dir <path>` (default `./chain`).
 
 `serve` also takes `--listen`, `--connect`, `--bootnodes`, `--peers`,
-`--interval`, `--api-listen`, `--api-token`, `--api-allowed-host`,
-`--credit-issuer` and `--no-mine`. `--bootnodes` dials peers at startup (SPEC §13.6: v0.2 has no
+`--interval`, `--api-listen`, `--api-token`, `--api-allowed-host` and
+`--no-mine`. `--bootnodes` dials peers at startup (SPEC §13.6: v0.2 has no
 ADDR gossip, so bootnodes plus `peers.json` are the only peer sources).
 `--credit-issuer` lists the BLS keys trusted to sign credit attestations for
 `POST /v1/credit/mint` (comma-separated 48-byte hex keys; with none listed,
@@ -877,7 +633,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1304 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1307 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -904,7 +660,7 @@ cargo test -p jnt-core --test pq_signature     # post-quantum bundle attacks
 ```
 
 CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release
-build, the vector cross-checks, attack simulations, and all fourteen fuzz targets
+build, the vector cross-checks, attack simulations, and all 17 fuzz targets
 on nightly with ASan. `.github/workflows/release.yml` re-runs the same gate on a
 tagged tree before publishing artifacts with checksums and a keyless
 cosign/Sigstore bundle.
@@ -925,15 +681,15 @@ written from `SPEC.md` rather than from the Rust, and it reproduces all 21 puzzl
 digests — that agreement is the evidence the spec is unambiguous rather than
 merely self-consistent.
 
-**Fuzzing.** 14 cargo-fuzz targets over L1 wire, mempool, storage and
+**Fuzzing.** 17 cargo-fuzz targets over L1 wire, mempool, storage and
 checkpoints; L2 codec, disputes, state and certificates; and the worker. They
 assert capability invariants — decode/encode inversion, bounded allocation, value
 conservation under adversarial transaction programs — not just panic-freedom.
 
 **Red team.** `crates/jnt-core/tests/redteam*.rs` holds 21 adversarial integration
 tests across four files (`redteam`, `redteam_credit`, `redteam_delegation`,
-`redteam_round2`), each confirmed to fail against the code it now guards. The full record of
-defects found and fixed is in [docs/status.md](docs/status.md).
+`redteam_round2`), each confirmed to fail against the code it now guards. The full
+record of defects found and fixed is in [docs/status.md](docs/status.md).
 
 ---
 

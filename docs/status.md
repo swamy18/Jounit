@@ -29,10 +29,10 @@ rules in code would have been the wrong order.
 
 ## Verified
 
-- `cargo test --workspace` — **1,304 tests pass, 0 failures, 1 ignored** across the workspace.
-  this file quote counts as of their own dates — 242, then 263, then 293 —
-  kept as history):**
-  - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite,, the 30-test real-BLS suite in
+- `cargo test --workspace` — **1,307 tests pass, 0 failures, 1 ignored** across the workspace.
+  (this file quote counts as of their own dates — 242, then 263, then 293 —
+  kept as history):
+  - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in
     `bls.rs`, the 10-case mempool attack suite, the 2 pinned L2 fee-schedule
     tests, and the rest)
   - 18 adversarial checkpoint tests against the real BLS verifier
@@ -1400,7 +1400,7 @@ untouched — task arbitration, not the L1 checkpoint committee.
 **Tests:** 13 new (`finality_m4`): committee determinism/hash, mainnet 21-key
 bootstrap + empty-L2 fail-closed, full-quorum observe, sub-quorum/forged/other-network refusal,
 monotonicity, bounded-codec round-trip and three oversize/count lies, and the
-non-binding reorg proof. Plus a new `checkpoint_codec` fuzz target (14 targets).
+non-binding reorg proof. Plus a new `checkpoint_codec` fuzz target (17 targets).
 
 **Verified:** 588 workspace tests / 0 failed / 1 ignored (575 + 13); fmt clean;
 clippy clean; release build clean; 14 fuzz targets compile; sim suite clean
@@ -1537,7 +1537,7 @@ New tests added this phase:
 
 **Security audit:** `docs/security_audit.md` — no critical or high-severity findings.
 All identified threat surfaces covered by tests and/or fuzzing. Fuzz report:
-`docs/fuzz.md` — 14 targets, 9,352,161 executions, 0 crashes (WSL2 nightly + ASan, measured 2026-10-09).
+`docs/fuzz.md` — 17 targets, 9,352,161 executions, 0 crashes (WSL2 nightly + ASan, measured 2026-10-09).
 
 **SPEC reconciliation:** `docs/roadmap.md` updated — 14/14 Phase 6 items implemented.
 SPEC.md §14.2 L2 payload types now match `crates/jnt-core/src/l2.rs` exactly.

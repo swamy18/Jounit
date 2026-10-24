@@ -54,7 +54,7 @@ also exists now, with a conservation gate before its first pass.)
   |---|---|---|
   | 1 | `cargo fmt --all --check` | clean |
   | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
-  | 3 | `cargo test --workspace` | 1304 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
+   | 3 | `cargo test --workspace` | 1307 passed, 0 failed, 1 ignored (`vwc_perf_probe`) |
   | 4 | `cargo build --workspace --release` | succeeds |
   | 5 | vector cross-check: `python sim/verify_vectors.py --check` | see `docs/status.md` |
   | 6 | confirm the only `#[ignore]`d test is the manual `vwc_perf_probe` | confirmed |
@@ -254,10 +254,10 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 1304 passed, 0 failed, 1 ignored |
+| `cargo test --workspace` passes | ✅ 1307 passed, 0 failed, 1 ignored |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
-| Fuzz: 14 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
+| Fuzz: 17 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
 | Deterministic genesis across profiles | ✅ |
 | BLS finality adversarial tests | ✅ (18 checkpoint tests) |
 | L2 end-to-end (deposits, tasks, VWC, reputation) | ✅ (2-process E2E + chaos suite) |

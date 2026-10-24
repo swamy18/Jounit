@@ -10,7 +10,7 @@ the numbers a specific execution produced, and they are labelled as such.
 
 ## Target inventory
 
-Fourteen targets in `fuzz/fuzz_targets/`, each asserting a property, not merely
+Seventeen targets in `fuzz/fuzz_targets/`, each asserting a property, not merely
 panic-freedom.
 
 | # | Target | Surface | Invariant asserted |
@@ -29,6 +29,9 @@ panic-freedom.
 | 12 | `vwc_decode` | VWC codec | Exact round-trip; id stability; `validate` totality |
 | 13 | `worker_flows` | Worker claim/settle/dispute flows | No partial state on error; replay refused |
 | 14 | `checkpoint_codec` | Checkpoint codec | Bounded; round-trip identity |
+| 15 | `deliverable_codec` | L2 deliverable codec | Round-trip identity; unknown types rejected; survives truncation |
+| 16 | `l2_policy_apply` | L2 policy state machine | Value conservation; grant caps never exceeded; revocation absolute; authority narrows; replay refused |
+| 17 | `l2_credit_apply` | L2 credit state machine | Conservation; collateral locked not spent; debt one-way; default not early; interest once per period |
 
 ## Campaign results — measured 2026-10-09
 
@@ -99,5 +102,5 @@ Any crash found by fuzzing becomes a regression test in the workspace suite
 before the fix merges. `crates/*/tests/fuzz_invariants.rs` holds the
 total-over-mutation tests derived from earlier fuzz-discovered panics. **No
 product bug was surfaced by the 2026-10-09 campaign** — 0 crashes across all
-fourteen targets — which is a statement about this run's coverage, not a proof
+seventeen targets — which is a statement about this run's coverage, not a proof
 that none exists.
