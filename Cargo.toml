@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Swamy Gadila"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/swamy18/Jounit"
 description = "Jounit: an AI-native cryptocurrency whose mining does real work on AI hardware."
 

@@ -80,7 +80,7 @@ ignore = []
 # More documentation for the licenses section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
 [licenses]
-# The workspace is MIT OR Apache-2.0, and those two head the allow list.
+# The workspace is MIT-licensed, and it heads the allow list.
 # Every further entry was added deliberately after reading the license, with
 # the reason beside it — never by widening the list to silence the check.
 allow = [

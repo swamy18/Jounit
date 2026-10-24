@@ -695,24 +695,26 @@ record of defects found and fixed is in [docs/status.md](docs/status.md).
 
 ## License and trademark
 
-**Copyright © 2026.** The code is open — no single person holds it, like Bitcoin.
+**Copyright © 2026 The Jounit developers.** The code is open — no single
+person holds it, like Bitcoin.
 
-**Code: `MIT OR Apache-2.0`** — the standard permissive Rust dual licence. Both
-texts ship at the repo root (`LICENSE-MIT`, `LICENSE-APACHE`). You may use,
-modify, run and redistribute the software, including commercially.
+**Code: MIT** — the same permissive licence Bitcoin Core uses. The full text
+ships at the repo root (`LICENSE-MIT`). You may use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the software, and permit
+persons to whom it is furnished to do so, including commercially.
 
-**Name and marks: community-owned.** The *Jounit* name, the `JNT`
-ticker and the project's logos are community marks, not part of the code
-licence. See [TRADEMARK.md](TRADEMARK.md).
+**Name and marks: community-owned.** The *Jounit* name, the `JNT` ticker and
+the project's logos are community marks — not part of the code licence and not
+held by any single person.
 
-The distinction is the same one Bitcoin uses: **the code is open so anyone can
-run it, and the name is a community mark.** Nothing in an open-source licence
-can stop someone from using the code — that is deliberate, and it is how the
-ecosystem works. The code belongs to everyone under the terms above; the name
-belongs to the community.
-
-If you want to use the name or marks commercially, open an issue — no single
-person holds it.
+This follows the same arrangement Bitcoin uses: **the code is open so anyone
+can run it, and the name belongs to the community.** Nothing in an open-source
+licence can stop someone from using the code — that is deliberate, and it is
+how the ecosystem works. You are free to fork the code and ship it under your
+own name; the only thing we ask is that you do not call your fork "Jounit" or
+use the `JNT` ticker, so that users holding real value are never confused
+about what chain they are on. That is a community norm, not a gate requiring
+permission — there is no trademark file to read and no application to file.
 
 ---
 
