@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize as _;
 
 use crate::error::{Error, Result};
-use crate::hash::{address_from_pubkey, Address};
+use crate::hash::{address_from_pubkey, Address, Hash};
 use crate::tx::{Input, OutPoint, Output, Transaction};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -78,7 +78,7 @@ impl Wallet {
             label: label.into(),
             private_key: pk,
         };
-        // Reject out-of-range scalars up front rather than at signing time.
+        pk.zeroize();
         w.signing_key()?;
         Ok(w)
     }
@@ -271,8 +271,10 @@ impl Wallet {
     pub fn schnorr_signing_key(&self) -> Result<k256::schnorr::SigningKey> {
         let mut raw = [0u8; 32];
         raw.copy_from_slice(&self.private_key);
-        k256::schnorr::SigningKey::from_bytes(&raw)
-            .map_err(|_| Error::BadKey("scalar out of range"))
+        let sk = k256::schnorr::SigningKey::from_bytes(&raw)
+            .map_err(|_| Error::BadKey("scalar out of range"))?;
+        raw.zeroize();
+        Ok(sk)
     }
 
     /// BIP-340 x-only public key, 32 bytes.
@@ -304,25 +306,24 @@ impl Wallet {
     /// domain-separated hash of the private key, not the scalar itself — the
     /// ML-DSA key generation must not depend on the secp256k1 scalar being a
     /// particular value.
-    fn ml_dsa_seed(&self) -> [u8; 32] {
-        use crate::hash::{sha256_dom, DOM_ADDR};
-        sha256_dom(DOM_ADDR, &[b"jounit/ml-dsa-65-seed/v1", &self.private_key])
+    fn ml_dsa_seed(&self) -> zeroize::Zeroizing<Hash> {
+        use crate::hash::{sha256_dom, DOM_ML_DSA_SEED};
+        zeroize::Zeroizing::new(sha256_dom(DOM_ML_DSA_SEED, &[&self.private_key]))
     }
 
     /// The ML-DSA-65 public key for this wallet, encoded (1952 bytes).
     pub fn ml_dsa_pubkey(&self) -> Result<Vec<u8>> {
         use ml_dsa::{Keypair as _, MlDsa65, SigningKey};
-        let sk = SigningKey::<MlDsa65>::from_seed(&self.ml_dsa_seed().into());
+        let seed = self.ml_dsa_seed();
+        let sk = SigningKey::<MlDsa65>::from_seed(&(*seed).into());
         Ok(sk.verifying_key().encode().to_vec())
     }
 
     /// ML-DSA-65 signature over a 32-byte digest (FIPS 204, deterministic).
     pub fn sign_ml_dsa(&self, digest: &[u8; 32]) -> Result<Vec<u8>> {
         use ml_dsa::{MlDsa65, SigningKey};
-        let sk = SigningKey::<MlDsa65>::from_seed(&self.ml_dsa_seed().into());
-        // `Signer` (the `SigningKey` wrapper) signs over a pre-hashed digest;
-        // the expanded key is what offers the deterministic primitive, and it
-        // is what `sign_deterministic` exists on.
+        let seed = self.ml_dsa_seed();
+        let sk = SigningKey::<MlDsa65>::from_seed(&(*seed).into());
         let sig = sk
             .expanded_key()
             .sign_deterministic(digest, &[])

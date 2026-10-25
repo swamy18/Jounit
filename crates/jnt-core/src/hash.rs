@@ -43,6 +43,12 @@ pub const DOM_TX512: &[u8] = b"jounit/txid512/v1";
 pub const DOM_TXBODY: &[u8] = b"jounit/txbody/v1";
 pub const DOM_SIG: &[u8] = b"jounit/sig/v1";
 pub const DOM_ADDR: &[u8] = b"jounit/addr/v2";
+/// Domain tag for ML-DSA-65 seed derivation from a secp256k1 wallet key.
+/// Keeps the seed derivation cryptographically separate from address
+/// derivation, which also hashes private key material.
+pub const DOM_ML_DSA_SEED: &[u8] = b"jounit/ml-dsa-65-seed/v1";
+/// Domain tag for ML-DSA-65 seed derivation from a BLS validator key.
+pub const DOM_VALIDATOR_ML_DSA: &[u8] = b"jounit/validator-mldsa/v1";
 pub const DOM_S1: &[u8] = b"jounit/puzzle/stage1/v1";
 pub const DOM_S2: &[u8] = b"jounit/puzzle/stage2/v1";
 pub const DOM_S3: &[u8] = b"jounit/puzzle/stage3/v1";

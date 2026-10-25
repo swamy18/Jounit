@@ -201,9 +201,14 @@ impl ValidatorKey {
     /// from everything the BLS key itself signs, so the two key pairs are
     /// independent even though they share a seed.
     fn mldsa_signing_key(&self) -> ml_dsa::SigningKey<ml_dsa::MlDsa65> {
-        use crate::hash::sha256_dom;
-        let seed = sha256_dom(b"jounit/validator-mldsa/v1", &[&self.key.scalar()]);
-        ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&seed.into())
+        use crate::hash::{sha256_dom, DOM_VALIDATOR_ML_DSA};
+        use zeroize::Zeroize as _;
+        let mut scalar = self.key.scalar();
+        let mut seed = sha256_dom(DOM_VALIDATOR_ML_DSA, &[&scalar]);
+        let sk = ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&seed.into());
+        seed.zeroize();
+        scalar.zeroize();
+        sk
     }
 
     /// The lattice public key this validator registers in its bond, encoded.

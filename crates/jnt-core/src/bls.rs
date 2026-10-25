@@ -153,7 +153,11 @@ impl SecretKey {
     /// no verification accepts, which looks exactly like a network fault.
     pub fn from_scalar(scalar: &[u8; 32]) -> Result<SecretKey, BlsError> {
         let sk = min_pk::SecretKey::from_bytes(scalar).map_err(|_| BlsError::BadSeed)?;
-        if sk.to_bytes().iter().all(|b| *b == 0) {
+        // Check for a zero scalar (blst would carry it through to signing,
+        // producing a certificate every peer rejects). The temporary bytes
+        // are wrapped so they wipe rather than sit in a freed stack slot.
+        let bytes = zeroize::Zeroizing::new(sk.to_bytes());
+        if bytes.iter().all(|b| *b == 0) {
             return Err(BlsError::BadSeed);
         }
         Ok(SecretKey(sk))
