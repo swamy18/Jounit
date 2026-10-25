@@ -110,6 +110,7 @@ fn error_name(e: &L2Error) -> &'static str {
         L2Error::CreditNotDue => "CreditNotDue",
         L2Error::CreditInterestOverflow => "CreditInterestOverflow",
         L2Error::CreditRepaymentExceedsDebt { .. } => "CreditRepaymentExceedsDebt",
+        L2Error::InvalidContractSpec(_) => "InvalidContractSpec",
     }
 }
 

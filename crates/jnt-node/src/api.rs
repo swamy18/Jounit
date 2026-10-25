@@ -1676,7 +1676,7 @@ async fn payment_settle(
             .iter()
             .filter(|o| o.address == recipient)
             .map(|o| o.value)
-            .sum();
+            .fold(0u64, u64::saturating_add);
         if paid < amount_sat {
             return Err(fail(
                 StatusCode::BAD_REQUEST,

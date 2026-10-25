@@ -244,20 +244,23 @@ impl<D, A> ServiceContract<D, A> {
     /// real deadline, a dispute window that fits before the deadline, and a
     /// distinct id. A caller that cannot be bothered with those is not opening a
     /// contract, it is assembling a struct.
-    pub fn open(spec: ServiceContractSpec<D>) -> Self {
-        assert!(
-            spec.payment_sat > 0,
-            "an escrow for nothing is not a contract"
-        );
-        assert!(
-            spec.deadline_height > 0,
-            "a contract with no deadline cannot time out"
-        );
-        assert!(
-            spec.dispute_window < spec.deadline_height,
-            "a dispute window that reaches the deadline cannot close before it"
-        );
-        ServiceContract {
+    ///
+    /// Invalid specs are refused by name ([`L2Error::InvalidContractSpec`])
+    /// rather than panicked: malformed input is a deterministic rejection, not
+    /// a crash, in the L2 consensus layer.
+    pub fn open(spec: ServiceContractSpec<D>) -> L2Result<Self> {
+        if spec.payment_sat == 0 {
+            return Err(L2Error::ZeroAmount("payment_sat"));
+        }
+        if spec.deadline_height == 0 {
+            return Err(L2Error::InvalidContractSpec("deadline_height is zero"));
+        }
+        if spec.dispute_window >= spec.deadline_height {
+            return Err(L2Error::InvalidContractSpec(
+                "dispute_window reaches the deadline",
+            ));
+        }
+        Ok(ServiceContract {
             task_id: spec.task_id,
             submitter: spec.submitter,
             worker: None,
@@ -268,7 +271,7 @@ impl<D, A> ServiceContract<D, A> {
             dispute_window: spec.dispute_window,
             nonce: spec.nonce,
             state: ContractState::Open,
-        }
+        })
     }
 }
 

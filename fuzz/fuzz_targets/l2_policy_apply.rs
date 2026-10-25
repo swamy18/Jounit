@@ -101,6 +101,7 @@ fuzz_target!(|data: &[u8]| {
     let mut child: Option<Hash> = None;
     let mut height = 1u64;
     let mut i = 100usize;
+    let mut last_spend_payload: Option<AgentSpendPayload> = None;
     let mut nonce = 0u64;
     while i + 4 <= data.len() {
         let op = data[i] % 5;
@@ -181,7 +182,7 @@ fuzz_target!(|data: &[u8]| {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let tx = L2Transaction::new(L2Payload::AgentSpend(payload));
+                let tx = L2Transaction::new(L2Payload::AgentSpend(payload.clone()));
                 let before = state.committed_root();
                 let applied = state.apply(&tx, height, &validators, &verifier).is_ok();
                 if applied {
@@ -212,6 +213,7 @@ fuzz_target!(|data: &[u8]| {
                         state.committed_root(),
                         "an applied spend must change the committed root"
                     );
+                    last_spend_payload = Some(payload);
                 } else {
                     assert_eq!(
                         before,
@@ -220,28 +222,18 @@ fuzz_target!(|data: &[u8]| {
                     );
                 }
             }
-            // The same transaction again: the replay guard.
+            // Replay the exact spend payload from op 3: applying it twice must
+            // be refused as Replay, and the state must be byte-identical.
             4 => {
-                let Some(hash) = published else { break };
-                let payload = match AgentSpendPayload::build(
-                    &agent,
-                    hash,
-                    nonce.max(1),
-                    aa,
-                    amount,
-                    None,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
+                let Some(payload) = last_spend_payload.clone() else { break };
                 let tx = L2Transaction::new(L2Payload::AgentSpend(payload));
                 let before = state.committed_root();
                 let err = state
                     .apply(&tx, height, &validators, &verifier)
-                    .expect_err("a repeated transaction must be refused");
+                    .expect_err("a replayed transaction must be refused");
                 assert!(
-                    matches!(err, L2Error::Replay) || !matches!(err, L2Error::UnknownPolicy),
-                    "unexpected refusal for a repeated transaction: {err:?}"
+                    matches!(err, L2Error::Replay) || matches!(err, L2Error::UnknownPolicy),
+                    "unexpected refusal for a replayed transaction: {err:?}"
                 );
                 assert_eq!(
                     before,

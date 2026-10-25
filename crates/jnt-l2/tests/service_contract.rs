@@ -314,7 +314,7 @@ fn a_non_compute_contract_opens_through_the_validated_constructor() {
         dispute_window: 5,
         nonce: 1,
     };
-    let mut contract = ServiceContract::open(spec);
+    let mut contract = ServiceContract::open(spec).expect("valid spec opens");
     assert_eq!(contract.state, ContractState::Open);
     assert_eq!(contract.worker, None, "unclaimed on open");
 
@@ -372,32 +372,35 @@ fn the_open_constructor_refuses_a_contract_that_cannot_settle() {
         payment_sat: 0,
         ..base.clone()
     };
-    let panicked = std::panic::catch_unwind(|| {
-        ServiceContract::<SortDeliverable, SortAttestation>::open(no_escrow)
-    })
-    .is_err();
-    assert!(panicked, "an escrow for nothing is not a contract");
+    let err = ServiceContract::<SortDeliverable, SortAttestation>::open(no_escrow)
+        .expect_err("an escrow for nothing is not a contract");
+    assert!(
+        matches!(err, L2Error::ZeroAmount("payment_sat")),
+        "zero payment is refused by name: {err:?}"
+    );
 
     let no_deadline = ServiceContractSpec {
         deadline_height: 0,
         ..base.clone()
     };
-    let panicked = std::panic::catch_unwind(|| {
-        ServiceContract::<SortDeliverable, SortAttestation>::open(no_deadline)
-    })
-    .is_err();
-    assert!(panicked, "a contract with no deadline cannot time out");
+    let err = ServiceContract::<SortDeliverable, SortAttestation>::open(no_deadline)
+        .expect_err("a contract with no deadline cannot time out");
+    assert!(
+        matches!(err, L2Error::InvalidContractSpec("deadline_height is zero")),
+        "zero deadline is refused by name: {err:?}"
+    );
 
     let window_past_deadline = ServiceContractSpec {
         dispute_window: 100,
         ..base.clone()
     };
-    let panicked = std::panic::catch_unwind(|| {
-        ServiceContract::<SortDeliverable, SortAttestation>::open(window_past_deadline)
-    })
-    .is_err();
+    let err = ServiceContract::<SortDeliverable, SortAttestation>::open(window_past_deadline)
+        .expect_err("a dispute window that reaches the deadline cannot close before it");
     assert!(
-        panicked,
-        "a dispute window that reaches the deadline cannot close before it"
+        matches!(
+            err,
+            L2Error::InvalidContractSpec("dispute_window reaches the deadline")
+        ),
+        "window past deadline is refused by name: {err:?}"
     );
 }

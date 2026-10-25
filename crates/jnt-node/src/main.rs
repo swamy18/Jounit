@@ -1422,7 +1422,9 @@ fn cmd_status(args: &Args) -> Result<(), String> {
         for w in &wallets {
             let addr = w.address().map_err(|e| e.to_string())?;
             let outputs = chain.utxo().outputs_for_address(&addr);
-            let total: u64 = outputs.iter().map(|(_, v)| v).sum();
+            let total: u64 = outputs
+                .iter()
+                .fold(0u64, |acc, (_, v)| acc.saturating_add(*v));
             // `is_mature` is the rule the mempool admission uses (a spend
             // lands in the next block, at `height() + 1`), so the report
             // matches what the API would actually accept — a plain
@@ -1432,8 +1434,7 @@ fn cmd_status(args: &Args) -> Result<(), String> {
                 .iter()
                 .filter(|(_, u)| u.out.address == addr)
                 .filter(|(_, u)| chain.is_mature(u.height))
-                .map(|(_, u)| u.out.value)
-                .sum();
+                .fold(0u64, |acc, (_, u)| acc.saturating_add(u.out.value));
             println!(
                 "wallet {:<10} {}  balance {} JNT ({} spendable)",
                 w.label,

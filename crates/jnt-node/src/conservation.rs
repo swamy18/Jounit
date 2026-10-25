@@ -135,8 +135,7 @@ pub fn joint_supply(chain: &Chain, l2: &NodeL2) -> JointSupply {
         .utxo()
         .outputs_for_address(&chain.params().l2_deposit_sink())
         .iter()
-        .map(|(_, v)| v)
-        .sum();
+        .fold(0u64, |acc, (_, v)| acc.saturating_add(*v));
     JointSupply {
         l1_live_sat,
         l2_held_sat,

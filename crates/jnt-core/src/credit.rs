@@ -192,6 +192,11 @@ impl CreditTerms {
     /// - **Monotone in amount.** Borrowing more requires more collateral.
     /// - **No overflow.** Every product is checked; a wrapped value would compare
     ///   small and pass the bound.
+    ///
+    /// A `CreditTerms` with `min_collateral_bps == 0` is rejected here, not just
+    /// at the call site: the invariant "there is no path to a zero-collateral
+    /// line" is enforced where the arithmetic lives, so a bad term set cannot be
+    /// slipped past an unwary caller.
     pub fn required_collateral(&self, amount_sat: u64, bond_sat: u64) -> Result<u64> {
         if amount_sat == 0 {
             return Err(Error::Malformed(
@@ -209,6 +214,11 @@ impl CreditTerms {
         if self.min_collateral_bps > self.base_collateral_bps {
             return Err(Error::Malformed(
                 "credit terms: floor above the base requirement",
+            ));
+        }
+        if self.min_collateral_bps == 0 {
+            return Err(Error::Malformed(
+                "credit terms: a zero collateral floor is not permitted",
             ));
         }
 
@@ -2720,14 +2730,12 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_collateral_position_for_a_new_borrower_does_not_panic() {
-        // A 1-sat position under no-collateral terms requires zero collateral,
-        // so the availability check passes for a borrower the book has never
-        // seen. That combination used to reach `self.free.get_mut(..).unwrap()`
-        // on a missing key.
-        let mut book = CreditBook::new();
+    fn a_zero_collateral_term_set_is_rejected_by_name() {
+        // The documentation promises there is no path to a zero-collateral line.
+        // That invariant is enforced in `required_collateral`, not left to callers
+        // to remember.
         let zero_terms = CreditTerms {
-            base_collateral_bps: 0,
+            base_collateral_bps: 10_000,
             max_discount_bps: 0,
             bond_ratio_bps: 0,
             min_collateral_bps: 0,
@@ -2746,13 +2754,48 @@ mod tests {
             drawn_at_height: 0,
             deadline_height: 100,
         };
-        assert_eq!(CreditPosition::open(&s).unwrap().collateral_sat, 0);
+        assert!(
+            matches!(
+                CreditPosition::open(&s),
+                Err(Error::Malformed(
+                    "credit terms: a zero collateral floor is not permitted"
+                ))
+            ),
+            "zero-collateral terms must be refused by name"
+        );
+    }
+
+    #[test]
+    fn a_new_borrower_with_a_small_position_does_not_panic() {
+        // The original bug: a 1-sat position under terms with a small floor hit
+        // `self.free.get_mut(..).unwrap()` on a missing borrower key. The fix
+        // uses `entry().or_insert(0)`; this pins it with real (non-zero) terms.
+        let mut book = CreditBook::new();
+        let terms = CreditTerms::default(); // 80% floor
+        let s = PositionSpec {
+            terms,
+            charge: ChargeSchedule {
+                rate_bps_per_window: 0,
+                window_blocks: 100,
+            },
+            borrower: [3u8; 20],
+            agent_id: [9u8; 32],
+            lender: [2u8; 20],
+            amount_sat: 100,
+            bond_sat: 0,
+            drawn_at_height: 0,
+            deadline_height: 100,
+        };
+        let required = terms.required_collateral(100, 0).unwrap();
+        // Fund the lender and borrower with the required values.
+        book.deposit([2u8; 20], 1000).unwrap();
+        book.deposit([3u8; 20], required).unwrap();
         let id = book
             .open(&s)
-            .expect("a zero-collateral position still opens");
-        // And a zero repayment against it is a clean no-op, not a panic.
+            .expect("a collateralised position still opens");
+        // A zero repayment against it is a clean no-op, not a panic.
         let r = book.repay(&id, 0, 1).unwrap();
-        assert_eq!(r.remaining_debt_sat, 1);
+        assert_eq!(r.remaining_debt_sat, 100);
         book.check_conservation().unwrap();
     }
 

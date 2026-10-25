@@ -615,8 +615,16 @@ impl Mempool {
         MempoolSummary {
             count: self.entries.len(),
             bytes: self.bytes,
-            total_gas: self.entries.values().map(|e| e.gas_used).sum(),
-            total_fees: self.entries.values().map(|e| e.fee_total).sum(),
+            total_gas: self
+                .entries
+                .values()
+                .map(|e| e.gas_used)
+                .fold(0u64, u64::saturating_add),
+            total_fees: self
+                .entries
+                .values()
+                .map(|e| e.fee_total)
+                .fold(0u64, u64::saturating_add),
         }
     }
 

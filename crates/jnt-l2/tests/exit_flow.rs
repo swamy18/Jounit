@@ -10,16 +10,17 @@
 //! types" and "value never leaves" pins below are rewritten as the six-type
 //! wire and the queue → release lifecycle.
 
+use jnt_core::agent::{derive_agent_id, AgentRole, SpendPolicy};
 use jnt_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
 use jnt_core::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
 use jnt_core::error::Error;
 use jnt_core::hash::{Address, Hash};
 use jnt_core::l2::{
-    ClaimTaskPayload, ExitQueuePayload, L2Payload, L2Transaction, L2TxType, PostTaskPayload,
-    SettlePayload, SubmitResultPayload, Verdict, L2_TX_AGENT_SPEND, L2_TX_CLAIM,
-    L2_TX_CREDIT_COLLATERAL, L2_TX_CREDIT_DEFAULT, L2_TX_CREDIT_OPEN, L2_TX_CREDIT_REPAY,
-    L2_TX_DISPUTE, L2_TX_EXIT_QUEUE, L2_TX_POLICY, L2_TX_POLICY_REVOKE, L2_TX_POST, L2_TX_SETTLE,
-    L2_TX_SUBMIT, MIN_EXIT_FEE_SAT,
+    ClaimTaskPayload, CreditOpenPayload, ExitQueuePayload, L2Payload, L2Transaction, L2TxType,
+    PolicyPayload, PostTaskPayload, SettlePayload, SubmitResultPayload, Verdict, L2_TX_AGENT_SPEND,
+    L2_TX_CLAIM, L2_TX_CREDIT_COLLATERAL, L2_TX_CREDIT_DEFAULT, L2_TX_CREDIT_OPEN,
+    L2_TX_CREDIT_REPAY, L2_TX_DISPUTE, L2_TX_EXIT_QUEUE, L2_TX_POLICY, L2_TX_POLICY_REVOKE,
+    L2_TX_POST, L2_TX_SETTLE, L2_TX_SUBMIT, MIN_EXIT_FEE_SAT,
 };
 use jnt_core::state_root::verify_inclusion;
 use jnt_core::wallet::Wallet;
@@ -592,4 +593,232 @@ fn the_l2_escrow_identity_has_no_key() {
         assert_ne!(addr(&wallet(seed)), escrow);
     }
     assert!(state.check_conservation());
+}
+
+// ---------------------------------------------------------------------------
+// 8. Exit proof against the committed root when policies/positions exist
+//    (regression for the divergent-leaf-set bug: exit_proof used to build
+//    only accounts+exits, but committed_root commits accounts+exits+policies+
+//    positions — so the proof index landed on the wrong leaf and the proof
+//    never verified once a single policy or position existed.)
+// ---------------------------------------------------------------------------
+
+fn network_id() -> String {
+    L2Config::mini().network_id
+}
+
+/// Publish a grant signed by `owner` for `agent` spending `recipient`'s funds.
+fn publish_policy(
+    state: &mut L2State,
+    validators: &ValidatorSet,
+    owner: &Wallet,
+    agent: &Wallet,
+    recipient: &Wallet,
+) -> Hash {
+    let agent_id = derive_agent_id(&network_id(), AgentRole::Machine, &owner.address().unwrap());
+    let policy = SpendPolicy {
+        version: jnt_core::agent::POLICY_VERSION,
+        network_id: network_id(),
+        agent_id,
+        owner: owner.address().unwrap(),
+        role: AgentRole::Machine,
+        per_tx_max_sat: 10_000,
+        window_blocks: 100,
+        cumulative_max_sat: 100_000,
+        allowed_recipients: vec![recipient.address().unwrap()],
+        allowed_services: vec![],
+        not_before_height: 0,
+        expires_at_height: 1_000_000,
+        revoked: false,
+        parent_agent_id: None,
+    };
+    let payload =
+        PolicyPayload::build_from_policy(owner, &policy, agent.address().unwrap()).unwrap();
+    let tx = L2Transaction::new(L2Payload::Policy(payload));
+    state
+        .apply(&tx, 10, validators, &MockBls)
+        .expect("the grant publishes");
+    policy.hash()
+}
+
+/// Open a credit position: lender funds borrower's account, collateral locks.
+fn open_credit(
+    state: &mut L2State,
+    validators: &ValidatorSet,
+    lender: &Wallet,
+    borrower: Address,
+    amount: u64,
+    collateral: u64,
+) {
+    let payload =
+        CreditOpenPayload::build(lender, borrower, amount, collateral, 100, 100, 1_000, 1).unwrap();
+    let tx = L2Transaction::new(L2Payload::CreditOpen(payload));
+    state
+        .apply(&tx, 10, validators, &MockBls)
+        .expect("the credit position opens");
+}
+
+/// An exit queued into a state that already holds a published policy still
+/// proves against `committed_root()` — the proof index must account for the
+/// policy leaf that now sits after the exit leaves.
+#[test]
+fn exit_proof_verifies_with_a_policy_already_published() {
+    let mut w = world_with(exits_on());
+    // Insert a policy leaf before queueing so the exit is *not* the last leaf.
+    let policy_hash = publish_policy(
+        &mut w.state,
+        &w.validators,
+        &w.submitter,
+        &wallet(3),
+        &w.worker,
+    );
+    assert!(
+        w.state.policy(&policy_hash).is_some(),
+        "policy was published"
+    );
+
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
+    let owner = addr(&w.submitter);
+    let root = w.state.committed_root();
+    let proof = w.state.exit_proof(&owner, 1).expect("queued exit proves");
+    let record = w.state.exit(&owner, 1).unwrap().clone();
+    assert!(
+        verify_inclusion(root, record.leaf(), &proof),
+        "exit proof must verify against committed_root even with policies present"
+    );
+    w.assert_conserved("policy + exit");
+}
+
+/// An exit queued into a state that already holds a credit position still
+/// proves against `committed_root()` — the index must skip position leaves.
+#[test]
+fn exit_proof_verifies_with_a_credit_position_already_open() {
+    let mut w = world_with(exits_on());
+    // Open a credit position to add a position leaf before queueing.
+    // Use `worker` (wallet 2, already credited) as borrower so collateral is funded.
+    open_credit(
+        &mut w.state,
+        &w.validators,
+        &w.submitter,
+        addr(&w.worker),
+        100_000,
+        100_000,
+    );
+    assert!(
+        !w.state.credit_positions().is_empty(),
+        "position was opened"
+    );
+
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
+    let owner = addr(&w.submitter);
+    let root = w.state.committed_root();
+    let proof = w.state.exit_proof(&owner, 1).expect("queued exit proves");
+    let record = w.state.exit(&owner, 1).unwrap().clone();
+    assert!(
+        verify_inclusion(root, record.leaf(), &proof),
+        "exit proof must verify against committed_root even with positions present"
+    );
+    w.assert_conserved("credit + exit");
+}
+
+/// An exit queued into a state with both policies and credit positions proves
+/// against `committed_root()` — every leaf category shifts the index.
+#[test]
+fn exit_proof_verifies_with_policies_and_positions_present() {
+    let mut w = world_with(exits_on());
+    let ph = publish_policy(
+        &mut w.state,
+        &w.validators,
+        &w.submitter,
+        &wallet(3),
+        &w.worker,
+    );
+    assert!(w.state.policy(&ph).is_some());
+    // Use `worker` (already credited) as borrower.
+    open_credit(
+        &mut w.state,
+        &w.validators,
+        &w.submitter,
+        addr(&w.worker),
+        100_000,
+        100_000,
+    );
+
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
+    let owner = addr(&w.submitter);
+    let root = w.state.committed_root();
+    let proof = w.state.exit_proof(&owner, 1).expect("queued exit proves");
+    let record = w.state.exit(&owner, 1).unwrap().clone();
+    assert!(
+        verify_inclusion(root, record.leaf(), &proof),
+        "exit proof must verify against committed_root with policies + positions"
+    );
+    w.assert_conserved("policy + credit + exit");
+}
+
+/// A proof built against a root that does **not** include the policy leaf
+/// must fail — this pins that `exit_proof` really uses `committed_root`, not
+/// a stale accounts+exits root.
+#[test]
+fn exit_proof_fails_against_a_root_built_without_policies() {
+    let mut w = world_with(exits_on());
+    // Queue an exit *before* the policy, so the pre-policy root is a real one.
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
+    let owner = addr(&w.submitter);
+
+    // Capture the root before policies are added (accounts + exits only).
+    let stale_root = w.state.committed_root();
+    let proof = w.state.exit_proof(&owner, 1).expect("queued exit proves");
+    let record = w.state.exit(&owner, 1).unwrap().clone();
+    assert!(
+        verify_inclusion(stale_root, record.leaf(), &proof),
+        "proof verifies against the pre-policy root"
+    );
+
+    // Now publish a policy — this changes `committed_root` but not the proof.
+    publish_policy(
+        &mut w.state,
+        &w.validators,
+        &w.submitter,
+        &wallet(3),
+        &w.worker,
+    );
+    let new_root = w.state.committed_root();
+    assert_ne!(new_root, stale_root, "policy changes the committed root");
+    assert!(
+        !verify_inclusion(new_root, record.leaf(), &proof),
+        "proof from before the policy must not verify against the post-policy root"
+    );
+}
+
+/// After release, the exit leaf is gone and adding a policy does not resurrect
+/// it — proves against the *current* tree even when the tree shrinks.
+#[test]
+fn exit_proof_after_release_and_policy_is_none() {
+    let mut w = world_with(exits_on());
+    publish_policy(
+        &mut w.state,
+        &w.validators,
+        &w.submitter,
+        &wallet(3),
+        &w.worker,
+    );
+
+    w.apply(&queue_tx(&w, 1, 100_000, 1_000), 5);
+    let owner = addr(&w.submitter);
+
+    // Publish a second policy (by `worker`, who is also credited) after the exit.
+    publish_policy(
+        &mut w.state,
+        &w.validators,
+        &w.worker,
+        &wallet(4),
+        &w.submitter,
+    );
+
+    w.state.note_release(&owner, 1).unwrap();
+    assert!(
+        w.state.exit_proof(&owner, 1).is_none(),
+        "released exit has no leaf even with policies in the tree"
+    );
 }

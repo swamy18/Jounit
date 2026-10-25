@@ -583,6 +583,32 @@ impl L2State {
         accounts
     }
 
+    /// The canonical ordered leaf set for the commitment tree.
+    ///
+    /// Leaves are: account leaves in address order, then exit leaves in
+    /// `(owner, nonce)` order, then policy leaves in hash order, then credit
+    /// position leaves in id order. This is the single source of truth both
+    /// [`L2State::committed_root`] and [`L2State::exit_proof`] build from, so
+    /// the proof index a verifier computes can never disagree with the
+    /// commitment it proves against.
+    fn commitment_leaves(&self) -> Vec<Hash> {
+        let mut leaves: Vec<Hash> = self
+            .account_leaves()
+            .iter()
+            .map(|(a, b)| account_leaf(a, *b))
+            .collect();
+        let mut exits: Vec<(&(Address, u64), &ExitRecord)> = self.exits.iter().collect();
+        exits.sort_by_key(|(k, _)| **k);
+        leaves.extend(exits.iter().map(|(_, r)| r.leaf()));
+        let mut policies: Vec<(&Hash, &PolicyEntry)> = self.policies.iter().collect();
+        policies.sort_by_key(|(h, _)| **h);
+        leaves.extend(policies.iter().map(|(_, e)| e.leaf()));
+        let mut positions: Vec<(&Hash, &CreditPosition)> = self.positions.iter().collect();
+        positions.sort_by_key(|(h, _)| **h);
+        leaves.extend(positions.iter().map(|(_, p)| p.leaf()));
+        leaves
+    }
+
     /// The committed root over every account balance.
     ///
     /// Zero-balance accounts are still leaves: the account *exists*, and
@@ -633,20 +659,7 @@ impl L2State {
     /// commits identically under both functions, and the block commitment never
     /// disagrees with the SDK root for states that predate exits.
     pub fn committed_root(&self) -> Hash {
-        let mut leaves: Vec<Hash> = self
-            .account_leaves()
-            .iter()
-            .map(|(a, b)| account_leaf(a, *b))
-            .collect();
-        let mut exits: Vec<(&(Address, u64), &ExitRecord)> = self.exits.iter().collect();
-        exits.sort_by_key(|(k, _)| **k);
-        leaves.extend(exits.iter().map(|(_, r)| r.leaf()));
-        let mut policies: Vec<(&Hash, &PolicyEntry)> = self.policies.iter().collect();
-        policies.sort_by_key(|(h, _)| **h);
-        leaves.extend(policies.iter().map(|(_, e)| e.leaf()));
-        let mut positions: Vec<(&Hash, &CreditPosition)> = self.positions.iter().collect();
-        positions.sort_by_key(|(h, _)| **h);
-        leaves.extend(positions.iter().map(|(_, p)| p.leaf()));
+        let leaves = self.commitment_leaves();
         state_root(&leaves)
     }
 
@@ -683,16 +696,15 @@ impl L2State {
     /// there is nothing to prove. Release *removes* the record precisely so a
     /// spent exit can never be proven again.
     pub fn exit_proof(&self, owner: &Address, nonce: u64) -> Option<InclusionProof> {
-        let mut leaves: Vec<Hash> = self
-            .account_leaves()
-            .iter()
-            .map(|(a, b)| account_leaf(a, *b))
-            .collect();
-        let mut exits: Vec<(&(Address, u64), &ExitRecord)> = self.exits.iter().collect();
-        exits.sort_by_key(|(k, _)| **k);
-        let position = exits.iter().position(|(k, _)| **k == (*owner, nonce))?;
-        leaves.extend(exits.iter().map(|(_, r)| r.leaf()));
-        prove_inclusion(&leaves, self.account_leaves().len() + position)
+        let leaves = self.commitment_leaves();
+        let offset = self.account_leaves().len();
+        let exits: Vec<(&(Address, u64), &ExitRecord)> = {
+            let mut e: Vec<_> = self.exits.iter().collect();
+            e.sort_by_key(|(k, _)| **k);
+            e
+        };
+        let position = offset + exits.iter().position(|(k, _)| **k == (*owner, nonce))?;
+        prove_inclusion(&leaves, position)
     }
 
     /// Whether a queued exit may be released at `tip`: its queue block is
@@ -1968,11 +1980,17 @@ impl L2State {
     // --- invariants ----------------------------------------------------
 
     pub fn total_accounts(&self) -> u64 {
-        self.accounts.values().copied().sum()
+        self.accounts
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add)
     }
 
     pub fn total_locked(&self) -> u64 {
-        self.tasks.values().map(|t| t.locked_total()).sum()
+        self.tasks
+            .values()
+            .map(|t| t.locked_total())
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Everything permanently destroyed: L2 fee burns plus failed-challenge and
@@ -2424,7 +2442,10 @@ impl L2State {
             }
         }
         let decoded_credit_locked = r.u64le().map_err(|_| codec_err("locked credit"))?;
-        let credit_locked: u64 = positions.values().map(|p| p.collateral_sat).sum();
+        let credit_locked: u64 = positions
+            .values()
+            .map(|p| p.collateral_sat)
+            .fold(0u64, u64::saturating_add);
         if decoded_credit_locked != credit_locked {
             return Err(codec_err("locked credit disagrees with the positions"));
         }

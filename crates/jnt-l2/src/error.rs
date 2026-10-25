@@ -160,6 +160,10 @@ pub enum L2Error {
     /// excess is not silently taken. The node-local credit book refuses the
     /// same shape (SPEC.md §22.5).
     CreditRepaymentExceedsDebt { debt: u64 },
+    /// A service-contract spec named an impossible contract: zero payment, no
+    /// deadline, or a dispute window that reaches the deadline. Refused by
+    /// name at construction rather than panicked.
+    InvalidContractSpec(&'static str),
 }
 
 impl fmt::Display for L2Error {
@@ -249,6 +253,9 @@ impl fmt::Display for L2Error {
             L2Error::CreditInterestOverflow => write!(f, "credit interest overflowed"),
             L2Error::CreditRepaymentExceedsDebt { debt } => {
                 write!(f, "the repayment exceeds the debt owed ({debt} sat)")
+            }
+            L2Error::InvalidContractSpec(why) => {
+                write!(f, "invalid service-contract spec: {why}")
             }
         }
     }
