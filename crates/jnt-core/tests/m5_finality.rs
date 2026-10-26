@@ -28,7 +28,7 @@ use jnt_core::hash::Hash512;
 use jnt_core::params::{
     mainnet_committee_secrets, mini_committee_secrets, testnet_committee_secrets, NetworkParams,
 };
-use jnt_core::validators::{equivocation_evidence, ValidatorError};
+use jnt_core::validators::{equivocation_evidence, ValidatorError, ValidatorRecord};
 use jnt_core::wallet::Wallet;
 use jnt_core::Address;
 
@@ -943,4 +943,229 @@ fn two_chains_accepting_the_same_certificates_reach_the_same_finality_state() {
     );
     assert_eq!(c1.finality().binding_finalized_height(), 20);
     assert_eq!(c2.finality().binding_finalized_height(), 20);
+}
+
+// ---------------------------------------------------------------------------
+// Stale-committee rotation safety (M5 §14.6)
+//
+// These pin the property the rotation audit hinges on: an epoch set is cached
+// *per epoch*, and a certificate is always verified against the set for its own
+// epoch (cache) or, on a cache miss, the *current* `self.keys` via the genesis
+// fallback. The cache therefore can never hand a stale committee to a
+// current-epoch certificate, and a certificate from an expired epoch can never
+// re-advance the observation frontier.
+// ---------------------------------------------------------------------------
+
+/// Local synthetic BLS keys for test committees. Distinct seed ranges keep A
+/// and B as genuinely different committees (disjoint key sets).
+fn sk(seed: u8) -> SecretKey {
+    SecretKey::derive(&[seed; 32]).unwrap()
+}
+
+/// Quorum size for an `n`-member set: `ceil(n * 6667 / 10000)` per §14.6.
+fn quorum(n: usize) -> usize {
+    let nn = n as u64;
+    (nn * 6_667).div_ceil(10_000) as usize
+}
+
+/// `(secret, public)` pairs for `seeds`, sorted by public-key bytes — the same
+/// canonical order `derive_set`/`genesis_epoch_set` impose, so bitmap bit `i`
+/// lines up with `ValidatorRecord` index `i` in the cached set.
+fn bonded_pairs(seeds: &[u8]) -> Vec<(SecretKey, BlsPublicKey)> {
+    let mut pairs: Vec<(SecretKey, BlsPublicKey)> = seeds
+        .iter()
+        .map(|&s| {
+            let k = sk(s);
+            (k.clone(), k.public_key())
+        })
+        .collect();
+    pairs.sort_by_key(|a| a.1 .0);
+    pairs
+}
+
+/// The bonded records that `BondLedger` would feed to `refresh_committee`, in
+/// the same key-sorted order as `bonded_pairs` so the set's bit `i` is member
+/// `i` of `pairs`.
+fn bonded_records(pairs: &[(SecretKey, BlsPublicKey)]) -> Vec<ValidatorRecord> {
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, pk))| ValidatorRecord {
+            stake_address: [(i as u8) + 1; 20],
+            bls_pk: *pk,
+            stake_sat: 1_000,
+            mldsa_pk: None,
+        })
+        .collect()
+}
+
+fn payload_mini(height: u64, block_hash: Hash512) -> CheckpointPayload {
+    CheckpointPayload {
+        height,
+        block_hash,
+        network_id: "jounit/mini".into(),
+        epoch: CheckpointPayload::epoch_for(height, 10),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn refused_fm(
+    fm: &mut FinalityManager,
+    cp: &Checkpoint,
+    canonical: Hash512,
+    expect: &str,
+) -> FinalityError {
+    let before_accepted = fm.accepted_height();
+    let before_finalized = fm.binding_finalized_height();
+    let err = fm.accept(cp, Some(canonical), &RealBls).expect_err(expect);
+    assert_eq!(
+        fm.accepted_height(),
+        before_accepted,
+        "{expect}: a refusal must not move the observation frontier"
+    );
+    assert_eq!(
+        fm.binding_finalized_height(),
+        before_finalized,
+        "{expect}: a refusal must not move binding finality"
+    );
+    err
+}
+
+#[test]
+fn a_certificate_signed_by_the_previous_committee_is_rejected_in_the_current_epoch() {
+    // Rotation A -> B across two epochs. A is cached at epoch 1; B takes over
+    // as the current set at epoch 2 (A lingers only in the one-epoch-grace
+    // `previous` slot). A certificate forged by A's quorum for the *current*
+    // epoch must fail signature verification against B's set: the cache is
+    // keyed by epoch, so A's set is never lent to epoch 2.
+    let mut fm = FinalityManager::new(&NetworkParams::mini());
+    let interval = 10u64;
+
+    let a_pairs = bonded_pairs(&[1, 2, 3, 4]);
+    let b_pairs = bonded_pairs(&[5, 6, 7, 8]);
+    let quorum = quorum(4);
+
+    // Cache A at epoch 1 (height 10), then rotate to B at epoch 2 (height 20).
+    fm.set_keys(a_pairs.iter().map(|(_, pk)| *pk).collect());
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20);
+    fm.set_keys(b_pairs.iter().map(|(_, pk)| *pk).collect());
+    fm.refresh_committee(&bonded_records(&b_pairs), 20, interval, 20);
+
+    let block: Hash512 = [0xBB; 64];
+
+    // B at the current epoch: accepted against the live B set.
+    let ok = signed_with(
+        &b_pairs,
+        payload_mini(20, block),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    fm.accept(&ok, Some(block), &RealBls).unwrap();
+    assert_eq!(fm.accepted_height(), 20);
+
+    // A for the current epoch: A's signatures do not verify under B's set.
+    let forged = signed_with(
+        &a_pairs,
+        payload_mini(20, block),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    let err = refused_fm(&mut fm, &forged, block, "A quorum over current epoch");
+    assert!(matches!(
+        err,
+        FinalityError::InvalidCertificate(ValidatorError::CheckpointBadSignature)
+    ));
+}
+
+#[test]
+fn a_certificate_from_an_expired_epoch_is_rejected_as_stale_even_when_its_set_is_cached() {
+    // Same rotation as the previous test. A's certificate at height 10 is a
+    // valid signature under A's cached set — but it is not strictly beyond the
+    // accepted frontier (20), so it is refused as monotonic stale rather than
+    // re-advancing the observation point.
+    let mut fm = FinalityManager::new(&NetworkParams::mini());
+    let interval = 10u64;
+
+    let a_pairs = bonded_pairs(&[1, 2, 3, 4]);
+    let b_pairs = bonded_pairs(&[5, 6, 7, 8]);
+    let quorum = quorum(4);
+
+    fm.set_keys(b_pairs.iter().map(|(_, pk)| *pk).collect());
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20);
+    fm.refresh_committee(&bonded_records(&b_pairs), 20, interval, 20);
+
+    let block: Hash512 = [0xCC; 64];
+
+    // Advance the frontier to epoch 2 with a valid B certificate.
+    let live = signed_with(
+        &b_pairs,
+        payload_mini(20, block),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    fm.accept(&live, Some(block), &RealBls).unwrap();
+    assert_eq!(fm.accepted_height(), 20);
+
+    // A's certificate at height 10: signature checks out against A (cached as
+    // the previous set), but height 10 <= accepted 20 is stale.
+    let stale = signed_with(
+        &a_pairs,
+        payload_mini(10, block),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    let err = refused_fm(&mut fm, &stale, block, "A quorum at epoch 1");
+    assert!(matches!(
+        err,
+        FinalityError::NotMonotonic {
+            height: 10,
+            accepted: 20
+        }
+    ));
+    assert_eq!(
+        fm.accepted_height(),
+        20,
+        "stale cert must not advance the frontier"
+    );
+    assert_eq!(fm.binding_finalized_height(), 0);
+}
+
+#[test]
+fn a_committee_swap_without_a_cached_set_still_serves_the_live_declared_keys() {
+    // The core stale-committee concern: keys swap to B but no B set is cached
+    // (the realistic upstream case is "no bonds yet", where derive_set is
+    // never fed candidates). The cache still holds A's set at epoch 1; a
+    // *current*-epoch certificate is validated against the live `self.keys`
+    // (B) via the genesis fallback — never the stale A set. So A's quorum is
+    // refused and B's quorum is accepted at the current epoch.
+    let mut fm = FinalityManager::new(&NetworkParams::mini());
+    let interval = 10u64;
+
+    let a_pairs = bonded_pairs(&[1, 2, 3, 4]);
+    let b_pairs = bonded_pairs(&[5, 6, 7, 8]);
+    let quorum = quorum(4);
+
+    // Seed the cache with A at epoch 1, then swap the declared keys to B
+    // without refreshing a B set into the cache.
+    fm.set_keys(a_pairs.iter().map(|(_, pk)| *pk).collect());
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20); // caches A@e1
+    fm.set_keys(b_pairs.iter().map(|(_, pk)| *pk).collect()); // keys=B, cache still A@e1
+
+    let block: Hash512 = [0xDD; 64];
+
+    // Current-epoch cert: get(e2) is uncached -> genesis fallback(keys=B).
+    let by_b = signed_with(
+        &b_pairs,
+        payload_mini(20, block),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    fm.accept(&by_b, Some(block), &RealBls).unwrap();
+    assert_eq!(fm.accepted_height(), 20);
+
+    let by_a = signed_with(
+        &a_pairs,
+        payload_mini(20, block),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    let err = refused_fm(&mut fm, &by_a, block, "A quorum after keys swapped to B");
+    assert!(matches!(
+        err,
+        FinalityError::InvalidCertificate(ValidatorError::CheckpointBadSignature)
+    ));
 }

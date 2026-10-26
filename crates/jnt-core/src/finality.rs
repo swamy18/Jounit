@@ -172,6 +172,14 @@ impl FinalityManager {
         let seed_epoch = crate::validators::epoch_of(seed, epoch_blocks);
         // Derive the set for the seed epoch and carry it forward for `epoch`;
         // the seed height's state is what determines this epoch's committee.
+        // A failed `derive_set` (e.g. degenerate shared-address input that can
+        // only arise from a malformed candidate list, never from bond admission)
+        // leaves the prior cache intact. That is safe: `EpochSetCache::get`
+        // matches on exact epoch, so a leftover set is only ever read back at its
+        // own epoch — where the `NotMonotonic` check refuses it as stale — while
+        // any current-epoch certificate misses the cache and falls through to
+        // the genesis fallback driven by the live `self.keys`. The cache can
+        // therefore never hand a stale committee to a current-epoch certificate.
         if let Ok(set) = derive_set(
             seed_epoch,
             candidates,
