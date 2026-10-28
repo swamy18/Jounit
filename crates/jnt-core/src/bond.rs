@@ -43,11 +43,14 @@
 //!   window with no special case;
 //! - every refusal names its rule (`Error::StakeInvalid`) and commits nothing.
 
-use crate::bls_checkpoint::{verify_checkpoint, BlsPublicKey, BlsSignature, ValidatorSet};
+use crate::bls_checkpoint::{
+    verify_checkpoint, BlsPublicKey, BlsSignature, Checkpoint, ValidatorSet,
+};
 use crate::error::{Error, Result};
 use crate::hash::{sha256_dom, Address, Hash, Hash512};
 use crate::slash::{VESTING_BLOCKS_MAINNET, VESTING_BLOCKS_MINI};
 use crate::tx::{StakePayload, Transaction, TX_BOND, TX_SLASH, TX_UNBOND};
+use crate::validators::{EpochSet, ValidatorError, ValidatorRecord};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Unbonding delay: 7 days at the mainnet 10-minute block time (Decision 20
@@ -419,21 +422,24 @@ pub fn check_unbond_tx(
 }
 
 /// Validate a `TX_SLASH` carrying equivocation evidence: two checkpoints that
-/// both verify against the current committee, name the same height with
-/// different hashes, and share a signer. Returns the bond id and record; the
-/// caller deletes the record and writes the full-bond slash into the vault.
+/// name the same height with different hashes and share a signer. Each
+/// checkpoint is verified against the committee that was authoritative for its
+/// own checkpoint epoch (P0-2), not against the current committee. Both
+/// checkpoints must claim the same epoch, and that epoch must be the epoch of
+/// their shared height. Returns the bond id and record; the caller deletes the
+/// record and writes the full-bond slash into the vault.
 ///
-/// The offender needs no separate bondedness check: it is drawn from the
-/// signers of checkpoints that verified against the bond-derived committee,
-/// so it is bonded by construction. Evidence for a key outside the committee
-/// fails verification, and an unbonded key leaves the committee — the
-/// unbonding delay is the evidence window with no special case.
+/// The offender must still hold an active bond at slash time: that is the
+/// evidence window (the unbonding delay). A key that unbonded leaves the
+/// ledger, so `find_by_key` refuses and the slash is rejected once the window
+/// closes.
 pub fn check_slash_tx(
     tx: &Transaction,
     bonds: &BondLedger,
-    committee: &[BlsPublicKey],
+    set_for_epoch: impl Fn(u64) -> std::result::Result<EpochSet, ValidatorError>,
     network_id: &str,
     height: u64,
+    epoch_blocks: u64,
     verifier: &dyn crate::bls_checkpoint::BlsVerifier,
 ) -> Result<(BondId, BondRecord)> {
     if tx.tx_type != TX_SLASH {
@@ -459,11 +465,35 @@ pub fn check_slash_tx(
     if first.payload.network_id != network_id || second.payload.network_id != network_id {
         return Err(Error::StakeInvalid("slash evidence wrong network"));
     }
-    // Cheap checks before crypto: the offender must still be bonded, or there
-    // is nothing to burn and no pairing is worth doing.
-    let set = ValidatorSet::new(committee.to_vec());
-    let signers_first = set.signers_from_bitmap(&first.signer_bitmap);
-    let signers_second = set.signers_from_bitmap(&second.signer_bitmap);
+    if first.payload.epoch != second.payload.epoch {
+        return Err(Error::StakeInvalid("slash checkpoints differ in epoch"));
+    }
+    if crate::validators::epoch_of(first.payload.height, epoch_blocks) != first.payload.epoch {
+        return Err(Error::StakeInvalid("slash checkpoint wrong epoch"));
+    }
+    // Verify each checkpoint against the committee authoritative for its own
+    // epoch (historical set), not the current committee.
+    let set_first = set_for_epoch(first.payload.epoch)
+        .map_err(|_| Error::StakeInvalid("slash first checkpoint epoch set unavailable"))?;
+    let set_second = set_for_epoch(second.payload.epoch)
+        .map_err(|_| Error::StakeInvalid("slash second checkpoint epoch set unavailable"))?;
+    let verify_first = |cp: &Checkpoint, set: &EpochSet| -> Result<()> {
+        let validator_set = ValidatorSet::from_records(&set.validators);
+        verify_checkpoint(cp, &validator_set, verifier)
+            .map_err(|_| Error::StakeInvalid("slash first checkpoint invalid"))
+    };
+    let verify_second = |cp: &Checkpoint, set: &EpochSet| -> Result<()> {
+        let validator_set = ValidatorSet::from_records(&set.validators);
+        verify_checkpoint(cp, &validator_set, verifier)
+            .map_err(|_| Error::StakeInvalid("slash second checkpoint invalid"))
+    };
+    verify_first(first, &set_first)?;
+    verify_second(second, &set_second)?;
+    // Common offending signer across both historical committees.
+    let set_first_vs = ValidatorSet::from_records(&set_first.validators);
+    let set_second_vs = ValidatorSet::from_records(&set_second.validators);
+    let signers_first = set_first_vs.signers_from_bitmap(&first.signer_bitmap);
+    let signers_second = set_second_vs.signers_from_bitmap(&second.signer_bitmap);
     let offender = signers_first
         .iter()
         .find(|k| signers_second.contains(k))
@@ -472,10 +502,6 @@ pub fn check_slash_tx(
         .find_by_key(offender)
         .map(|(id, r)| (id, r.clone()))
         .ok_or(Error::StakeInvalid("slash offender has no active bond"))?;
-    verify_checkpoint(first, &set, verifier)
-        .map_err(|_| Error::StakeInvalid("slash first checkpoint invalid"))?;
-    verify_checkpoint(second, &set, verifier)
-        .map_err(|_| Error::StakeInvalid("slash second checkpoint invalid"))?;
     Ok((bond_id, record))
 }
 
@@ -489,6 +515,7 @@ pub fn admit_stake_tx(
     bonds: &BondLedger,
     network_id: &str,
     height: u64,
+    epoch_blocks: u64,
     verifier: &dyn crate::bls_checkpoint::BlsVerifier,
 ) -> Result<()> {
     match tx.tx_type {
@@ -499,13 +526,43 @@ pub fn admit_stake_tx(
             check_unbond_tx(tx, bonds, height)?;
         }
         TX_SLASH => {
-            let committee: Vec<BlsPublicKey> =
-                bonds.committee().into_iter().map(|r| r.bls_pk).collect();
-            check_slash_tx(tx, bonds, &committee, network_id, height, verifier)?;
+            let set_for_epoch = |_epoch| Ok(current_epoch_set(bonds, network_id, 0));
+            check_slash_tx(
+                tx,
+                bonds,
+                set_for_epoch,
+                network_id,
+                height,
+                epoch_blocks,
+                verifier,
+            )?;
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Build the current committee as an `EpochSet` labeled with `epoch`. Used by
+/// mempool/probe slash admission, which has no historical bond state and so
+/// verifies against the live committee (re-verified with history on-chain).
+fn current_epoch_set(bonds: &BondLedger, network_id: &str, epoch: u64) -> EpochSet {
+    let validators: Vec<ValidatorRecord> = bonds
+        .committee()
+        .into_iter()
+        .map(|r| ValidatorRecord {
+            stake_address: bond_identity(network_id, &r.bonder, &r.bls_pk),
+            bls_pk: r.bls_pk,
+            stake_sat: r.amount_sat,
+            mldsa_pk: r.mldsa_pk,
+        })
+        .collect();
+    let mut set = EpochSet {
+        epoch,
+        validators,
+        set_hash: Hash::default(),
+    };
+    set.set_hash = crate::validators::set_hash(&set);
+    set
 }
 
 /// Scratch-ledger stake transition: validate AND mutate a scratch ledger.
@@ -521,6 +578,7 @@ pub fn probe_stake_tx(
     bonds: &mut BondLedger,
     network_id: &str,
     height: u64,
+    epoch_blocks: u64,
     tx_index: u32,
     verifier: &dyn crate::bls_checkpoint::BlsVerifier,
 ) -> Result<()> {
@@ -544,9 +602,16 @@ pub fn probe_stake_tx(
             bonds.remove(&id);
         }
         TX_SLASH => {
-            let committee: Vec<BlsPublicKey> =
-                bonds.committee().into_iter().map(|r| r.bls_pk).collect();
-            let (id, _) = check_slash_tx(tx, bonds, &committee, network_id, height, verifier)?;
+            let set_for_epoch = |_epoch| Ok(current_epoch_set(bonds, network_id, 0));
+            let (id, _) = check_slash_tx(
+                tx,
+                bonds,
+                set_for_epoch,
+                network_id,
+                height,
+                epoch_blocks,
+                verifier,
+            )?;
             bonds.remove(&id);
         }
         _ => {}
@@ -557,6 +622,7 @@ pub fn probe_stake_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bls_checkpoint::CheckpointPayload;
     use crate::tx::{Input, OutPoint, Transaction};
 
     const NET: &str = "jounit/testnet";
@@ -565,6 +631,12 @@ mod tests {
         crate::bls::SecretKey::derive(&[seed; 32])
             .unwrap()
             .public_key()
+    }
+
+    fn bls_pair(seed: u8) -> (crate::bls::SecretKey, BlsPublicKey) {
+        let sk = crate::bls::SecretKey::derive(&[seed; 32]).unwrap();
+        let pk = sk.public_key();
+        (sk, pk)
     }
 
     fn unsigned_input() -> Input {
@@ -676,5 +748,209 @@ mod tests {
         assert_eq!(ledger.get(&[9u8; 64]), Some(&record));
         // Key index restored too: the same key bonds once.
         assert!(ledger.find_by_key(&record.bls_pk).is_some());
+    }
+
+    fn slashing_tx(
+        sk: &crate::bls::SecretKey,
+        height: u64,
+        epoch: u64,
+        network_id: &str,
+    ) -> Transaction {
+        let (first, second) = conflicting_checkpoints(sk, height, epoch, network_id);
+        Transaction {
+            version: 1,
+            tx_type: TX_SLASH,
+            lock_time: 0,
+            inputs: vec![unsigned_input()],
+            outputs: vec![],
+            stake: Some(StakePayload::Slash {
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+        }
+    }
+
+    fn conflicting_checkpoints(
+        sk: &crate::bls::SecretKey,
+        height: u64,
+        epoch: u64,
+        network_id: &str,
+    ) -> (Checkpoint, Checkpoint) {
+        let a = CheckpointPayload {
+            height,
+            block_hash: [0xAAu8; 64],
+            network_id: network_id.to_string(),
+            epoch,
+        };
+        let b = CheckpointPayload {
+            height,
+            block_hash: [0xBBu8; 64],
+            network_id: network_id.to_string(),
+            epoch,
+        };
+        (lone_bls_checkpoint(sk, a), lone_bls_checkpoint(sk, b))
+    }
+
+    fn lone_bls_checkpoint(sk: &crate::bls::SecretKey, payload: CheckpointPayload) -> Checkpoint {
+        let msg = payload.signing_hash();
+        let sig = crate::bls::RealBls::aggregate(&[sk.sign(&msg)]).unwrap();
+        Checkpoint {
+            payload,
+            aggregate_sig: sig,
+            signer_bitmap: vec![1u8],
+            signer_count: 1,
+            pq_sidecar: Vec::new(),
+        }
+    }
+
+    fn record_for(bls_pk: BlsPublicKey, stake: u64) -> BondRecord {
+        BondRecord {
+            bonder: [1u8; 20],
+            bls_pk,
+            mldsa_pk: None,
+            amount_sat: stake,
+            bond_height: 100,
+            bond_index: 0,
+        }
+    }
+
+    fn epoch_set_with(keys: &[BlsPublicKey]) -> EpochSet {
+        let mut validators: Vec<ValidatorRecord> = keys
+            .iter()
+            .map(|k| ValidatorRecord {
+                bls_pk: *k,
+                stake_address: [1u8; 20],
+                stake_sat: 0,
+                mldsa_pk: None,
+            })
+            .collect();
+        validators.sort_by(|a, b| a.bls_pk.as_bytes().cmp(b.bls_pk.as_bytes()));
+        let set_hash = crate::validators::set_hash(&EpochSet {
+            epoch: 0,
+            validators: validators.clone(),
+            set_hash: [0u8; 32],
+        });
+        EpochSet {
+            epoch: 0,
+            validators,
+            set_hash,
+        }
+    }
+
+    /// P0-2: a validator that has been slashed *and* dropped out of the
+    /// active TopN committee still has its slash evidence verified against the
+    /// committee that was authoritative at the evidence's epoch, which still
+    /// contained the key. The bond is removed regardless of current committee
+    /// membership.
+    #[test]
+    fn slash_succeeds_after_validator_drops_out_of_topn() {
+        let (sk, pk) = bls_pair(7);
+        let tx = slashing_tx(&sk, 110, 11, NET);
+        let mut bonds = BondLedger::default();
+        bonds.insert(tx.txid(), record_for(pk, 5_000_000));
+        let epoch_set = epoch_set_with(&[pk]);
+        let set_for_epoch = |_| Ok(epoch_set.clone());
+        let result = check_slash_tx(
+            &tx,
+            &bonds,
+            set_for_epoch,
+            NET,
+            300,
+            10,
+            &crate::bls::RealBls,
+        );
+        assert!(
+            result.is_ok(),
+            "slash evidence should verify against the set that contained the key"
+        );
+        let (id, _) = result.unwrap();
+        assert!(bonds.get(&id).is_some());
+    }
+
+    /// P0-2: evidence from an epoch whose committee is no longer reconstructable
+    /// (expired/unavailable) is refused — `check_slash_tx` does not silently
+    /// fall back to a stale set.
+    #[test]
+    fn expired_epoch_set_rejects_evidence() {
+        let (sk, pk) = bls_pair(7);
+        let tx = slashing_tx(&sk, 110, 11, NET);
+        let mut bonds = BondLedger::default();
+        bonds.insert(tx.txid(), record_for(pk, 5_000_000));
+        let set_for_epoch = |epoch| {
+            if epoch == 11 {
+                Err(ValidatorError::SetExpired { epoch })
+            } else {
+                Ok(epoch_set_with(&[pk]))
+            }
+        };
+        let err = check_slash_tx(
+            &tx,
+            &bonds,
+            set_for_epoch,
+            NET,
+            300,
+            10,
+            &crate::bls::RealBls,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            Error::StakeInvalid("slash first checkpoint epoch set unavailable")
+        );
+    }
+
+    /// P0-2: two individually valid checkpoints with no signer in common
+    /// cannot name an offender — `check_slash_tx` refuses with
+    /// "share no signer" rather than silently picking one side.
+    ///
+    /// Any two quorums of the *same* committee intersect (quorum > n/2), so
+    /// this branch is only reachable when the two checkpoints verify against
+    /// different sets. The stateful resolver below returns a different
+    /// single-member set per call to pin exactly that shape.
+    #[test]
+    fn disjoint_signer_certificates_are_rejected() {
+        let (sk_a, pk_a) = bls_pair(7);
+        let (sk_b, pk_b) = bls_pair(8);
+        let (first, _) = conflicting_checkpoints(&sk_a, 110, 11, NET);
+        let (_, second) = conflicting_checkpoints(&sk_b, 110, 11, NET);
+        let tx = Transaction {
+            version: 1,
+            tx_type: TX_SLASH,
+            lock_time: 0,
+            inputs: vec![unsigned_input()],
+            outputs: vec![],
+            stake: Some(StakePayload::Slash {
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+        };
+        let set_a = epoch_set_with(&[pk_a]);
+        let set_b = epoch_set_with(&[pk_b]);
+        let mut bonds = BondLedger::default();
+        bonds.insert(tx.txid(), record_for(pk_a, 5_000_000));
+        let calls = std::cell::Cell::new(0u32);
+        let set_for_epoch = |_| {
+            let c = calls.get();
+            calls.set(c + 1);
+            if c == 0 {
+                Ok(set_a.clone())
+            } else {
+                Ok(set_b.clone())
+            }
+        };
+        let err = check_slash_tx(
+            &tx,
+            &bonds,
+            set_for_epoch,
+            NET,
+            300,
+            10,
+            &crate::bls::RealBls,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            Error::StakeInvalid("slash checkpoints share no signer")
+        );
     }
 }

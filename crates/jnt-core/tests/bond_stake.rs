@@ -175,20 +175,30 @@ fn lone_checkpoint(sk: &SecretKey, payload: CheckpointPayload) -> Checkpoint {
     }
 }
 
-fn conflicting_pair(sk: &SecretKey, height: u64, network_id: &str) -> (Checkpoint, Checkpoint) {
+fn conflicting_pair(
+    sk: &SecretKey,
+    height: u64,
+    epoch: u64,
+    network_id: &str,
+) -> (Checkpoint, Checkpoint) {
     let a = CheckpointPayload {
         height,
         block_hash: [0xAAu8; 64],
         network_id: network_id.to_string(),
-        epoch: 0,
+        epoch,
     };
     let b = CheckpointPayload {
         height,
         block_hash: [0xBBu8; 64],
         network_id: network_id.to_string(),
-        epoch: 0,
+        epoch,
     };
     (lone_checkpoint(sk, a), lone_checkpoint(sk, b))
+}
+
+/// Epoch of `height` on this chain's checkpoint interval.
+fn epoch_at(chain: &Chain, height: u64) -> u64 {
+    CheckpointPayload::epoch_for(height, chain.params().checkpoint_interval_blocks)
 }
 
 fn slash_tx(
@@ -266,11 +276,21 @@ fn happy_path_bond_registers_and_joins_the_committee() {
     assert_eq!(record.bls_pk, pk);
     assert_eq!(record.amount_sat, BOND);
 
-    // The committee follows the ledger: the bonded key, and only it.
+    // The committee follows the seed-height ledger, not the live one: the
+    // bond at height 81 is invisible to epoch 8 (seed height 60), so the
+    // genesis fallback stays in effect until rotation.
+    assert_eq!(
+        chain.committee_keys(),
+        chain.params().genesis_validators.clone(),
+        "the committee stays on the seed-height set until rotation"
+    );
+
+    // Once the bond is visible at a seed height it joins the committee.
+    mine_to(&mut chain, bonder, 110);
     assert_eq!(chain.committee_keys(), vec![pk]);
 
     // Finality follows too: a checkpoint signed by the bonded key verifies
-    // against the live committee and is accepted (observation on mini).
+    // against the seed-derived committee and is accepted (observation on mini).
     let h = chain.height();
     let interval = chain.params().checkpoint_interval_blocks;
     let payload = CheckpointPayload {
@@ -290,17 +310,19 @@ fn a_bond_below_the_old_minimum_is_still_accepted() {
     // is valid. A 1-satoshi bond must be accepted and join the committee.
     let (mut chain, w, ops) = rich_chain();
     let bonder = w.address().unwrap();
-    let (sk, pk) = bls_pair(7);
+    let (sk, _) = bls_pair(7);
     let tiny_bond = bond_tx_value(&chain, &w, &ops[..66], &sk, 1);
     let bond_id = tiny_bond.txid();
     submit_block(&mut chain, bonder, vec![tiny_bond]).unwrap();
 
     let record = chain.bonds().get(&bond_id).expect("bond must be recorded");
     assert_eq!(record.amount_sat, 1, "a 1-sat bond must be accepted");
+    // The bond is recorded immediately; it joins the committee only once a
+    // seed height sees it (epoch 8's seed is height 60, before this bond).
     assert_eq!(
         chain.committee_keys(),
-        vec![pk],
-        "1-sat bond still joins the committee"
+        chain.params().genesis_validators.clone(),
+        "a new bond does not rotate the committee mid-epoch"
     );
 }
 
@@ -311,9 +333,12 @@ fn a_checkpoint_from_outside_the_bonded_committee_is_refused() {
     let (sk, pk) = bls_pair(7);
     let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
+    // The bond becomes effective at the next rotation; the stranger is
+    // refused against the bonded committee, not the genesis fallback.
+    mine_to(&mut chain, bonder, 110);
     assert_eq!(chain.committee_keys(), vec![pk]);
 
-    // A stranger's key signs a well-formed checkpoint â€” but the committee is
+    // A stranger's key signs a well-formed checkpoint — but the committee is
     // the bonded key now, so the bitmap names nobody and quorum fails.
     let h = chain.height();
     let interval = chain.params().checkpoint_interval_blocks;
@@ -653,12 +678,11 @@ fn happy_path_unbond_releases_after_the_lock() {
     let held = chain.utxo().get(&release).expect("release must exist");
     assert_eq!(held.out.value, BOND);
     assert_eq!(held.out.address, bonder);
-    assert_eq!(
-        chain.committee_keys(),
-        chain.params().genesis_validators.clone()
-    );
+    // P0-1: the unbond removes the ledger entry but the epoch committee is
+    // stable — the seed snapshot still names the key until rotation.
+    assert_eq!(chain.committee_keys(), vec![sk.public_key()]);
 
-    // And the release spends like any other output â€” after its own 10-block
+    // And the release spends like any other output — after its own 10-block
     // maturity, which applies to every output, not just coinbases.
     let spend_at = chain.height() + 10;
     mine_to(&mut chain, bonder, spend_at);
@@ -675,6 +699,13 @@ fn happy_path_unbond_releases_after_the_lock() {
         .unwrap();
     let _ = &mut spend;
     submit_block(&mut chain, bonder, vec![spend]).unwrap();
+    // Past the first seed height taken after the unbond, no bond-backed
+    // committee remains and the genesis fallback returns.
+    mine_to(&mut chain, bonder, 1110);
+    assert_eq!(
+        chain.committee_keys(),
+        chain.params().genesis_validators.clone()
+    );
 }
 
 #[test]
@@ -713,25 +744,47 @@ fn unbond_refusals_name_their_rule() {
 
 #[test]
 fn happy_path_slash_burns_the_full_bond() {
-    let (mut chain, w, ops) = rich_chain();
+    // `richer_chain` (200 matured outputs): advancing to the bond's first
+    // effective epoch and past the slash costs ~60 funded blocks.
+    let (mut chain, w, ops) = richer_chain();
     let bonder = w.address().unwrap();
     let (sk, pk) = bls_pair(7);
     let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
-    assert_eq!(chain.committee_keys(), vec![pk]);
+    // P0-1: the committee for the bond's epoch is fixed at that epoch's seed
+    // height (epoch 21's seed is height 190, before the bond at height 211),
+    // so the new bond does not join the committee mid-epoch.
+    assert_eq!(
+        chain.committee_keys(),
+        chain.params().genesis_validators.clone(),
+        "the committee stays on the seed-height set until rotation"
+    );
 
-    // Two conflicting checkpoints, both really signed by the bonded key.
+    // Advance to the first epoch whose seed height sees the bond (mini:
+    // epoch 24, seed height 220, past the bond at height 211), then
+    // equivocate at the tip of that epoch.
+    mine_to(&mut chain, bonder, 240);
+    assert_eq!(
+        chain.committee_keys(),
+        vec![pk],
+        "the seed-visible bond now forms the committee"
+    );
+    // Two conflicting checkpoints, both really signed by the bonded key, at
+    // the tip's own epoch so historical verification resolves.
     let h = chain.height();
-    let (first, second) = conflicting_pair(&sk, h, "jounit/mini");
-    let slash = slash_tx(&chain, &w, &ops[67..68], first, second);
+    let epoch = epoch_at(&chain, h);
+    let (first, second) = conflicting_pair(&sk, h, epoch, "jounit/mini");
+    let slash = slash_tx(&chain, &w, &ops[66..67], first, second);
     let burned_before = chain.burned_fees_total();
     submit_block(&mut chain, bonder, vec![slash]).unwrap();
 
-    // The bond is gone and the committee falls back.
+    // The bond is gone, but the committee is stable for its epoch: the seed
+    // snapshot still names the slashed key until rotation.
     assert!(chain.bonds().is_empty());
     assert_eq!(
         chain.committee_keys(),
-        chain.params().genesis_validators.clone()
+        vec![pk],
+        "the epoch committee does not rotate mid-epoch when its bond is slashed"
     );
     // Half burned at once (Decision 2 item 4: full bond through the vault).
     // The vault's own counter is exact; the chain burned total carries the
@@ -743,43 +796,54 @@ fn happy_path_slash_burns_the_full_bond() {
     // Half vests to the PSCB reserve block by block.
     // With BOND = 5 JNT: vest_total = 250_000_000, vest_per_block = 125_000.
     let pscb_after_slash = chain.pscb_reserve();
-    mine(&mut chain, bonder, 5);
+    mine_to(&mut chain, bonder, 246);
     assert_eq!(chain.pscb_reserve() - pscb_after_slash, 5 * 125_000);
+    // Past the first seed height taken after the slash (height 250, empty),
+    // the committee falls back to genesis: no bond-backed committee remains.
+    mine_to(&mut chain, bonder, 270);
+    assert_eq!(
+        chain.committee_keys(),
+        chain.params().genesis_validators.clone()
+    );
 }
 
 #[test]
 fn slash_refusals_name_their_rule() {
-    let (mut chain, w, ops) = rich_chain();
+    // Rich chain: the bond only becomes slashable once its epoch is effective.
+    let (mut chain, w, ops) = richer_chain();
     let bonder = w.address().unwrap();
     let (sk, _) = bls_pair(7);
     let first_bond = bond_tx(&chain, &w, &ops[..66], &sk);
     submit_block(&mut chain, bonder, vec![first_bond]).unwrap();
+    mine_to(&mut chain, bonder, 240);
     let h = chain.height();
+    let epoch = epoch_at(&chain, h);
     let net = "jounit/mini";
+    let fund = &ops[66..67];
 
     // Same hash twice is a repeat, not equivocation.
-    let (first, _) = conflicting_pair(&sk, h, net);
-    let repeat = slash_tx(&chain, &w, &ops[67..68], first.clone(), first);
+    let (first, _) = conflicting_pair(&sk, h, epoch, net);
+    let repeat = slash_tx(&chain, &w, fund, first.clone(), first);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![repeat]).unwrap_err(),
         Error::StakeInvalid("slash checkpoints do not conflict")
     );
 
     // Evidence above the tip.
-    let (future_a, future_b) = conflicting_pair(&sk, h + 100, net);
-    let future = slash_tx(&chain, &w, &ops[67..68], future_a, future_b);
+    let (future_a, future_b) = conflicting_pair(&sk, h + 100, epoch + 10, net);
+    let future = slash_tx(&chain, &w, fund, future_a, future_b);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![future]).unwrap_err(),
         Error::StakeInvalid("slash evidence above tip")
     );
 
     // A foreign key signs, but the bitmap claims the bonded member signed:
-    // the aggregate does not match the claimed signers, so verification â€”
-    // not any bond lookup â€” refuses it. (The offender is drawn from verified
+    // the aggregate does not match the claimed signers, so verification —
+    // not any bond lookup — refuses it. (The offender is drawn from verified
     // bitmaps over the bonded set, so an "unbonded offender" cannot verify
     // in the first place: there is no such rule to pin.)
     let (osk, _) = bls_pair(9);
-    let (outsider_a, outsider_b) = conflicting_pair(&osk, h, net);
+    let (outsider_a, outsider_b) = conflicting_pair(&osk, h, epoch, net);
     // Re-point both bitmaps at the bonded member: the lie is now exact.
     let mut lie_a = outsider_a;
     let mut lie_b = outsider_b;
@@ -787,20 +851,45 @@ fn slash_refusals_name_their_rule() {
     lie_a.signer_count = 1;
     lie_b.signer_bitmap = vec![1u8];
     lie_b.signer_count = 1;
-    let outsider = slash_tx(&chain, &w, &ops[67..68], lie_a, lie_b);
+    let outsider = slash_tx(&chain, &w, fund, lie_a, lie_b);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![outsider]).unwrap_err(),
         Error::StakeInvalid("slash first checkpoint invalid")
     );
 
     // Forged aggregate for the bonded key: crypto runs last, and fails.
-    let (good_a, good_b) = conflicting_pair(&sk, h, net);
+    let (good_a, good_b) = conflicting_pair(&sk, h, epoch, net);
     let mut forged_a = good_a;
     forged_a.aggregate_sig = jnt_core::bls_checkpoint::BlsSignature([0u8; 96]);
-    let forged = slash_tx(&chain, &w, &ops[67..68], forged_a, good_b);
+    let forged = slash_tx(&chain, &w, fund, forged_a, good_b);
     assert_eq!(
         submit_block(&mut chain, bonder, vec![forged]).unwrap_err(),
         Error::StakeInvalid("slash first checkpoint invalid")
+    );
+
+    // Same height but different checkpoint epochs: not one equivocation.
+    let (diff_a, mut diff_b) = conflicting_pair(&sk, h, epoch, net);
+    diff_b.payload.epoch = epoch - 1;
+    let differ = slash_tx(&chain, &w, fund, diff_a, diff_b);
+    assert_eq!(
+        submit_block(&mut chain, bonder, vec![differ]).unwrap_err(),
+        Error::StakeInvalid("slash checkpoints differ in epoch")
+    );
+
+    // Both checkpoints claim an epoch their height does not belong to.
+    let (wrong_a, wrong_b) = conflicting_pair(&sk, h, epoch - 1, net);
+    let wrong = slash_tx(&chain, &w, fund, wrong_a, wrong_b);
+    assert_eq!(
+        submit_block(&mut chain, bonder, vec![wrong]).unwrap_err(),
+        Error::StakeInvalid("slash checkpoint wrong epoch")
+    );
+
+    // Evidence for another network is refused before any signature work.
+    let (xn_a, xn_b) = conflicting_pair(&sk, h, epoch, "jounit/other");
+    let xnet = slash_tx(&chain, &w, fund, xn_a, xn_b);
+    assert_eq!(
+        submit_block(&mut chain, bonder, vec![xnet]).unwrap_err(),
+        Error::StakeInvalid("slash evidence wrong network")
     );
 
     assert_eq!(chain.bonds().len(), 1, "refusals must not touch the bond");
@@ -872,7 +961,7 @@ fn stake_transaction_codec_round_trips_exactly() {
     assert_eq!(back, unbond);
     assert_eq!(back.serialize(), bytes);
 
-    let (first, second) = conflicting_pair(&sk, h, "jounit/mini");
+    let (first, second) = conflicting_pair(&sk, h, epoch_at(&chain, h), "jounit/mini");
     let slash = slash_tx(&chain, &w, &ops[67..68], first, second);
     let bytes = slash.serialize();
     let back = Transaction::deserialize(&bytes).expect("slash must decode");
@@ -936,10 +1025,10 @@ fn a_reorged_bond_leaves_no_undo_record_behind() {
 }
 
 /// Item 5: the checkpoint committee is stake-weighted (TopN), not bond-
-/// insertion-ordered. Three validators bond at the minimum with distinct BLS
-/// keys. The signing committee (`committee_keys`) follows bond insertion order,
-/// but the epoch set (`derive_set(TopN)`) must be in canonical key-first order
-/// with a real `stake_address` (the bond identity, not the zero placeholder).
+/// insertion-ordered. Three validators bond with distinct BLS keys. Both the
+/// signing committee (`committee_keys`) and the epoch set come from the same
+/// seed-height bond state, so they name the same members in canonical
+/// key-first order with real `stake_address` values (bond identities).
 #[test]
 fn committee_is_derived_by_stake_topn_not_bond_order() {
     let (mut chain, w, ops) = richer_chain();
@@ -959,6 +1048,9 @@ fn committee_is_derived_by_stake_topn_not_bond_order() {
         let block = chain.mine_block(bonder, vec![tx], ts(h)).unwrap();
         chain.submit(block).unwrap();
     }
+    // The bonds (heights 211-213) are invisible until a seed height sees
+    // them; advance to the first effective epoch (mini epoch 24, seed 220).
+    mine_to(&mut chain, bonder, 240);
     // All three bonded keys are listed for signing (genesis fallback is off):
     let keys = chain.committee_keys();
     assert_eq!(

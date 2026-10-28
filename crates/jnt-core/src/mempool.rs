@@ -232,6 +232,7 @@ impl Mempool {
                 bonds,
                 &params.network_id,
                 height,
+                params.checkpoint_interval_blocks,
                 &crate::bls::RealBls,
             )
             .map_err(|e| MempoolError::Invalid(e.to_string()))?;
@@ -388,6 +389,7 @@ impl Mempool {
                 &snap.bonds,
                 &snap.params.network_id,
                 snap.height,
+                snap.params.checkpoint_interval_blocks,
                 &crate::bls::RealBls,
             )
             .map_err(|e| MempoolError::Invalid(e.to_string()))?;

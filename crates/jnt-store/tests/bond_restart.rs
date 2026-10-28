@@ -106,10 +106,21 @@ fn chain_with_a_bond() -> (Chain, Wallet, jnt_core::hash::Hash512) {
     let b = chain.mine_block(bonder, vec![tx], ts(h)).unwrap();
     chain.submit(b).unwrap();
     assert_eq!(chain.bonds().len(), 1, "the bond committed");
+    // P0-1: the bond at height 81 is invisible to epoch 8 (seed height 60),
+    // so the committee stays on the genesis fallback until rotation...
+    assert_eq!(
+        chain.committee_keys(),
+        chain.params().genesis_validators.clone(),
+        "the committee stays on the seed-height set until rotation"
+    );
+    // ...and once a seed height sees the bond, the committee is bond-backed.
+    // Mining to height 110 (mini epoch 11, seed height 90) exercises the
+    // snapshot path the restart replay below must rebuild.
+    mine_empty_to(&mut chain, bonder, 110);
     assert_eq!(
         chain.committee_keys(),
         vec![pk],
-        "the committee follows the ledger"
+        "the seed-visible bond now forms the committee"
     );
     (chain, w, bond_id)
 }
