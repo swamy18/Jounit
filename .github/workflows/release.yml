@@ -70,12 +70,15 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: jnt-node
+            miner: jnt-miner
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: jnt-node
+            miner: jnt-miner
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: jnt-node.exe
+            miner: jnt-miner.exe
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -88,18 +91,22 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p jnt-node
+        run: cargo build --release --target ${{ matrix.target }} -p jnt-node -p jnt-miner
 
       - name: Checksum
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${{ matrix.artifact }}" | sed 's#  *#  #' > SHA256SUMS
-          else
-            # macOS ships shasum rather than sha256sum; the format is identical.
-            shasum -a 256 "${{ matrix.artifact }}" | sed 's#  *#  #' > SHA256SUMS
-          fi
+          artifacts=("${{ matrix.artifact }}" "${{ matrix.miner }}")
+          : > SHA256SUMS
+          for a in "${artifacts[@]}"; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$a" | sed 's#  *#  #' >> SHA256SUMS
+            else
+              # macOS ships shasum rather than sha256sum; the format is identical.
+              shasum -a 256 "$a" | sed 's#  *#  #' >> SHA256SUMS
+            fi
+          done
           cat SHA256SUMS
 
       # Keyless signing (cosign/OIDC). No long-lived private key is stored in
@@ -112,20 +119,23 @@ jobs:
         with:
           cosign-version: '3.1.3'
 
-      - name: Sign binary
+      - name: Sign binaries
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          cosign sign-blob --bundle "${{ matrix.artifact }}.sig" \
-            --yes "${{ matrix.artifact }}"
+          for a in "${{ matrix.artifact }}" "${{ matrix.miner }}"; do
+            cosign sign-blob --bundle "$a.sig" --yes "$a"
+          done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jnt-node-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/${{ matrix.artifact }}
+            target/${{ matrix.target }}/release/${{ matrix.miner }}
             target/${{ matrix.target }}/release/SHA256SUMS
             target/${{ matrix.target }}/release/${{ matrix.artifact }}.sig
+            target/${{ matrix.target }}/release/${{ matrix.miner }}.sig
           if-no-files-found: error
 
   publish:
