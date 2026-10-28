@@ -22,12 +22,22 @@
 //! node uses; the node re-checks again at submit.
 //!
 //! Share difficulty: the pool accepts proofs meeting a weaker `share_difficulty`
-//! (default 1) as shares for accounting, and forwards only proofs that also
-//! meet the job's network difficulty as blocks. Share counting is in-memory;
-//! payout logic is the pool operator's job, not this crate's.
+//! as shares for accounting, and forwards only proofs that also meet the
+//! job's network difficulty as blocks. Found blocks close a PPLNS round over
+//! the trailing window (see [`crate::payout`]): pool hopping has no timing
+//! edge because every share in the window is worth the same. Share and payout
+//! accounting is in-memory; moving actual coin on chain stays the operator's
+//! job (`mark_paid` records it).
+//!
+//! Known non-fixable: block withholding. A miner who finds a full-difficulty
+//! proof and never submits it is indistinguishable from an unlucky one — no
+//! pool protocol can tell them apart. The damage is bounded by construction:
+//! a withheld block earns no share (nothing was submitted) and the round it
+//! would have closed stays open, so the withholder dilutes their own window
+//! weight along with everyone else's.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
@@ -35,9 +45,9 @@ use jnt_core::block::{Block, Header};
 use jnt_core::error::{Error, Result};
 use jnt_core::hash::Address;
 use jnt_core::hbm_pow::HbmConfig;
-use jnt_core::puzzle::{PuzzleKind, PuzzleSolver, PuzzleSpec};
+use jnt_core::puzzle::{PuzzleSolver, PuzzleSpec};
 
-use crate::payout::{FinalizedRound, RoundTracker};
+use crate::payout::{FinalizedRound, RoundTracker, PPLNS_MAX_WINDOW};
 
 /// A job handed to one miner: an unsolved template plus its id.
 #[derive(Debug, Clone)]
@@ -81,7 +91,18 @@ struct PoolInner {
     next_job_id: u64,
     jobs: HashMap<u64, Block>,
     stats: HashMap<Address, ShareStats>,
+    /// Block hashes of accepted solutions, oldest-first. One proof, one
+    /// share: without this, a miner hands the same solved header in under two
+    /// job ids (the pool serves the same template twice) and gets paid twice
+    /// for one grind, diluting every honest miner.
+    seen: HashSet<jnt_core::hash::Hash512>,
+    seen_order: VecDeque<jnt_core::hash::Hash512>,
 }
+
+/// How many accepted solutions the duplicate filter remembers. Past that,
+/// the oldest is forgotten — a forgotten hash colliding with a fresh proof
+/// would need the same 512-bit block hash twice, i.e. the same proof.
+const SEEN_CAP: usize = 4096;
 
 impl Pool {
     /// `share_difficulty` must be non-zero and no harder than any template
@@ -108,6 +129,8 @@ impl Pool {
                 next_job_id: 1,
                 jobs: HashMap::new(),
                 stats: HashMap::new(),
+                seen: HashSet::new(),
+                seen_order: VecDeque::new(),
             }),
             payouts: Mutex::new(RoundTracker::new(fee_bps)?),
             template_fn: Box::new(template_fn),
@@ -176,6 +199,10 @@ impl Pool {
         if block.txs != template.txs {
             return Err(Error::Malformed("share transactions differ from its job"));
         }
+        // The solution identity, computed before the block moves into the
+        // submit callback below: one proof, one share (see the duplicate
+        // check ahead of accounting).
+        let digest = block.block_hash();
 
         // Share bar first: the proof must meet `share_difficulty`.
         if !self.proof_meets(&block.header, self.share_difficulty)? {
@@ -189,10 +216,30 @@ impl Pool {
             .map(|o| o.value)
             .unwrap_or(0);
         let block_height = b.height;
+        // Copied before `block` moves into the submit callback below.
+        let template_difficulty = b.difficulty;
         if is_block {
             let accepted = (self.submit_fn)(block)?;
             if !accepted {
                 return Err(Error::Malformed("node refused the block"));
+            }
+        }
+        // One proof, one share: the same solved header handed in under two
+        // job ids (or replayed twice) counts once. Checked before any
+        // accounting, so a duplicate records nothing anywhere.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| Error::Malformed("pool lock"))?;
+            if !inner.seen.insert(digest) {
+                return Err(Error::Malformed("duplicate solution"));
+            }
+            inner.seen_order.push_back(digest);
+            if inner.seen_order.len() > SEEN_CAP {
+                if let Some(oldest) = inner.seen_order.pop_front() {
+                    inner.seen.remove(&oldest);
+                }
             }
         }
         {
@@ -207,9 +254,12 @@ impl Pool {
             }
         }
         // Payout accounting mirrors the share stats exactly: every accepted
-        // share (blocks included) earns round weight, and a found block
-        // closes the round on its coinbase value. This runs after the node
-        // accepted, so a refused block never pays anyone.
+        // share (blocks included) earns window weight, and a found block
+        // closes the round on its coinbase value over the trailing PPLNS
+        // window (twice the expected shares per block, so every share is
+        // worth the same no matter when it landed — pool hopping has no
+        // timing edge). This runs after the node accepted, so a refused
+        // block never pays anyone.
         {
             let mut payouts = self
                 .payouts
@@ -217,7 +267,16 @@ impl Pool {
                 .map_err(|_| Error::Malformed("pool lock"))?;
             payouts.record_share(&miner);
             if is_block {
-                payouts.finalize_block(block_height, coinbase_sat);
+                // Twice the expected shares per block at the template's own
+                // difficulty: a share-difficulty bar above the network bar
+                // would admit no shares at all, so the quotient is ≥ 2 in
+                // every reachable state and the clamp is pure belt-and-braces.
+                let window = (template_difficulty
+                    .saturating_mul(2)
+                    .checked_div(self.share_difficulty)
+                    .unwrap_or(0))
+                .clamp(1, PPLNS_MAX_WINDOW as u128) as usize;
+                payouts.finalize_block(block_height, coinbase_sat, window);
             }
         }
         Ok(SubmitOutcome {
@@ -263,6 +322,11 @@ impl Pool {
     /// Check the header's proof against an arbitrary bar by re-running the
     /// consensus rule with the difficulty field swapped. The header's own
     /// difficulty is untouched, so this never weakens what `submit` enforces.
+    ///
+    /// Dispatch is on the *header's* puzzle id, not the pool's spec: a pool
+    /// serving both puzzles (hybrid spec + HBM config) must verify an HBM
+    /// template with the HBM rule. Dispatching on the pool spec instead
+    /// refused every valid HBM share as below-difficulty.
     fn proof_meets(&self, header: &Header, difficulty: u128) -> Result<bool> {
         if difficulty == 0 {
             return Err(Error::InvalidDifficulty(0));
@@ -274,14 +338,17 @@ impl Pool {
         }
         let mut probe = header.clone();
         probe.difficulty = difficulty;
-        match self.spec.kind {
-            PuzzleKind::Hybrid => PuzzleSolver::new(self.spec.clone()).satisfies(&probe),
-            PuzzleKind::Hbm => {
+        match probe.puzzle_id {
+            1 => PuzzleSolver::new(self.spec.clone()).satisfies(&probe),
+            2 => {
                 let cfg = self.hbm.as_ref().ok_or_else(|| {
                     Error::BadPuzzleSpec("hbm proof without an hbm config".into())
                 })?;
                 jnt_core::hbm_pow::hbm_satisfies_cfg(&probe, difficulty, cfg)
             }
+            other => Err(Error::BadPuzzleSpec(format!(
+                "pool cannot verify puzzle {other}"
+            ))),
         }
     }
 }
@@ -289,6 +356,13 @@ impl Pool {
 /// Serve the JSON-lines protocol on `listener` until the process exits.
 /// Each connection is handled on its own thread; a malformed line gets a
 /// `{"accepted":false,"reason":"..."}` reply and the connection continues.
+///
+/// DoS posture: one thread per connection (a flood holds threads, not pool
+/// state), a 16 MiB line cap (a client that never sends `\n` is dropped, not
+/// buffered forever), and a 60 s read deadline per line. Job memory itself is
+/// capped at 1024 entries in [`Pool::get_job`]. An operator facing the open
+/// internet still wants a firewall in front — this is pool software, not a
+/// hardened edge daemon.
 pub fn serve(listener: TcpListener, pool: Arc<Pool>) -> ! {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -298,6 +372,11 @@ pub fn serve(listener: TcpListener, pool: Arc<Pool>) -> ! {
     unreachable!("listener.incoming never returns None");
 }
 
+/// Largest single protocol line the pool will buffer (16 MiB, mirroring the
+/// node API's response cap): a valid share line is kilobytes, so anything
+/// larger without a newline is an allocation attack.
+const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+
 fn reply(stream: &mut TcpStream, value: serde_json::Value) {
     let mut line = value.to_string();
     line.push('\n');
@@ -305,16 +384,38 @@ fn reply(stream: &mut TcpStream, value: serde_json::Value) {
 }
 
 fn handle_conn(stream: TcpStream, pool: &Pool) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    // Slowloris guard: a peer that never finishes a line holds one handler
+    // thread, never pool memory — the read deadline below drops it.
+    if stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .is_err()
+    {
+        return;
+    }
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
     let mut line = String::new();
     loop {
         line.clear();
-        let n = match reader.read_line(&mut line) {
+        // Line cap: block_hex rides inside one JSON line, and a valid v1
+        // template is kilobytes — anything past 16 MiB without a newline is
+        // an allocation attack, not a share.
+        let mut capped = reader.by_ref().take(MAX_LINE_BYTES);
+        let n = match capped.read_line(&mut line) {
             Ok(n) => n,
             Err(_) => return,
         };
         if n == 0 {
+            return;
+        }
+        if n as u64 >= MAX_LINE_BYTES && !line.ends_with('\n') {
+            reply(
+                &mut writer,
+                serde_json::json!({"accepted": false, "reason": "line too long"}),
+            );
             return;
         }
         let req: serde_json::Value = match serde_json::from_str(&line) {
@@ -526,6 +627,113 @@ mod tests {
         let err = pool.submit_job(job.job_id, miner, job.block).unwrap_err();
         assert_eq!(err, Error::Malformed("share below pool difficulty"));
         assert!(submitted.lock().unwrap().is_empty());
+    }
+
+    /// An HBM template must verify under the HBM rule, not the pool's hybrid
+    /// spec: a proof that passes HBM at network difficulty but fails hybrid
+    /// is a block, and the pool must forward it. (Dispatching on the pool
+    /// spec instead counted it as a mere share and never submitted.)
+    #[test]
+    fn hbm_template_verifies_under_the_hbm_rule() {
+        use jnt_core::hbm_pow::{hbm_satisfies_cfg, HbmConfig};
+
+        const DIFFICULTY: u128 = 64;
+        let miner = [7u8; 20];
+        let chain = Arc::new(Mutex::new(Chain::new(NetworkParams::mini()).unwrap()));
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let submitted_clone = submitted.clone();
+        let pool = Pool::new(
+            PuzzleSpec::hybrid_v1(),
+            Some(HbmConfig::test()),
+            1,
+            0,
+            {
+                let chain = chain.clone();
+                move || {
+                    let mut template = chain.lock().unwrap().build_template_with(
+                        miner,
+                        vec![],
+                        1_767_225_601_000,
+                        Some(DIFFICULTY),
+                    )?;
+                    // The node would only serve puzzle 2 under an HBM-active
+                    // profile; here we re-tag the header to exercise the
+                    // pool's dispatch without forking consensus params.
+                    template.header.puzzle_id = 2;
+                    Ok(template)
+                }
+            },
+            move |block| {
+                submitted_clone.lock().unwrap().push(block);
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        let job = pool.get_job().unwrap();
+        assert_eq!(job.block.header.puzzle_id, 2);
+        let cfg = HbmConfig::test();
+        let mut hybrid = PuzzleSolver::new(PuzzleSpec::hybrid_v1());
+        // Grind for a nonce that passes HBM but fails hybrid at the same
+        // difficulty: at difficulty 64 the first HBM pass almost surely
+        // fails hybrid (2^-256-ish collision either way).
+        let mut winner = None;
+        for nonce in 0..50_000u64 {
+            let mut header = job.block.header.clone();
+            header.nonce = nonce;
+            let hbm_ok = hbm_satisfies_cfg(&header, DIFFICULTY, &cfg).unwrap();
+            if hbm_ok && !hybrid.satisfies(&header).unwrap() {
+                winner = Some(header);
+                break;
+            }
+        }
+        let header = winner.expect("difficulty 64 must solve in 50k tries");
+        let mut block = job.block.clone();
+        block.header = header;
+        let out = pool.submit_job(job.job_id, miner, block).unwrap();
+        assert_eq!(
+            out,
+            SubmitOutcome {
+                share: true,
+                block: true
+            }
+        );
+        assert_eq!(submitted.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn same_proof_under_two_jobs_counts_once() {
+        // Attack: the pool serves the same template twice (same tip, two
+        // job ids). A miner solves once and submits the identical solved
+        // block under both ids, billing two shares for one grind.
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let (pool, miner) = test_pool(1, submitted.clone());
+
+        let job_a = pool.get_job().unwrap();
+        let job_b = pool.get_job().unwrap();
+        assert_ne!(job_a.job_id, job_b.job_id);
+        // Difficulty 1: nonce 0 is already a valid proof.
+        let out = pool
+            .submit_job(job_a.job_id, miner, job_a.block.clone())
+            .unwrap();
+        assert_eq!(
+            out,
+            SubmitOutcome {
+                share: true,
+                block: true
+            }
+        );
+        let err = pool
+            .submit_job(job_b.job_id, miner, job_a.block)
+            .unwrap_err();
+        assert_eq!(err, Error::Malformed("duplicate solution"));
+        let stats = pool.stats_for(&miner);
+        assert_eq!(stats.shares, 1);
+        assert_eq!(stats.blocks_found, 1);
+        assert_eq!(pool.pending_payout(&miner), {
+            let coinbase: u64 = submitted.lock().unwrap()[0].txs[0].outputs[0].value;
+            coinbase
+        });
     }
 
     #[test]

@@ -811,8 +811,18 @@ fn decode_hash512(s: &str) -> Result<Hash512, (StatusCode, Json<ErrorBody>)> {
     hash512_from_hex(s).map_err(|e| bad(format!("hash: {e}")))
 }
 
+/// Hex-decode a request field with a global 16 MiB cap (8 MiB decoded).
+/// Without it, a single `block_hex` field could force a 500 MB allocation
+/// before the codec ever sees the bytes: consensus caps blocks at
+/// `max_block_bytes` (4 MB on every profile, i.e. 8 M hex chars), so nothing
+/// legitimate is even close to this bar, and the codec additionally bounds
+/// every count before allocating.
 fn decode_hex_bytes(s: &str, what: &str) -> Result<Vec<u8>, (StatusCode, Json<ErrorBody>)> {
+    const MAX_HEX_CHARS: usize = 16 * 1024 * 1024;
     let raw = s.trim().trim_start_matches("0x");
+    if raw.len() > MAX_HEX_CHARS {
+        return Err(bad(format!("{what} exceeds the 16 MiB request cap")));
+    }
     hex::decode(raw).map_err(|e| bad(format!("{what} hex: {e}")))
 }
 

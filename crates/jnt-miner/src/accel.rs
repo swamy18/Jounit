@@ -512,6 +512,62 @@ mod tests {
         assert!(BackendKind::parse("quantum").is_err());
     }
 
+    /// Differential fuzz: 512 pseudorandom headers across hostile epochs,
+    /// difficulties and extra-nonces — all three implementations (reference,
+    /// portable, consensus) must agree on every digest. A silicon vendor's
+    /// backend joins this exact test: any divergence is a consensus split,
+    /// not rounding noise.
+    #[test]
+    fn backends_agree_on_pseudorandom_headers() {
+        // xorshift64*: deterministic, no dependencies, full-period.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state = state.wrapping_mul(0x2545F4914F6CDD1D);
+            state
+        };
+
+        let spec = PuzzleSpec::hybrid_v1();
+        let mut cpu = BatchSolver::new(spec.clone());
+        let mut portable = BatchSolver::with_backend(spec.clone(), PortableBackend);
+        for _ in 0..16 {
+            let headers: Vec<Header> = (0..32)
+                .map(|_| {
+                    let mut h = jnt_core::block::genesis_block(1).header;
+                    h.height = next();
+                    h.difficulty = (next() | 1) as u128;
+                    h.puzzle_id = 1;
+                    h.epoch_id = (next() % 300) as u32;
+                    h.nonce = next();
+                    let mut extra = [0u8; 16];
+                    for b in extra.iter_mut() {
+                        *b = (next() & 0xFF) as u8;
+                    }
+                    h.extra_nonce = extra;
+                    h.timestamp_ms = next();
+                    h
+                })
+                .collect();
+            // Batches must be epoch-homogeneous; group before evaluating.
+            let mut by_epoch: std::collections::BTreeMap<u32, Vec<Header>> =
+                std::collections::BTreeMap::new();
+            for h in headers {
+                by_epoch.entry(h.epoch_id).or_default().push(h);
+            }
+            for headers in by_epoch.values() {
+                let a = cpu.evaluate(headers).unwrap();
+                let b = portable.evaluate(headers).unwrap();
+                for ((h, x), y) in headers.iter().zip(a.iter()).zip(b.iter()) {
+                    let r = run_puzzle(&spec, h);
+                    assert_eq!(*x, r, "cpu diverged on {:?}", h.nonce);
+                    assert_eq!(*y, r, "portable diverged on {:?}", h.nonce);
+                }
+            }
+        }
+    }
+
     #[test]
     fn batch_rebuilds_weights_across_epochs() {
         let spec = PuzzleSpec::hybrid_v1();

@@ -3108,3 +3108,16 @@ fn external_miner_template_and_submit_roundtrip() {
     let (s, body) = get(&node, "/v1/mine/template?miner=zz");
     assert_eq!(s, 400, "{body}");
 }
+
+#[test]
+fn oversized_submit_hex_is_refused_before_allocation() {
+    // A 17 MiB hex field must be refused before decoding it into an 8.5 MB
+    // buffer: the HTTP layer's body cap (413) or the hex field cap (400).
+    let node = start();
+    let big = "ab".repeat(17 * 1024 * 1024 / 2);
+    let (s, body) = post(&node, "/v1/mine/submit", &json!({ "block_hex": big }));
+    assert!(s == 400 || s == 413, "{s} {body}");
+    if s == 400 {
+        assert!(body.to_string().contains("16 MiB"));
+    }
+}

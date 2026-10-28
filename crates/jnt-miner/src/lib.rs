@@ -200,7 +200,6 @@ pub fn solve_header(
                             Some(next) => nonce = next,
                             None => break,
                         }
-                        let _ = t;
                     }
                     extra = extra.wrapping_add(1);
                     if extra == u128::from_le_bytes(template.extra_nonce) {
