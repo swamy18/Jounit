@@ -698,7 +698,10 @@ dependencies = [
 name = "jnt-miner"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "jnt-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

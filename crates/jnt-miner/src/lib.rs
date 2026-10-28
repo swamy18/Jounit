@@ -9,7 +9,10 @@
 //! `submit` — the miner is never trusted.
 //!
 //! v1 scope: CPU only, single header template, `nonce` + `extra_nonce[16]`
-//! search. Stratum/pool wiring and GPU kernels are follow-ups.
+//! search. The [`stratum`] module adds the pool-side job protocol;
+//! GPU kernels are follow-ups.
+
+pub mod stratum;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
