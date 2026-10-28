@@ -180,6 +180,23 @@ batched solving, automatic retry with backoff).
 The `--miner` address need not belong to any wallet on the node — it is just
 where the coinbase pays out.
 
+### Seed node on a small box (24×7)
+
+A seed node keeps the network alive while mining happens elsewhere. It needs
+almost nothing — 512 MB RAM and a few GB of persistent disk are enough —
+because it relays and validates but never grinds. Run it relay-only:
+
+```sh
+./target/release/jnt-node serve --network mainnet --data-dir ./chain \
+  --no-mine --listen 0.0.0.0:9833
+```
+
+Three things matter here: `--no-mine` (no CPU burn), `--data-dir` on a disk
+that survives restarts (lose it and the node resyncs from genesis), and port
+`9833` reachable from the internet so other nodes can dial in. Point
+`jnt-miner --node` at this box's API port and your laptop keeps mining while
+the box keeps the chain.
+
 ### Option C — mine through a pool
 
 Pools speak stratum-lite JSON-lines over TCP: `getjob` hands each miner an
