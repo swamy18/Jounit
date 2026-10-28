@@ -52,8 +52,10 @@ struct Snapshot {
     exit_undo: HashMap<Hash512, Vec<(Address, u64)>>,
     bonds: BondLedger,
     bond_undo: HashMap<Hash512, Vec<BondUndoOp>>,
+    bond_snapshots: HashMap<u64, BondLedger>,
     slash_vault: SlashVault,
     slash_undo: HashMap<Hash512, SlashVault>,
+    finality: FinalityManager,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +108,13 @@ pub struct Chain {
     /// Per-block bond inverses, keyed by block hash — rewound exactly like
     /// the UTXO undo records, for the same reason.
     bond_undo: HashMap<Hash512, Vec<BondUndoOp>>,
+    /// Bond-ledger snapshots at seed heights (P0-1). The committee for epoch
+    /// `e` is derived from the bond state at `seed_height(e)`, not from
+    /// whatever bonds exist mid-epoch. Keyed by seed height so each epoch's
+    /// committee is stable for the whole epoch. Snapshots are taken when a
+    /// block at a seed height is applied and rewound on reorg via `bond_undo`
+    /// replay (a rolled-back seed block removes its snapshot).
+    bond_snapshots: HashMap<u64, BondLedger>,
     /// M2 slash vault (Decision 2 item 4, Decision 20 item 4): equivocation
     /// slashes write full-bond records here — half burned at once, half
     /// vested to the PSCB reserve over time. Rebuilt by replay like every
@@ -160,6 +169,7 @@ impl Chain {
             burned_undo: HashMap::new(),
             bonds: BondLedger::default(),
             bond_undo: HashMap::new(),
+            bond_snapshots: HashMap::from([(0u64, BondLedger::default())]),
             slash_vault: SlashVault::new(),
             slash_undo: HashMap::new(),
             released_exits: HashSet::new(),
@@ -774,17 +784,39 @@ impl Chain {
         // `rollback_block` if a reorg takes it.
         self.exit_undo.insert(hash, marked);
         self.undo.insert(hash, body_undo);
-        // The committee follows the bonds: refresh the finality key set now
-        // that canonical state advanced. Side branches never reach here (only
-        // canonical advancement applies blocks), so the keys always describe
-        // the canonical ledger.
-        self.finality.set_keys(self.committee_keys());
-        self.finality.refresh_committee(
-            &self.committee_records(),
-            self.height(),
+        // Snapshot the bond ledger whenever the applied block lands on a seed
+        // height, so each epoch's committee is derived from the bond state that
+        // existed at its seed height rather than from mid-epoch bond changes.
+        // Taken before the refresh so the seed block's own bond state is the
+        // one that seeds its epoch's committee. `height` here is the applied
+        // block's height (`canon` is pushed by the caller afterwards).
+        if crate::validators::is_seed_height(
+            height,
             self.params.checkpoint_interval_blocks,
             crate::validators::EPOCH_LOOKBACK_DEFAULT,
-        );
+        ) {
+            self.bond_snapshots.insert(height, self.bonds.clone());
+        }
+        // The committee follows the seed-height bonds: refresh the finality
+        // key set now that canonical state advanced. Side branches never reach
+        // here (only canonical advancement applies blocks). The epoch set is
+        // derived from seed-height bond state (P0-1), so it stays stable for
+        // the whole epoch.
+        let keys = self
+            .committee_keys_at(height)
+            .ok_or(Error::StakeInvalid("missing seed snapshot"))?;
+        self.finality.set_keys(keys);
+        let records = self
+            .committee_records_at(height)
+            .ok_or(Error::StakeInvalid("missing seed snapshot"))?;
+        self.finality
+            .refresh_committee(
+                &records,
+                height,
+                self.params.checkpoint_interval_blocks,
+                crate::validators::EPOCH_LOOKBACK_DEFAULT,
+            )
+            .map_err(|_| Error::StakeInvalid("committee derivation failed"))?;
         Ok(())
     }
 
@@ -920,18 +952,19 @@ impl Chain {
                 undo.created.push(release);
             }
             TX_SLASH => {
-                let committee: Vec<BlsPublicKey> = self
-                    .bonds
-                    .committee()
-                    .into_iter()
-                    .map(|r| r.bls_pk)
-                    .collect();
+                // P0-2: verify each checkpoint against the committee
+                // authoritative for its own checkpoint epoch, reconstructed
+                // from the seed-height bond snapshot — not the cache, and
+                // never the current committee.
+                let epoch_blocks = self.params.checkpoint_interval_blocks;
+                let set_for_epoch = |epoch| self.historical_epoch_set(epoch);
                 let (id, record) = check_slash_tx(
                     tx,
                     &self.bonds,
-                    &committee,
+                    set_for_epoch,
                     &self.params.network_id,
                     height,
+                    epoch_blocks,
                     &RealBls,
                 )?;
                 self.bonds.remove(&id);
@@ -974,6 +1007,89 @@ impl Chain {
         }
     }
 
+    /// Validator records for one bond ledger: the committee's TopN members
+    /// with network-bound bond identities, BLS keys, lattice keys and stakes.
+    /// The single mapping from ledger state to candidate records, shared by
+    /// the live committee and historical reconstruction.
+    fn records_from_ledger(&self, ledger: &BondLedger) -> Vec<crate::validators::ValidatorRecord> {
+        use crate::bond::bond_identity;
+        ledger
+            .committee()
+            .into_iter()
+            .map(|r| crate::validators::ValidatorRecord {
+                stake_address: bond_identity(&self.params.network_id, &r.bonder, &r.bls_pk),
+                bls_pk: r.bls_pk,
+                stake_sat: r.amount_sat,
+                mldsa_pk: r.mldsa_pk,
+            })
+            .collect()
+    }
+
+    /// The bond ledger state at the seed height for the epoch containing
+    /// `height` (P0-1). Returns `None` when no snapshot exists for that seed
+    /// height, so callers fail closed instead of substituting live state.
+    fn seed_bonds_at(&self, height: u64) -> Option<&BondLedger> {
+        let epoch = crate::validators::epoch_of(height, self.params.checkpoint_interval_blocks);
+        let seed = crate::validators::seed_height(
+            epoch,
+            self.params.checkpoint_interval_blocks,
+            crate::validators::EPOCH_LOOKBACK_DEFAULT,
+        );
+        self.bond_snapshots.get(&seed)
+    }
+
+    /// Committee candidate records for the epoch containing `height`, derived
+    /// from that epoch's seed-height bond snapshot. `None` when the snapshot
+    /// is missing — the caller must fail closed, never substitute live bonds.
+    fn committee_records_at(&self, height: u64) -> Option<Vec<crate::validators::ValidatorRecord>> {
+        self.seed_bonds_at(height)
+            .map(|l| self.records_from_ledger(l))
+    }
+
+    /// Committee keys for the epoch containing `height`: the seed-height TopN,
+    /// or the declared bootstrap committee when the seed state holds no bonds.
+    /// `None` when the seed snapshot is missing (fail closed).
+    fn committee_keys_at(&self, height: u64) -> Option<Vec<BlsPublicKey>> {
+        let ledger = self.seed_bonds_at(height)?;
+        let bonded = ledger.committee();
+        Some(if bonded.is_empty() {
+            self.params.genesis_validators.clone()
+        } else {
+            bonded.into_iter().map(|r| r.bls_pk).collect()
+        })
+    }
+
+    /// Reconstruct the exact `EpochSet` for `epoch` from the bond snapshot at
+    /// its seed height (P0-1/P0-2). Independent of the one-epoch-grace cache,
+    /// so slash evidence stays verifiable while it is within the evidence
+    /// window. Missing snapshots, empty seed ledgers and derivation failures
+    /// are all reported — never silently replaced with another committee.
+    pub fn historical_epoch_set(
+        &self,
+        epoch: u64,
+    ) -> std::result::Result<crate::validators::EpochSet, crate::validators::ValidatorError> {
+        use crate::validators::ValidatorError;
+        let seed = crate::validators::seed_height(
+            epoch,
+            self.params.checkpoint_interval_blocks,
+            crate::validators::EPOCH_LOOKBACK_DEFAULT,
+        );
+        let snapshot = self
+            .bond_snapshots
+            .get(&seed)
+            .ok_or(ValidatorError::NoCandidates { epoch })?;
+        let records = self.records_from_ledger(snapshot);
+        if records.is_empty() {
+            return Err(ValidatorError::NoCandidates { epoch });
+        }
+        crate::validators::derive_set(
+            epoch,
+            &records,
+            crate::validators::SelectionRule::TopN,
+            crate::bond::MAX_COMMITTEE_SIZE,
+        )
+    }
+
     /// Active checkpoint committee (Decision 20 item 2): the 21
     /// highest-staked bonds, per [`BondLedger::committee`] — the one
     /// definition shared with slashing and with the epoch set. An empty ledger
@@ -981,13 +1097,23 @@ impl Chain {
     /// deterministic keys on mainnet (Decision 27), four test keys on mini and
     /// testnet. The first bond replaces the bootstrap set under the existing
     /// TopN rule.
+    ///
+    /// The committee is derived from seed-height bond state (P0-1), so it is
+    /// stable for the current epoch and does not rotate mid-epoch when later
+    /// blocks add or remove bonds.
     pub fn committee_keys(&self) -> Vec<BlsPublicKey> {
-        let bonded = self.bonds.committee();
-        if bonded.is_empty() {
-            self.params.genesis_validators.clone()
-        } else {
-            bonded.into_iter().map(|r| r.bls_pk).collect()
-        }
+        // The tip always has its seed snapshot once the chain advances past
+        // genesis (snapshots are taken at every seed height); fall back to the
+        // live ledger only for a chain that has never snapshotted.
+        let height = self.height();
+        self.committee_keys_at(height).unwrap_or_else(|| {
+            let bonded = self.bonds.committee();
+            if bonded.is_empty() {
+                self.params.genesis_validators.clone()
+            } else {
+                bonded.into_iter().map(|r| r.bls_pk).collect()
+            }
+        })
     }
 
     /// The same membership as [`Chain::committee_keys`], as full records: each
@@ -996,7 +1122,13 @@ impl Chain {
     /// lattice key, exactly like the genesis epoch set the verifier derives.
     pub fn committee_signing_records(&self) -> Vec<crate::validators::ValidatorRecord> {
         use crate::bond::bond_identity;
-        let bonded = self.bonds.committee();
+        let height = self.height();
+        // Seed-derived membership, with the same live-ledger fallback as
+        // `committee_keys` for a chain that has never snapshotted.
+        let bonded = match self.seed_bonds_at(height) {
+            Some(ledger) => ledger.committee(),
+            None => self.bonds.committee(),
+        };
         if bonded.is_empty() {
             self.params
                 .genesis_validators
@@ -1027,24 +1159,66 @@ impl Chain {
     /// masquerade as a mini bond), its BLS key, its registered lattice key if
     /// any, and its locked value as `stake_sat`.
     ///
-    /// The members come from [`BondLedger::committee`] — the same 21
+    /// The members come from seed-height bond state (P0-1): the seed snapshot
+    /// for the current epoch, then [`BondLedger::committee`] — the same 21
     /// signing/slashing already uses — so `derive_set`'s TopN pass over this
     /// list re-selects exactly those 21 and the epoch set cannot drift from
-    /// the set that signed. Feeding it *every* bond instead was the bug: with
-    /// a 22nd bond, finality verified against the top 21 by stake while
-    /// validators had signed as the first 21 by bond order.
+    /// the set that signed.
     pub fn committee_records(&self) -> Vec<crate::validators::ValidatorRecord> {
-        use crate::bond::bond_identity;
-        self.bonds
-            .committee()
-            .into_iter()
-            .map(|r| crate::validators::ValidatorRecord {
-                stake_address: bond_identity(&self.params.network_id, &r.bonder, &r.bls_pk),
-                bls_pk: r.bls_pk,
-                stake_sat: r.amount_sat,
-                mldsa_pk: r.mldsa_pk,
-            })
-            .collect()
+        let height = self.height();
+        match self.committee_records_at(height) {
+            Some(records) => records,
+            None => self.records_from_ledger(&self.bonds),
+        }
+    }
+
+    /// Rebuild the finality cache for a rewound tip (reorg across an epoch
+    /// boundary). Forward application inserts epochs in increasing order, but
+    /// a rollback can move the tip to an earlier epoch, which a plain
+    /// `refresh_committee` insert cannot represent (its out-of-order branch
+    /// would leave a newer previous set beside an older current set). Clearing
+    /// and re-inserting previous-then-current from the restored seed snapshots
+    /// reproduces exactly what forward application to this tip would hold —
+    /// including clearing when the seed state holds no bonds.
+    fn rebuild_finality_at(
+        &mut self,
+        tip_height: u64,
+    ) -> std::result::Result<(), crate::validators::ValidatorError> {
+        let epoch_blocks = self.params.checkpoint_interval_blocks;
+        let lookback = crate::validators::EPOCH_LOOKBACK_DEFAULT;
+        self.finality.clear_sets();
+        let epoch = crate::validators::epoch_of(tip_height, epoch_blocks);
+        if epoch > 0 {
+            let prev = epoch - 1;
+            if let Some(records) = self.committee_records_at(
+                prev.saturating_mul(epoch_blocks)
+                    .saturating_add(epoch_blocks.saturating_sub(1)),
+            ) {
+                if !records.is_empty() {
+                    // Any height inside the previous epoch labels the insert.
+                    let prev_height = prev
+                        .saturating_mul(epoch_blocks)
+                        .saturating_add(epoch_blocks.saturating_sub(1));
+                    self.finality.refresh_committee(
+                        &records,
+                        prev_height,
+                        epoch_blocks,
+                        lookback,
+                    )?;
+                }
+            }
+        }
+        match self.committee_records_at(tip_height) {
+            Some(records) => {
+                self.finality
+                    .refresh_committee(&records, tip_height, epoch_blocks, lookback)?;
+            }
+            None => {
+                self.finality.clear_sets();
+            }
+        }
+        self.finality.rewind_observation(tip_height);
+        Ok(())
     }
 
     /// Current epoch on this branch, for committee derivation.
@@ -1311,9 +1485,9 @@ impl Chain {
         }
     }
 
-    fn rollback_block(&mut self, hash: &Hash512) {
+    fn rollback_block(&mut self, hash: &Hash512) -> std::result::Result<(), Error> {
         let Some(block) = self.blocks.get(hash).cloned() else {
-            return;
+            return Ok(());
         };
         if let Some(undo) = self.undo.get(hash).cloned() {
             // Undo the whole record once: it covers body transactions AND
@@ -1362,15 +1536,26 @@ impl Chain {
         if let Some(vault) = self.slash_undo.remove(hash) {
             self.slash_vault = vault;
         }
-        // The committee follows the bonds: the ledger just moved, so the key
-        // set moves with it before any checkpoint is validated.
-        self.finality.set_keys(self.committee_keys());
-        self.finality.refresh_committee(
-            &self.committee_records(),
-            self.height(),
+        // A rolled-back seed block removes its snapshot so the epochs it
+        // seeded are re-derived from the restored seed-height state. `canon`
+        // is truncated by the caller afterwards; rebuild the finality cache
+        // for the rewound tip explicitly, since a rollback can move the tip
+        // to an earlier epoch, which incremental insertion cannot represent.
+        let rolled_height = block.header.height;
+        if crate::validators::is_seed_height(
+            rolled_height,
             self.params.checkpoint_interval_blocks,
             crate::validators::EPOCH_LOOKBACK_DEFAULT,
-        );
+        ) {
+            self.bond_snapshots.remove(&rolled_height);
+        }
+        let tip_height = rolled_height.saturating_sub(1);
+        if let Some(keys) = self.committee_keys_at(tip_height) {
+            self.finality.set_keys(keys);
+        }
+        self.rebuild_finality_at(tip_height)
+            .map_err(|_| Error::StakeInvalid("committee derivation failed"))?;
+        Ok(())
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -1386,8 +1571,10 @@ impl Chain {
             exit_undo: self.exit_undo.clone(),
             bonds: self.bonds.clone(),
             bond_undo: self.bond_undo.clone(),
+            bond_snapshots: self.bond_snapshots.clone(),
             slash_vault: self.slash_vault.clone(),
             slash_undo: self.slash_undo.clone(),
+            finality: self.finality.clone(),
         }
     }
 
@@ -1403,8 +1590,10 @@ impl Chain {
         self.exit_undo = s.exit_undo;
         self.bonds = s.bonds;
         self.bond_undo = s.bond_undo;
+        self.bond_snapshots = s.bond_snapshots;
         self.slash_vault = s.slash_vault;
         self.slash_undo = s.slash_undo;
+        self.finality = s.finality;
     }
 
     fn path_to(&self, target: &Hash512) -> Option<Vec<Hash512>> {
@@ -1593,7 +1782,10 @@ impl Chain {
 
         for i in (common..self.canon.len()).rev() {
             let hash = self.canon[i];
-            self.rollback_block(&hash);
+            if let Err(e) = self.rollback_block(&hash) {
+                self.restore(saved);
+                return Err(e);
+            }
         }
         self.canon.truncate(common);
 
@@ -2027,6 +2219,7 @@ impl Chain {
                 &mut scratch,
                 &self.params.network_id,
                 height,
+                self.params.checkpoint_interval_blocks,
                 index,
                 &RealBls,
             )
@@ -2213,6 +2406,13 @@ impl Chain {
         }
         if probe.slash_undo != self.slash_undo {
             return Err(Error::Malformed("slash vault undo diverged on replay"));
+        }
+        // Seed-height bond snapshots are consensus derivation input (P0-1):
+        // the epoch committees are derived from them, so a reorg that
+        // forgets to restore them would verify checkpoints against the wrong
+        // committee while every ledger above still matches.
+        if probe.bond_snapshots != self.bond_snapshots {
+            return Err(Error::Malformed("bond snapshots diverged on replay"));
         }
         Ok(())
     }
