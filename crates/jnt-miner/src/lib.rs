@@ -12,6 +12,8 @@
 //! search. The [`stratum`] module adds the pool-side job protocol;
 //! GPU kernels are follow-ups.
 
+pub mod accel;
+pub mod payout;
 pub mod stratum;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

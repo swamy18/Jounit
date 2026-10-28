@@ -6,12 +6,14 @@
 //!
 //! Usage:
 //! ```text
-//! jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N]
+//! jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N] [--batch N]
 //! ```
 //!
-//! `--threads 0` (default) means one thread per CPU. Blocks are solved at the
-//! template's own difficulty; when the network outruns us the submit is
-//! refused as stale and we fetch a fresh template.
+//! `--threads 0` (default) means one thread per CPU. `--batch N` evaluates N
+//! candidates per solver step through the batch interface (`accel`); 1 is the
+//! plain sequential path. Blocks are solved at the template's own difficulty;
+//! when the network outruns us the submit is refused as stale and we fetch a
+//! fresh template.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -19,14 +21,16 @@ use std::time::Duration;
 
 use jnt_core::block::Block;
 
-use jnt_miner::{solve_header, PowMode};
+use jnt_miner::PowMode;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_SLEEP: Duration = Duration::from_secs(2);
 
 fn usage() -> ! {
-    eprintln!("usage: jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N]");
+    eprintln!(
+        "usage: jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N] [--batch N]"
+    );
     std::process::exit(2);
 }
 
@@ -34,12 +38,14 @@ struct Args {
     node: SocketAddr,
     miner: String,
     threads: usize,
+    batch: usize,
 }
 
 fn parse_args() -> Args {
     let mut node = None;
     let mut miner = None;
     let mut threads = 0usize;
+    let mut batch = 1usize;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -48,6 +54,12 @@ fn parse_args() -> Args {
             "--threads" => {
                 threads = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
                     eprintln!("--threads needs a number");
+                    usage()
+                })
+            }
+            "--batch" => {
+                batch = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--batch needs a number");
                     usage()
                 })
             }
@@ -69,6 +81,7 @@ fn parse_args() -> Args {
         node,
         miner,
         threads,
+        batch,
     }
 }
 
@@ -169,8 +182,14 @@ fn mine_once(args: &Args) -> Result<(), String> {
     }
     println!("jnt-miner: grinding height {height} at difficulty {difficulty} ...");
     let mode = PowMode::Hybrid(jnt_core::puzzle::PuzzleSpec::hybrid_v1());
-    let Some(sol) = solve_header(&template.header, mode, args.threads, u64::MAX)
-        .map_err(|e| format!("solver: {e}"))?
+    let Some(sol) = jnt_miner::accel::solve_header_batched(
+        &template.header,
+        mode,
+        args.threads,
+        args.batch,
+        u64::MAX,
+    )
+    .map_err(|e| format!("solver: {e}"))?
     else {
         return Err("nonce space exhausted without a solution".into());
     };

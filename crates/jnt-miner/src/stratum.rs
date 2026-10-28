@@ -37,6 +37,8 @@ use jnt_core::hash::Address;
 use jnt_core::hbm_pow::HbmConfig;
 use jnt_core::puzzle::{PuzzleKind, PuzzleSolver, PuzzleSpec};
 
+use crate::payout::{FinalizedRound, RoundTracker};
+
 /// A job handed to one miner: an unsolved template plus its id.
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -67,6 +69,7 @@ pub struct SubmitOutcome {
 /// that meet network difficulty and returns whether the node accepted them.
 pub struct Pool {
     inner: Mutex<PoolInner>,
+    payouts: Mutex<RoundTracker>,
     template_fn: Box<dyn Fn() -> Result<Block> + Send + Sync>,
     submit_fn: Box<dyn Fn(Block) -> Result<bool> + Send + Sync>,
     share_difficulty: u128,
@@ -84,11 +87,12 @@ impl Pool {
     /// `share_difficulty` must be non-zero and no harder than any template
     /// the pool will serve (a share can never beat a harder bar it was not
     /// ground against — here the bar only filters, so an unreachable bar
-    /// would refuse every share).
+    /// would refuse every share). `fee_bps` is the pool fee in basis points.
     pub fn new(
         spec: PuzzleSpec,
         hbm: Option<HbmConfig>,
         share_difficulty: u128,
+        fee_bps: u32,
         template_fn: impl Fn() -> Result<Block> + Send + Sync + 'static,
         submit_fn: impl Fn(Block) -> Result<bool> + Send + Sync + 'static,
     ) -> Result<Self> {
@@ -105,6 +109,7 @@ impl Pool {
                 jobs: HashMap::new(),
                 stats: HashMap::new(),
             }),
+            payouts: Mutex::new(RoundTracker::new(fee_bps)?),
             template_fn: Box::new(template_fn),
             submit_fn: Box::new(submit_fn),
             share_difficulty,
@@ -177,6 +182,13 @@ impl Pool {
             return Err(Error::Malformed("share below pool difficulty"));
         }
         let is_block = self.proof_meets(&block.header, b.difficulty)?;
+        let coinbase_sat = template
+            .txs
+            .first()
+            .and_then(|tx| tx.outputs.first())
+            .map(|o| o.value)
+            .unwrap_or(0);
+        let block_height = b.height;
         if is_block {
             let accepted = (self.submit_fn)(block)?;
             if !accepted {
@@ -194,6 +206,20 @@ impl Pool {
                 stats.blocks_found += 1;
             }
         }
+        // Payout accounting mirrors the share stats exactly: every accepted
+        // share (blocks included) earns round weight, and a found block
+        // closes the round on its coinbase value. This runs after the node
+        // accepted, so a refused block never pays anyone.
+        {
+            let mut payouts = self
+                .payouts
+                .lock()
+                .map_err(|_| Error::Malformed("pool lock"))?;
+            payouts.record_share(&miner);
+            if is_block {
+                payouts.finalize_block(block_height, coinbase_sat);
+            }
+        }
         Ok(SubmitOutcome {
             share: true,
             block: is_block,
@@ -206,6 +232,32 @@ impl Pool {
             .lock()
             .map(|inner| inner.stats.get(miner).cloned().unwrap_or_default())
             .unwrap_or_default()
+    }
+
+    /// Pending (unpaid) earnings for `miner` in sats.
+    pub fn pending_payout(&self, miner: &Address) -> u64 {
+        self.payouts.lock().map(|p| p.pending(miner)).unwrap_or(0)
+    }
+
+    /// The pool operator's earned fees in sats.
+    pub fn operator_earned(&self) -> u64 {
+        self.payouts
+            .lock()
+            .map(|p| p.operator_earned())
+            .unwrap_or(0)
+    }
+
+    /// Most recently finalized round, if the pool has found a block yet.
+    pub fn last_round(&self) -> Option<FinalizedRound> {
+        self.payouts.lock().ok()?.rounds().last().cloned()
+    }
+
+    /// Record an on-chain payment to a miner against their pending balance.
+    pub fn mark_paid(&self, miner: &Address, amount_sat: u64) -> Result<()> {
+        self.payouts
+            .lock()
+            .map_err(|_| Error::Malformed("pool lock"))?
+            .mark_paid(miner, amount_sat)
     }
 
     /// Check the header's proof against an arbitrary bar by re-running the
@@ -383,6 +435,7 @@ mod tests {
             PuzzleSpec::hybrid_v1(),
             None,
             share_difficulty,
+            0,
             {
                 let chain = chain.clone();
                 move || {
@@ -473,6 +526,52 @@ mod tests {
         let err = pool.submit_job(job.job_id, miner, job.block).unwrap_err();
         assert_eq!(err, Error::Malformed("share below pool difficulty"));
         assert!(submitted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn block_find_pays_miner_minus_fee() {
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let submitted_clone = submitted.clone();
+        let chain = Arc::new(Mutex::new(Chain::new(NetworkParams::mini()).unwrap()));
+        let miner = [7u8; 20];
+        let pool = Pool::new(
+            PuzzleSpec::hybrid_v1(),
+            None,
+            1,
+            1_000, // 10% pool fee
+            {
+                let chain = chain.clone();
+                move || {
+                    chain.lock().unwrap().build_template_with(
+                        miner,
+                        vec![],
+                        1_767_225_601_000,
+                        Some(1),
+                    )
+                }
+            },
+            move |block| {
+                submitted_clone.lock().unwrap().push(block);
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        let job = pool.get_job().unwrap();
+        let coinbase: u64 = job.block.txs[0].outputs[0].value;
+        pool.submit_job(job.job_id, miner, job.block).unwrap();
+
+        let fee = coinbase * 1_000 / 10_000;
+        assert_eq!(pool.pending_payout(&miner), coinbase - fee);
+        assert_eq!(pool.operator_earned(), fee);
+        let round = pool.last_round().expect("a found block finalizes a round");
+        assert_eq!(round.block_height, 1);
+        assert_eq!(round.payouts, vec![(miner, coinbase - fee)]);
+
+        // Operator pays out; double-pay is refused.
+        pool.mark_paid(&miner, coinbase - fee).unwrap();
+        assert_eq!(pool.pending_payout(&miner), 0);
+        assert!(pool.mark_paid(&miner, 1).is_err());
     }
 
     #[test]
