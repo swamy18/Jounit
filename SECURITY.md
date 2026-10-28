@@ -93,7 +93,7 @@ It is announced as such in the release notes before it ships.
 
 This policy covers the code in this repository: the protocol implementation, the
 node, the standalone miner and pool server (`jnt-miner`, including the
-stratum-lite wire protocol and PROP payout accounting), the worker SDK, the
+stratum-lite wire protocol and PPLNS payout accounting), the worker SDK, the
 MCP surface, the fuzzing harnesses and the
 simulation suite.
 

@@ -183,11 +183,14 @@ where the coinbase pays out.
 ### Option C — mine through a pool
 
 Pools speak stratum-lite JSON-lines over TCP: `getjob` hands each miner an
-unsolved template, `submit` returns shares. Jobs are single-use, submissions
-are pinned to the job (same transactions, difficulty and history — swapping
-the coinbase invalidates the share), weak proofs count as shares for
-accounting while only full-difficulty proofs go to the chain as blocks.
-Rewards split proportionally to shares minus the pool fee, rounding dust
+unsolved template, `submit` returns shares. Jobs are single-use, one solved
+proof counts as one share pool-wide (no double-billing across jobs),
+submissions are pinned to the job (same transactions, difficulty and history
+— swapping the coinbase invalidates the share), weak proofs count as shares
+for accounting while only full-difficulty proofs go to the chain as blocks.
+Rewards split over the last N shares (PPLNS, N ≈ two blocks' worth — every
+share is worth the same no matter when it landed, so pool hopping has no
+timing edge) minus the pool fee, rounding dust
 carries to the next round instead of leaking to the operator, and every payout
 is recorded before it is paid. Pool accounting never mints: only the consensus
 coinbase creates coins.
@@ -846,7 +849,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/jnt-store/` | Append-only checksummed block log, crash recovery. |
 | `crates/jnt-l2/` | Layer 2: contracts, disputes, certificates, exits. |
 | `crates/jnt-node/` | CLI and node daemon. |
-| `crates/jnt-miner/` | Standalone CPU miner: template grinder, stratum-lite pool server with PROP payouts, universal compute backends. |
+| `crates/jnt-miner/` | Standalone CPU miner: template grinder, stratum-lite pool server with PPLNS payouts, universal compute backends. |
 | `crates/jnt-worker/` | Worker-side SDK. Client only, no consensus. |
 | `crates/jnt-mcp/` | Keyless MCP surface over agent identity and payments. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |

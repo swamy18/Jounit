@@ -2742,14 +2742,18 @@ templates at `GET /v1/mine/template?miner=<20-byte hex>` (unsolved block as
 template rule) and accepts solved blocks at `POST /v1/mine/submit
 {"block_hex": ...}`, which runs the identical `submit` path — proof,
 difficulty, tip and timestamp rules included — so external mining adds no
-trust. The reference miner is `jnt-miner --node ADDR:PORT --miner HEX
+trust. Hex request fields are capped at 16 MiB (consensus caps blocks at 4
+MB, so nothing legitimate approaches it); the pool wire caps lines at the
+same 16 MiB with a read deadline, and duplicate solutions are refused, so one
+proof counts as one share. The reference miner is `jnt-miner --node ADDR:PORT --miner HEX
 [--threads N] [--batch N] [--backend cpu|portable|auto]`, which loops
 template → solve → submit; pool operators get the same flow as stratum-lite
 JSON-lines (`getjob`/`submit` over TCP, single-use job ids, submissions
 pinned to the job's `merkle_root`/`prev_hash`/`height`/`difficulty`/
 `puzzle_id`/`epoch_id`, share difficulty vs network difficulty, per-miner
-share stats). Pool reward splitting is off-chain PROP accounting
-(`fee_bps` off the top, proportional split, flooring dust carried forward,
+share stats). Pool reward splitting is off-chain PPLNS accounting (last-N-shares
+window, so pool hopping has no timing edge; `fee_bps` off the top, flooring
+dust carried forward,
 `mark_paid` recorded) and never new issuance: only the consensus coinbase
 rule mints, and only `submit` enforces it.
 

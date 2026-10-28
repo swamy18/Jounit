@@ -104,7 +104,7 @@ rules in code would have been the wrong order.
   template to `jnt-miner` (multithread nonce + `extra_nonce` grind, `--backend
   cpu|portable`), the node serves it at `GET /v1/mine/template` and accepts
   the solution at `POST /v1/mine/submit`, and pools get the same flow over
-  stratum-lite JSON-lines with PROP round accounting (fee, proportional split,
+  stratum-lite JSON-lines with PPLNS accounting (fee, windowed split,
   dust carry). Pinned by the `template → solve → submit` roundtrip test, the
   wire `getjob`/`submit` tests and the cpu-vs-portable differential tests;
   measured ~114k H/s release on 4 threads (`bench_hashrate` example).
