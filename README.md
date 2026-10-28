@@ -37,12 +37,18 @@ The principle every blockchain shares is *solving is hard, verifying is easy*.
 Bitcoin's solution is pure hashing, which leaves GPUs idle and ties no energy to
 anything useful.
 
-Jounit keeps the principle and changes the work. Mining runs three stages:
+Jounit keeps the principle and changes the work. Mining runs three stages
+(`hybrid-v1`, `puzzle_id = 1` — the active mining puzzle on every profile):
 
 1. **A SHA-256 hash chain** — carries the security. This is what a quantum
    adversary has to break.
 2. **An integer-only neural network** — makes the work meaningful for AI hardware.
 3. **A final hash** — binds both into the value that must fall below the target.
+
+A second puzzle, `hbm-v1` (`puzzle_id = 2`), is designed and registered in
+code but is **not** the active mining puzzle — the chain rests on §5 alone
+(Decision 22). The memory-hard HBM path is the upgrade route for when ASIC
+pressure appears, not a second live puzzle.
 
 Two properties keep the neural stage a cost model rather than a liability:
 
@@ -56,6 +62,15 @@ Two properties keep the neural stage a cost model rather than a liability:
 
 Because weights come from the epoch id, no miner can precompute them before an
 epoch starts.
+
+Mining is hardware-universal by construction, not GPU-only. There are no
+floats anywhere in the PoW, so CPU, GPU, NPU, TPU, photonic chips and domestic
+accelerators all compute bit-identical results. The `jnt-miner` crate exposes
+one `ComputeBackend` contract with two in-tree implementations — the reference
+`CpuBackend` and an independently written `PortableBackend` that silicon
+vendors port — pinned equal by differential tests. The three stages also pull
+in different directions (hash throughput, matrix-vector units, memory
+bandwidth), so no single exotic chip dominates all of them.
 
 ---
 
@@ -87,6 +102,24 @@ export JNT_WALLET_PASSPHRASE=change-me
 ./target/release/jnt-node serve  --network testnet --data-dir ./chain \
                                   --listen 127.0.0.1:9833
 ```
+
+External miners do not need the node's built-in loop. Serve with `--no-mine`,
+hand out templates over HTTP, and grind them with the standalone miner:
+
+```sh
+# Node side: relay-only, templates on loopback.
+./target/release/jnt-node serve --network testnet --data-dir ./chain \
+  --no-mine --api-listen 127.0.0.1:8080
+
+# Miner side: fetch a template, solve it, submit the block — repeat forever.
+./target/release/jnt-miner --node 127.0.0.1:8080 \
+  --miner <20-byte-hex-address> --threads 0 --backend auto
+```
+
+`jnt-miner` usage: `--threads N` (`0` = one per CPU), `--batch N` (candidates
+per solver step, default 1), `--backend cpu|portable|auto` (or the
+`JNT_MINER_BACKEND` environment variable) to select the compute substrate.
+Measured on a 4-thread CPU: ~114k H/s release against `hybrid-v1`.
 
 `verify` replays the whole chain from genesis and diffs the resulting UTXO set,
 supply, bond ledger and binding-finalized point against stored state. It is the
@@ -460,6 +493,21 @@ on mainnet from genesis. Depth-based finality (100 blocks) secures the chain
 before that — the same Bitcoin-style rule. The 21-key bootstrap committee signs
 until the first bond, then the stake-weighted TopN set replaces it.
 
+**Fixed-epoch committees.** Each epoch's committee derives from the bond state
+at its seed height and stays fixed for the whole epoch; a bond mid-epoch takes
+effect only at the epoch its seed first sees. Reorgs across a seed height roll
+the committee back exactly — snapshots travel with the chain state and the
+finality observation frontier rewinds with them (`rewind_observation`), so a
+certificate from a losing branch can never be replayed.
+
+**Slash verification is per-epoch.** `check_slash_tx` verifies each checkpoint
+against its own epoch's committee and fails closed when that set is
+unavailable — an expired epoch or disjoint signer sets refuse rather than fall
+back. A validator that drops out of TopN can still be slashed on evidence from
+when it was bonded. Committee caches hold the current set plus the previous
+one inside its grace, then expire; deriving a set that fails is a hard error,
+and there is no genesis fallback once bonds exist.
+
 ---
 
 ## Credit and lending
@@ -720,6 +768,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/jnt-store/` | Append-only checksummed block log, crash recovery. |
 | `crates/jnt-l2/` | Layer 2: contracts, disputes, certificates, exits. |
 | `crates/jnt-node/` | CLI and node daemon. |
+| `crates/jnt-miner/` | Standalone CPU miner: template grinder, stratum-lite pool server with PROP payouts, universal compute backends. |
 | `crates/jnt-worker/` | Worker-side SDK. Client only, no consensus. |
 | `crates/jnt-mcp/` | Keyless MCP surface over agent identity and payments. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
@@ -728,7 +777,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `docs/` | Design records, verification status and readiness reports. |
 | `paper/` | The Jounit protocol paper (LaTeX + PDF). |
 
-Seven crates in one workspace. **All consensus logic lives in `jnt-core`**, which
+Eight crates in one workspace. **All consensus logic lives in `jnt-core`**, which
 has no I/O, no clock and no network. The `mini` profile is the same code with
 different parameters — never a second implementation — so anything tested on
 `mini` is the production code path.
@@ -756,6 +805,9 @@ Same code, different numbers.
 | Binding finality | on at height 100 | on at height 20 | off |
 | Exits | on at height 1 | on at height 1 | on at height 1 |
 | PQ spend requirement | **off** | off | off |
+| Mining puzzle | `hybrid-v1` (`puzzle_id = 1`) | `hybrid-v1` (`puzzle_id = 1`) | `hybrid-v1` (`puzzle_id = 1`) |
+| Retarget | LWMA every block, ±10% | LWMA every block, ±10% | LWMA every block, ±10% |
+| Genesis difficulty | 1 | 1 | 1 |
 
 `mainnet` ships with 21 public deterministic bootstrap keys (quorum 15) so
 finality can bind before any stake exists; the first bond replaces them with
@@ -794,6 +846,26 @@ jnt-node <COMMAND> [OPTIONS]
   export      Write the canonical chain to JSON
   serve       Run a P2P node: relay, sync, opt-in REST API, exit crank, signing
 ```
+
+```
+jnt-miner --node 127.0.0.1:PORT --miner <20-byte-hex> [--threads N] [--batch N] [--backend cpu|portable|auto]
+```
+`--threads 0` means one thread per CPU. `--batch` groups candidates per
+solver step (default 1). `--backend` (or `JNT_MINER_BACKEND`) picks the
+compute substrate: `cpu` reference or `portable` independent implementation —
+GPU, NPU, TPU, photonic and domestic-accelerator ports implement the same
+`ComputeBackend` contract, so a new chip joins by passing the differential
+test, not by forking consensus.
+
+The node side is two REST endpoints (same auth/host limits as the rest of the
+API): `GET /v1/mine/template?miner=<hex>` returns an unsolved block
+(`block_hex` plus height/difficulty/puzzle_id), `POST /v1/mine/submit
+{"block_hex": ...}` hands the solved block to `submit`, which re-validates
+everything including the proof. The binary loops template → solve → submit
+forever. Pool operators get the same flow over stratum-lite JSON-lines
+(`getjob`/`submit`, single-use job ids, coinbase-theft pinning) with PROP
+round accounting: pool fee off the top, proportional split, dust carried
+forward, `mark_paid` recorded — accounting only, never new issuance.
 
 ### Agent authority and credit, from the terminal
 
@@ -879,7 +951,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1307 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1360 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors

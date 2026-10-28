@@ -100,9 +100,21 @@ rules in code would have been the wrong order.
   (replays from genesis and diffs UTXO + supply), status. Fee burn reconciles
   exactly — 31 blocks issue 2356 JNT, live supply is 2355.99825 JNT, the
   0.00175 JNT difference being the destroyed base fee.
-- Supply schedule matches design doc §16, including that only 298 000 of the
-  304 000 JNT mini cap is reachable and the remainder is permanently
-  unmintable rather than merely reserved.
+- External mining end to end: `Chain::build_template_with` hands an unsolved
+  template to `jnt-miner` (multithread nonce + `extra_nonce` grind, `--backend
+  cpu|portable`), the node serves it at `GET /v1/mine/template` and accepts
+  the solution at `POST /v1/mine/submit`, and pools get the same flow over
+  stratum-lite JSON-lines with PROP round accounting (fee, proportional split,
+  dust carry). Pinned by the `template → solve → submit` roundtrip test, the
+  wire `getjob`/`submit` tests and the cpu-vs-portable differential tests;
+  measured ~114k H/s release on 4 threads (`bench_hashrate` example).
+- Supply schedule matches design doc §16. There is **no stock cap** (Decision
+  18): the ladder totals 39 157 124 JNT and the tail pays a permanent 0.1 JNT
+  floor (1 sat on testnet/mini), enforced by the issuance integral and the
+  rate anchor — not by an unmintable remainder. (An earlier revision of this
+  line described a 304 000 JNT mini cap with permanently unmintable remainder;
+  that language predates Decision 18 and is superseded by
+  `docs/monetary-policy.md`.)
 - The mempool (`jnt-core/src/mempool.rs`) has a 10-case attack suite. Each case
   names the rule it enforces and the attack it stops: double spending one output
   twice, spending a nonexistent output, a byte-cap flood, overshooting the gas

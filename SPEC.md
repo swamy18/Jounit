@@ -285,6 +285,12 @@ Per Section 29: security rests on the hash stages; the NN stage guarantees GPU/A
 
 These live in the versioned **puzzle registry**. Supply, halving and base rules are immutable; only puzzle parameters are upgradeable (Section 19.3 item 3), and only via the governance timelock (`docs/roadmap.md`).
 
+`hbm-v1` is registered in code as `puzzle_id = 2` (`PuzzleSpec::hbm_v1`) but
+is **not** the active mining puzzle on any profile: every profile mines
+`puzzle_id = 1`, and the chain rests on §5 alone (Decision 22). The HBM
+scratchpad is the designed upgrade route for ASIC pressure, not a second live
+puzzle.
+
 ### 5.2 Stage 1 — memory-hard-ish hash chain
 
 ```
@@ -315,14 +321,15 @@ bias(l,o)     = wstream(1_000_000 + l * nn_hidden_dim + o)[0] % 63   // ∈ [0, 
 ```
 x[j] = seed[j] as i32 − 128                for j in 0..nn_input_dim
 activations = empty byte string
-for l in 0 .. nn_layers-1:
-    for o in 0 .. nn_hidden_dim-1:
+for l in 0 .. nn_layers:
+    for o in 0 .. nn_hidden_dim:
         s = bias(l, o)
-        for i in 0 .. in_dim(l)-1:
+        for i in 0 .. in_dim(l):
             s += x[i] * weight(l, o, i)          // i64 accumulator
         z[o] = fold32(s)                          // wrap to i32
     activations ‖= U4LE(z[o]) for all o          // ALL layers, pre-activation
-    x[o] = max(z[o] >> 2, 0)                      // arithmetic shift, then ReLU
+    for o in 0 .. nn_hidden_dim:
+        x[o] = max(z[o] >> ACTIVATION_SHIFT, 0)   // arithmetic shift, then ReLU
 ```
 
 ```
@@ -332,7 +339,16 @@ fold32(v) = let u = (v mod 2^32) as u32
 
 Accumulator bound: `|s| ≤ 16 × 128 × 128 + 62 = 262 206 < 2^63`, so `i64` cannot overflow on any conforming implementation.
 
-`>> 2` is an **arithmetic** shift right (sign-extending). ReLU is applied *after* the shift.
+`>> ACTIVATION_SHIFT` is an **arithmetic** shift right (sign-extending),
+`ACTIVATION_SHIFT = 2`. ReLU is applied *after* the shift.
+
+`ACTIVATION_SHIFT`, `fold32` and `PuzzleSpec::in_dim` are the portable kernel
+surface (`jnt-core::puzzle`): every compute backend — CPU, GPU, NPU, TPU,
+photonic, domestic accelerators — implements exactly these primitives, so all
+substrates compute bit-identical digests. The `jnt-miner` differential tests
+pin a reference backend against an independently written one
+candidate-for-candidate; a new substrate joins by passing that test, never by
+renegotiating the math.
 
 **Activation digest** — every layer, pre-activation, so no layer can be skipped or approximated:
 
@@ -709,10 +725,11 @@ A node that receives a block MUST run the same `validate_standalone` +
 fast path, no relaxed validation for relayed data, and no way for a peer to
 influence a consensus decision.
 
-**v0.2 relays blocks only.** Transactions are mined directly into blocks
-(`mine_block` takes a body), so there is nothing to gossip until a mempool exists.
-§13.13 records what a mempool will require; it is deliberately unspecified here
-rather than guessed at.
+Blocks relay as before; transactions relay per §13.14 and the mempool selects
+them into blocks. External mining templates served over the §19.2 endpoints
+are coinbase-only in v1 (pool transaction inclusion is the next step, not this
+route), so relay and mining stay orthogonal: gossip moves data, templates move
+work.
 
 ### 13.1 Design constraints inherited from §9
 
@@ -729,30 +746,35 @@ and reorgs against undo records, so a block cannot be validated in isolation and
 then stored. Validation and application are one operation, and the network layer
 MUST NOT split them.
 
-**`Chain` is single-owner.** `submit`, `adopt` and `mine_block` all take
-`&mut self`. The network layer therefore MUST NOT hold `Arc<Mutex<Chain>>`: mining
-is an unbounded CPU loop inside `mine_block` (`chain.rs`), and a lock held across
-it would stall every peer thread for as long as the block takes to solve. Instead
+**`Chain` is single-owner.** `submit`, `adopt`, `mine_block` and
+`build_template_with` all take `&mut self`. The network layer therefore MUST NOT
+hold `Arc<Mutex<Chain>>`: template construction and submission mutate the tip,
+and a lock held across them would stall every peer thread. Instead
 there is one **chain thread** owning the `Chain`, and peer threads exchange
-messages with it over channels. The chain thread is the only writer.
+messages with it over channels. The chain thread is the only writer. (The
+unbounded solving loop lives outside it, in `jnt-miner` or any pool speaking
+the §19.2 mining endpoints.)
 
 ```
 peer threads (N)                   chain thread (1)
   read socket                        own the Chain (sole writer)
   frame/deframe                      loop:
   validate framing bounds              - drain inbound channel -> submit() -> canon/utxo
-  hand off Message ----------------->  - mine on request        -> submit(winner)
-  <--------------- outbound           - fan out resulting INV to peers
+  hand off Message ----------------->  - build template on request
+  <--------------- outbound           - submit(winner) -> canon/utxo
+                                       - fan out resulting INV to peers
 ```
 
-Mining runs **on** the chain thread rather than beside it, because `mine_block`
-needs `&mut Chain` to build the header against the current tip. A miner therefore
-cannot build against a stale tip; it asks the chain thread to mine, which is
-correct and costs nothing at v0.2 block times. On `mainnet` (10-minute blocks)
-this means block processing waits on mining — acceptable, because a node that is
-mining is by definition not required to process blocks at that instant, and
-v0.2 has no mempool whose contents would go stale. A future mempool makes this a
-real cost and is the reason that work must then split the two (§13.13).
+Mining runs **beside** the chain thread, not on it. `Chain::build_template_with`
+builds an unsolved block against the current tip — everything fixed except
+`nonce`/`extra_nonce`, which both commit into the proof through the serialized
+header — and an external miner (`jnt-miner`, or any pool speaking the §19.2
+mining endpoints) grinds the template and hands the solved block to `submit`,
+which re-validates everything including the proof. The template path and the
+in-process `mine_block` path share the same header construction, so a template
+can never commit to a different block than the node would mine itself. Mining
+against a stale tip is harmless: `submit` enforces the tip, the difficulty and
+the timestamp rules, so a stale solution is refused, never half-applied.
 
 ### 13.2 Transport and framing
 
@@ -1207,7 +1229,7 @@ model.
 | M1 | 50/50 PSCB base-fee split | `fees.rs`, `chain.rs` | **Yes** — changes the UTXO set and therefore supply accounting | §8 |
 | M2 | Anti-collusion slash vault (50% burn + 50% linear vesting) | `slash.rs` | No — defined and tested, nothing creates a slash record yet | this section |
 | M3 | Hardware-agnostic compute IR + attestation envelope | `compute_ir.rs` | No — serialization and signing hashes only | this section |
-| M4 | Memory-bound HBM scratchpad PoW | `hbm_pow.rs` | No — an alternative puzzle body, not registered in the §5.1 registry | this section |
+| M4 | Memory-bound HBM scratchpad PoW | `hbm_pow.rs` | No — registered in code as `puzzle_id = 2` (`PuzzleSpec::hbm_v1`) but not the active mining puzzle on any profile; the chain rests on the §5 puzzle (Decision 22) | this section |
 | M5 | BLS12-381 aggregate finality gadget | `bls_checkpoint.rs`, `finality.rs` | **Conditional** — pairing-checked since §14.5; binding only on profiles with a non-zero `finality_activation_height` (Decision 12): active on `testnet` at 20 and on `mainnet` at 100 with its 21-key bootstrap committee (Decision 27), observation-only on `mini` | §14.5–§14.8 |
 
 **Why M2–M4 are not wired in.** Each needs a rule that no spec currently
@@ -1410,6 +1432,23 @@ byte.
 > test bootstrap). The library text that follows is unchanged and still
 > describes the pure derivation machinery; the candidate list it derives from
 > is now the bond ledger, and the selection rule in force is bond order.
+
+**As built (committee behavior the chain enforces).** The library derivation
+above is the pure function; the chain wires it as follows. Each epoch's
+committee derives from the bond state at its **seed height** and stays fixed
+for the whole epoch — a bond placed mid-epoch takes effect only at the epoch
+whose seed first sees it. Seed snapshots travel with chain state, so a reorg
+across a seed height rolls the committee back exactly, and the finality
+observation frontier rewinds with it: a checkpoint accepted on a losing branch
+is forgotten, never replayed. The epoch-set cache holds the current set plus
+the previous one inside a one-epoch grace (late previous-epoch checkpoints
+still verify), then expires fail-closed; once bonds exist there is no genesis
+fallback, and a committee that fails to derive is a hard block error, never a
+silent empty set. Slash evidence is verified per epoch — each checkpoint
+against its own epoch's committee via the seed snapshot, refusing when that
+set is unavailable — so a validator that drops out of TopN is still slashable
+on evidence from when it was bonded, while expired evidence and disjoint
+signer sets are refused.
 
 This section defines the validator-set machinery completely enough to
 implement and attack-test as a **library**, so that the remaining open
@@ -2684,6 +2723,23 @@ design. Host-header validation runs on every bind, bearer authentication
 binds, and a per-request deadline plus a global in-flight cap run on every
 bind. Replay/idempotence for writes rests on the node's existing L2 dedup
 and mempool rules rather than on a transport nonce or credential.
+
+**Implemented (measured).** External mining. The node serves coinbase-only
+templates at `GET /v1/mine/template?miner=<20-byte hex>` (unsolved block as
+`block_hex` plus `height`/`difficulty`/`puzzle_id`/`prev_hash`, per the §13.1
+template rule) and accepts solved blocks at `POST /v1/mine/submit
+{"block_hex": ...}`, which runs the identical `submit` path — proof,
+difficulty, tip and timestamp rules included — so external mining adds no
+trust. The reference miner is `jnt-miner --node ADDR:PORT --miner HEX
+[--threads N] [--batch N] [--backend cpu|portable|auto]`, which loops
+template → solve → submit; pool operators get the same flow as stratum-lite
+JSON-lines (`getjob`/`submit` over TCP, single-use job ids, submissions
+pinned to the job's `merkle_root`/`prev_hash`/`height`/`difficulty`/
+`puzzle_id`/`epoch_id`, share difficulty vs network difficulty, per-miner
+share stats). Pool reward splitting is off-chain PROP accounting
+(`fee_bps` off the top, proportional split, flooring dust carried forward,
+`mark_paid` recorded) and never new issuance: only the consensus coinbase
+rule mints, and only `submit` enforces it.
 
 ### 19.3 Superseded — genesis validator committee and checkpoints (Decisions 11–14)
 

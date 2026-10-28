@@ -92,7 +92,9 @@ It is announced as such in the release notes before it ships.
 ## Scope of this policy
 
 This policy covers the code in this repository: the protocol implementation, the
-node, the worker SDK, the MCP surface, the fuzzing harnesses and the
+node, the standalone miner and pool server (`jnt-miner`, including the
+stratum-lite wire protocol and PROP payout accounting), the worker SDK, the
+MCP surface, the fuzzing harnesses and the
 simulation suite.
 
 It does **not** cover a network operated by a third party, an exchange, a

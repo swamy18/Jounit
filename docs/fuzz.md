@@ -33,6 +33,13 @@ panic-freedom.
 | 16 | `l2_policy_apply` | L2 policy state machine | Value conservation; grant caps never exceeded; revocation absolute; authority narrows; replay refused |
 | 17 | `l2_credit_apply` | L2 credit state machine | Conservation; collateral locked not spent; debt one-way; default not early; interest once per period |
 
+Not yet covered: the PoW boundary (template construction, header solving,
+`extra_nonce` rolling) and the stratum wire protocol (`getjob`/`submit`
+framing, job pinning, share accounting). Those surfaces are pinned by
+integration and differential tests instead (`template → solve → submit`
+roundtrip, wire `getjob`/`submit` tests, cpu-vs-portable digest equality);
+fuzz targets for them are future work, not present coverage.
+
 ## Campaign results — measured 2026-10-09
 
 One `-max_total_time=30 -rss_limit_mb=4096` run per target, ASan on, over each
