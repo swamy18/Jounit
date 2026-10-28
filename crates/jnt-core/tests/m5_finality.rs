@@ -1047,9 +1047,11 @@ fn a_certificate_signed_by_the_previous_committee_is_rejected_in_the_current_epo
 
     // Cache A at epoch 1 (height 10), then rotate to B at epoch 2 (height 20).
     fm.set_keys(a_pairs.iter().map(|(_, pk)| *pk).collect());
-    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20);
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20)
+        .unwrap();
     fm.set_keys(b_pairs.iter().map(|(_, pk)| *pk).collect());
-    fm.refresh_committee(&bonded_records(&b_pairs), 20, interval, 20);
+    fm.refresh_committee(&bonded_records(&b_pairs), 20, interval, 20)
+        .unwrap();
 
     let block: Hash512 = [0xBB; 64];
 
@@ -1089,8 +1091,10 @@ fn a_certificate_from_an_expired_epoch_is_rejected_as_stale_even_when_its_set_is
     let quorum = quorum(4);
 
     fm.set_keys(b_pairs.iter().map(|(_, pk)| *pk).collect());
-    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20);
-    fm.refresh_committee(&bonded_records(&b_pairs), 20, interval, 20);
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20)
+        .unwrap();
+    fm.refresh_committee(&bonded_records(&b_pairs), 20, interval, 20)
+        .unwrap();
 
     let block: Hash512 = [0xCC; 64];
 
@@ -1127,13 +1131,11 @@ fn a_certificate_from_an_expired_epoch_is_rejected_as_stale_even_when_its_set_is
 }
 
 #[test]
-fn a_committee_swap_without_a_cached_set_still_serves_the_live_declared_keys() {
-    // The core stale-committee concern: keys swap to B but no B set is cached
-    // (the realistic upstream case is "no bonds yet", where derive_set is
-    // never fed candidates). The cache still holds A's set at epoch 1; a
-    // *current*-epoch certificate is validated against the live `self.keys`
-    // (B) via the genesis fallback — never the stale A set. So A's quorum is
-    // refused and B's quorum is accepted at the current epoch.
+fn a_missing_set_with_a_bond_backed_committee_rejects_instead_of_falling_back() {
+    // P0-3: keys swap to B but no B set is cached while a bond-backed
+    // committee exists (A@e1 cached). A current-epoch certificate must be
+    // rejected — never validated against the declared genesis keys — whether
+    // it is signed by the new keys (B) or the stale ones (A).
     let mut fm = FinalityManager::new(&NetworkParams::mini());
     let interval = 10u64;
 
@@ -1144,20 +1146,27 @@ fn a_committee_swap_without_a_cached_set_still_serves_the_live_declared_keys() {
     // Seed the cache with A at epoch 1, then swap the declared keys to B
     // without refreshing a B set into the cache.
     fm.set_keys(a_pairs.iter().map(|(_, pk)| *pk).collect());
-    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20); // caches A@e1
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20)
+        .unwrap(); // caches A@e1
     fm.set_keys(b_pairs.iter().map(|(_, pk)| *pk).collect()); // keys=B, cache still A@e1
 
     let block: Hash512 = [0xDD; 64];
 
-    // Current-epoch cert: get(e2) is uncached -> genesis fallback(keys=B).
+    // Current-epoch cert signed by B: the set is missing while a bond-backed
+    // committee should exist, so it is rejected rather than falling back.
     let by_b = signed_with(
         &b_pairs,
         payload_mini(20, block),
         &(0..quorum).collect::<Vec<_>>(),
     );
-    fm.accept(&by_b, Some(block), &RealBls).unwrap();
-    assert_eq!(fm.accepted_height(), 20);
+    let err = refused_fm(&mut fm, &by_b, block, "B quorum with no cached B set");
+    assert!(matches!(
+        err,
+        FinalityError::InvalidCertificate(ValidatorError::NoCandidates { .. })
+    ));
+    assert_eq!(fm.accepted_height(), 0);
 
+    // Same for the stale A quorum: no fallback to either key set.
     let by_a = signed_with(
         &a_pairs,
         payload_mini(20, block),
@@ -1166,6 +1175,117 @@ fn a_committee_swap_without_a_cached_set_still_serves_the_live_declared_keys() {
     let err = refused_fm(&mut fm, &by_a, block, "A quorum after keys swapped to B");
     assert!(matches!(
         err,
-        FinalityError::InvalidCertificate(ValidatorError::CheckpointBadSignature)
+        FinalityError::InvalidCertificate(ValidatorError::NoCandidates { .. })
+    ));
+}
+
+#[test]
+fn genesis_fallback_still_serves_the_declared_keys_when_no_bonds_exist() {
+    // P0-3 companion: with no bond-backed committee ever installed, the
+    // declared genesis committee remains the genuine fallback.
+    let mut fm = FinalityManager::new(&NetworkParams::mini());
+
+    let b_pairs = bonded_pairs(&[5, 6, 7, 8]);
+    let quorum = quorum(4);
+    fm.set_keys(b_pairs.iter().map(|(_, pk)| *pk).collect()); // keys=B, never bonded
+
+    let block: Hash512 = [0xDD; 64];
+    let by_b = signed_with(
+        &b_pairs,
+        payload_mini(20, block),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    fm.accept(&by_b, Some(block), &RealBls).unwrap();
+    assert_eq!(fm.accepted_height(), 20);
+}
+
+#[test]
+fn an_expired_epoch_set_is_rejected_not_fallen_back() {
+    // P0-3: epoch 1's set ages out as the cache rotates to epochs 2 and 3.
+    // A late epoch-1 certificate must be rejected as expired — never
+    // validated against the declared genesis keys — while a current-epoch
+    // certificate validates normally.
+    let mut fm = FinalityManager::new(&NetworkParams::mini());
+    let interval = 10u64;
+
+    let a_pairs = bonded_pairs(&[1, 2, 3, 4]);
+    let b_pairs = bonded_pairs(&[5, 6, 7, 8]);
+    let c_pairs = bonded_pairs(&[9, 10, 11, 12]);
+    let quorum = quorum(4);
+
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20)
+        .unwrap();
+    fm.refresh_committee(&bonded_records(&b_pairs), 20, interval, 20)
+        .unwrap();
+    fm.refresh_committee(&bonded_records(&c_pairs), 30, interval, 20)
+        .unwrap();
+
+    // Epoch 1 aged out at the rotation to epoch 3: expired, not missing.
+    let stale_a = signed_with(
+        &a_pairs,
+        payload_mini(10, [0xA1; 64]),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    let err = refused_fm(&mut fm, &stale_a, [0xA1; 64], "expired epoch-1 certificate");
+    assert!(matches!(
+        err,
+        FinalityError::InvalidCertificate(ValidatorError::SetExpired { .. })
+    ));
+
+    // The current committee still validates normally.
+    let live_c = signed_with(
+        &c_pairs,
+        payload_mini(30, [0xC3; 64]),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    fm.accept(&live_c, Some([0xC3; 64]), &RealBls).unwrap();
+    assert_eq!(fm.accepted_height(), 30);
+}
+
+#[test]
+fn a_failed_committee_derivation_leaves_the_prior_set_intact() {
+    // P0-4: a `derive_set` failure (here a duplicated candidate key) is
+    // returned, not silently ignored — and the previously cached set keeps
+    // serving its own epoch rather than being replaced by a fallback.
+    let mut fm = FinalityManager::new(&NetworkParams::mini());
+    let interval = 10u64;
+
+    let a_pairs = bonded_pairs(&[1, 2, 3, 4]);
+    let quorum = quorum(4);
+    fm.refresh_committee(&bonded_records(&a_pairs), 10, interval, 20)
+        .unwrap();
+
+    let mut bad = bonded_records(&a_pairs);
+    bad.push(bad[0].clone()); // duplicate key and address: derivation must fail
+    let err = fm
+        .refresh_committee(&bad, 20, interval, 20)
+        .expect_err("duplicate candidates must fail derivation");
+    assert!(matches!(err, ValidatorError::DuplicateKey { .. }));
+
+    // The prior epoch-1 set is untouched and still verifies.
+    let live_a = signed_with(
+        &a_pairs,
+        payload_mini(10, [0xA1; 64]),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    fm.accept(&live_a, Some([0xA1; 64]), &RealBls).unwrap();
+    assert_eq!(fm.accepted_height(), 10);
+
+    // The epoch that failed to derive has no usable committee: rejected,
+    // with no silent fallback to the declared keys.
+    let missing_b = signed_with(
+        &a_pairs,
+        payload_mini(20, [0xB2; 64]),
+        &(0..quorum).collect::<Vec<_>>(),
+    );
+    let err = refused_fm(
+        &mut fm,
+        &missing_b,
+        [0xB2; 64],
+        "epoch with failed derivation",
+    );
+    assert!(matches!(
+        err,
+        FinalityError::InvalidCertificate(ValidatorError::NoCandidates { .. })
     ));
 }

@@ -109,6 +109,12 @@ pub struct FinalityManager {
     recent: Vec<Checkpoint>,
     /// Deterministic equivocation evidence, bounded.
     evidence: Vec<EquivocationEvidence>,
+    /// Whether a bond-backed epoch set has ever been installed. When false the
+    /// declared genesis committee is a genuine fallback (no bonds ever existed);
+    /// when true a missing/expired set means a stake-backed committee should
+    /// exist and certificates must be rejected rather than falling back to
+    /// genesis keys (P0-3).
+    bonded: bool,
 }
 
 /// How many recent certificates are retained for conflict evidence. Bounded so
@@ -130,10 +136,9 @@ impl FinalityManager {
             finalized_checkpoint: None,
             recent: Vec::new(),
             evidence: Vec::new(),
+            bonded: false,
         }
     }
-
-    /// Number of validators in the declared committee.
     pub fn committee_len(&self) -> usize {
         self.keys.len()
     }
@@ -146,51 +151,72 @@ impl FinalityManager {
         self.keys = keys;
     }
 
+    /// Clear every cached epoch set and mark the manager as having no
+    /// bond-backed committee. Used when the seed state for the current epoch
+    /// holds no bonds, and when rebuilding the cache after a rewind.
+    pub fn clear_sets(&mut self) {
+        self.sets.clear();
+        self.bonded = false;
+    }
+
+    /// Rewind the observation frontier and recent-checkpoint ring when a reorg
+    /// removes the canonical block at or above the accepted height.
+    ///
+    /// Certificates observed on a branch that is no longer canonical are stale;
+    /// their heights no longer exist in the ledger's history, so re-accepting
+    /// one on the winning branch would falsely replay the old frontier. Binding
+    /// finality is *not* touched here: it is only ever advanced by `accept`,
+    /// never rolled back (P2-15).
+    pub fn rewind_observation(&mut self, tip_height: u64) {
+        if self.accepted_height > tip_height {
+            self.accepted_height = 0;
+        }
+        self.recent.retain(|c| c.payload.height <= tip_height);
+    }
+
     /// Install the stake-backed epoch sets (Item 5). The chain calls this on
     /// every canonical advance, passing the active `ValidatorRecord`s derived
     /// from `BondLedger` and the height at which the set takes effect. The cache
     /// holds the current and previous epoch's sets (one-epoch grace for late
     /// checkpoints per \u{b7}14.6); `accept` reads from it and only falls back
-    /// to the declared genesis committee when it is empty.
+    /// to the declared genesis committee when no bond-backed committee exists.
     ///
     /// With no bonds the candidate list is empty: rather than install an empty
     /// set (which would shadow the genesis fallback needed on testnet/mini),
     /// the cache is cleared so the declared committee stays in effect.
+    ///
+    /// A failed `derive_set` (duplicate key/address/ML-DSA key, bad key) is a
+    /// consensus-critical failure and is returned rather than silently ignored
+    /// (P0-4). The prior cache is left intact on failure.
     pub fn refresh_committee(
         &mut self,
         candidates: &[ValidatorRecord],
         height: u64,
         epoch_blocks: u64,
         lookback: u64,
-    ) {
+    ) -> Result<(), ValidatorError> {
         if candidates.is_empty() {
             self.sets.clear();
-            return;
+            self.bonded = false;
+            return Ok(());
         }
+        self.bonded = true;
         let epoch = crate::validators::epoch_of(height, epoch_blocks);
         let seed = crate::validators::seed_height(epoch, epoch_blocks, lookback);
         let seed_epoch = crate::validators::epoch_of(seed, epoch_blocks);
         // Derive the set for the seed epoch and carry it forward for `epoch`;
         // the seed height's state is what determines this epoch's committee.
-        // A failed `derive_set` (e.g. degenerate shared-address input that can
-        // only arise from a malformed candidate list, never from bond admission)
-        // leaves the prior cache intact. That is safe: `EpochSetCache::get`
-        // matches on exact epoch, so a leftover set is only ever read back at its
-        // own epoch — where the `NotMonotonic` check refuses it as stale — while
-        // any current-epoch certificate misses the cache and falls through to
-        // the genesis fallback driven by the live `self.keys`. The cache can
-        // therefore never hand a stale committee to a current-epoch certificate.
-        if let Ok(set) = derive_set(
+        let set = derive_set(
             seed_epoch,
             candidates,
             SelectionRule::TopN,
             crate::bond::MAX_COMMITTEE_SIZE,
-        ) {
-            let mut live = set;
-            live.epoch = epoch;
-            live.set_hash = crate::validators::set_hash(&live);
-            self.sets.insert(live, 1);
-        }
+        )?;
+        let mut live = set;
+        live.epoch = epoch;
+        live.set_hash = crate::validators::set_hash(&live);
+        self.sets.insert(live, 1);
+        Ok(())
     }
 
     /// The configured activation height (0 = binding finality never activates).
@@ -265,14 +291,31 @@ impl FinalityManager {
         // signature). Monotonicity is checked here, not by clause 6, so a
         // same-height conflicting certificate is classified as a conflict
         // rather than a stale replay. A floor of 0 makes clause 6 inert.
+        //
+        // P0-3: the set resolver distinguishes three conditions instead of
+        // collapsing them into one genesis fallback:
+        //   * a cached set -> verify against it;
+        //   * SetExpired / a missing set while a bond-backed committee should
+        //     exist (bonded == true) -> reject, fail closed;
+        //   * NoCandidates with no bond-backed committee ever installed
+        //     (bonded == false) -> genuine genesis fallback, allowed.
         let keys = &self.keys;
         let sets = &self.sets;
+        let bonded = self.bonded;
         validate_checkpoint_against_set(
             checkpoint,
-            |epoch| {
-                sets.get(epoch)
-                    .cloned()
-                    .or_else(|_| genesis_epoch_set_at(epoch, keys))
+            move |epoch| match sets.get(epoch) {
+                Ok(set) => Ok(set.clone()),
+                Err(ValidatorError::SetExpired { .. }) => Err(ValidatorError::SetExpired { epoch }),
+                Err(ValidatorError::NoCandidates { .. }) if bonded => {
+                    Err(ValidatorError::NoCandidates { epoch })
+                }
+                Err(ValidatorError::NoCandidates { .. }) => {
+                    // Genuine no-bond state: the declared genesis committee is
+                    // the only authority, and it is allowed as the fallback.
+                    genesis_epoch_set_at(epoch, keys)
+                }
+                Err(other) => Err(other),
             },
             0,
             self.epoch_blocks,
@@ -378,11 +421,19 @@ impl FinalityManager {
     /// The epoch set for `epoch`, for callers that want to inspect it.
     /// Reads the staked cache first (Item 5); falls back to the declared genesis
     /// committee when no bonds are live yet.
-    pub fn epoch_set(&self, epoch: u64) -> Result<EpochSet, ValidatorError> {
+    pub fn epoch_set(&self, epoch: u64) -> std::result::Result<EpochSet, ValidatorError> {
         self.sets
             .get(epoch)
             .cloned()
             .or_else(|_| genesis_epoch_set_at(epoch, &self.keys))
+    }
+
+    /// Strict lookup of the cached epoch set for `epoch` with **no** genesis
+    /// fallback. Used for historical slash verification and anywhere a
+    /// bond-backed committee is required: returns `SetExpired`/`NoCandidates`
+    /// when the set is unavailable rather than validating against genesis keys.
+    pub fn epoch_set_strict(&self, epoch: u64) -> std::result::Result<EpochSet, ValidatorError> {
+        self.sets.get(epoch).cloned()
     }
 }
 
@@ -431,6 +482,7 @@ impl Default for FinalityManager {
             finalized_checkpoint: None,
             recent: Vec::new(),
             evidence: Vec::new(),
+            bonded: false,
         }
     }
 }

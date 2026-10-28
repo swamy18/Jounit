@@ -413,6 +413,21 @@ pub fn epoch_of(height: u64, epoch_blocks: u64) -> u64 {
     height / epoch_blocks.max(1)
 }
 
+/// True when `height` is a seed height for some epoch: `height == 0`, or
+/// `height + lookback` is a positive multiple of `epoch_blocks` (i.e. there
+/// is an epoch `e >= 1` with `seed_height(e) == height`). Checked arithmetic:
+/// `height + lookback` overflowing `u64` is not a seed height.
+pub fn is_seed_height(height: u64, epoch_blocks: u64, lookback: u64) -> bool {
+    let epoch_blocks = epoch_blocks.max(1);
+    if height == 0 {
+        return true;
+    }
+    match height.checked_add(lookback) {
+        Some(s) => s % epoch_blocks == 0,
+        None => false,
+    }
+}
+
 /// The set cache a node keeps: current epoch and the previous one (grace).
 ///
 /// §14.6: a node tracks `set(e-1)` for one full epoch after handover, solely
@@ -426,6 +441,14 @@ pub struct EpochSetCache {
     /// expiry *height* would re-derive epoch geometry inside the cache; the
     /// epoch number is the unit the grace period is defined in.
     previous_expires_at_epoch: Option<u64>,
+    /// The epoch of the current set, used by `get` to decide whether a
+    /// previous-set read has passed its grace expiry without waiting for a
+    /// future `insert()` to eager-drop it.
+    current_epoch: Option<u64>,
+    /// The epoch of the most recent previous set that aged out. Kept so `get`
+    /// reports `SetExpired` (we held it, it expired) rather than
+    /// `NoCandidates` (we never had it) for a displaced-but-expired set.
+    expired_previous_epoch: Option<u64>,
 }
 
 impl EpochSetCache {
@@ -440,32 +463,37 @@ impl EpochSetCache {
         match &self.current {
             Some(cur) if cur.epoch == incoming_epoch => {
                 self.current = Some(set);
+                self.current_epoch = Some(incoming_epoch);
             }
             Some(cur) if incoming_epoch > cur.epoch => {
-                // Previous becomes the old current if it is still within its
-                // grace; anything older is dropped.
+                // The old previous is being displaced by the old current. If the
+                // old previous has already reached its expiry, remember it so
+                // `get` reports `SetExpired` rather than `NoCandidates`.
+                if let Some(prev) = &self.previous {
+                    let prev_expires = self.previous_expires_at_epoch.unwrap_or(incoming_epoch);
+                    if incoming_epoch >= prev_expires {
+                        self.expired_previous_epoch = Some(prev.epoch);
+                    }
+                }
                 self.previous = Some(cur.clone());
                 self.previous_expires_at_epoch = Some(incoming_epoch + grace_epochs);
                 self.current = Some(set);
-                self.drop_expired(incoming_epoch);
+                self.current_epoch = Some(incoming_epoch);
             }
             _ => {
                 self.current = Some(set);
-            }
-        }
-    }
-
-    fn drop_expired(&mut self, at_epoch: u64) {
-        if let Some(expires) = self.previous_expires_at_epoch {
-            if at_epoch >= expires {
-                self.previous = None;
-                self.previous_expires_at_epoch = None;
+                self.current_epoch = Some(incoming_epoch);
             }
         }
     }
 
     /// The set for `epoch`, if cached: current, or previous within grace.
-    pub fn get(&self, epoch: u64) -> Result<&EpochSet, ValidatorError> {
+    ///
+    /// Never returns an expired set: a previous-set read is refused once the
+    /// recorded grace expiry has passed, without waiting for a future
+    /// `insert()` to eager-drop it. Distinguishes `SetExpired` (we held the
+    /// set and it aged out) from `NoCandidates` (we never had it).
+    pub fn get(&self, epoch: u64) -> std::result::Result<&EpochSet, ValidatorError> {
         if let Some(cur) = &self.current {
             if cur.epoch == epoch {
                 return Ok(cur);
@@ -473,36 +501,30 @@ impl EpochSetCache {
         }
         if let Some(prev) = &self.previous {
             if prev.epoch == epoch {
-                self.drop_expired_in_get(epoch);
-                if self.previous.is_some() {
-                    return Ok(prev);
+                let expired = self
+                    .previous_expires_at_epoch
+                    .is_some_and(|expires| self.current_epoch.is_some_and(|c| c >= expires));
+                if expired {
+                    return Err(ValidatorError::SetExpired { epoch });
                 }
+                return Ok(prev);
             }
         }
-        // Distinguish "never had it" from "had it and it expired".
-        match (&self.previous_expires_at_epoch, &self.previous) {
-            (Some(_), None) => Err(ValidatorError::SetExpired { epoch }),
-            _ => Err(ValidatorError::NoCandidates { epoch }),
+        if self.expired_previous_epoch == Some(epoch) {
+            return Err(ValidatorError::SetExpired { epoch });
         }
-    }
-
-    // The cache cannot mutate through &self, so expiry-on-read is enforced at
-    // insert time (drop_expired) and here via a const-folded check: a set
-    // retrieved from `previous` is valid only while the caller's epoch is
-    // before the expiry recorded at insert. To keep `get` honest without
-    // interior mutability, the caller's epoch is checked against the stored
-    // expiry and an expired read reports SetExpired.
-    fn drop_expired_in_get(&self, at_epoch: u64) {
-        // Intentionally empty: see comment. Expiry is enforced by `insert`
-        // (which drops eagerly) and by `validate_checkpoint` (which refuses
-        // epochs beyond the cached range). Kept as a named no-op so the
-        // reasoning is visible where a future refactor would look first.
-        let _ = at_epoch;
+        Err(ValidatorError::NoCandidates { epoch })
     }
 
     /// Current epoch's set, if any.
     pub fn current(&self) -> Option<&EpochSet> {
         self.current.as_ref()
+    }
+
+    /// Previous epoch's set, if any (for inspection only; callers should use
+    /// `get` so expiry is enforced).
+    pub fn previous(&self) -> Option<&EpochSet> {
+        self.previous.as_ref()
     }
 
     /// Drop all cached epoch sets, restoring the genesis-fallback behaviour
@@ -511,11 +533,8 @@ impl EpochSetCache {
         self.current = None;
         self.previous = None;
         self.previous_expires_at_epoch = None;
-    }
-
-    /// Previous epoch's set, if still within grace.
-    pub fn previous(&self) -> Option<&EpochSet> {
-        self.previous.as_ref()
+        self.current_epoch = None;
+        self.expired_previous_epoch = None;
     }
 }
 
@@ -834,6 +853,28 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_mldsa_key_is_refused() {
+        let mut cands = candidates(4);
+        let shared_pk = [0x42u8; 1952];
+        cands.push(ValidatorRecord {
+            stake_address: [0x88; 20],
+            bls_pk: sk(0x88).public_key(),
+            stake_sat: 1,
+            mldsa_pk: Some(shared_pk),
+        });
+        cands.push(ValidatorRecord {
+            stake_address: [0x89; 20],
+            bls_pk: sk(0x89).public_key(),
+            stake_sat: 1,
+            mldsa_pk: Some(shared_pk),
+        });
+        assert!(matches!(
+            derive_set(1, &cands, SelectionRule::TopN, 21),
+            Err(ValidatorError::DuplicateMldsaKey)
+        ));
+    }
+
+    #[test]
     fn an_invalid_key_is_refused_not_skipped() {
         let mut cands = candidates(4);
         cands.push(ValidatorRecord {
@@ -874,6 +915,33 @@ mod tests {
         assert_eq!(seed_height(5, 100, 20), 480);
         assert_eq!(epoch_of(99, 100), 0);
         assert_eq!(epoch_of(100, 100), 1);
+    }
+
+    #[test]
+    fn seed_height_membership_matches_the_formula() {
+        // mainnet shape: seeds are 0, 80, 180, ...
+        for h in [0u64, 80, 180, 280] {
+            assert!(is_seed_height(h, 100, 20), "height {h} is a seed height");
+        }
+        for h in [1u64, 79, 81, 100, 179] {
+            assert!(
+                !is_seed_height(h, 100, 20),
+                "height {h} is not a seed height"
+            );
+        }
+        // mini shape: seeds are 0, 10, 20, 30, ...
+        for h in [0u64, 10, 20, 30] {
+            assert!(is_seed_height(h, 10, 20), "height {h} is a seed height");
+        }
+        for h in [1u64, 9, 11, 21] {
+            assert!(
+                !is_seed_height(h, 10, 20),
+                "height {h} is not a seed height"
+            );
+        }
+        // Checked arithmetic: an overflowing height + lookback is not a seed.
+        assert!(!is_seed_height(u64::MAX, 100, 20));
+        assert!(!is_seed_height(u64::MAX, 1, 1));
     }
 
     #[test]
@@ -1071,20 +1139,23 @@ mod tests {
 
         let e3 = fixed_set(4, 3);
         cache.insert(e3, 1);
-        // The cache holds exactly two sets: on rotating to epoch 3 the
-        // previous slot becomes epoch 2 and epoch 1 is gone entirely. The
-        // first version of this test asserted previous() would be None after
-        // the second rotation, which is wrong — the grace slot is for the
-        // epoch BEFORE the current one, and epoch 2 is exactly that.
+        // The cache holds exactly two sets: on rotating to epoch 3 the previous
+        // slot becomes epoch 2; epoch 1 has reached its expiry (epoch 3) and is
+        // reported as `SetExpired` rather than silently dropped.
+        // The grace slot is for the epoch before the current one, and epoch 2
+        // is exactly that.
         assert_eq!(cache.current().unwrap().epoch, 3);
         assert_eq!(
             cache.previous().unwrap().epoch,
             2,
             "the grace slot now holds epoch 2"
         );
+        // Epoch 1 was held as the previous set and reached its expiry (epoch 3)
+        // exactly as we rotated to epoch 3: it aged out, so it is `SetExpired`,
+        // not `NoCandidates` (we did hold it once).
         assert!(
-            matches!(cache.get(1), Err(ValidatorError::NoCandidates { .. })),
-            "epoch 1 is beyond the two-set window entirely"
+            matches!(cache.get(1), Err(ValidatorError::SetExpired { .. })),
+            "epoch 1 aged out at epoch 3"
         );
 
         // With a longer grace, a two-rotations-old set is still reachable:
@@ -1141,5 +1212,103 @@ mod tests {
         let ev = equivocation_evidence(&set.validators[0].bls_pk, &a, &b).unwrap();
         assert_eq!(ev.offender, set.validators[0].bls_pk);
         assert_ne!(ev.first, ev.second);
+    }
+
+    // ------------------------------------------------------------------
+    // EpochSetCache expiry semantics (P1-5)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cache_get_never_returns_an_expired_set() {
+        let mut cache = EpochSetCache::new();
+        let e1 = fixed_set(4, 1);
+        let e2 = fixed_set(4, 2);
+        // Grace of 1: epoch 1 expires once we reach epoch 2 + 1 = 3.
+        cache.insert(e1, 1);
+        cache.insert(e2, 1); // current=2, previous=1, expires at epoch 3
+
+        // Previous epoch (1) is still within grace at current epoch 2.
+        assert!(cache.get(1).is_ok());
+        // Current epoch is available.
+        assert!(cache.get(2).is_ok());
+
+        // Advance to epoch 3: epoch 1 is now past its grace expiry.
+        let e3 = fixed_set(4, 3);
+        cache.insert(e3, 1); // current=3, previous=2 (1 dropped eagerly)
+        assert!(matches!(
+            cache.get(1),
+            Err(ValidatorError::SetExpired { .. })
+        ));
+        // Previous (2) still within grace at epoch 3 (expires at 4).
+        assert!(cache.get(2).is_ok());
+        // Current available.
+        assert!(cache.get(3).is_ok());
+
+        // Advance past expiry of epoch 2 (grace 1: expires at 4).
+        let e4 = fixed_set(4, 4);
+        cache.insert(e4, 1); // current=4, previous=3 (2 dropped eagerly)
+        assert!(matches!(
+            cache.get(2),
+            Err(ValidatorError::SetExpired { .. })
+        ));
+        assert!(cache.get(3).is_ok());
+    }
+
+    #[test]
+    fn cache_get_distinguishes_expired_from_never_had() {
+        let mut cache = EpochSetCache::new();
+        // Never had any set: NoCandidates.
+        assert!(matches!(
+            cache.get(5),
+            Err(ValidatorError::NoCandidates { .. })
+        ));
+
+        // Install and age out a set: SetExpired.
+        let e1 = fixed_set(4, 1);
+        let e2 = fixed_set(4, 2);
+        cache.insert(e1, 1);
+        cache.insert(e2, 0); // grace 0: epoch 1 expires immediately at epoch 2
+        assert!(matches!(
+            cache.get(1),
+            Err(ValidatorError::SetExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn cache_get_missing_epoch_is_nocandidates() {
+        let mut cache = EpochSetCache::new();
+        let e5 = fixed_set(4, 5);
+        cache.insert(e5, 1);
+        // Epochs other than current are never held (no previous): NoCandidates.
+        assert!(matches!(
+            cache.get(3),
+            Err(ValidatorError::NoCandidates { .. })
+        ));
+        assert!(matches!(
+            cache.get(4),
+            Err(ValidatorError::NoCandidates { .. })
+        ));
+        assert!(matches!(
+            cache.get(6),
+            Err(ValidatorError::NoCandidates { .. })
+        ));
+        assert!(cache.get(5).is_ok());
+    }
+
+    #[test]
+    fn cache_previous_survives_one_epoch_grace_then_expires() {
+        let mut cache = EpochSetCache::new();
+        let e1 = fixed_set(4, 1);
+        let e2 = fixed_set(4, 2);
+        let e3 = fixed_set(4, 3);
+        cache.insert(e1, 1);
+        cache.insert(e2, 1); // current=2, previous=1, expires at 3
+        assert!(cache.get(1).is_ok());
+        cache.insert(e3, 1); // current=3, previous=2 (1 expired)
+        assert!(matches!(
+            cache.get(1),
+            Err(ValidatorError::SetExpired { .. })
+        ));
+        assert!(cache.get(2).is_ok());
     }
 }
