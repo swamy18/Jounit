@@ -256,7 +256,7 @@ reached.
 |---|---|
 | `cargo fmt --all --check` clean | ✅ |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean | ✅ |
-| `cargo test --workspace` passes | ✅ 1307 passed, 0 failed, 1 ignored |
+| `cargo test --workspace` passes | ✅ 1360 passed, 0 failed, 1 ignored |
 | Release build compiles | ✅ |
 | Vector cross-check (Python vs Rust) | ✅ (`docs/status.md`) |
 | Fuzz: 17 targets executed, real campaigns | ✅ see `docs/fuzz.md` |
@@ -267,6 +267,8 @@ reached.
 | Local multi-node launch scripts (start / stop / reset) | ✅ (`scripts/start-network`, `stop-network`, `reset-network`) |
 | L2 → L1 exits | ✅ implemented and active on mainnet (`exit_activation_height = 1`) |
 | Stake ledger / bond / unbond / slash | ✅ implemented and tested — any positive bond accepted, no minimum stake (Decision 20 update) |
+| Committee rotation + slash verification | ✅ seed-height snapshots with reorg rollback, per-epoch slash checks, fail-closed expiry (`committee_rotation`, P0-2 tests) |
+| External mining | ✅ `jnt-miner` binary + `GET /v1/mine/template` / `POST /v1/mine/submit` + stratum-lite pools with PROP payouts; ~114k H/s reference (4-thread CPU, release) |
 | Validator committee derivation | ✅ stake-weighted TopN with genesis fallback |
 | Checkpoint signing | ✅ built and tested (`signing.rs`, serve loop) |
 | M2 / M4 | M2 closed (canonical reference + fraud slashing); M4 registered (`puzzle_id = 2`) but not active on mainnet by design |

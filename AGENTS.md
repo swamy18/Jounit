@@ -19,6 +19,10 @@ cargo test --workspace
 cargo test -p jnt-core --lib
 # Node HTTP API integration tests (roadmap items 2 and 4).
 cargo test -p jnt-node --test api
+# Mining stack: solver/stratum/payouts/backends, template/submit roundtrips.
+cargo test -p jnt-miner
+cargo test -p jnt-core --test committee_rotation
+cargo test -p jnt-node --test api external_miner
 # Escrow-specific subsets.
 cargo test -p jnt-core --lib escrow
 cargo test -p jnt-node --test api escrow

@@ -793,6 +793,15 @@ required — any positive bond is accepted.
 `Chain::submit` does not reference `validators.rs` (grep-verified); no
 consensus rule changed; no monetary rule changed.
 
+> **Update 2026-10-28 (activation shipped):** the library above is now wired
+> in. Decision 20 put the bond ledger, TopN selection, unbonding and
+> full-bond slash on chain; follow-up fixes added seed-height committee
+> snapshots with reorg rollback (`committee_rotation` suite), per-epoch slash
+> verification that fails closed (`bond::` P0-2 tests), one-epoch-grace set
+> expiry, and finality observation rewind on rollback. The "activation
+> deferred" framing above is therefore historical — committees, rotation and
+> slashing are live consensus.
+
 Attack tests (21): deterministic derivation + key-first canonical ordering
 (stake changes cannot reshuffle bitmap bits mid-epoch); TopN selection with
 deterministic tie-breaks; duplicate key refused (a two-slot key could double

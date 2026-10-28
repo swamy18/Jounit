@@ -62,6 +62,10 @@ The module doc (`hbm_pow.rs:30-34`) states production uses **8–64 MiB** scratc
 ## 7. Recommendation
 
 - **Accept HBM for testnet registration** as `puzzle_id = 2` with the `test()` config (8 KiB / 8) used in tests and a documented non-production `HbmConfig`. This unblocks wiring (`puzzle.rs` already supports a second `PuzzleSpec` registration; `HybridPuzzleSolver` would need an HBM solver arm).
+  - *Update 2026-10-28:* registration is done (`PuzzleSpec::hbm_v1`,
+    `puzzle_id = 2`) and `jnt-miner` now carries the HBM solver arm
+    (`PowMode::Hbm`, `hbm_satisfies_cfg`); it is still **not active** on any
+    profile, and the §5/§6 items below still gate mainnet use.
 - **FIX before mainnet:** item 5 (parameter config) and item 6 (panic guard). Record the large-config parameters as a `NetworkParams` field, not a compile-time constant, so they are governance-upgradeable per `docs/decisions.md` P4 ("only puzzle parameters are upgradeable, and only through the governance timelock").
 
 No soundness, overflow, or consensus-split issues were found in the verification path.

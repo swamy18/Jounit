@@ -370,6 +370,11 @@ final = SHA256( DOM_S3 ‖ seed ‖ act_digest ‖ U8LE(nonce) ‖ U4LE(epoch_id
 solve(header) = ( U256_BE(final) ≤ target(header.difficulty) )
 ```
 
+That predicate is the whole validity rule, and it is also the conformance
+rule for miner backends: a batched or device implementation (`jnt-miner`
+`ComputeBackend`, §19.2) is conformant iff it returns this predicate's answer
+on every header — byte-identical `final`, never a tolerance.
+
 ### 5.6 NN share of work (Section 29.3 audit rule)
 
 The protocol cannot measure wall-clock, so the `30–50%` rule is enforced as an auditable **cost model** on the puzzle parameters:
@@ -1292,7 +1297,9 @@ from a SHA-256 output. Mainnet is 16 384 lanes (512 KiB) and 64 accesses.
 
 The security claim is that the access sequence cannot be precomputed without the
 header, so an ASIC cannot parallelise it and a cloud burst cannot amortise it.
-It is **not** registered as a `puzzle_id` in §5.1, so it validates nothing today.
+It is registered in code as `puzzle_id = 2` (`PuzzleSpec::hbm_v1`) but is not
+the active mining puzzle on any profile, so it validates nothing in consensus
+today.
 
 ### 14.4 M5 — BLS aggregate finality
 
@@ -1852,6 +1859,11 @@ commitment rather than a claim.
 The **dispute window is a protocol parameter**, not a field an actor chooses: a
 submitter who could pick their own window could pick zero, and a worker who
 could pick it could make challenges impossible. `L2Config` fixes it per network.
+
+Opening is fail-closed with named errors, never panics: a contract with zero
+payment, no deadline, or a dispute window reaching the deadline is refused at
+construction (`L2Error::ZeroAmount` / `L2Error::InvalidContractSpec`). Malformed
+input is a deterministic rejection in the L2 layer, not a crash.
 
 The L2 `deadline_height` must equal the embedded M3 envelope's `expiry_height`.
 Two deadlines for one task is an ambiguity, not a feature, and the mismatch is
@@ -3307,10 +3319,13 @@ A position is refused unless **all** of the following hold:
    silent clamp would hide what the lender asked for;
 4. the deadline is above the current height;
 5. the collateral meets the requirement, which without a bond is
-   **full collateralisation** (`CreditTerms::default().required_collateral`,
-   the same arithmetic the node-local book used, with a zero bond);
-6. the position id is new;
-7. the lender can fund the principal and the fee, and the borrower can fund
+    **full collateralisation** (`CreditTerms::default().required_collateral`,
+    the same arithmetic the node-local book used, with a zero bond);
+6. the term set itself is valid: `min_collateral_bps` must be non-zero — a
+    zero collateral floor is refused where the arithmetic lives
+    (`required_collateral`), so no caller can admit a zero-collateral line;
+7. the position id is new;
+8. the lender can fund the principal and the fee, and the borrower can fund
    the collateral **from its own balance** - the collateral is checked before
    the principal arrives, so the borrowed money cannot secure itself.
 

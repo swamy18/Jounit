@@ -616,6 +616,10 @@ fee is not paid to the block producer. Burnt gets the odd satoshi on ties
   the discount is zero, so `required = max(100% − 0%, 80%) = 100%`. The collateral
   must be the borrower's own money, checked **before** the principal arrives, so
   a position can never outrun its backing.
+- **No zero-collateral term sets.** A `CreditTerms` with `min_collateral_bps ==
+  0` is refused by name where the arithmetic lives (`required_collateral`),
+  not left to callers to remember — there is no path to a zero-collateral
+  line.
 - **Interest rate cap.** A position may charge at most
   `MAX_CREDIT_RATE_BPS_PER_WINDOW = 1_000` (10%) per window. A rate above that is
   refused rather than clamped.
@@ -1027,6 +1031,9 @@ Targeted suites for the fast loops:
 cargo test -p jnt-core --lib arbitration::    # fraud-arbitration votes
 cargo test -p jnt-core --test cp_signing_nodes # quorum, conflicts, restart
 cargo test -p jnt-core --test bond_stake      # bonded-stake attacks
+cargo test -p jnt-core --test committee_rotation # seed-epoch committees + reorg rollback
+cargo test -p jnt-miner                       # solver, stratum, payouts, backends
+cargo test -p jnt-node --test api external_miner # template/submit over HTTP
 cargo test -p jnt-l2  --test unverified_result # the unchallenged-result rule
 cargo test -p jnt-node --test arbitration_path # full fraud lifecycle
 cargo test -p jnt-net  --test arbitration_votes # 3 nodes, real TCP

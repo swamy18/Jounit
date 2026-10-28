@@ -1032,6 +1032,15 @@ that remain unbuilt:
 
 None of 1–6 may be invented by implementation; each needs a recorded decision.
 
+> **Update 2026-10-10 (Decision 20, implemented):** items 1 (stake/bond
+> validation rules), 2 (bond ledger + TopN selection), 3 (unbonding after a
+> full finality window), 5 (full-bond equivocation burn via `TX_SLASH`) and 6
+> (21-key bootstrap via Decision 27) are built; item 4 stays deliberately
+> *none* (no rewards, no fee share). The mechanism has since been hardened
+> further: seed-height committee snapshots with reorg rollback, per-epoch
+> slash verification, fail-closed committees, and one-epoch-grace set expiry
+> (2026-10-28 fixes).
+
 ## P3 — M2 activation rule (mainnet blocker)
 
 The anti-collusion slash vault exists (`slash.rs`) but **no rule triggers it**.
@@ -1040,10 +1049,11 @@ slash, and how that verdict enters consensus. Unspecified → M2 stays inactive.
 
 ## P4 — M4 registration (mainnet blocker)
 
-The HBM scratchpad puzzle (`hbm_pow.rs`) is **not a registered `puzzle_id`**.
-What must be decided: whether M4 *replaces* or *composes with* the §5 puzzle,
-and the registration/versioning rule. Unspecified → chain security rests on §5
-only.
+The HBM scratchpad puzzle (`hbm_pow.rs`) is registered in code as
+`puzzle_id = 2` (`PuzzleSpec::hbm_v1`), but it is **not the active mining
+puzzle on any profile**. What must still be decided: whether M4 *replaces* or
+*composes with* the §5 puzzle at activation, and the governance rule for
+flipping it. Until then chain security rests on §5 only.
 
 ## P5 — Open interaction carried from Phase 2/3 (economic)
 
@@ -1317,6 +1327,13 @@ Activation requires a written security analysis and benchmarks first; until
 then chain security rests on §5 alone. Design shape recorded in
 `docs/hbm-composition-draft.md` (2026-10-10): additional header commitment,
 activation checklist, open questions — still no code, still not activated.
+
+> **Update 2026-10-12 / 2026-10-28:** the code now exists — `hbm_pow.rs`
+> verified and reviewed, registered as `puzzle_id = 2`, and `jnt-miner` carries
+> an HBM solver arm (`PowMode::Hbm`) — but activation is still **not** set on
+> any profile, and the `production()` parameter defect plus the missing panic
+> guard (`docs/security-review-hbm-2026-10-12.md` §§5–6) still block mainnet
+> use.
 
 ## Decision 23 — Proportional settle fee (P5)
 

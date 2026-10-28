@@ -126,13 +126,24 @@ that disagreed with code that is itself correct and test-pinned.
 
 Recorded as blockers (not choices) in `docs/decisions.md` → *Pending*:
 
-- **P1 — L2 → L1 exit primitive.** The sink is unspendable; an exit needs a new
-  L1 release rule. Six questions itemised in `docs/l2-exit-design.md`.
-- **P2 — Bonded stake / mainnet committee.** Stake transaction, bond ledger,
-  unbonding, mainnet bootstrap committee, and the equivocation-slashing path.
-- **P3 — M2 activation rule** (what proves a compute result fraudulent).
-- **P4 — M4 registration** (does the HBM puzzle replace or compose with §5).
-- **P5 — settle-fee vs small-task interaction** (`AmountTooSmallForFee`).
+- **P1 — L2 → L1 exit primitive.** ~~The sink is unspendable; an exit needs a
+  new L1 release rule.~~ **Resolved by Decision 19** (see §11.1): exits are
+  implemented.
+- **P2 — Bonded stake / mainnet committee.** ~~Stake transaction, bond ledger,
+  unbonding, mainnet bootstrap committee, and the equivocation-slashing
+  path.~~ **Resolved by Decision 20 + Decision 27** (bond ledger, TopN,
+  unbonding, full-bond burn, 21-key bootstrap), **hardened 2026-10-28**
+  (seed snapshots, per-epoch slash verification, fail-closed expiry).
+- **P3 — M2 activation rule** ~~(what proves a compute result fraudulent)~~.
+  **Resolved:** canonical CPU reference + fraud slashing through the M2 vault
+  (see mainnet-readiness §7).
+- **P4 — M4 registration** ~~(does the HBM puzzle replace or compose with
+  §5)~~. **Partly resolved:** registered in code as `puzzle_id = 2` with a
+  miner solver arm, but **not active** on any profile; activation still needs
+  its decision (parameter defect + panic guard still open per the 2026-10-12
+  HBM review).
+- **P5 — settle-fee vs small-task interaction** ~~(`AmountTooSmallForFee`)~~.
+  **Resolved by Decision 23:** 0.1% proportional fee, 1 000-sat floor.
 
 ## 9. Implementation work still remaining
 
@@ -164,10 +175,13 @@ implemented and verified.
 
 ## 12. Exact blockers preventing mainnet
 
-1. **P1 — exits undefined** (fund-safety).
-2. **P2 — no stake ledger and no mainnet committee** (`mainnet` committee is
-   empty → finality fails closed and is untestable there).
-3. **P3/P4 — M2 and M4 activation rules unspecified.**
+1. ~~**P1 — exits undefined** (fund-safety).~~ **Resolved by Decision 19.**
+2. ~~**P2 — no stake ledger and no mainnet committee** (`mainnet` committee is
+   empty → finality fails closed and is untestable there).~~ **Resolved by
+   Decisions 20 + 27**, hardened 2026-10-28 (seed snapshots, per-epoch slash
+   verification).
+3. **P3/P4 — M2 and M4 activation rules unspecified.** P3 resolved (M2
+   closed); P4 still open — registered but inactive.
 4. **§10 operational gaps** and **no third-party security audit**.
 
 Mainnet readiness is **not claimed**.
