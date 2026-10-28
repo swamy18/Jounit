@@ -1,33 +1,42 @@
-//! GPU seam: batched stage-2 evaluation for the mining loop.
+//! Universal compute seam: one contract, every substrate.
 //!
-//! The consensus math is **not** reimplemented here: every digest below is
-//! produced by the same verified `jnt-core` stage functions the sequential
-//! solver calls, only applied to many candidates at once. The batch boundary
-//! is exactly where a GPU backend plugs in — stage 2 is a data-parallel
-//! matrix-vector forward pass over independent seeds, which is what GPUs
-//! (and the HBM scratchpad design) are for.
+//! This coin is for every generation of hardware — CPU, GPU, NPU, TPU,
+//! photonic chips, domestic accelerators — so the PoW is deliberately
+//! portable: pure integer arithmetic and SHA-256, no floats anywhere, which
+//! means every substrate that implements two's-complement math computes
+//! bit-identical results. No single exotic chip can dominate either, because
+//! the three stages pull in different directions: hash chains want raw
+//! scalar throughput, the NN wants matrix-vector units (photonic MAC arrays
+//! shine here), and the HBM path wants random memory bandwidth (which optical
+//! and systolic hardware is bad at).
 //!
-//! [`NnBackend`] is the contract a future wgpu/CUDA backend implements:
-//! same inputs, same outputs, same order as [`CpuBackend`]. [`BatchSolver`]
-//! drives it with one weight derivation per batch instead of one per
-//! candidate, and [`solve_header_batched`] is the threaded grind over that
-//! interface. Equivalence with the sequential solver is pinned by tests, so
-//! swapping the backend can never silently change what counts as a solution.
+//! The consensus math is **not** reimplemented here: backends implement the
+//! [`ComputeBackend`] contract against the portable kernel surface
+//! (`jnt-core::puzzle::{ACTIVATION_SHIFT, fold32}`, `in_dim`, the weight and
+//! bias accessors, `DOM_S2`, plain `sha256`). [`BatchSolver`] drives one
+//! backend with one weight derivation per batch, and
+//! [`solve_header_batched`] is the threaded grind over that interface.
+//! Equivalence with the sequential solver is pinned by differential tests, so
+//! a new backend can never silently change what counts as a solution: any
+//! substrate that passes the differential test mines the same chain.
 
 use jnt_core::block::Header;
 use jnt_core::error::{Error, Result};
-use jnt_core::hash::Hash;
+use jnt_core::hash::{sha256, Hash, DOM_S2};
 use jnt_core::puzzle::{
-    stage1_seed, stage2_activation_digest_with, stage3_final, EpochWeights, PuzzleRun,
-    PuzzleSolver, PuzzleSpec,
+    fold32, stage1_seed, stage2_activation_digest_with, stage3_final, EpochWeights, PuzzleRun,
+    PuzzleSolver, PuzzleSpec, ACTIVATION_SHIFT,
 };
 
-/// Stage-2 backend contract: digests for `seeds` under `weights`, in order.
+/// Stage-2 compute contract: digests for `seeds` under `weights`, in order.
 ///
-/// A GPU implementation moves the forward pass (and only the forward pass)
-/// onto the device; weight derivation and stage 1/3 stay on the host, so the
-/// host still commits every layer exactly as consensus requires.
-pub trait NnBackend {
+/// A photonic/NPU/TPU/GPU implementation moves the forward pass (and only
+/// the forward pass) onto its substrate; weight derivation and stages 1/3
+/// stay on the host, so the host still commits every layer exactly as
+/// consensus requires. Same inputs, same outputs, same order — on every chip.
+pub trait ComputeBackend {
+    /// Backend name for selection and logging (`cpu`, `portable`, ...).
+    fn name(&self) -> &'static str;
     fn stage2_batch(&self, spec: &PuzzleSpec, seeds: &[Hash], weights: &EpochWeights) -> Vec<Hash>;
 }
 
@@ -35,12 +44,100 @@ pub trait NnBackend {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
 
-impl NnBackend for CpuBackend {
+impl ComputeBackend for CpuBackend {
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+
     fn stage2_batch(&self, spec: &PuzzleSpec, seeds: &[Hash], weights: &EpochWeights) -> Vec<Hash> {
         seeds
             .iter()
             .map(|seed| stage2_activation_digest_with(spec, seed, weights))
             .collect()
+    }
+}
+
+/// Portable backend: an independently written forward pass over the public
+/// kernel surface — separate loop structure and buffer handling from the
+/// reference, identical arithmetic order, so the differential test proves the
+/// spec is implementable without copying the reference implementation. This
+/// is the template a silicon vendor ports: replace the scalar loops with
+/// device kernels, keep the commit layout byte-identical.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PortableBackend;
+
+impl ComputeBackend for PortableBackend {
+    fn name(&self) -> &'static str {
+        "portable"
+    }
+
+    fn stage2_batch(&self, spec: &PuzzleSpec, seeds: &[Hash], weights: &EpochWeights) -> Vec<Hash> {
+        seeds
+            .iter()
+            .map(|seed| portable_digest(spec, seed, weights))
+            .collect()
+    }
+}
+
+/// Forward pass written only against the kernel surface: seed expansion,
+/// per-layer matrix-vector products via the weight/bias accessors, ReLU
+/// after [`ACTIVATION_SHIFT`], every layer's pre-activation values committed
+/// little-endian under [`DOM_S2`] — the same commit layout as consensus.
+fn portable_digest(spec: &PuzzleSpec, seed: &Hash, weights: &EpochWeights) -> Hash {
+    // Seed bytes as signed inputs, layer 0 width.
+    let mut x: Vec<i32> = seed.iter().map(|b| *b as i32 - 128).collect();
+    let mut committed: Vec<u8> =
+        Vec::with_capacity(DOM_S2.len() + spec.nn_layers * spec.nn_hidden_dim * 4);
+    committed.extend_from_slice(DOM_S2);
+    let mut z = vec![0i32; spec.nn_hidden_dim];
+    for layer in 0..spec.nn_layers {
+        let width = spec.in_dim(layer);
+        for (out, z_out) in z.iter_mut().enumerate().take(spec.nn_hidden_dim) {
+            let mut acc: i64 = weights.bias(spec, layer, out) as i64;
+            for (inp, x_inp) in x.iter().enumerate().take(width) {
+                acc += *x_inp as i64 * weights.weight(spec, layer, out, inp) as i64;
+            }
+            *z_out = fold32(acc);
+        }
+        for value in &z {
+            committed.extend_from_slice(&value.to_le_bytes());
+        }
+        for (o, value) in z.iter().enumerate() {
+            x[o] = (*value >> ACTIVATION_SHIFT).max(0);
+        }
+    }
+    sha256(&[&committed])
+}
+
+/// Which compute substrate grinds a template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendKind {
+    /// [`CpuBackend`]: the reference host implementation.
+    #[default]
+    Cpu,
+    /// [`PortableBackend`]: the independent implementation (and the template
+    /// silicon vendors port to their substrate).
+    Portable,
+}
+
+impl BackendKind {
+    /// `auto` (or unset) means the reference CPU backend. The environment
+    /// override `JNT_MINER_BACKEND=cpu|portable|auto` lets operators pin a
+    /// substrate without rebuilding; unknown values refuse loudly rather than
+    /// silently grinding on the wrong chip.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cpu" => Ok(BackendKind::Cpu),
+            "portable" => Ok(BackendKind::Portable),
+            "auto" | "" => Ok(BackendKind::Cpu),
+            other => Err(Error::BadPuzzleSpec(format!(
+                "unknown backend '{other}' (cpu|portable|auto)"
+            ))),
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        Self::parse(&std::env::var("JNT_MINER_BACKEND").unwrap_or_default())
     }
 }
 
@@ -50,13 +147,13 @@ impl NnBackend for CpuBackend {
 /// batches are refused rather than silently evaluated under one epoch's
 /// weights.
 #[derive(Debug, Clone)]
-pub struct BatchSolver<B: NnBackend = CpuBackend> {
+pub struct BatchSolver<B: ComputeBackend = CpuBackend> {
     spec: PuzzleSpec,
     weights: EpochWeights,
     backend: B,
 }
 
-impl<B: NnBackend> BatchSolver<B> {
+impl<B: ComputeBackend> BatchSolver<B> {
     pub fn with_backend(spec: PuzzleSpec, backend: B) -> Self {
         let weights = EpochWeights::build(&spec, 0);
         BatchSolver {
@@ -103,8 +200,8 @@ impl BatchSolver<CpuBackend> {
 /// Batched grind: same search order and solution as [`crate::solve_header`]
 /// (single thread), but candidates are evaluated `batch` at a time through
 /// [`BatchSolver`]. `batch == 0` means 1 (sequential-equivalent). This is the
-/// entry point a GPU backend accelerates: swap [`CpuBackend`] for the device
-/// backend and the loop above it does not change.
+/// entry point a device backend accelerates: swap [`CpuBackend`] for the
+/// substrate backend and the loop above it does not change.
 pub fn evaluate_batch_sequential(spec: &PuzzleSpec, headers: &[Header]) -> Result<Vec<PuzzleRun>> {
     BatchSolver::new(spec.clone()).evaluate(headers)
 }
@@ -126,6 +223,21 @@ pub fn solve_header_batched(
     threads: usize,
     batch: usize,
     max_attempts: u64,
+) -> Result<Option<crate::MineSolution>> {
+    solve_header_batched_with(template, mode, threads, batch, max_attempts, CpuBackend)
+}
+
+/// Threaded grind over any [`ComputeBackend`]: the same loop as
+/// [`solve_header_batched`], with the stage-2 substrate swapped. A photonic
+/// array, an NPU, a TPU, a domestic accelerator — each plugs in here, and the
+/// differential tests prove the swap changes nothing but speed.
+pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
+    template: &Header,
+    mode: crate::PowMode,
+    threads: usize,
+    batch: usize,
+    max_attempts: u64,
+    backend: B,
 ) -> Result<Option<crate::MineSolution>> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -187,10 +299,13 @@ pub fn solve_header_batched(
             let template = template.clone();
             let mode = mode.clone();
             let spec = spec.clone();
+            let backend = backend.clone();
             s.spawn(move || {
                 let stride = n_threads as u64;
                 let mut extra: u128 = u128::from_le_bytes(template.extra_nonce);
-                let mut batch_solver = spec.clone().map(BatchSolver::new);
+                let mut batch_solver = spec
+                    .clone()
+                    .map(|s| BatchSolver::with_backend(s, backend.clone()));
                 let mut seq_solver = match &mode {
                     crate::PowMode::Hybrid(spec) => Some(PuzzleSolver::new(spec.clone())),
                     crate::PowMode::Hbm(_) => None,
@@ -322,6 +437,79 @@ mod tests {
         for (h, run) in headers.iter().zip(batched.iter()) {
             assert_eq!(*run, run_puzzle(&spec, h));
         }
+    }
+
+    /// The universality test: two independently written implementations plus
+    /// the consensus reference agree on every candidate, across epochs. Any
+    /// future substrate backend (NPU, TPU, photonic, ...) joins this test:
+    /// pass it and you mine the same chain.
+    #[test]
+    fn backends_agree_candidate_for_candidate_across_epochs() {
+        let spec = PuzzleSpec::hybrid_v1();
+        let mut cpu = BatchSolver::new(spec.clone());
+        let mut portable = BatchSolver::with_backend(spec.clone(), PortableBackend);
+        for epoch in [0u32, 1, 7, 255] {
+            let headers: Vec<Header> = (0..32u64)
+                .map(|n| {
+                    let mut h = header_with_nonce(n * 7919);
+                    h.epoch_id = epoch;
+                    h
+                })
+                .collect();
+            let a = cpu.evaluate(&headers).unwrap();
+            let b = portable.evaluate(&headers).unwrap();
+            for ((h, x), y) in headers.iter().zip(a.iter()).zip(b.iter()) {
+                assert_eq!(*x, run_puzzle(&spec, h), "cpu disagrees at epoch {epoch}");
+                assert_eq!(
+                    *y,
+                    run_puzzle(&spec, h),
+                    "portable disagrees at epoch {epoch}"
+                );
+            }
+        }
+        assert_eq!(CpuBackend.name(), "cpu");
+        assert_eq!(PortableBackend.name(), "portable");
+    }
+
+    /// The portable backend grinds the same winning nonce as the reference:
+    /// substrates differ in speed, never in the solution.
+    #[test]
+    fn portable_backend_finds_the_same_solution() {
+        use crate::accel::solve_header_batched_with;
+
+        let template = header_with_nonce(0);
+        let seq = crate::solve_header(
+            &template,
+            PowMode::Hybrid(PuzzleSpec::hybrid_v1()),
+            1,
+            50_000,
+        )
+        .unwrap()
+        .expect("difficulty 1 solves");
+        let port = solve_header_batched_with(
+            &template,
+            PowMode::Hybrid(PuzzleSpec::hybrid_v1()),
+            1,
+            64,
+            50_000,
+            PortableBackend,
+        )
+        .unwrap()
+        .expect("portable must solve too");
+        assert_eq!(port.header.nonce, seq.header.nonce);
+    }
+
+    #[test]
+    fn backend_selection_parses_and_defaults() {
+        assert_eq!(BackendKind::parse("cpu").unwrap(), BackendKind::Cpu);
+        assert_eq!(
+            BackendKind::parse("portable").unwrap(),
+            BackendKind::Portable
+        );
+        assert_eq!(BackendKind::parse("auto").unwrap(), BackendKind::Cpu);
+        assert_eq!(BackendKind::parse("").unwrap(), BackendKind::Cpu);
+        assert_eq!(BackendKind::default(), BackendKind::Cpu);
+        assert!(BackendKind::parse("quantum").is_err());
     }
 
     #[test]

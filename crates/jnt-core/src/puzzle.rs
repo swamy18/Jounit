@@ -24,9 +24,29 @@ use crate::u256::{target_for_difficulty, U256};
 
 /// Bias index space is offset from weight indices so the two never collide.
 const BIAS_INDEX_OFFSET: u32 = 1_000_000;
-/// Post-shift right amount applied before ReLU.
-const ACTIVATION_SHIFT: u32 = 2;
 
+// ---------------------------------------------------------------------------
+// Portable kernel surface: the stable contract third-party compute backends
+// (GPU, NPU, TPU, photonic, domestic accelerators) implement against.
+//
+// Everything here is pure integer arithmetic — there are no floats anywhere
+// in the PoW, so every substrate that implements two's-complement arithmetic
+// and SHA-256 computes bit-identical results. A backend that reproduces these
+// primitives reproduces consensus; the differential tests in `jnt-miner` pin
+// that property by comparing independent implementations candidate for
+// candidate. Changing any of these values is a consensus change (new puzzle
+// id), never a tunable.
+// ---------------------------------------------------------------------------
+
+/// Post-shift right amount applied before ReLU (SPEC.md §5.3).
+pub const ACTIVATION_SHIFT: u32 = 2;
+
+/// Wrap a 64-bit accumulator into a signed 32-bit value, two's complement.
+/// Defined alongside the stages below; listed here as part of the
+/// surface above.
+///
+/// [`PuzzleSpec::in_dim`] is the other half: backends index weights with it.
+///
 /// Discriminates registered puzzle mechanisms (SPEC.md §5 / §M4).
 ///
 /// A `PuzzleSpec` describes either the hybrid hash+NN puzzle (id 1) or the HBM
@@ -95,7 +115,9 @@ impl PuzzleSpec {
         }
     }
 
-    fn in_dim(&self, layer: usize) -> usize {
+    /// Input width of `layer`: the seed for layer 0, the hidden width after.
+    /// Part of the portable kernel surface: backends index weights with this.
+    pub fn in_dim(&self, layer: usize) -> usize {
         if layer == 0 {
             self.nn_input_dim
         } else {
@@ -235,8 +257,11 @@ pub fn bias(spec: &PuzzleSpec, layer: usize, out: usize, epoch_id: u32) -> i32 {
 }
 
 /// Wrap a 64-bit accumulator into a signed 32-bit value, two's complement.
+///
+/// Part of the portable kernel surface (see above): every hardware backend
+/// reimplements exactly this wrap.
 #[inline]
-fn fold32(v: i64) -> i32 {
+pub fn fold32(v: i64) -> i32 {
     let u = (v as u64 & 0xFFFF_FFFF) as u32;
     if u >= 0x8000_0000 {
         (u as i64 - 0x1_0000_0000) as i32

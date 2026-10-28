@@ -6,14 +6,18 @@
 //!
 //! Usage:
 //! ```text
-//! jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N] [--batch N]
+//! jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N] [--batch N] [--backend cpu|portable|auto]
 //! ```
 //!
 //! `--threads 0` (default) means one thread per CPU. `--batch N` evaluates N
 //! candidates per solver step through the batch interface (`accel`); 1 is the
-//! plain sequential path. Blocks are solved at the template's own difficulty;
-//! when the network outruns us the submit is refused as stale and we fetch a
-//! fresh template.
+//! plain sequential path. `--backend` (or `JNT_MINER_BACKEND`) selects the
+//! compute substrate: `cpu` is the reference, `portable` the independent
+//! implementation every substrate backend must match — GPU, NPU, TPU,
+//! photonic and domestic accelerators all plug into the same trait, so the
+//! flag is where a vendor backend gets selected once built. Blocks are solved
+//! at the template's own difficulty; when the network outruns us the submit
+//! is refused as stale and we fetch a fresh template.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -29,7 +33,7 @@ const RETRY_SLEEP: Duration = Duration::from_secs(2);
 
 fn usage() -> ! {
     eprintln!(
-        "usage: jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N] [--batch N]"
+        "usage: jnt-miner --node 127.0.0.1:PORT --miner <20-byte hex> [--threads N] [--batch N] [--backend cpu|portable|auto]"
     );
     std::process::exit(2);
 }
@@ -39,6 +43,7 @@ struct Args {
     miner: String,
     threads: usize,
     batch: usize,
+    backend: jnt_miner::accel::BackendKind,
 }
 
 fn parse_args() -> Args {
@@ -46,6 +51,7 @@ fn parse_args() -> Args {
     let mut miner = None;
     let mut threads = 0usize;
     let mut batch = 1usize;
+    let mut backend_flag = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -63,6 +69,7 @@ fn parse_args() -> Args {
                     usage()
                 })
             }
+            "--backend" => backend_flag = it.next(),
             _ => usage(),
         }
     }
@@ -77,11 +84,30 @@ fn parse_args() -> Args {
         eprintln!("--miner must be a 20-byte hex address");
         usage();
     }
+    // Flag wins over the environment; unset means the environment, unset
+    // means the reference CPU backend.
+    let backend = backend_flag
+        .map(|s| {
+            jnt_miner::accel::BackendKind::parse(&s).unwrap_or_else(|e| {
+                eprintln!("--backend: {e}");
+                usage()
+            })
+        })
+        .or_else(|| {
+            jnt_miner::accel::BackendKind::from_env()
+                .map_err(|e| {
+                    eprintln!("JNT_MINER_BACKEND: {e}");
+                    usage()
+                })
+                .ok()
+        })
+        .unwrap_or_default();
     Args {
         node,
         miner,
         threads,
         batch,
+        backend,
     }
 }
 
@@ -180,15 +206,29 @@ fn mine_once(args: &Args) -> Result<(), String> {
             template.header.puzzle_id
         ));
     }
-    println!("jnt-miner: grinding height {height} at difficulty {difficulty} ...");
     let mode = PowMode::Hybrid(jnt_core::puzzle::PuzzleSpec::hybrid_v1());
-    let Some(sol) = jnt_miner::accel::solve_header_batched(
-        &template.header,
-        mode,
-        args.threads,
-        args.batch,
-        u64::MAX,
-    )
+    let backend_name = match args.backend {
+        jnt_miner::accel::BackendKind::Cpu => "cpu",
+        jnt_miner::accel::BackendKind::Portable => "portable",
+    };
+    println!("jnt-miner: [{backend_name}] grinding height {height} at difficulty {difficulty} ...");
+    let Some(sol) = match args.backend {
+        jnt_miner::accel::BackendKind::Cpu => jnt_miner::accel::solve_header_batched(
+            &template.header,
+            mode,
+            args.threads,
+            args.batch,
+            u64::MAX,
+        ),
+        jnt_miner::accel::BackendKind::Portable => jnt_miner::accel::solve_header_batched_with(
+            &template.header,
+            mode,
+            args.threads,
+            args.batch.max(2),
+            u64::MAX,
+            jnt_miner::accel::PortableBackend,
+        ),
+    }
     .map_err(|e| format!("solver: {e}"))?
     else {
         return Err("nonce space exhausted without a solution".into());
