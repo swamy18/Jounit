@@ -15,6 +15,7 @@ and redistribute — no single person owns it.
 
 - [What this is](#what-this-is)
 - [Quick start](#quick-start)
+- [Mining](#mining)
 - [Supply](#supply)
 - [What the chain is for](#what-the-chain-is-for)
 - [Use cases](#use-cases)
@@ -103,24 +104,6 @@ export JNT_WALLET_PASSPHRASE=change-me
                                   --listen 127.0.0.1:9833
 ```
 
-External miners do not need the node's built-in loop. Serve with `--no-mine`,
-hand out templates over HTTP, and grind them with the standalone miner:
-
-```sh
-# Node side: relay-only, templates on loopback.
-./target/release/jnt-node serve --network testnet --data-dir ./chain \
-  --no-mine --api-listen 127.0.0.1:8080
-
-# Miner side: fetch a template, solve it, submit the block — repeat forever.
-./target/release/jnt-miner --node 127.0.0.1:8080 \
-  --miner <20-byte-hex-address> --threads 0 --backend auto
-```
-
-`jnt-miner` usage: `--threads N` (`0` = one per CPU), `--batch N` (candidates
-per solver step, default 1), `--backend cpu|portable|auto` (or the
-`JNT_MINER_BACKEND` environment variable) to select the compute substrate.
-Measured on a 4-thread CPU: ~114k H/s release against `hybrid-v1`.
-
 `verify` replays the whole chain from genesis and diffs the resulting UTXO set,
 supply, bond ledger and binding-finalized point against stored state. It is the
 check worth running after any change.
@@ -135,6 +118,97 @@ scripts/start-network --nodes 3          # init, serve, wait until all share a t
 scripts/stop-network                     # graceful stop via pid files
 scripts/reset-network                    # stop and delete the data root
 ```
+
+---
+
+## Mining
+
+Three ways to mine, from simplest to pooled. All three produce the same blocks
+and pay the same coinbase — the difference is only where the grinding happens.
+
+**Where the reward goes.** Every block pays its coinbase to one address: the
+node's miner wallet for in-node mining, or the `--miner` address you pass to
+`jnt-miner`. New coins are **immature** first — spendable after 100 blocks on
+mainnet, 10 on testnet/mini — then they are ordinary UTXOs. Check them with
+`jnt-node balance --address <addr>` or `status`.
+
+**Difficulty, honest numbers.** Every profile starts at difficulty 1 (trivially
+mineable — a laptop mines block after block on a fresh chain) and retargets
+every block toward its target spacing (10 minutes mainnet, 1 second
+testnet/mini), at most ±10% per block. As miners join, difficulty rises and the
+same hardware finds fewer blocks. Measured reference: ~114k H/s on 4 CPU
+threads (release build, `hybrid-v1`), so one such machine holds ~10-minute
+blocks alone until difficulty passes ~68M. Launch is CPU-fair by construction;
+difficulty does the hardening, not special hardware.
+
+### Option A — mine inside the node (simplest start)
+
+```sh
+export JNT_WALLET_PASSPHRASE=change-me
+./target/release/jnt-node init --network testnet --data-dir ./chain
+./target/release/jnt-node serve --network testnet --data-dir ./chain \
+  --listen 127.0.0.1:9833
+```
+
+`serve` mines by default into the wallet created by `init`. One command, no
+other software. Good for: first launch, testing, solo mining while the network
+is small.
+
+### Option B — mine with the standalone miner (recommended)
+
+Run the node relay-only and grind on any machine with the `jnt-miner` binary:
+
+```sh
+# 1. Node side: no built-in mining, templates on loopback.
+./target/release/jnt-node serve --network testnet --data-dir ./chain \
+  --no-mine --api-listen 127.0.0.1:8080
+
+# 2. Miner side: fetch a template, solve it, submit the block — repeat forever.
+./target/release/jnt-miner --node 127.0.0.1:8080 \
+  --miner <20-byte-hex-address> --threads 0 --backend auto
+```
+
+How it works: `GET /v1/mine/template?miner=<hex>` returns an unsolved block
+(`block_hex` plus height/difficulty/puzzle_id); the miner grinds `nonce` and
+`extra_nonce` until the proof passes, then `POST /v1/mine/submit
+{"block_hex": ...}` hands it back. The node re-validates everything —
+template, proof, tip, timestamp — so a stale or forged solution is refused,
+never half-applied. Any HTTP client can do this loop; the binary just does it
+well (multithreaded, `--threads N` with `0` = one per CPU, `--batch N` for
+batched solving, automatic retry with backoff).
+
+The `--miner` address need not belong to any wallet on the node — it is just
+where the coinbase pays out.
+
+### Option C — mine through a pool
+
+Pools speak stratum-lite JSON-lines over TCP: `getjob` hands each miner an
+unsolved template, `submit` returns shares. Jobs are single-use, submissions
+are pinned to the job (same transactions, difficulty and history — swapping
+the coinbase invalidates the share), weak proofs count as shares for
+accounting while only full-difficulty proofs go to the chain as blocks.
+Rewards split proportionally to shares minus the pool fee, rounding dust
+carries to the next round instead of leaking to the operator, and every payout
+is recorded before it is paid. Pool accounting never mints: only the consensus
+coinbase creates coins.
+
+### What hardware mines
+
+Anything. The PoW is integer-only — no floats anywhere — so CPU, GPU, NPU,
+TPU, photonic chips and domestic accelerators all compute bit-identical
+results, and the three stages pull in different directions (hash throughput,
+matrix-vector units, memory bandwidth), so no single exotic chip dominates.
+`jnt-miner` exposes one `ComputeBackend` contract with two in-tree backends:
+
+| Flag | Backend | Meaning |
+|---|---|---|
+| `--backend cpu` | `CpuBackend` | Reference implementation. Default. |
+| `--backend portable` | `PortableBackend` | Independently written implementation; differential-tested equal to the reference on every candidate. The template silicon vendors port. |
+| `--backend auto` | — | Same as `cpu` today; picks the best available backend. Also via `JNT_MINER_BACKEND`. |
+
+A new chip joins by implementing the same contract and passing the
+differential test — never by forking consensus. (SPEC §5.3 names the exact
+kernel surface; SPEC §13.1/§19.2 specify the template and pool protocols.)
 
 ---
 
@@ -850,22 +924,9 @@ jnt-node <COMMAND> [OPTIONS]
 ```
 jnt-miner --node 127.0.0.1:PORT --miner <20-byte-hex> [--threads N] [--batch N] [--backend cpu|portable|auto]
 ```
-`--threads 0` means one thread per CPU. `--batch` groups candidates per
-solver step (default 1). `--backend` (or `JNT_MINER_BACKEND`) picks the
-compute substrate: `cpu` reference or `portable` independent implementation —
-GPU, NPU, TPU, photonic and domestic-accelerator ports implement the same
-`ComputeBackend` contract, so a new chip joins by passing the differential
-test, not by forking consensus.
-
-The node side is two REST endpoints (same auth/host limits as the rest of the
-API): `GET /v1/mine/template?miner=<hex>` returns an unsolved block
-(`block_hex` plus height/difficulty/puzzle_id), `POST /v1/mine/submit
-{"block_hex": ...}` hands the solved block to `submit`, which re-validates
-everything including the proof. The binary loops template → solve → submit
-forever. Pool operators get the same flow over stratum-lite JSON-lines
-(`getjob`/`submit`, single-use job ids, coinbase-theft pinning) with PROP
-round accounting: pool fee off the top, proportional split, dust carried
-forward, `mark_paid` recorded — accounting only, never new issuance.
+Full mining guide — three ways to mine, where rewards go, hardware backends,
+pool protocol — is in [Mining](#mining) above; the node endpoints
+(`GET /v1/mine/template`, `POST /v1/mine/submit`) are specified in SPEC §19.2.
 
 ### Agent authority and credit, from the terminal
 
