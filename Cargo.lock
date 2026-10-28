@@ -695,6 +695,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jnt-miner"
+version = "0.1.0"
+dependencies = [
+ "jnt-core",
+]
+
+[[package]]
 name = "jnt-net"
 version = "0.1.0"
 dependencies = [

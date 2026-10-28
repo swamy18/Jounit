@@ -3074,3 +3074,37 @@ fn a_mint_needs_a_trusted_signature_and_can_never_mint_twice() {
     assert_eq!(s, 409, "{body}");
     assert_eq!(body["error"], "attestation_expired");
 }
+
+#[test]
+fn external_miner_template_and_submit_roundtrip() {
+    // Mining-stack seam over the wire: a template for a miner address, then
+    // the solved block back. On a fresh mini chain difficulty is 1, so the
+    // template itself (nonce 0) is already a valid proof — the test pins the
+    // plumbing, while real grinding lives in jnt-miner.
+    let node = start();
+    let miner = wallet(77, "ext-miner");
+    let miner_hex = address_to_hex(&miner.address().unwrap());
+
+    let (s, tpl) = get(&node, &format!("/v1/mine/template?miner={miner_hex}"));
+    assert_eq!(s, 200, "{tpl}");
+    assert_eq!(tpl["height"], 1);
+    assert_eq!(tpl["puzzle_id"], 1);
+    let block_hex = tpl["block_hex"].as_str().expect("template block_hex");
+
+    let (s, out) = post(&node, "/v1/mine/submit", &json!({ "block_hex": block_hex }));
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["height"], 1);
+    assert_eq!(node_height(&node), 1);
+
+    // The same block twice is already-known, not a second confirmation.
+    let (s, _) = post(&node, "/v1/mine/submit", &json!({ "block_hex": block_hex }));
+    assert!(s == 400 || s == 409, "replay must be refused, got {s}");
+
+    // Garbage bytes are a client error, never a panic.
+    let (s, body) = post(&node, "/v1/mine/submit", &json!({ "block_hex": "zz" }));
+    assert_eq!(s, 400, "{body}");
+
+    // A malformed miner address is refused before any template is built.
+    let (s, body) = get(&node, "/v1/mine/template?miner=zz");
+    assert_eq!(s, 400, "{body}");
+}

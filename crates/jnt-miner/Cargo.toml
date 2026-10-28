@@ -1,0 +1,15 @@
+[package]
+publish = false
+name = "jnt-miner"
+description = "Jounit standalone CPU miner: multithreaded nonce grinder over jnt-core block templates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jnt-core.workspace = true
+
+[dev-dependencies]
+jnt-core.workspace = true

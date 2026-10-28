@@ -121,6 +121,7 @@ use std::sync::{Arc, Mutex};
 use tower::Service as _;
 
 use jnt_core::agent::{derive_agent_id, AgentRole};
+use jnt_core::block::Block;
 use jnt_core::chain::Chain;
 use jnt_core::credit::CreditGate;
 use jnt_core::fees;
@@ -1290,6 +1291,74 @@ async fn block_by_hash(State(state): State<ApiState>, Path(hash): Path<String>) 
         Ok(Json(
             json!({ "hash": hash512_to_hex(&hash), "block": value }),
         ))
+    })?
+}
+
+/// External-miner template (mining-stack seam).
+///
+/// Returns an unsolved coinbase-only block paying `miner` at tip height + 1,
+/// built by [`Chain::build_template_with`]: everything is fixed except
+/// `nonce` / `extra_nonce`, which the miner grinds (both commit into the
+/// proof through the serialized header). The template is returned as binary
+/// `block_hex` plus the fields a miner needs without decoding it. Submit the
+/// solved block to `POST /v1/mine/submit`, which re-validates the proof —
+/// the miner is never trusted.
+///
+/// v1 serves coinbase-only templates (no mempool selection); pool
+/// transaction inclusion is the next step, not this route.
+#[derive(Deserialize)]
+struct MineTemplateQuery {
+    miner: String,
+}
+
+async fn mine_template(
+    State(state): State<ApiState>,
+    Query(q): Query<MineTemplateQuery>,
+) -> ApiResult {
+    let miner = decode_address(&q.miner)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    with_shared(&state, |sh| {
+        let template = sh
+            .chain
+            .build_template_with(miner, Vec::new(), now_ms, None)
+            .map_err(|e| bad(format!("template: {e}")))?;
+        Ok(Json(json!({
+            "height": template.header.height,
+            "difficulty": template.header.difficulty.to_string(),
+            "puzzle_id": template.header.puzzle_id,
+            "prev_hash": hash512_to_hex(&template.header.prev_hash),
+            "block_hex": hex::encode(template.serialize()),
+        })))
+    })?
+}
+
+/// Accept a miner-solved block: decode, then `submit`, which re-validates
+/// everything including the proof of work and the claimed difficulty.
+#[derive(Deserialize)]
+struct MineSubmitReq {
+    block_hex: String,
+}
+
+async fn mine_submit(State(state): State<ApiState>, Json(req): Json<MineSubmitReq>) -> ApiResult {
+    let bytes = decode_hex_bytes(&req.block_hex, "block")?;
+    let block = Block::deserialize(&bytes).map_err(|e| bad(format!("block decode: {e}")))?;
+    let want = block.block_hash();
+    with_shared(&state, |sh| match sh.chain.submit(block) {
+        Ok(()) => {
+            let h = sh.chain.height();
+            Ok(Json(json!({
+                "height": h,
+                "hash": hash512_to_hex(&want),
+            })))
+        }
+        Err(e) => Err(fail(
+            StatusCode::BAD_REQUEST,
+            "block_refused",
+            e.to_string(),
+        )),
     })?
 }
 
@@ -3590,6 +3659,8 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/utxo/{address}", get(utxos))
         .route("/v1/block/latest", get(block_latest))
         .route("/v1/block/{hash}", get(block_by_hash))
+        .route("/v1/mine/template", get(mine_template))
+        .route("/v1/mine/submit", post(mine_submit))
         .route("/v1/tx/{hash}", get(tx_lookup))
         .route("/v1/mempool", get(mempool_view))
         .route("/v1/tx/build", post(tx_build))

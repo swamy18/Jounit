@@ -1812,11 +1812,43 @@ impl Chain {
     // Mining
     // -----------------------------------------------------------------
 
+    /// Unsolved block template for external miners (mining-stack seam).
+    ///
+    /// Returns the block `build_block` would mine with `nonce = 0` and a zero
+    /// `extra_nonce`: coinbase, merkle root, difficulty, base fee, timestamp,
+    /// `epoch_id` and `puzzle_id` are all fixed, so the header is fully
+    /// determined except for the two proof fields. An external miner grinds
+    /// `nonce` (u64) and `extra_nonce` ([u8; 16]) — both already commit into
+    /// `stage1_seed` via the serialized header — until `pow_satisfies` holds,
+    /// then hands the solved block to `submit`, which re-validates everything
+    /// including the proof. The template itself is *not* submittable at real
+    /// difficulty (its proof is almost surely invalid); that is expected.
+    ///
+    /// `difficulty_override` is the test/benchmark seam (same meaning as in
+    /// `mine_block_with`); production callers pass `None`.
+    pub fn build_template_with(
+        &mut self,
+        miner_address: crate::hash::Address,
+        body: Vec<Transaction>,
+        now_ms: u64,
+        difficulty_override: Option<u128>,
+    ) -> Result<Block> {
+        self.build_template_inner(
+            miner_address,
+            body,
+            Vec::new(),
+            Vec::new(),
+            None,
+            now_ms,
+            difficulty_override,
+        )
+    }
+
     // Nine parameters: body, L2 trailer, claims and root are independent
     // caller-supplied lists, like `apply_body`'s accumulators. Bundling them
     // would trade one lint for a struct every caller constructs.
     #[allow(clippy::too_many_arguments)]
-    fn build_block(
+    fn build_template_inner(
         &mut self,
         miner_address: crate::hash::Address,
         body: Vec<Transaction>,
@@ -1825,7 +1857,6 @@ impl Chain {
         l2_root: Option<Hash>,
         now_ms: u64,
         difficulty_override: Option<u128>,
-        max_attempts: u64,
     ) -> Result<Block> {
         let parent = self.tip().clone();
         let parent_hash = parent.block_hash();
@@ -1901,7 +1932,7 @@ impl Chain {
         let merkle =
             crate::block::merkle_root_with_l2(&txs, &l2_txs, l2_root.as_ref(), &exit_claims);
 
-        let mut header = Header {
+        let header = Header {
             version: crate::block::BLOCK_VERSION,
             height,
             prev_hash: parent_hash,
@@ -1916,6 +1947,42 @@ impl Chain {
             sig_scheme: crate::hash::SIG_SCHEME_SECP256K1_ECDSA,
         };
 
+        Ok(Block {
+            header,
+            signature: [0u8; 64],
+            signer_pubkey: [0u8; 33],
+            txs,
+            l2_txs,
+            l2_state_root: l2_root,
+            exit_claims,
+        })
+    }
+
+    // Nine parameters: same shape as the template builder above; the attempt
+    // cap is the only addition. Callers that need an unsolved block for an
+    // external miner use `build_template_with` instead.
+    #[allow(clippy::too_many_arguments)]
+    fn build_block(
+        &mut self,
+        miner_address: crate::hash::Address,
+        body: Vec<Transaction>,
+        l2_txs: Vec<crate::l2::L2Transaction>,
+        exit_claims: Vec<ExitClaim>,
+        l2_root: Option<Hash>,
+        now_ms: u64,
+        difficulty_override: Option<u128>,
+        max_attempts: u64,
+    ) -> Result<Block> {
+        let mut template = self.build_template_inner(
+            miner_address,
+            body,
+            l2_txs,
+            exit_claims,
+            l2_root,
+            now_ms,
+            difficulty_override,
+        )?;
+        let mut header = template.header.clone();
         let mut nonce = 0u64;
         // The attempt budget is enforced here, in the loop that actually does
         // the work. It used to be applied only by the second loop in
@@ -1925,32 +1992,12 @@ impl Chain {
         for _ in 0..max_attempts {
             header.nonce = nonce;
             if self.pow_satisfies(&header)? {
-                return Ok(Block {
-                    header,
-                    signature: [0u8; 64],
-                    signer_pubkey: [0u8; 33],
-                    txs,
-                    // Cloned rather than moved: the value is also needed by the
-                    // unmined block below. One clone per *successful* mine, in
-                    // exchange for not threading it through the loop.
-                    l2_txs: l2_txs.clone(),
-                    l2_state_root: l2_root,
-                    exit_claims: exit_claims.clone(),
-                });
+                template.header = header;
+                return Ok(template);
             }
             nonce = nonce.wrapping_add(1);
         }
-        let unmined = Block {
-            header,
-            signature: [0u8; 64],
-            signer_pubkey: [0u8; 33],
-            txs,
-            // Reported through the error's hash, so it must be the block that
-            // would have been produced — L2 payload and claims included.
-            l2_txs,
-            l2_state_root: l2_root,
-            exit_claims,
-        };
+        let unmined = template;
         Err(Error::PowInvalid {
             hash: crate::hash::hash512_to_hex(&unmined.block_hash()),
             difficulty: unmined.header.difficulty,
