@@ -11,7 +11,10 @@ can price or gate access from it.
    assembles the subject's events from node books).
 2. An issuer (marketplace, service, lender) that verified the events signs a
    `PassportBatch` (`POST /v1/reputation/batch`). The node re-verifies every
-   payment and loan source against its own books before storing it;
+   payment and loan source against its own books before storing it — and
+   binds each event to it: the subject must be the payment's agent (or the
+   loan's borrower), the counterparty the other side, and the amounts must
+   match, so real-but-unrelated history cannot inflate anyone's score;
    task/dispute/refund kinds are issuer-attested.
 3. Any service combines live batches into one score + tier
    (`GET /v1/reputation/score/{agent}?role=machine` → `Deny | Throttled |
