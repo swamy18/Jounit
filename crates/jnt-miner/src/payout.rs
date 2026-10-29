@@ -33,13 +33,30 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use jnt_core::error::{Error, Result};
-use jnt_core::hash::Address;
+use jnt_core::hash::{Address, Hash512};
+use jnt_core::ser::{Reader, Writer};
 
 /// Upper bound on the PPLNS window (and hence on the share log): one million
 /// shares ≈ 20 MB of addresses. Windows are derived as twice the expected
 /// shares per block, so an operator whose rounds routinely exceed this should
 /// raise share difficulty, not memory.
 pub const PPLNS_MAX_WINDOW: usize = 1_000_000;
+
+/// How many finalized rounds the ledger keeps in memory. Older rounds are
+/// pruned: the per-miner `pending` balances already carry what is owed, and
+/// an unbounded round history would let a long-lived pool grow without
+/// bound. The prune point is well past any operator reconciliation window.
+pub const MAX_ROUNDS_KEPT: usize = 1024;
+
+/// How many payment receipts the ledger keeps. Receipt ids stay monotonic
+/// across the prune (only the oldest records are dropped), so uniqueness is
+/// never reused.
+pub const MAX_RECEIPTS_KEPT: usize = 10_000;
+
+/// Version byte of the [`RoundTracker`] persistence encoding. A build that
+/// writes a different layout writes a different value, so an old file is
+/// refused by version instead of misread field by field.
+pub const LEDGER_VERSION: u8 = 1;
 
 /// One finalized round: who earned what, deterministically ordered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +71,48 @@ pub struct FinalizedRound {
     pub payouts: Vec<(Address, u64)>,
     /// Flooring remainder carried into the next round's pot.
     pub dust_sat: u64,
+}
+
+/// One recorded on-chain payment: a unique, monotonic `receipt_id`, the
+/// miner, the amount, the latest finalized round at payment time (0 when no
+/// round exists yet), and the settling transaction when the operator binds
+/// one. The `txid` is what reconciles this record against the chain: a
+/// receipt without a bound transaction is "recorded, not yet proven paid",
+/// and `mark_paid_with_txid` is how it becomes proven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentReceipt {
+    pub receipt_id: u64,
+    pub round_id: u64,
+    pub miner: Address,
+    pub amount_sat: u64,
+    pub txid: Option<Hash512>,
+}
+
+fn encode_addr_u64(w: &mut Writer, map: &BTreeMap<Address, u64>) {
+    w.u32le(map.len() as u32);
+    for (addr, v) in map {
+        w.fixed(addr).u64le(*v);
+    }
+}
+
+fn decode_addr_u64(
+    r: &mut Reader<'_>,
+    what: &str,
+    cap: usize,
+) -> std::result::Result<BTreeMap<Address, u64>, String> {
+    let n = r.u32le().map_err(|e| format!("{what}: {e}"))? as usize;
+    if n > cap {
+        return Err(format!("{what}: {n} entries over the {cap} cap"));
+    }
+    let mut map = BTreeMap::new();
+    for _ in 0..n {
+        let addr: Address = r.fixed().map_err(|e| format!("{what}: {e}"))?;
+        let v = r.u64le().map_err(|e| format!("{what}: {e}"))?;
+        if map.insert(addr, v).is_some() {
+            return Err(format!("{what}: duplicate key"));
+        }
+    }
+    Ok(map)
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +130,12 @@ pub struct RoundTracker {
     /// Pool operator's earned fees, separate from miner money.
     operator_earned_sat: u64,
     rounds: Vec<FinalizedRound>,
+    /// Monotonic receipt counter: never reused, never rewound by pruning.
+    next_receipt_id: u64,
+    /// Atomic payout records, oldest-first, capped at [`MAX_RECEIPTS_KEPT`].
+    receipts: VecDeque<PaymentReceipt>,
+    /// Lifetime paid per miner (sums every receipt, pruned or not).
+    paid_total: BTreeMap<Address, u64>,
 }
 
 impl RoundTracker {
@@ -88,6 +153,9 @@ impl RoundTracker {
             carry_sat: 0,
             operator_earned_sat: 0,
             rounds: Vec::new(),
+            next_receipt_id: 1,
+            receipts: VecDeque::new(),
+            paid_total: BTreeMap::new(),
         })
     }
 
@@ -165,19 +233,263 @@ impl RoundTracker {
             dust_sat: self.carry_sat,
         };
         self.rounds.push(round.clone());
+        // Bound the history: pending balances already carry what is owed, so
+        // dropping the oldest finalized records bounds memory without
+        // forgiving any debt. Round ids stay monotonic regardless.
+        while self.rounds.len() > MAX_ROUNDS_KEPT {
+            self.rounds.remove(0);
+        }
         round
     }
 
-    /// Record an on-chain payment of `amount_sat` to `miner` against their
-    /// pending balance. Overpaying (more than pending) is refused: it would
-    /// hide an accounting bug as generosity.
-    pub fn mark_paid(&mut self, miner: &Address, amount_sat: u64) -> Result<()> {
+    /// Record a payment of `amount_sat` to `miner` against their pending
+    /// balance. Overpaying (more than pending) is refused: it would hide an
+    /// accounting bug as generosity. Returns the atomic receipt: its
+    /// `receipt_id` is unique across the ledger's lifetime, and the receipt
+    /// is stored before returning so a crash after this call cannot lose it
+    /// once the operator persists the ledger (see [`Self::save_to_file`]).
+    pub fn mark_paid(&mut self, miner: &Address, amount_sat: u64) -> Result<PaymentReceipt> {
+        self.mark_paid_with_txid(miner, amount_sat, None)
+    }
+
+    /// Like [`Self::mark_paid`], binding the record to the on-chain
+    /// transaction that paid it. Reconciling receipts against the chain is
+    /// how an operator proves "paid": a receipt with `txid: None` is
+    /// recorded intent, one with `Some` names the evidence.
+    pub fn mark_paid_with_txid(
+        &mut self,
+        miner: &Address,
+        amount_sat: u64,
+        txid: Option<Hash512>,
+    ) -> Result<PaymentReceipt> {
         let pending = self.pending.get(miner).copied().unwrap_or(0);
         if amount_sat > pending {
             return Err(Error::Malformed("payout exceeds pending balance"));
         }
         self.pending.insert(*miner, pending - amount_sat);
+        let receipt = PaymentReceipt {
+            receipt_id: self.next_receipt_id,
+            round_id: self.round_id,
+            miner: *miner,
+            amount_sat,
+            txid,
+        };
+        self.next_receipt_id = self.next_receipt_id.wrapping_add(1).max(1);
+        self.receipts.push_back(receipt.clone());
+        while self.receipts.len() > MAX_RECEIPTS_KEPT {
+            self.receipts.pop_front();
+        }
+        *self.paid_total.entry(*miner).or_insert(0) = self
+            .paid_total
+            .get(miner)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(amount_sat);
+        Ok(receipt)
+    }
+
+    /// Kept payment receipts, oldest-first.
+    pub fn receipts(&self) -> impl Iterator<Item = &PaymentReceipt> {
+        self.receipts.iter()
+    }
+
+    /// Lifetime paid to `miner` across all receipts, pruned or not.
+    pub fn paid_total(&self, miner: &Address) -> u64 {
+        self.paid_total.get(miner).copied().unwrap_or(0)
+    }
+
+    /// Encode the whole ledger — shares, balances, carry, rounds, receipts —
+    /// into one versioned blob. A pool restart restores from this instead of
+    /// starting with empty balances: without it, unpaid earnings and share
+    /// history die with the process and `mark_paid` guards a balance that
+    /// no longer exists.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(4096);
+        w.u8(LEDGER_VERSION);
+        w.u32le(self.fee_bps).u64le(self.round_id);
+        w.u32le(self.log.len() as u32);
+        for miner in &self.log {
+            w.fixed(miner);
+        }
+        encode_addr_u64(&mut w, &self.lifetime_shares);
+        encode_addr_u64(&mut w, &self.pending);
+        w.u64le(self.carry_sat).u64le(self.operator_earned_sat);
+        w.u32le(self.rounds.len() as u32);
+        for r in &self.rounds {
+            w.u64le(r.round_id)
+                .u64le(r.block_height)
+                .u64le(r.coinbase_sat)
+                .u64le(r.fee_sat)
+                .u64le(r.window as u64);
+            w.u32le(r.payouts.len() as u32);
+            for (miner, pay) in &r.payouts {
+                w.fixed(miner).u64le(*pay);
+            }
+            w.u64le(r.dust_sat);
+        }
+        w.u64le(self.next_receipt_id);
+        w.u32le(self.receipts.len() as u32);
+        for rc in &self.receipts {
+            w.u64le(rc.receipt_id)
+                .u64le(rc.round_id)
+                .fixed(&rc.miner)
+                .u64le(rc.amount_sat);
+            match &rc.txid {
+                Some(t) => {
+                    w.u8(1).fixed(t);
+                }
+                None => {
+                    w.u8(0);
+                }
+            }
+        }
+        encode_addr_u64(&mut w, &self.paid_total);
+        w.into_vec()
+    }
+
+    /// Inverse of [`Self::encode`]. Every section decodes into locals and
+    /// only commits on full success, so a refused blob never leaves a
+    /// half-loaded ledger. Count guards precede every allocation, so a lying
+    /// length cannot force a huge allocation before the codec trips.
+    pub fn decode(bytes: &[u8]) -> std::result::Result<Self, String> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|e| format!("ledger: {e}"))?;
+        if version != LEDGER_VERSION {
+            return Err(format!(
+                "ledger version {version}, this build reads {LEDGER_VERSION}"
+            ));
+        }
+        let fee_bps = r.u32le().map_err(|e| format!("ledger: {e}"))?;
+        if fee_bps > 10_000 {
+            return Err("ledger: fee exceeds 100%".into());
+        }
+        let round_id = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+        let log_len = r.u32le().map_err(|e| format!("ledger: {e}"))? as usize;
+        if log_len > PPLNS_MAX_WINDOW {
+            return Err(format!("ledger: {log_len} log entries over the cap"));
+        }
+        let mut log = VecDeque::with_capacity(log_len);
+        for _ in 0..log_len {
+            log.push_back(r.fixed::<20>().map_err(|e| format!("ledger: {e}"))?);
+        }
+        let lifetime_shares = decode_addr_u64(&mut r, "lifetime_shares", 1_000_000)?;
+        let pending = decode_addr_u64(&mut r, "pending", 1_000_000)?;
+        let carry_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+        let operator_earned_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+        let rounds_len = r.u32le().map_err(|e| format!("ledger: {e}"))? as usize;
+        if rounds_len > MAX_ROUNDS_KEPT + 1 {
+            return Err(format!("ledger: {rounds_len} rounds over the cap"));
+        }
+        let mut rounds = Vec::with_capacity(rounds_len);
+        for _ in 0..rounds_len {
+            let rid = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let block_height = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let coinbase_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let fee_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let window = r.u64le().map_err(|e| format!("ledger: {e}"))? as usize;
+            if window > PPLNS_MAX_WINDOW {
+                return Err("ledger: round window over the cap".into());
+            }
+            let n = r.u32le().map_err(|e| format!("ledger: {e}"))? as usize;
+            if n > 1_000_000 {
+                return Err("ledger: round payouts over the cap".into());
+            }
+            let mut payouts = Vec::with_capacity(n);
+            for _ in 0..n {
+                let miner: Address = r.fixed().map_err(|e| format!("ledger: {e}"))?;
+                let pay = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+                payouts.push((miner, pay));
+            }
+            let dust_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            rounds.push(FinalizedRound {
+                round_id: rid,
+                block_height,
+                coinbase_sat,
+                fee_sat,
+                window,
+                payouts,
+                dust_sat,
+            });
+        }
+        let next_receipt_id = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+        if next_receipt_id == 0 {
+            return Err("ledger: receipt counter must not be zero".into());
+        }
+        let rc_len = r.u32le().map_err(|e| format!("ledger: {e}"))? as usize;
+        if rc_len > MAX_RECEIPTS_KEPT {
+            return Err(format!("ledger: {rc_len} receipts over the cap"));
+        }
+        let mut receipts = VecDeque::with_capacity(rc_len);
+        for _ in 0..rc_len {
+            let receipt_id = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let round_id = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let miner: Address = r.fixed().map_err(|e| format!("ledger: {e}"))?;
+            let amount_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let has_txid = r.u8().map_err(|e| format!("ledger: {e}"))?;
+            let txid = match has_txid {
+                0 => None,
+                1 => Some(r.fixed::<64>().map_err(|e| format!("ledger: {e}"))?),
+                _ => return Err("ledger: bad txid flag".into()),
+            };
+            receipts.push_back(PaymentReceipt {
+                receipt_id,
+                round_id,
+                miner,
+                amount_sat,
+                txid,
+            });
+        }
+        let paid_total = decode_addr_u64(&mut r, "paid_total", 1_000_000)?;
+        r.expect_end()
+            .map_err(|e| format!("ledger: trailing bytes ({e})"))?;
+        // Receipt ids must be unique and below the counter: a file that pays
+        // the same receipt twice (or rewinds the counter) is corrupt.
+        {
+            let mut last = 0u64;
+            for rc in &receipts {
+                if rc.receipt_id == 0 || rc.receipt_id >= next_receipt_id {
+                    return Err("ledger: receipt id outside the counter range".into());
+                }
+                if rc.receipt_id <= last {
+                    return Err("ledger: receipts out of order".into());
+                }
+                last = rc.receipt_id;
+            }
+        }
+        Ok(RoundTracker {
+            fee_bps,
+            round_id,
+            log,
+            lifetime_shares,
+            pending,
+            carry_sat,
+            operator_earned_sat,
+            rounds,
+            next_receipt_id,
+            receipts,
+            paid_total,
+        })
+    }
+
+    /// Atomically persist the ledger: write to a sibling temp file and
+    /// rename over the target, so a crash mid-write leaves either the old
+    /// file or the new one, never a torn half. Call after every finalized
+    /// round and every payment; the file is the durable payment ledger.
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let bytes = self.encode();
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes).map_err(|_| Error::Malformed("ledger write failed"))?;
+        std::fs::rename(&tmp, path).map_err(|_| Error::Malformed("ledger commit failed"))?;
         Ok(())
+    }
+
+    /// Load a ledger written by [`Self::save_to_file`]. Any failure — missing
+    /// file, bad version, trailing bytes — is a refusal, never a partial
+    /// best effort: the caller must not run payouts on a ledger it cannot
+    /// prove is complete.
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self> {
+        let bytes = std::fs::read(path).map_err(|_| Error::Malformed("ledger read failed"))?;
+        Self::decode(&bytes).map_err(|_| Error::Malformed("ledger decode failed"))
     }
 
     pub fn pending(&self, miner: &Address) -> u64 {
@@ -194,6 +506,13 @@ impl RoundTracker {
 
     pub fn lifetime_shares(&self, miner: &Address) -> u64 {
         self.lifetime_shares.get(miner).copied().unwrap_or(0)
+    }
+
+    /// Whether `miner` already has ledger state (share history or a
+    /// balance). Used by the pool's miner-table bound: only unknown miners
+    /// count against the cap.
+    pub fn is_tracked(&self, miner: &Address) -> bool {
+        self.lifetime_shares.contains_key(miner) || self.pending.contains_key(miner)
     }
 
     pub fn rounds(&self) -> &[FinalizedRound] {
@@ -325,11 +644,110 @@ mod tests {
     fn rounds_are_deterministic_and_ordered() {
         let mut t = RoundTracker::new(0).unwrap();
         // Insert out of order; payouts must still sort by address.
-        t.record_share(&addr(9));
         t.record_share(&addr(1));
+        t.record_share(&addr(9));
         let r = t.finalize_block(100, 100, 1_000_000);
         assert_eq!(r.payouts, vec![(addr(1), 50), (addr(9), 50)]);
         assert_eq!(t.rounds().len(), 1);
         assert_eq!(t.rounds()[0].round_id, 1);
+    }
+
+    #[test]
+    fn receipts_are_unique_monotonic_and_bound_to_txid() {
+        let mut t = RoundTracker::new(0).unwrap();
+        t.record_share(&addr(1));
+        t.finalize_block(100, 100, 1_000_000);
+        let r1 = t.mark_paid(&addr(1), 40).unwrap();
+        let txid = [0xABu8; 64];
+        let r2 = t.mark_paid_with_txid(&addr(1), 60, Some(txid)).unwrap();
+        assert_eq!((r1.receipt_id, r2.receipt_id), (1, 2));
+        assert_eq!(r1.txid, None);
+        assert_eq!(r2.txid, Some(txid));
+        assert_eq!(t.paid_total(&addr(1)), 100);
+        assert_eq!(t.pending(&addr(1)), 0);
+        let ids: Vec<u64> = t.receipts().map(|r| r.receipt_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn finalized_history_is_bounded() {
+        let mut t = RoundTracker::new(0).unwrap();
+        t.record_share(&addr(1));
+        for h in 0..(MAX_ROUNDS_KEPT as u64 + 10) {
+            t.finalize_block(h, 10, 1_000_000);
+        }
+        assert_eq!(t.rounds().len(), MAX_ROUNDS_KEPT);
+        // Ids stay monotonic across the prune: no round is ever renumbered.
+        assert_eq!(
+            t.rounds().last().unwrap().round_id,
+            MAX_ROUNDS_KEPT as u64 + 10
+        );
+        assert_eq!(t.rounds().first().unwrap().round_id, 11);
+    }
+
+    #[test]
+    fn ledger_survives_a_restart_through_encode_decode() {
+        let mut t = RoundTracker::new(250).unwrap();
+        t.record_share(&addr(1));
+        t.record_share(&addr(2));
+        t.finalize_block(100, 101, 1_000_000);
+        let txid = [0xCDu8; 64];
+        let r = t.mark_paid_with_txid(&addr(1), 10, Some(txid)).unwrap();
+        assert_eq!(r.receipt_id, 1);
+        let bytes = t.encode();
+        let u = RoundTracker::decode(&bytes).unwrap();
+        assert_eq!(u.pending(&addr(1)), t.pending(&addr(1)));
+        assert_eq!(u.pending(&addr(2)), t.pending(&addr(2)));
+        assert_eq!(u.carry(), t.carry());
+        assert_eq!(u.operator_earned(), t.operator_earned());
+        assert_eq!(u.rounds(), t.rounds());
+        let receipts: Vec<_> = u.receipts().cloned().collect();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].txid, Some(txid));
+        assert_eq!(u.paid_total(&addr(1)), 10);
+        // The counter survives too: the next receipt is 2, never reused.
+        let mut u = u;
+        u.record_share(&addr(1));
+        u.finalize_block(101, 50, 1_000_000);
+        let r2 = u.mark_paid(&addr(1), 1).unwrap();
+        assert_eq!(r2.receipt_id, 2);
+    }
+
+    #[test]
+    fn ledger_decode_is_fail_closed() {
+        let mut t = RoundTracker::new(0).unwrap();
+        t.record_share(&addr(1));
+        t.finalize_block(100, 50, 1_000_000);
+        let mut bytes = t.encode();
+        // Trailing bytes: refused.
+        bytes.push(0xFF);
+        assert!(RoundTracker::decode(&bytes).is_err());
+        // Bad version: refused, never misread.
+        let mut bad = t.encode();
+        bad[0] = 0x7F;
+        assert!(RoundTracker::decode(&bad).is_err());
+        // Empty: refused.
+        assert!(RoundTracker::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn ledger_save_and_load_is_atomic() {
+        let mut t = RoundTracker::new(100).unwrap();
+        t.record_share(&addr(3));
+        t.finalize_block(7, 90, 1_000_000);
+        t.mark_paid(&addr(3), 5).unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pplns-ledger-test-{}.bin", std::process::id()));
+        t.save_to_file(&path).unwrap();
+        // No temp file lingers after the atomic rename.
+        assert!(!path.with_extension("tmp").exists());
+        let u = RoundTracker::load_from_file(&path).unwrap();
+        assert_eq!(u.pending(&addr(3)), t.pending(&addr(3)));
+        assert_eq!(u.rounds(), t.rounds());
+        assert_eq!(u.paid_total(&addr(3)), 5);
+        std::fs::remove_file(&path).ok();
+        // Missing file is a refusal, not an empty ledger: running payouts on
+        // an unprovable ledger would silently drop debt.
+        assert!(RoundTracker::load_from_file(&path).is_err());
     }
 }

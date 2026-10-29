@@ -71,14 +71,21 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: jnt-node
             miner: jnt-miner
+            # Uniquely named per-platform archive: the linux and macOS jobs
+            # both build files named `jnt-node`/`jnt-miner`, so publishing
+            # bare files collides. One archive per target keeps every
+            # platform's files separate by construction.
+            package: jounit-x86_64-unknown-linux-gnu.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: jnt-node
             miner: jnt-miner
+            package: jounit-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: jnt-node.exe
             miner: jnt-miner.exe
+            package: jounit-x86_64-pc-windows-msvc.zip
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -127,15 +134,36 @@ jobs:
             cosign sign-blob --bundle "$a.sig" --yes "$a"
           done
 
+      # One self-contained archive per platform: binaries, their Sigstore
+      # bundles and the per-platform SHA256SUMS travel together under a
+      # name that is unique across the matrix, so no platform can
+      # overwrite another's files at download or release time.
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          stage="pkg-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "${{ matrix.artifact }}" "${{ matrix.miner }}" SHA256SUMS \
+             "${{ matrix.artifact }}.sig" "${{ matrix.miner }}.sig" "$stage/"
+          if [[ "${{ matrix.package }}" == *.zip ]]; then
+            python3 -c "
+          import zipfile, os
+          stage = os.environ.get('STAGE', '$stage')
+          out = '${{ matrix.package }}'
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+              for f in sorted(os.listdir(stage)):
+                  z.write(os.path.join(stage, f), f)
+          "
+          else
+            tar -czf "${{ matrix.package }}" -C "$stage" .
+          fi
+          ls -la "${{ matrix.package }}"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jnt-node-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/${{ matrix.artifact }}
-            target/${{ matrix.target }}/release/${{ matrix.miner }}
-            target/${{ matrix.target }}/release/SHA256SUMS
-            target/${{ matrix.target }}/release/${{ matrix.artifact }}.sig
-            target/${{ matrix.target }}/release/${{ matrix.miner }}.sig
+          path: target/${{ matrix.target }}/release/${{ matrix.package }}
           if-no-files-found: error
 
   publish:
@@ -150,44 +178,62 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      # No `merge-multiple`: the linux and macOS jobs both produce a file
-      # named `jnt-node` (and each its own SHA256SUMS), so a flat merge
-      # would let one platform silently overwrite the other. Keeping the
-      # per-artifact directories preserves every platform's files.
+      # Archive names are unique per target (`jounit-<target>.tar.gz/.zip`),
+      # so a flat merge is collision-free: each artifact contributes exactly
+      # one distinctly named file.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
+          merge-multiple: true
 
       - name: Assets
         shell: bash
         run: |
+          cd dist
+          # One combined manifest over the archives themselves, generated
+          # only after all platforms are downloaded, so the release carries
+          # a single checksum file covering every platform exactly once.
+          : > SHA256SUMS
+          for a in jounit-*.tar.gz jounit-*.zip; do
+            [ -e "$a" ] || continue
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$a" | sed 's#  *#  #' >> SHA256SUMS
+            else
+              shasum -a 256 "$a" | sed 's#  *#  #' >> SHA256SUMS
+            fi
+          done
+          cat SHA256SUMS
           {
             echo 'Release artifacts are signed keyless with cosign (OIDC identity)'
             echo 'from this GitHub Actions run — no long-lived signing key is stored'
             echo 'in the repository. See docs/mainnet-readiness.md §7.'
             echo
+            echo 'Each platform ships as one archive (binaries + .sig bundles +'
+            echo 'per-platform SHA256SUMS inside):'
+            echo '  jounit-x86_64-unknown-linux-gnu.tar.gz'
+            echo '  jounit-aarch64-apple-darwin.tar.gz'
+            echo '  jounit-x86_64-pc-windows-msvc.zip'
+            echo
             echo 'Verification:'
             echo
-            echo '  1. Fetch the binary and its .sig bundle for your platform from the'
-            echo '     GitHub Release assets (each platform lives in its own'
-            echo '     jnt-node-<target>/ directory).'
-            echo '  2. Verify the SHA-256 checksum inside that directory:'
-            echo '       cd jnt-node-<target> && sha256sum -c SHA256SUMS'
-            echo '  3. Verify the sigstore bundle (cosign 2.x):'
+            echo '  1. Fetch the archive for your platform and unpack it.'
+            echo '  2. Verify the archive checksum:'
+            echo '       sha256sum -c SHA256SUMS   (matching entry)'
+            echo '  3. Inside the unpacked directory, verify the binaries:'
+            echo '       sha256sum -c SHA256SUMS'
+            echo '  4. Verify the sigstore bundles (cosign 2.x):'
             echo '       cosign verify-blob --bundle <binary>.sig <binary>'
             echo
-            echo 'Checksums per platform:'
-            for f in dist/*/SHA256SUMS; do
-              echo
-              echo "## $f"
-              cat "$f"
-            done
-          } > dist/VERIFICATION.txt
+            echo 'Checksums (archives):'
+            cat SHA256SUMS
+          } > VERIFICATION.txt
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
-            dist/**
+            dist/jounit-*.tar.gz
+            dist/jounit-*.zip
+            dist/SHA256SUMS
           fail_on_unmatched_files: true
           body_path: dist/VERIFICATION.txt

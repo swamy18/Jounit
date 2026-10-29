@@ -47,7 +47,7 @@ use jnt_core::hash::Address;
 use jnt_core::hbm_pow::HbmConfig;
 use jnt_core::puzzle::{PuzzleSolver, PuzzleSpec};
 
-use crate::payout::{FinalizedRound, RoundTracker, PPLNS_MAX_WINDOW};
+use crate::payout::{FinalizedRound, PaymentReceipt, RoundTracker, PPLNS_MAX_WINDOW};
 
 /// A job handed to one miner: an unsolved template plus its id.
 #[derive(Debug, Clone)]
@@ -87,10 +87,21 @@ pub struct Pool {
     hbm: Option<HbmConfig>,
 }
 
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pool")
+            .field("share_difficulty", &self.share_difficulty)
+            .field("spec_id", &self.spec.id)
+            .field("has_hbm", &self.hbm.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 struct PoolInner {
     next_job_id: u64,
     jobs: HashMap<u64, Block>,
     stats: HashMap<Address, ShareStats>,
+    max_miners: usize,
     /// Block hashes of accepted solutions, oldest-first. One proof, one
     /// share: without this, a miner hands the same solved header in under two
     /// job ids (the pool serves the same template twice) and gets paid twice
@@ -104,11 +115,78 @@ struct PoolInner {
 /// would need the same 512-bit block hash twice, i.e. the same proof.
 const SEEN_CAP: usize = 4096;
 
+/// Hard ceiling on miners with accounting state. A valid share can add a new
+/// miner address, so without this a flood of unique addresses grows `stats`,
+/// `pending`, `lifetime_shares` and the share log's key space without bound.
+/// Full pools refuse new miners instead of growing: fail closed, not OOM.
+pub const MAX_MINERS: usize = 100_000;
+
+/// Floor for the share bar on Internet-facing pools. Share difficulty 1
+/// means every hash is a payable share — fine for a private test pool, but
+/// an open pool must price shares so that accounting entries cost real work.
+/// `Pool::new` keeps accepting 1 for tests and private pools;
+/// [`Pool::new_with_config`] enforces the configured floor.
+pub const MIN_OPERATIONAL_SHARE_DIFFICULTY: u128 = 1_000;
+
+/// Connection-level DoS posture for [`serve`]. One thread per connection
+/// means threads are the bound, not memory — but only when the count itself
+/// is bounded. These caps shed floods at accept time instead of spawning
+/// without limit.
+#[derive(Debug, Clone, Copy)]
+pub struct ServeLimits {
+    /// Total concurrent connections across all source addresses.
+    pub max_connections: usize,
+    /// Concurrent connections from one IP address.
+    pub max_per_ip: usize,
+    /// Requests (lines) served per connection before it is closed. Bounds
+    /// how much work one connection can ever extract.
+    pub max_lines_per_conn: u64,
+}
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        ServeLimits {
+            max_connections: 512,
+            max_per_ip: 32,
+            max_lines_per_conn: 50_000,
+        }
+    }
+}
+
+/// Pool construction knobs. `Pool::new` uses the permissive defaults
+/// (any non-zero share difficulty, [`MAX_MINERS`] accounting cap);
+/// Internet-facing operators use `new_with_config` with a real share
+/// floor so that each accounting entry costs proven work.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    /// Largest number of miners with accounting state.
+    pub max_miners: usize,
+    /// Minimum accepted `share_difficulty`.
+    pub min_share_difficulty: u128,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig {
+            max_miners: MAX_MINERS,
+            min_share_difficulty: 1,
+        }
+    }
+}
+
 impl Pool {
     /// `share_difficulty` must be non-zero and no harder than any template
     /// the pool will serve (a share can never beat a harder bar it was not
     /// ground against — here the bar only filters, so an unreachable bar
     /// would refuse every share). `fee_bps` is the pool fee in basis points.
+    ///
+    /// Accounting state (per-miner stats, payout balances, round history)
+    /// is bounded: the miner table refuses newcomers past [`MAX_MINERS`],
+    /// the job store evicts past 1024 entries, the duplicate filter holds
+    /// 4096 digests, and finalized rounds/receipts are pruned by the
+    /// payout ledger. The payout ledger itself persists via
+    /// [`Pool::save_state`]/[`Pool::load_state`]: restart without loading
+    /// starts with empty balances, which would silently drop debt.
     pub fn new(
         spec: PuzzleSpec,
         hbm: Option<HbmConfig>,
@@ -117,8 +195,40 @@ impl Pool {
         template_fn: impl Fn() -> Result<Block> + Send + Sync + 'static,
         submit_fn: impl Fn(Block) -> Result<bool> + Send + Sync + 'static,
     ) -> Result<Self> {
+        Self::new_with_config(
+            spec,
+            hbm,
+            share_difficulty,
+            fee_bps,
+            PoolConfig::default(),
+            template_fn,
+            submit_fn,
+        )
+    }
+
+    /// Like [`Pool::new`] with explicit limits. `config.min_share_difficulty`
+    /// refuses unreachable-cheap pools for open operation: a share bar below
+    /// the floor is a configuration error, not a share.
+    pub fn new_with_config(
+        spec: PuzzleSpec,
+        hbm: Option<HbmConfig>,
+        share_difficulty: u128,
+        fee_bps: u32,
+        config: PoolConfig,
+        template_fn: impl Fn() -> Result<Block> + Send + Sync + 'static,
+        submit_fn: impl Fn(Block) -> Result<bool> + Send + Sync + 'static,
+    ) -> Result<Self> {
         if share_difficulty == 0 {
             return Err(Error::InvalidDifficulty(0));
+        }
+        if share_difficulty < config.min_share_difficulty {
+            return Err(Error::BadPuzzleSpec(format!(
+                "share difficulty {share_difficulty} below the pool minimum {}",
+                config.min_share_difficulty
+            )));
+        }
+        if config.max_miners == 0 {
+            return Err(Error::Malformed("pool miner cap must be non-zero"));
         }
         spec.validate()?;
         if let Some(cfg) = &hbm {
@@ -131,6 +241,7 @@ impl Pool {
                 stats: HashMap::new(),
                 seen: HashSet::new(),
                 seen_order: VecDeque::new(),
+                max_miners: config.max_miners,
             }),
             payouts: Mutex::new(RoundTracker::new(fee_bps)?),
             template_fn: Box::new(template_fn),
@@ -202,6 +313,25 @@ impl Pool {
         }
         if block.txs != template.txs {
             return Err(Error::Malformed("share transactions differ from its job"));
+        }
+        // Miner-table bound before any accounting or forwarding: a fresh
+        // address per share would otherwise grow `stats`, the payout
+        // tracker's lifetime map and pending balances without bound. New
+        // miners past the cap are refused up front, so a full pool neither
+        // records debt it cannot track nor forwards work it will not pay.
+        {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| Error::Malformed("pool lock"))?;
+            let payouts = self
+                .payouts
+                .lock()
+                .map_err(|_| Error::Malformed("pool lock"))?;
+            let known = inner.stats.contains_key(&miner) || payouts.is_tracked(&miner);
+            if !known && inner.stats.len() >= inner.max_miners {
+                return Err(Error::Malformed("miner table full"));
+            }
         }
         // The solution identity, computed before the block moves into the
         // submit callback below: one proof, one share (see the duplicate
@@ -338,11 +468,184 @@ impl Pool {
     }
 
     /// Record an on-chain payment to a miner against their pending balance.
-    pub fn mark_paid(&self, miner: &Address, amount_sat: u64) -> Result<()> {
+    /// Returns the atomic receipt (unique id, bound to the latest round).
+    /// Prefer [`Pool::mark_paid_with_txid`] with the settling transaction:
+    /// a receipt that names its txid is provably paid, one without is only
+    /// recorded intent.
+    pub fn mark_paid(&self, miner: &Address, amount_sat: u64) -> Result<PaymentReceipt> {
         self.payouts
             .lock()
             .map_err(|_| Error::Malformed("pool lock"))?
             .mark_paid(miner, amount_sat)
+    }
+
+    /// Like [`Pool::mark_paid`], bound to the on-chain transaction that paid
+    /// it — the evidence that reconciles this record against the chain.
+    pub fn mark_paid_with_txid(
+        &self,
+        miner: &Address,
+        amount_sat: u64,
+        txid: jnt_core::hash::Hash512,
+    ) -> Result<PaymentReceipt> {
+        self.payouts
+            .lock()
+            .map_err(|_| Error::Malformed("pool lock"))?
+            .mark_paid_with_txid(miner, amount_sat, Some(txid))
+    }
+
+    /// Kept payment receipts, oldest-first (capped by the ledger).
+    pub fn receipts(&self) -> Vec<PaymentReceipt> {
+        self.payouts
+            .lock()
+            .map(|p| p.receipts().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Lifetime paid to `miner` across all receipts, pruned or not.
+    pub fn paid_total(&self, miner: &Address) -> u64 {
+        self.payouts
+            .lock()
+            .map(|p| p.paid_total(miner))
+            .unwrap_or(0)
+    }
+
+    /// Number of miners with accounting state.
+    pub fn miner_count(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.stats.len())
+            .unwrap_or(0)
+    }
+
+    /// Encode the pool's accounting state (miner stats, duplicate filter,
+    /// payout ledger) into one versioned blob. The job store is
+    /// deliberately excluded: jobs are single-use live state, and a
+    /// restarted pool reissues them.
+    pub fn encode_state(&self) -> Result<Vec<u8>> {
+        use jnt_core::ser::Writer;
+        let payouts = self
+            .payouts
+            .lock()
+            .map_err(|_| Error::Malformed("pool lock"))?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Malformed("pool lock"))?;
+        let mut w = Writer::with_capacity(4096);
+        w.u8(1);
+        w.u64le(inner.next_job_id);
+        w.u32le(inner.stats.len() as u32);
+        for (miner, s) in inner.stats.iter() {
+            w.fixed(miner).u64le(s.shares).u64le(s.blocks_found);
+        }
+        w.u32le(inner.seen_order.len() as u32);
+        for d in inner.seen_order.iter() {
+            w.fixed(d);
+        }
+        let ledger = payouts.encode();
+        w.u32le(ledger.len() as u32).raw(&ledger);
+        Ok(w.into_vec())
+    }
+
+    /// Inverse of [`Pool::encode_state`]: decodes into locals and commits
+    /// only on full success, so a refused blob never leaves half-loaded
+    /// accounting. Outstanding jobs are left untouched (live single-use
+    /// state the file never contained).
+    pub fn decode_state(&self, bytes: &[u8]) -> Result<()> {
+        use jnt_core::ser::Reader;
+        use std::collections::{HashMap, HashSet};
+        let mut r = Reader::new(bytes);
+        let version = r.u8().map_err(|_| Error::Malformed("pool state version"))?;
+        if version != 1 {
+            return Err(Error::Malformed("pool state version"));
+        }
+        let next_job_id = r.u64le().map_err(|_| Error::Malformed("pool state"))?;
+        if next_job_id == 0 {
+            return Err(Error::Malformed("pool state job counter"));
+        }
+        let n_stats = r.u32le().map_err(|_| Error::Malformed("pool state"))? as usize;
+        if n_stats > MAX_MINERS + 1 {
+            return Err(Error::Malformed("pool state miners over the cap"));
+        }
+        let mut stats = HashMap::with_capacity(n_stats);
+        for _ in 0..n_stats {
+            let miner: Address = r.fixed().map_err(|_| Error::Malformed("pool state"))?;
+            let shares = r.u64le().map_err(|_| Error::Malformed("pool state"))?;
+            let blocks_found = r.u64le().map_err(|_| Error::Malformed("pool state"))?;
+            if stats
+                .insert(
+                    miner,
+                    ShareStats {
+                        shares,
+                        blocks_found,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::Malformed("pool state duplicate miner"));
+            }
+        }
+        let n_seen = r.u32le().map_err(|_| Error::Malformed("pool state"))? as usize;
+        if n_seen > SEEN_CAP {
+            return Err(Error::Malformed("pool state seen over the cap"));
+        }
+        let mut seen = HashSet::with_capacity(n_seen);
+        let mut seen_order = VecDeque::with_capacity(n_seen);
+        for _ in 0..n_seen {
+            let d: jnt_core::hash::Hash512 =
+                r.fixed().map_err(|_| Error::Malformed("pool state"))?;
+            if !seen.insert(d) {
+                return Err(Error::Malformed("pool state duplicate digest"));
+            }
+            seen_order.push_back(d);
+        }
+        let ledger_len = r.u32le().map_err(|_| Error::Malformed("pool state"))? as usize;
+        if ledger_len > 64 * 1024 * 1024 {
+            return Err(Error::Malformed("pool state ledger over the cap"));
+        }
+        let ledger_bytes = r
+            .fixed_slice(ledger_len)
+            .map_err(|_| Error::Malformed("pool state"))?;
+        let ledger =
+            RoundTracker::decode(ledger_bytes).map_err(|_| Error::Malformed("pool ledger"))?;
+        r.expect_end()
+            .map_err(|_| Error::Malformed("pool state trailing"))?;
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| Error::Malformed("pool lock"))?;
+            inner.stats = stats;
+            inner.seen = seen;
+            inner.seen_order = seen_order;
+            inner.next_job_id = next_job_id.max(1);
+        }
+        {
+            let mut payouts = self
+                .payouts
+                .lock()
+                .map_err(|_| Error::Malformed("pool lock"))?;
+            *payouts = ledger;
+        }
+        Ok(())
+    }
+
+    /// Atomically persist accounting state (temp file + rename, so a crash
+    /// leaves the old file or the new one, never a torn half). Call after
+    /// every finalized round and every payment.
+    pub fn save_state(&self, path: &std::path::Path) -> Result<()> {
+        let bytes = self.encode_state()?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes).map_err(|_| Error::Malformed("pool state write"))?;
+        std::fs::rename(&tmp, path).map_err(|_| Error::Malformed("pool state commit"))?;
+        Ok(())
+    }
+
+    /// Load state written by [`Pool::save_state`]. Fail-closed: any error
+    /// refuses without touching live accounting.
+    pub fn load_state(&self, path: &std::path::Path) -> Result<()> {
+        let bytes = std::fs::read(path).map_err(|_| Error::Malformed("pool state read"))?;
+        self.decode_state(&bytes)
     }
 
     /// Check the header's proof against an arbitrary bar by re-running the
@@ -383,17 +686,65 @@ impl Pool {
 /// Each connection is handled on its own thread; a malformed line gets a
 /// `{"accepted":false,"reason":"..."}` reply and the connection continues.
 ///
-/// DoS posture: one thread per connection (a flood holds threads, not pool
-/// state), a 16 MiB line cap (a client that never sends `\n` is dropped, not
-/// buffered forever), and a 60 s read deadline per line. Job memory itself is
-/// capped at 1024 entries in [`Pool::get_job`]. An operator facing the open
-/// internet still wants a firewall in front — this is pool software, not a
-/// hardened edge daemon.
+/// DoS posture: connections are capped ([`ServeLimits`], enforced at accept
+/// time both globally and per source IP, so a flood is shed instead of
+/// spawning threads without limit), each connection serves a bounded number
+/// of requests, and a 16 MiB line cap plus a 60 s read deadline per line
+/// stop slowloris and allocation attacks. Accounting itself is bounded —
+/// the miner table refuses newcomers past [`MAX_MINERS`], the job store
+/// evicts past 1024 entries, and the payout ledger prunes rounds and
+/// receipts. An operator facing the open internet still wants a firewall
+/// in front — this is pool software, not a hardened edge daemon.
 pub fn serve(listener: TcpListener, pool: Arc<Pool>) -> ! {
+    serve_limited(listener, pool, ServeLimits::default())
+}
+
+/// Like [`serve`] with explicit connection limits.
+pub fn serve_limited(listener: TcpListener, pool: Arc<Pool>, limits: ServeLimits) -> ! {
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    let total = Arc::new(Mutex::new(0usize));
+    let per_ip = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+        let admitted = {
+            let mut t = total.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ips = per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let ip_count = peer_ip
+                .map(|ip| ips.get(&ip).copied().unwrap_or(0))
+                .unwrap_or(0);
+            if *t >= limits.max_connections.max(1) || ip_count >= limits.max_per_ip.max(1) {
+                false
+            } else {
+                *t += 1;
+                if let Some(ip) = peer_ip {
+                    ips.insert(ip, ip_count + 1);
+                }
+                true
+            }
+        };
+        if !admitted {
+            drop(stream);
+            continue;
+        }
         let pool = pool.clone();
-        std::thread::spawn(move || handle_conn(stream, &pool));
+        let total = total.clone();
+        let per_ip = per_ip.clone();
+        std::thread::spawn(move || {
+            handle_conn(stream, &pool, limits.max_lines_per_conn);
+            let mut t = total.lock().unwrap_or_else(|e| e.into_inner());
+            *t = t.saturating_sub(1);
+            if let Some(ip) = peer_ip {
+                let mut ips = per_ip.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(c) = ips.get_mut(&ip) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        ips.remove(&ip);
+                    }
+                }
+            }
+        });
     }
     unreachable!("listener.incoming never returns None");
 }
@@ -409,7 +760,7 @@ fn reply(stream: &mut TcpStream, value: serde_json::Value) {
     let _ = stream.write_all(line.as_bytes());
 }
 
-fn handle_conn(stream: TcpStream, pool: &Pool) {
+fn handle_conn(stream: TcpStream, pool: &Pool, max_lines: u64) {
     // Slowloris guard: a peer that never finishes a line holds one handler
     // thread, never pool memory — the read deadline below drops it.
     if stream
@@ -424,7 +775,14 @@ fn handle_conn(stream: TcpStream, pool: &Pool) {
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
     let mut line = String::new();
+    let mut served: u64 = 0;
     loop {
+        // Bound the work one connection can ever extract: even a
+        // well-formed chatterbox eventually reconnects.
+        if served >= max_lines.max(1) {
+            return;
+        }
+        served += 1;
         line.clear();
         // Line cap: block_hex rides inside one JSON line, and a valid v1
         // template is kilobytes — anything past 16 MiB without a newline is
@@ -861,5 +1219,136 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         let out: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(out["accepted"], false);
+    }
+
+    fn capped_pool(max_miners: usize) -> (Pool, Address) {
+        let miner = [7u8; 20];
+        let chain = Arc::new(Mutex::new(Chain::new(NetworkParams::mini()).unwrap()));
+        let pool = Pool::new_with_config(
+            PuzzleSpec::hybrid_v1(),
+            None,
+            1,
+            0,
+            PoolConfig {
+                max_miners,
+                min_share_difficulty: 1,
+            },
+            {
+                let chain = chain.clone();
+                move || {
+                    chain.lock().unwrap().build_template_with(
+                        miner,
+                        vec![],
+                        1_767_225_601_000,
+                        Some(1),
+                    )
+                }
+            },
+            |_| Ok(true),
+        )
+        .unwrap();
+        (pool, miner)
+    }
+
+    #[test]
+    fn share_floor_below_minimum_is_a_config_error() {
+        let chain = Arc::new(Mutex::new(Chain::new(NetworkParams::mini()).unwrap()));
+        let err = Pool::new_with_config(
+            PuzzleSpec::hybrid_v1(),
+            None,
+            1,
+            0,
+            PoolConfig {
+                max_miners: MAX_MINERS,
+                min_share_difficulty: MIN_OPERATIONAL_SHARE_DIFFICULTY,
+            },
+            {
+                let chain = chain.clone();
+                move || {
+                    chain.lock().unwrap().build_template_with(
+                        [7u8; 20],
+                        vec![],
+                        1_767_225_601_000,
+                        Some(1),
+                    )
+                }
+            },
+            |_| Ok(true),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::BadPuzzleSpec(_)));
+    }
+
+    #[test]
+    fn full_miner_table_refuses_newcomers_but_keeps_regulars() {
+        // Attack: a fresh address per share would grow accounting without
+        // bound. Past the cap, unknown miners are refused before anything
+        // is recorded or forwarded, while known miners keep working.
+        let (pool, miner) = capped_pool(1);
+        let job_a = pool.get_job().unwrap();
+        pool.submit_job(job_a.job_id, miner, job_a.block).unwrap();
+        assert_eq!(pool.miner_count(), 1);
+
+        let newcomer = [9u8; 20];
+        let job_b = pool.get_job().unwrap();
+        // A distinct proof (nonce 1 also solves at difficulty 1) from a
+        // fresh address: refused as full, not counted, not forwarded.
+        let mut other = job_b.block.clone();
+        other.header.nonce = 1;
+        let err = pool.submit_job(job_b.job_id, newcomer, other).unwrap_err();
+        assert_eq!(err, Error::Malformed("miner table full"));
+        assert_eq!(pool.stats_for(&newcomer).shares, 0);
+        assert_eq!(pool.pending_payout(&newcomer), 0);
+
+        // The regular's next share still works (fresh nonce: the pool
+        // serves the same template twice, and replaying the first proof
+        // would be a duplicate, not a second share).
+        let job_c = pool.get_job().unwrap();
+        let mut again = job_c.block.clone();
+        again.header.nonce = 2;
+        pool.submit_job(job_c.job_id, miner, again).unwrap();
+        assert_eq!(pool.stats_for(&miner).shares, 2);
+    }
+
+    #[test]
+    fn pool_state_survives_a_restart() {
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let (pool, miner) = test_pool(1, submitted.clone());
+        let job = pool.get_job().unwrap();
+        let coinbase: u64 = job.block.txs[0].outputs[0].value;
+        pool.submit_job(job.job_id, miner, job.block).unwrap();
+        let txid = [0xEEu8; 64];
+        let r = pool.mark_paid_with_txid(&miner, 10, txid).unwrap();
+        assert_eq!(r.receipt_id, 1);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pool-state-test-{}.bin", std::process::id()));
+        pool.save_state(&path).unwrap();
+        assert!(!path.with_extension("tmp").exists());
+
+        // A fresh pool with no template/submit history loads the accounting.
+        let (fresh, _) = test_pool(1, Arc::new(Mutex::new(Vec::new())));
+        fresh.load_state(&path).unwrap();
+        assert_eq!(fresh.pending_payout(&miner), coinbase - 10);
+        assert_eq!(fresh.paid_total(&miner), 10);
+        assert_eq!(fresh.stats_for(&miner).shares, 1);
+        let receipts = fresh.receipts();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].txid, Some(txid));
+        // The receipt counter survives: no id is ever reused.
+        let r2 = fresh.mark_paid(&miner, 1).unwrap();
+        assert_eq!(r2.receipt_id, 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pool_state_decode_is_fail_closed() {
+        let (pool, _) = test_pool(1, Arc::new(Mutex::new(Vec::new())));
+        assert!(pool.decode_state(&[]).is_err());
+        let mut bytes = pool.encode_state().unwrap();
+        bytes.push(0xFF);
+        // Live accounting untouched by the refusal.
+        assert!(pool.decode_state(&bytes).is_err());
+        assert_eq!(pool.miner_count(), 0);
     }
 }

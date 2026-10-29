@@ -69,8 +69,8 @@ fn mine_to(chain: &mut Chain, to: Address, target: u64) {
     }
 }
 
-fn rich_chain() -> (Chain, Wallet, Vec<OutPoint>) {
-    let mut chain = Chain::new(NetworkParams::mini()).unwrap();
+fn rich_chain_with(params: NetworkParams) -> (Chain, Wallet, Vec<OutPoint>) {
+    let mut chain = Chain::new(params).unwrap();
     let w = wallet(1);
     let addr = w.address().unwrap();
     mine(&mut chain, addr, 80);
@@ -82,6 +82,10 @@ fn rich_chain() -> (Chain, Wallet, Vec<OutPoint>) {
         });
     }
     (chain, w, ops)
+}
+
+fn rich_chain() -> (Chain, Wallet, Vec<OutPoint>) {
+    rich_chain_with(NetworkParams::mini())
 }
 
 fn fee_for(chain: &Chain, n_in: usize, n_out: usize) -> u64 {
@@ -408,5 +412,199 @@ fn reorg_across_a_seed_height_rolls_the_committee_back() {
     let fresh_a = canonical_checkpoint(&chain, &sk_a, 110);
     chain.apply_checkpoint(&fresh_a, &RealBls).unwrap();
 
+    chain.verify_canonical_chain().unwrap();
+}
+
+/// Two seed heights crossed by one reorg: bonds effective at epochs 12 and
+/// 14 both roll back when a bond-less rival takes the lead, and both return
+/// exactly when the bonded branch retakes it. The committee after each leg
+/// equals the winning branch's seed state — never a mix of both.
+///
+/// Needs `finality_depth = 200`: the reorg spans ~70 blocks, so a stock
+/// depth would finalize the fork point and refuse the very reorg under
+/// test. The depth only moves the finality gate, not the committee rule.
+#[test]
+fn reorg_across_two_seed_heights_rolls_back_twice() {
+    let mut p = NetworkParams::mini();
+    p.finality_depth = 200;
+    let (mut chain, w, ops) = rich_chain_with(p.clone());
+    let bonder = w.address().unwrap();
+
+    let (sk_a, pk_a) = bls_pair(7);
+    let bond_a = bond_tx(&chain, &w, &ops[..66], &sk_a, BOND_A);
+    submit_block(&mut chain, bonder, vec![bond_a]).unwrap();
+    mine_to(&mut chain, bonder, 110);
+    assert_eq!(chain.committee_keys(), vec![pk_a]);
+
+    // Bond B lands at 111: epoch 12 (seed 100) still names only A, epoch
+    // 14 (seed 120, taken after B) names both.
+    let (sk_b, pk_b) = bls_pair(8);
+    let bond_b = bond_tx(&chain, &w, &ops[66..68], &sk_b, BOND_B);
+    submit_block(&mut chain, bonder, vec![bond_b]).unwrap();
+    mine_to(&mut chain, bonder, 145);
+    let both = sorted(vec![pk_a, pk_b]);
+    assert_eq!(chain.committee_keys(), both);
+    let set12: Vec<BlsPublicKey> = chain
+        .historical_epoch_set(12)
+        .unwrap()
+        .validators
+        .iter()
+        .map(|v| v.bls_pk)
+        .collect();
+    assert_eq!(set12, vec![pk_a]);
+    let set14: Vec<BlsPublicKey> = chain
+        .historical_epoch_set(14)
+        .unwrap()
+        .validators
+        .iter()
+        .map(|v| v.bls_pk)
+        .collect();
+    assert_eq!(set14, both);
+
+    // The bonded branch aside; a bond-less rival forking at 80 outworks it.
+    let mut fork = chain.clone();
+    let mut rival = Chain::new(p.clone()).unwrap();
+    for h in 1..=80u64 {
+        let b = rival.mine_block(bonder, vec![], ts(h)).unwrap();
+        rival.submit(b).unwrap();
+    }
+    assert_eq!(
+        rival.block_at(80).unwrap().block_hash(),
+        chain.block_at(80).unwrap().block_hash()
+    );
+    for h in 81..=150u64 {
+        let b = rival.mine_block(bonder, vec![], ts(h)).unwrap();
+        rival.submit(b).unwrap();
+    }
+    for h in 81..=150u64 {
+        let b = rival.block_at(h).unwrap().clone();
+        chain.submit(b).unwrap();
+    }
+    assert_eq!(chain.height(), 150);
+    assert_eq!(chain.bonds().len(), 0);
+    assert_eq!(chain.committee_keys(), rival.committee_keys());
+    assert_ne!(chain.committee_keys(), both);
+    // The losing branch's seed states are gone with it, not merged.
+    for epoch in [12u64, 14] {
+        let keys: Vec<BlsPublicKey> = chain
+            .historical_epoch_set(epoch)
+            .map(|s| s.validators.iter().map(|v| v.bls_pk).collect())
+            .unwrap_or_default();
+        assert!(
+            !keys.contains(&pk_a),
+            "epoch {epoch} must not name A after the reorg"
+        );
+        assert!(
+            !keys.contains(&pk_b),
+            "epoch {epoch} must not name B after the reorg"
+        );
+    }
+
+    // The bonded branch retakes the lead: both committees restore exactly.
+    for h in 146..=151u64 {
+        let b = fork.mine_block(bonder, vec![], ts(h)).unwrap();
+        fork.submit(b).unwrap();
+    }
+    for h in 146..=151u64 {
+        let b = fork.block_at(h).unwrap().clone();
+        chain.submit(b).unwrap();
+    }
+    assert_eq!(chain.height(), 151);
+    assert_eq!(chain.bonds().len(), 2);
+    assert_eq!(chain.committee_keys(), both);
+    let set12_back: Vec<BlsPublicKey> = chain
+        .historical_epoch_set(12)
+        .unwrap()
+        .validators
+        .iter()
+        .map(|v| v.bls_pk)
+        .collect();
+    assert_eq!(set12_back, vec![pk_a]);
+    let set14_back: Vec<BlsPublicKey> = chain
+        .historical_epoch_set(14)
+        .unwrap()
+        .validators
+        .iter()
+        .map(|v| v.bls_pk)
+        .collect();
+    assert_eq!(set14_back, both);
+
+    chain.verify_canonical_chain().unwrap();
+}
+
+/// Restart and independent sync: a chain rebuilt block-by-block from a
+/// peer's blocks reaches the identical tip and committee, and a stale
+/// single-signer certificate from the pre-rotation committee is refused on
+/// both — while a certificate from the current committee is accepted on
+/// both. Two nodes syncing the same blocks never disagree.
+#[test]
+fn rebuilt_chain_agrees_and_refuses_stale_certs() {
+    let (mut chain, w, ops) = rich_chain();
+    let bonder = w.address().unwrap();
+    let (sk_a, pk_a) = bls_pair(7);
+    let bond_a = bond_tx(&chain, &w, &ops[..66], &sk_a, BOND_A);
+    submit_block(&mut chain, bonder, vec![bond_a]).unwrap();
+    mine_to(&mut chain, bonder, 110);
+    let (sk_b, pk_b) = bls_pair(8);
+    let bond_b = bond_tx(&chain, &w, &ops[66..68], &sk_b, BOND_B);
+    submit_block(&mut chain, bonder, vec![bond_b]).unwrap();
+    mine_to(&mut chain, bonder, 140);
+    let both = sorted(vec![pk_a, pk_b]);
+    assert_eq!(chain.committee_keys(), both);
+
+    // Restart proxy: a clone carries the identical tip and committee.
+    let restarted = chain.clone();
+    assert_eq!(restarted.tip_hash(), chain.tip_hash());
+    assert_eq!(restarted.committee_keys(), chain.committee_keys());
+
+    // Independent sync: fresh chain, same blocks in order.
+    let mut peer = Chain::new(NetworkParams::mini()).unwrap();
+    for h in 1..=140u64 {
+        peer.submit(chain.block_at(h).unwrap().clone()).unwrap();
+    }
+    assert_eq!(peer.tip_hash(), chain.tip_hash());
+    assert_eq!(peer.committee_keys(), both);
+
+    // Stale: an epoch-11 certificate by A alone (valid before B bonded)
+    // is refused under the [A, B] committee on both chains.
+    let stale = canonical_checkpoint(&chain, &sk_a, 115);
+    assert!(chain.apply_checkpoint(&stale, &RealBls).is_err());
+    assert!(peer.apply_checkpoint(&stale, &RealBls).is_err());
+
+    // Current: A+B jointly sign the tip; accepted on both, same finality.
+    let committee = chain.committee_keys();
+    let payload = CheckpointPayload {
+        height: 140,
+        block_hash: chain.block_at(140).unwrap().block_hash(),
+        network_id: chain.params().network_id.clone(),
+        epoch: epoch_at(&chain, 140),
+    };
+    let msg = payload.signing_hash();
+    let mut sigs = Vec::new();
+    for pk in &committee {
+        let sk = if *pk == pk_a {
+            &sk_a
+        } else {
+            assert_eq!(*pk, pk_b);
+            &sk_b
+        };
+        sigs.push(sk.sign(&msg));
+    }
+    let joint = Checkpoint {
+        payload,
+        aggregate_sig: RealBls::aggregate(&sigs).unwrap(),
+        // One bit per signer over the sorted committee: both of two.
+        signer_bitmap: vec![0b11u8],
+        signer_count: committee.len() as u32,
+        pq_sidecar: Vec::new(),
+    };
+    chain.apply_checkpoint(&joint, &RealBls).unwrap();
+    peer.apply_checkpoint(&joint, &RealBls).unwrap();
+    assert_eq!(
+        peer.finality().accepted_height(),
+        chain.finality().accepted_height()
+    );
+
+    peer.verify_canonical_chain().unwrap();
     chain.verify_canonical_chain().unwrap();
 }
