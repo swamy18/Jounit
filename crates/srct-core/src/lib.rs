@@ -62,8 +62,14 @@ pub mod supply;
 pub mod tx;
 pub mod u256;
 pub mod validators;
+pub mod jobs;
+pub mod lending;
 pub mod micro;
+pub mod passport;
+pub mod ramp;
+pub mod fx;
 pub mod safety;
+pub mod tiers;
 pub mod wallet;
 pub mod x402;
 

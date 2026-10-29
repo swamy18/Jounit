@@ -607,6 +607,13 @@ impl CreditBook {
         self.positions.iter().filter(|(_, p)| !p.is_terminal())
     }
 
+    /// Every position, live and terminal, in id order. Read-only views
+    /// (repayment history, lender dashboards) iterate here; nothing here
+    /// changes a position.
+    pub fn positions(&self) -> impl Iterator<Item = (&Hash, &CreditPosition)> {
+        self.positions.iter()
+    }
+
     /// Repay against a position.
     ///
     /// The payment comes from the borrower's free balance and lands with the

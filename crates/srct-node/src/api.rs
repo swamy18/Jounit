@@ -62,10 +62,37 @@
 //! POST /v1/streams/open        open a pay-as-you-use stream channel
 //! POST /v1/streams/settle      accept one stream voucher receipt
 //! GET  /v1/streams/{id}        stream accounting + claimable at this height
-//! GET  /v1/payments/unsettled  recorded payments with no settlement bound
-//! GET  /v1/receipts/orphans    receipts claiming unrecorded payments
-//! GET  /v1/audit               tamper-evident audit ring + chain check
-//! GET  /v1/risk/policy         safety knobs: thresholds, velocity, test mode
+//! GET /v1/payments/unsettled  recorded payments with no settlement bound
+//! GET /v1/receipts/orphans    receipts claiming unrecorded payments
+//! GET /v1/audit               tamper-evident audit ring + chain check
+//! GET /v1/risk/policy         safety knobs: thresholds, velocity, test mode
+//! POST /v1/reputation/passport/attest  assemble verifiable history events
+//! POST /v1/reputation/batch   register an issuer-signed passport batch
+//! GET /v1/reputation/score/{agent}     combined score + access tier
+//! POST /v1/wallet/tier        validate + register a max/min-spend tier
+//! GET /v1/wallet/tiers/{agent} tiers under an agent id
+//! POST /v1/jobs/open          hirer locks escrow + posts an agent job
+//! POST /v1/jobs/{id}/accept|deliver|dispute|resolve  job lifecycle
+//! GET /v1/jobs/{id}           job record + escrow state + hold flag
+//! GET /v1/payments/{id}/receipt_status  recorded/receipt/settlement state
+//! POST /v1/fx/rates           register an operator-signed USD rate
+//! GET /v1/fx/rates/list       live rates at this height
+//! POST /v1/fx/quote           lock a dollar price into exact satoshis
+//! POST /v1/fx/swap            record a stablecoin-in SRCT settlement
+//! POST /v1/ramp/quote         register a provider-signed ramp quote
+//! GET /v1/ramp/quotes         live entry/exit quotes
+//! POST /v1/ramp/intent        accept a quote; provider fills out of band
+//! POST /v1/ramp/intent/{id}/settle  provider closes filled/refunded
+//! GET /v1/ramp/intents        registry trail for entry and exit
+//! POST /v1/loans/offers       lender publishes signed standard terms
+//! GET /v1/loans/offers/list   discover live offers, cheapest first
+//! POST /v1/loans/accept       open a position on signed offer terms
+//! GET /v1/lending/borrower/{a} verified history + suggested ceiling
+//! GET /v1/lending/dashboard   exposure, due-soon, defaults, interest
+//! GET /v1/lending/limit/{b}   suggested ceiling + loss-bearing rule
+//! GET /v1/lending/collateral/{p} live collateral vs debt valuation
+//! POST /v1/lending/autorepay  register standing auto-repay instruction
+//! GET /v1/lending/autorepay/{b} the live instruction, if any
 //! GET  /v1/exit/crankable      the exit claims this node could settle now
 //! POST /v1/escrow/open         open a conditional escrow with a chosen arbitrator
 //! POST /v1/escrow/{id}/release arbiter- or mutual-release a live escrow (non-consensus)
@@ -162,11 +189,15 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// a different value, so an old file is refused by name instead of misread
 /// field by field.
 ///
-/// Version 5 adds the stream opens/settlement accounting and the session
-/// budgets (micro-payment channels + wallet safety). The audit ring is
-/// intentionally not persisted: it restarts empty, full history stays in the
-/// payment/receipt stores.
-const STATE_ENVELOPE_VERSION: u8 = 5;
+/// Version 6 adds the agent-economy books: disputed-escrow holds, job
+/// records, passport batches, FX rates, ramp quotes/intents, loan offers and
+/// standing auto-repay instructions. The audit ring is intentionally not
+/// persisted: it restarts empty, full history stays in the payment/receipt
+/// stores.
+///
+/// Version 5 added the stream opens/settlement accounting and the session
+/// budgets (micro-payment channels + wallet safety).
+const STATE_ENVELOPE_VERSION: u8 = 6;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -213,6 +244,23 @@ fn encode_state_map<T>(map: &BTreeMap<Hash, T>, enc: impl Fn(&T) -> Vec<u8>) -> 
         w.u32le(bytes.len() as u32).raw(&bytes);
     }
     w.into_vec()
+}
+
+/// Encode a signature/key bundle length-prefixed.
+fn put_bundle(w: &mut Writer, b: &srct_core::sig::Bundle) {
+    let bytes = b.to_bytes();
+    w.u32le(bytes.len() as u32).raw(&bytes);
+}
+
+/// Decode a length-prefixed bundle, bounded like every other section.
+fn get_bundle(r: &mut Reader<'_>, what: &str) -> Result<srct_core::sig::Bundle, String> {
+    let len = r.u32le().map_err(|e| format!("{what}: {e}"))? as usize;
+    if len > 8 * 1024 {
+        return Err(format!("{what}: bundle over the 8 KiB cap"));
+    }
+    let bytes = r.fixed_slice(len).map_err(|e| format!("{what}: {e}"))?;
+    let mut br = Reader::new(bytes);
+    srct_core::sig::Bundle::from_reader(&mut br).map_err(|e| format!("{what}: {e}"))
 }
 
 /// Inverse of [`encode_state_map`]: bounded count, no duplicate keys, every
@@ -377,6 +425,32 @@ pub struct SharedNode {
     /// A policy rotation starts a fresh policy window by design; the session
     /// book is what stops spend being split across N policies.
     pub sessions: srct_core::safety::SessionBook,
+    /// Escrow ids under dispute: release, settlement and auto-refund are all
+    /// refused while an id is held. Funds stay locked until resolve.
+    pub held_escrows: BTreeSet<Hash>,
+    /// Agent-to-agent job records by job id.
+    pub jobs: BTreeMap<Hash, srct_core::jobs::JobRecord>,
+    /// Issuer-signed reputation passport batches by batch id.
+    pub passport_batches: BTreeMap<Hash, srct_core::passport::PassportBatch>,
+    /// Live FX rates by base asset (e.g. "USDC"), from trusted issuers.
+    pub fx_rates: BTreeMap<String, srct_core::fx::FxRate>,
+    /// Provider-signed ramp quotes by quote id.
+    pub ramp_quotes:
+        BTreeMap<Hash, (srct_core::ramp::RampQuote, srct_core::sig::Bundle, srct_core::sig::Bundle)>,
+    /// Ramp intents by intent id.
+    pub ramp_intents: BTreeMap<Hash, srct_core::ramp::RampIntent>,
+    /// Lender-signed standard loan offers by offer id.
+    pub loan_offers:
+        BTreeMap<Hash, (srct_core::lending::LoanOffer, srct_core::sig::Bundle, srct_core::sig::Bundle)>,
+    /// One live standing auto-repay instruction per borrower.
+    pub standing_repay: BTreeMap<
+        Address,
+        (
+            srct_core::lending::StandingRepay,
+            srct_core::sig::Bundle,
+            srct_core::sig::Bundle,
+        ),
+    >,
     /// Bounded in-memory audit ring (hash-chained, tamper-evident). The full
     /// history lives in the payment/receipt stores this ring references;
     /// intentionally not persisted, so a restart starts a fresh chain.
@@ -435,6 +509,14 @@ impl SharedNode {
             stream_store: BTreeMap::new(),
             streams: srct_core::stream::StreamBook::default(),
             sessions: srct_core::safety::SessionBook::default(),
+            held_escrows: BTreeSet::new(),
+            jobs: BTreeMap::new(),
+            passport_batches: BTreeMap::new(),
+            fx_rates: BTreeMap::new(),
+            ramp_quotes: BTreeMap::new(),
+            ramp_intents: BTreeMap::new(),
+            loan_offers: BTreeMap::new(),
+            standing_repay: BTreeMap::new(),
             audit: srct_core::safety::AuditLog::default(),
             escrows: BTreeMap::new(),
             escrow_exit: BTreeMap::new(),
@@ -543,6 +625,123 @@ impl SharedNode {
                 .u64le(st.total_spent_sat);
         }
         put_section(&mut w, &sessions.into_vec());
+        // Agent economy (v6): dispute holds, jobs, passports, FX, ramps,
+        // loan offers, standing auto-repay. All node-local books.
+        let mut held = Writer::with_capacity(4 + self.held_escrows.len() * 32);
+        held.u32le(self.held_escrows.len() as u32);
+        for id in &self.held_escrows {
+            held.fixed(id);
+        }
+        put_section(&mut w, &held.into_vec());
+        put_section(
+            &mut w,
+            &encode_state_map(&self.jobs, |j| {
+                let mut jw = Writer::with_capacity(256);
+                jw.u32le(j.network_id.len() as u32).raw(j.network_id.as_bytes());
+                jw.fixed(&j.hirer).fixed(&j.worker).fixed(&j.arbitrator.0);
+                jw.fixed(&j.service_id).u64le(j.amount_sat);
+                match j.result_hash {
+                    Some(h) => {
+                        jw.u8(1).fixed(&h);
+                    }
+                    None => {
+                        jw.u8(0);
+                    }
+                }
+                jw.u64le(j.deadline_height);
+                match j.escrow_id {
+                    Some(e) => {
+                        jw.u8(1).fixed(&e);
+                    }
+                    None => {
+                        jw.u8(0);
+                    }
+                }
+                jw.u8(j.state.as_u8());
+                jw.into_vec()
+            }),
+        );
+        put_section(
+            &mut w,
+            &encode_state_map(&self.passport_batches, |b| {
+                let mut bw = Writer::with_capacity(256 + b.events.len() * 80);
+                bw.u32le(b.network_id.len() as u32).raw(b.network_id.as_bytes());
+                bw.fixed(&b.subject);
+                bw.u32le(b.events.len() as u32);
+                for e in &b.events {
+                    bw.u8(e.kind.as_u8()).u64le(e.height).fixed(&e.source);
+                    bw.fixed(&e.counterparty).u64le(e.amount_sat);
+                }
+                bw.fixed(&b.issuer.0);
+                bw.u64le(b.issued_height).u64le(b.expires_height);
+                bw.fixed(&b.sig.0);
+                bw.into_vec()
+            }),
+        );
+        let mut fx = Writer::with_capacity(4 + self.fx_rates.len() * 200);
+        fx.u32le(self.fx_rates.len() as u32);
+        for (base, rate) in &self.fx_rates {
+            fx.u32le(base.len() as u32).raw(base.as_bytes());
+            fx.u64le(rate.sat_per_minor);
+            fx.u64le(rate.valid_from_height).u64le(rate.valid_until_height);
+            fx.u32le(rate.source.len() as u32).raw(rate.source.as_bytes());
+            fx.fixed(&rate.issuer.0).fixed(&rate.sig.0);
+        }
+        put_section(&mut w, &fx.into_vec());
+        put_section(
+            &mut w,
+            &encode_state_map(&self.ramp_quotes, |(q, sigs, keys)| {
+                let mut qw = Writer::with_capacity(256);
+                qw.u32le(q.network_id.len() as u32).raw(q.network_id.as_bytes());
+                qw.fixed(&q.provider).u8(q.direction.as_u8());
+                qw.u32le(q.asset.len() as u32).raw(q.asset.as_bytes());
+                qw.u64le(q.asset_minor).u64le(q.sat_amount).u64le(q.fee_sat);
+                qw.u64le(q.expires_height).u64le(q.nonce);
+                put_bundle(&mut qw, sigs);
+                put_bundle(&mut qw, keys);
+                qw.into_vec()
+            }),
+        );
+        put_section(
+            &mut w,
+            &encode_state_map(&self.ramp_intents, |i| {
+                let mut iw = Writer::with_capacity(128);
+                iw.fixed(&i.quote_id).fixed(&i.user).fixed(&i.provider);
+                iw.u32le(i.fill_ref.len() as u32).raw(i.fill_ref.as_bytes());
+                iw.u8(i.filled as u8).u8(i.refunded as u8);
+                iw.into_vec()
+            }),
+        );
+        put_section(
+            &mut w,
+            &encode_state_map(&self.loan_offers, |(o, sigs, keys)| {
+                let mut ow = Writer::with_capacity(256);
+                ow.u32le(o.network_id.len() as u32).raw(o.network_id.as_bytes());
+                ow.fixed(&o.lender);
+                ow.u64le(o.min_principal_sat).u64le(o.max_principal_sat);
+                ow.u64le(o.rate_bps_per_window).u64le(o.window_blocks);
+                ow.u32le(o.base_collateral_bps)
+                    .u32le(o.max_discount_bps)
+                    .u32le(o.bond_ratio_bps)
+                    .u32le(o.min_collateral_bps);
+                ow.u64le(o.expires_height).u64le(o.nonce);
+                put_bundle(&mut ow, sigs);
+                put_bundle(&mut ow, keys);
+                ow.into_vec()
+            }),
+        );
+        let mut standing = Writer::with_capacity(4 + self.standing_repay.len() * 200);
+        standing.u32le(self.standing_repay.len() as u32);
+        for (borrower, (instr, sigs, keys)) in &self.standing_repay {
+            standing.fixed(borrower);
+            standing.u32le(instr.network_id.len() as u32).raw(instr.network_id.as_bytes());
+            standing.fixed(&instr.position_id);
+            standing.u64le(instr.pct_bps).u64le(instr.cap_sat).u64le(instr.applied_sat);
+            standing.u64le(instr.expires_height).u64le(instr.nonce);
+            put_bundle(&mut standing, sigs);
+            put_bundle(&mut standing, keys);
+        }
+        put_section(&mut w, &standing.into_vec());
         w.into_vec()
     }
 
@@ -736,6 +935,323 @@ impl SharedNode {
             }
             Ok(book)
         })?;
+        let held_escrows = decode_section(&mut r, "held_escrows", |sr| {
+            let count = sr.u32le().map_err(|e| format!("held_escrows: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "held_escrows: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut set = BTreeSet::new();
+            for _ in 0..count {
+                let id: Hash = sr.fixed().map_err(|e| format!("held_escrows: {e}"))?;
+                if !set.insert(id) {
+                    return Err("held_escrows: duplicate id".into());
+                }
+            }
+            Ok(set)
+        })?;
+        let jobs = decode_section(&mut r, "jobs", |sr| decode_state_map(sr, "jobs", |bytes| {
+            let mut jr = Reader::new(bytes);
+            let net_len = jr.u32le().map_err(|e| format!("jobs: {e}"))? as usize;
+            if net_len > 64 {
+                return Err("jobs: network id over cap".into());
+            }
+            let net_bytes = jr.fixed_slice(net_len).map_err(|e| format!("jobs: {e}"))?;
+            let network_id = std::str::from_utf8(net_bytes)
+                .map_err(|_| "jobs: network id not utf-8".to_string())?
+                .to_string();
+            let hirer: Address = jr.fixed().map_err(|e| format!("jobs: {e}"))?;
+            let worker: Address = jr.fixed().map_err(|e| format!("jobs: {e}"))?;
+            let arbitrator: [u8; 48] = jr.fixed().map_err(|e| format!("jobs: {e}"))?;
+            let service_id: [u8; 32] = jr.fixed().map_err(|e| format!("jobs: {e}"))?;
+            let amount_sat = jr.u64le().map_err(|e| format!("jobs: {e}"))?;
+            let has_result = jr.u8().map_err(|e| format!("jobs: {e}"))?;
+            let result_hash = match has_result {
+                0 => None,
+                1 => Some(jr.fixed().map_err(|e| format!("jobs: {e}"))?),
+                _ => return Err("jobs: bad result flag".into()),
+            };
+            let deadline_height = jr.u64le().map_err(|e| format!("jobs: {e}"))?;
+            let has_escrow = jr.u8().map_err(|e| format!("jobs: {e}"))?;
+            let escrow_id = match has_escrow {
+                0 => None,
+                1 => Some(jr.fixed().map_err(|e| format!("jobs: {e}"))?),
+                _ => return Err("jobs: bad escrow flag".into()),
+            };
+            let state = srct_core::jobs::JobState::from_u8(
+                jr.u8().map_err(|e| format!("jobs: {e}"))?,
+            )
+            .ok_or("jobs: unknown state")?;
+            jr.expect_end().map_err(|e| format!("jobs: {e}"))?;
+            Ok(srct_core::jobs::JobRecord {
+                network_id,
+                hirer,
+                worker,
+                arbitrator: srct_core::bls_checkpoint::BlsPublicKey(arbitrator),
+                service_id,
+                amount_sat,
+                result_hash,
+                deadline_height,
+                escrow_id,
+                state,
+            })
+        }))?;
+        let passport_batches = decode_section(&mut r, "passport_batches", |sr| decode_state_map(sr, "passport_batches", |bytes| {
+            let mut pr = Reader::new(bytes);
+            let net_len = pr.u32le().map_err(|e| format!("passport: {e}"))? as usize;
+            if net_len > 64 {
+                return Err("passport: network id over cap".into());
+            }
+            let net_bytes = pr.fixed_slice(net_len).map_err(|e| format!("passport: {e}"))?;
+            let network_id = std::str::from_utf8(net_bytes)
+                .map_err(|_| "passport: network id not utf-8".to_string())?
+                .to_string();
+            let subject: srct_core::agent::AgentId =
+                pr.fixed().map_err(|e| format!("passport: {e}"))?;
+            let count = pr.u32le().map_err(|e| format!("passport: {e}"))? as usize;
+            if count > srct_core::passport::MAX_PASSPORT_EVENTS {
+                return Err("passport: too many events".into());
+            }
+            let mut events = Vec::with_capacity(count);
+            for _ in 0..count {
+                let kind = srct_core::passport::PassportEventKind::from_u8(
+                    pr.u8().map_err(|e| format!("passport: {e}"))?,
+                )
+                .ok_or("passport: unknown event kind")?;
+                let height = pr.u64le().map_err(|e| format!("passport: {e}"))?;
+                let source: Hash = pr.fixed().map_err(|e| format!("passport: {e}"))?;
+                let counterparty: srct_core::agent::AgentId =
+                    pr.fixed().map_err(|e| format!("passport: {e}"))?;
+                let amount_sat = pr.u64le().map_err(|e| format!("passport: {e}"))?;
+                events.push(srct_core::passport::PassportEvent {
+                    kind,
+                    height,
+                    source,
+                    counterparty,
+                    amount_sat,
+                });
+            }
+            let issuer: [u8; 48] = pr.fixed().map_err(|e| format!("passport: {e}"))?;
+            let issued_height = pr.u64le().map_err(|e| format!("passport: {e}"))?;
+            let expires_height = pr.u64le().map_err(|e| format!("passport: {e}"))?;
+            let sig: [u8; 96] = pr.fixed().map_err(|e| format!("passport: {e}"))?;
+            pr.expect_end().map_err(|e| format!("passport: {e}"))?;
+            Ok(srct_core::passport::PassportBatch {
+                network_id,
+                subject,
+                events,
+                issuer: srct_core::bls_checkpoint::BlsPublicKey(issuer),
+                issued_height,
+                expires_height,
+                sig: srct_core::bls_checkpoint::BlsSignature(sig),
+            })
+        }))?;
+        let fx_rates = decode_section(&mut r, "fx_rates", |sr| {
+            let count = sr.u32le().map_err(|e| format!("fx_rates: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "fx_rates: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut map = BTreeMap::new();
+            for _ in 0..count {
+                let base_len = sr.u32le().map_err(|e| format!("fx_rates: {e}"))? as usize;
+                if base_len == 0 || base_len > srct_core::fx::MAX_FX_SYMBOL_LEN {
+                    return Err("fx_rates: bad base length".into());
+                }
+                let base_bytes = sr.fixed_slice(base_len).map_err(|e| format!("fx_rates: {e}"))?;
+                let base = std::str::from_utf8(base_bytes)
+                    .map_err(|_| "fx_rates: base not utf-8".to_string())?
+                    .to_string();
+                let sat_per_minor = sr.u64le().map_err(|e| format!("fx_rates: {e}"))?;
+                let valid_from_height = sr.u64le().map_err(|e| format!("fx_rates: {e}"))?;
+                let valid_until_height = sr.u64le().map_err(|e| format!("fx_rates: {e}"))?;
+                let src_len = sr.u32le().map_err(|e| format!("fx_rates: {e}"))? as usize;
+                if src_len > 64 {
+                    return Err("fx_rates: source over cap".into());
+                }
+                let src_bytes = sr.fixed_slice(src_len).map_err(|e| format!("fx_rates: {e}"))?;
+                let source = std::str::from_utf8(src_bytes)
+                    .map_err(|_| "fx_rates: source not utf-8".to_string())?
+                    .to_string();
+                let issuer: [u8; 48] = sr.fixed().map_err(|e| format!("fx_rates: {e}"))?;
+                let sig: [u8; 96] = sr.fixed().map_err(|e| format!("fx_rates: {e}"))?;
+                let rate = srct_core::fx::FxRate {
+                    base: base.clone(),
+                    sat_per_minor,
+                    valid_from_height,
+                    valid_until_height,
+                    source,
+                    issuer: srct_core::bls_checkpoint::BlsPublicKey(issuer),
+                    sig: srct_core::bls_checkpoint::BlsSignature(sig),
+                };
+                if map.insert(base, rate).is_some() {
+                    return Err("fx_rates: duplicate base".into());
+                }
+            }
+            Ok(map)
+        })?;
+        let ramp_quotes = decode_section(&mut r, "ramp_quotes", |sr| decode_state_map(sr, "ramp_quotes", |bytes| {
+            let mut qr = Reader::new(bytes);
+            let net_len = qr.u32le().map_err(|e| format!("ramp_quotes: {e}"))? as usize;
+            if net_len > 64 {
+                return Err("ramp_quotes: network id over cap".into());
+            }
+            let net_bytes = qr.fixed_slice(net_len).map_err(|e| format!("ramp_quotes: {e}"))?;
+            let network_id = std::str::from_utf8(net_bytes)
+                .map_err(|_| "ramp_quotes: network id not utf-8".to_string())?
+                .to_string();
+            let provider: Address = qr.fixed().map_err(|e| format!("ramp_quotes: {e}"))?;
+            let direction = srct_core::ramp::RampDirection::from_u8(
+                qr.u8().map_err(|e| format!("ramp_quotes: {e}"))?,
+            )
+            .ok_or("ramp_quotes: unknown direction")?;
+            let asset_len = qr.u32le().map_err(|e| format!("ramp_quotes: {e}"))? as usize;
+            if asset_len == 0 || asset_len > 16 {
+                return Err("ramp_quotes: bad asset length".into());
+            }
+            let asset = std::str::from_utf8(
+                qr.fixed_slice(asset_len).map_err(|e| format!("ramp_quotes: {e}"))?,
+            )
+            .map_err(|_| "ramp_quotes: asset not utf-8".to_string())?
+            .to_string();
+            let asset_minor = qr.u64le().map_err(|e| format!("ramp_quotes: {e}"))?;
+            let sat_amount = qr.u64le().map_err(|e| format!("ramp_quotes: {e}"))?;
+            let fee_sat = qr.u64le().map_err(|e| format!("ramp_quotes: {e}"))?;
+            let expires_height = qr.u64le().map_err(|e| format!("ramp_quotes: {e}"))?;
+            let nonce = qr.u64le().map_err(|e| format!("ramp_quotes: {e}"))?;
+            let sigs = get_bundle(&mut qr, "ramp_quotes")?;
+            let keys = get_bundle(&mut qr, "ramp_quotes")?;
+            qr.expect_end().map_err(|e| format!("ramp_quotes: {e}"))?;
+            Ok((
+                srct_core::ramp::RampQuote {
+                    network_id,
+                    provider,
+                    direction,
+                    asset,
+                    asset_minor,
+                    sat_amount,
+                    fee_sat,
+                    expires_height,
+                    nonce,
+                },
+                sigs,
+                keys,
+            ))
+        }))?;
+        let ramp_intents = decode_section(&mut r, "ramp_intents", |sr| decode_state_map(sr, "ramp_intents", |bytes| {
+            let mut ir = Reader::new(bytes);
+            let quote_id: Hash = ir.fixed().map_err(|e| format!("ramp_intents: {e}"))?;
+            let user: Address = ir.fixed().map_err(|e| format!("ramp_intents: {e}"))?;
+            let provider: Address = ir.fixed().map_err(|e| format!("ramp_intents: {e}"))?;
+            let fill_len = ir.u32le().map_err(|e| format!("ramp_intents: {e}"))? as usize;
+            if fill_len > 128 {
+                return Err("ramp_intents: fill ref over cap".into());
+            }
+            let fill_ref = std::str::from_utf8(
+                ir.fixed_slice(fill_len).map_err(|e| format!("ramp_intents: {e}"))?,
+            )
+            .map_err(|_| "ramp_intents: fill ref not utf-8".to_string())?
+            .to_string();
+            let filled = ir.u8().map_err(|e| format!("ramp_intents: {e}"))? != 0;
+            let refunded = ir.u8().map_err(|e| format!("ramp_intents: {e}"))? != 0;
+            ir.expect_end().map_err(|e| format!("ramp_intents: {e}"))?;
+            Ok(srct_core::ramp::RampIntent {
+                quote_id,
+                user,
+                provider,
+                fill_ref,
+                filled,
+                refunded,
+            })
+        }))?;
+        let loan_offers = decode_section(&mut r, "loan_offers", |sr| decode_state_map(sr, "loan_offers", |bytes| {
+            let mut lor = Reader::new(bytes);
+            let net_len = lor.u32le().map_err(|e| format!("loan_offers: {e}"))? as usize;
+            if net_len > 64 {
+                return Err("loan_offers: network id over cap".into());
+            }
+            let net_bytes = lor.fixed_slice(net_len).map_err(|e| format!("loan_offers: {e}"))?;
+            let network_id = std::str::from_utf8(net_bytes)
+                .map_err(|_| "loan_offers: network id not utf-8".to_string())?
+                .to_string();
+            let lender: Address = lor.fixed().map_err(|e| format!("loan_offers: {e}"))?;
+            let min_principal_sat = lor.u64le().map_err(|e| format!("loan_offers: {e}"))?;
+            let max_principal_sat = lor.u64le().map_err(|e| format!("loan_offers: {e}"))?;
+            let rate_bps_per_window = lor.u64le().map_err(|e| format!("loan_offers: {e}"))?;
+            let window_blocks = lor.u64le().map_err(|e| format!("loan_offers: {e}"))?;
+            let base_collateral_bps = lor.u32le().map_err(|e| format!("loan_offers: {e}"))?;
+            let max_discount_bps = lor.u32le().map_err(|e| format!("loan_offers: {e}"))?;
+            let bond_ratio_bps = lor.u32le().map_err(|e| format!("loan_offers: {e}"))?;
+            let min_collateral_bps = lor.u32le().map_err(|e| format!("loan_offers: {e}"))?;
+            let expires_height = lor.u64le().map_err(|e| format!("loan_offers: {e}"))?;
+            let nonce = lor.u64le().map_err(|e| format!("loan_offers: {e}"))?;
+            let sigs = get_bundle(&mut lor, "loan_offers")?;
+            let keys = get_bundle(&mut lor, "loan_offers")?;
+            lor.expect_end().map_err(|e| format!("loan_offers: {e}"))?;
+            Ok((
+                srct_core::lending::LoanOffer {
+                    network_id,
+                    lender,
+                    min_principal_sat,
+                    max_principal_sat,
+                    rate_bps_per_window,
+                    window_blocks,
+                    base_collateral_bps,
+                    max_discount_bps,
+                    bond_ratio_bps,
+                    min_collateral_bps,
+                    expires_height,
+                    nonce,
+                },
+                sigs,
+                keys,
+            ))
+        }))?;
+        let standing_repay = decode_section(&mut r, "standing_repay", |sr| {
+            let count = sr.u32le().map_err(|e| format!("standing_repay: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "standing_repay: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut map = BTreeMap::new();
+            for _ in 0..count {
+                let borrower: Address = sr.fixed().map_err(|e| format!("standing_repay: {e}"))?;
+                let net_len = sr.u32le().map_err(|e| format!("standing_repay: {e}"))? as usize;
+                if net_len > 64 {
+                    return Err("standing_repay: network id over cap".into());
+                }
+                let network_id = std::str::from_utf8(
+                    sr.fixed_slice(net_len).map_err(|e| format!("standing_repay: {e}"))?,
+                )
+                .map_err(|_| "standing_repay: network id not utf-8".to_string())?
+                .to_string();
+                let position_id: Hash = sr.fixed().map_err(|e| format!("standing_repay: {e}"))?;
+                let pct_bps = sr.u64le().map_err(|e| format!("standing_repay: {e}"))?;
+                let cap_sat = sr.u64le().map_err(|e| format!("standing_repay: {e}"))?;
+                let applied_sat = sr.u64le().map_err(|e| format!("standing_repay: {e}"))?;
+                let expires_height = sr.u64le().map_err(|e| format!("standing_repay: {e}"))?;
+                let nonce = sr.u64le().map_err(|e| format!("standing_repay: {e}"))?;
+                let sigs = get_bundle(sr, "standing_repay")?;
+                let keys = get_bundle(sr, "standing_repay")?;
+                let instr = srct_core::lending::StandingRepay {
+                    network_id,
+                    borrower,
+                    position_id,
+                    pct_bps,
+                    cap_sat,
+                    applied_sat,
+                    expires_height,
+                    nonce,
+                };
+                if map.insert(borrower, (instr, sigs, keys)).is_some() {
+                    return Err("standing_repay: duplicate borrower".into());
+                }
+            }
+            Ok(map)
+        })?;
         // Anything after the last section means the envelope is malformed.
         r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
 
@@ -755,6 +1271,14 @@ impl SharedNode {
         self.stream_store = stream_store;
         self.streams = streams;
         self.sessions = sessions;
+        self.held_escrows = held_escrows;
+        self.jobs = jobs;
+        self.passport_batches = passport_batches;
+        self.fx_rates = fx_rates;
+        self.ramp_quotes = ramp_quotes;
+        self.ramp_intents = ramp_intents;
+        self.loan_offers = loan_offers;
+        self.standing_repay = standing_repay;
         Ok(())
     }
 
@@ -771,7 +1295,14 @@ impl SharedNode {
     pub fn advance_escrow_finality(&mut self) {
         let now = self.chain.height();
         let activation = self.chain.params().finality_activation_height;
+        // Collect the held ids first: the loop borrows the escrows, and a
+        // disputed escrow must neither auto-refund on expiry nor finalize —
+        // funds stay locked until the arbitrator resolves.
+        let held: Vec<Hash> = self.held_escrows.iter().copied().collect();
         for (id, escrow) in self.escrows.iter_mut() {
+            if held.contains(id) {
+                continue;
+            }
             // The timeout first: an open escrow past `ESCROW_EXPIRY_BLOCKS`
             // refunds its payer, which is what stops a silent or unreachable
             // arbitrator from holding the value forever. Only a *released*
@@ -3017,9 +3548,92 @@ async fn credit_deposit(
         sh.credit
             .deposit(addr, req.amount_sat)
             .map_err(|e| fail(StatusCode::BAD_REQUEST, "credit_refused", e.to_string()))?;
+        // Standing auto-repay (opt-in, borrower-signed): earned revenue pays
+        // the position down without a second transaction. The deposit is real
+        // regardless — if the position settled or the instruction lapsed, the
+        // value simply stays free and the node says so.
+        let mut autorepay: Option<Value> = None;
+        let height = sh.chain.height();
+        let network = sh.chain.params().network_id.clone();
+        if let Some((instr, sigs, keys)) = sh.standing_repay.get(&addr).cloned() {
+            if instr.network_id == network
+                && srct_core::lending::verify_standing_repay(&instr, &sigs, &keys, &network, height)
+                    .is_ok()
+            {
+                if let Some(position) = sh.credit.position(&instr.position_id) {
+                    let debt_now: Option<u64> = match &position.state {
+                        srct_core::credit::PositionState::Drawn {
+                            repaid_principal_sat,
+                            repaid_interest_sat,
+                            ..
+                        } => {
+                            let interest = position
+                                .charge
+                                .accrued_interest(
+                                    position.amount_sat,
+                                    position.drawn_at_height,
+                                    height,
+                                )
+                                .unwrap_or(0);
+                            let total = position.amount_sat.saturating_add(interest);
+                            let paid = repaid_principal_sat
+                                .saturating_add(*repaid_interest_sat);
+                            Some(total.saturating_sub(paid))
+                        }
+                        _ => None,
+                    };
+                    if let Some(debt) = debt_now {
+                        if debt > 0 {
+                            let (to_position, _) = srct_core::lending::apply_standing_repay(
+                                &instr,
+                                req.amount_sat,
+                                debt,
+                            );
+                            if to_position > 0 {
+                                match sh.credit.repay(&instr.position_id, to_position, height) {
+                                    Ok(result) => {
+                                        if let Some((live, _, _)) =
+                                            sh.standing_repay.get_mut(&addr)
+                                        {
+                                            live.applied_sat = live
+                                                .applied_sat
+                                                .saturating_add(to_position);
+                                        }
+                                        audit_push(
+                                            sh,
+                                            "autorepay",
+                                            Some(instr.position_id),
+                                            Some(to_position),
+                                            format!(
+                                                "standing instruction repaid {to_position}"
+                                            ),
+                                        );
+                                        autorepay = Some(json!({
+                                            "position_id": hash_to_hex(&instr.position_id),
+                                            "repaid_sat": to_position,
+                                            "remaining_debt_sat": result.remaining_debt_sat,
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        audit_push(
+                                            sh,
+                                            "autorepay_skipped",
+                                            Some(instr.position_id),
+                                            Some(to_position),
+                                            e.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(Json(json!({
             "address": address_to_hex(&addr),
             "balance": sh.credit.free(&addr),
+            "autorepay": autorepay,
         })))
     })?
 }
@@ -3409,6 +4023,14 @@ async fn escrow_settle(
         _ => return Err(bad("settlement must carry an ExitQueue transaction")),
     };
     with_shared(&state, |sh| {
+        // Dispute hold: no settlement binds while the job is disputed.
+        if sh.held_escrows.contains(&id) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "escrow_held",
+                "this escrow is under dispute; settlement is refused until resolve",
+            ));
+        }
         let (payer, payee, amount_sat) = {
             let e = sh
                 .escrows
@@ -3583,6 +4205,14 @@ async fn escrow_release(
     };
     let keys = srct_core::escrow::RealBls;
     with_shared(&state, |sh| {
+        // Dispute hold: funds stay locked until the arbitrator resolves.
+        if sh.held_escrows.contains(&id) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "escrow_held",
+                "this escrow is under dispute; release is refused until resolve",
+            ));
+        }
         let escrow = sh
             .escrows
             .get_mut(&id)
@@ -4687,6 +5317,1352 @@ async fn risk_policy(State(state): State<ApiState>) -> ApiResult {
     })?
 }
 
+/// Parse a comma-separated env list of hex BLS public keys (trust anchors).
+fn env_bls_keys(var: &str) -> Vec<srct_core::bls_checkpoint::BlsPublicKey> {
+    let raw = std::env::var(var).unwrap_or_default();
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim().trim_start_matches("0x");
+        let Ok(bytes) = hex::decode(part) else { continue };
+        if bytes.len() != 48 {
+            continue;
+        }
+        let mut key = [0u8; 48];
+        key.copy_from_slice(&bytes);
+        out.push(srct_core::bls_checkpoint::BlsPublicKey(key));
+    }
+    out
+}
+
+fn decode_bls_sig(hex_str: &str) -> Result<srct_core::bls_checkpoint::BlsSignature, (StatusCode, Json<ErrorBody>)> {
+    let b = decode_hex_bytes(hex_str, "signature")?;
+    if b.len() != 96 {
+        return Err(bad("signature must be 96 hex bytes"));
+    }
+    let mut s = [0u8; 96];
+    s.copy_from_slice(&b);
+    Ok(srct_core::bls_checkpoint::BlsSignature(s))
+}
+
+fn decode_agent(hex_str: &str) -> Result<srct_core::agent::AgentId, (StatusCode, Json<ErrorBody>)> {
+    // Accepts raw 20-byte hex or the `jt1`-prefixed address form: passport
+    // counterparties are addresses, subjects are raw agent ids.
+    if let Ok(addr) = decode_address(hex_str) {
+        return Ok(addr);
+    }
+    let b = decode_hex_bytes(hex_str, "agent")?;
+    if b.len() != 20 {
+        return Err(bad("agent must be 20 hex bytes"));
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&b);
+    Ok(a)
+}
+
+// --- Portable reputation ---
+
+/// `POST /v1/reputation/passport/attest` — assemble a subject's verifiable
+/// events from this node's own books (receipts → task/payment completions,
+/// positions → repayments/defaults). Unsigned: an issuer signs the returned
+/// event list out of band; `POST /v1/reputation/batch` registers the signed
+/// batch after re-verifying every source.
+async fn passport_attest(
+    State(state): State<ApiState>,
+    Json(req): Json<Value>,
+) -> ApiResult {
+    let address_hex = req.get("address_hex").and_then(|v| v.as_str()).ok_or_else(|| bad("address_hex required"))?;
+    let role = req.get("role").and_then(|v| v.as_str()).unwrap_or("machine");
+    let addr = decode_address(address_hex)?;
+    let agent_role = match role {
+        "machine" => srct_core::agent::AgentRole::Machine,
+        "human" => srct_core::agent::AgentRole::Human,
+        "service" => srct_core::agent::AgentRole::Service,
+        _ => return Err(bad("role must be machine, human or service")),
+    };
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let agent_id = srct_core::agent::derive_agent_id(&network, agent_role, &addr);
+        let mut events = Vec::new();
+        for receipt in sh.receipts.iter() {
+            if receipt.payer == addr {
+                events.push(json!({
+                    "kind": "PaymentCompleted",
+                    "height": 0,
+                    "source": hash_to_hex(&receipt.receipt_id()),
+                    "counterparty": address_to_hex(&receipt.recipient),
+                    "amount_sat": receipt.amount_sat,
+                }));
+            }
+            if receipt.recipient == addr {
+                events.push(json!({
+                    "kind": "TaskCompleted",
+                    "height": 0,
+                    "source": hash_to_hex(&receipt.receipt_id()),
+                    "counterparty": address_to_hex(&receipt.payer),
+                    "amount_sat": receipt.amount_sat,
+                }));
+            }
+        }
+        for (pid, position) in sh.credit.positions() {
+            if position.borrower != addr {
+                continue;
+            }
+            match &position.state {
+                srct_core::credit::PositionState::Repaid { .. } => events.push(json!({
+                    "kind": "LoanRepaid",
+                    "height": 0,
+                    "source": hash_to_hex(pid),
+                    "counterparty": address_to_hex(&position.lender),
+                    "amount_sat": position.amount_sat,
+                })),
+                srct_core::credit::PositionState::Defaulted { .. } => events.push(json!({
+                    "kind": "LoanDefaulted",
+                    "height": 0,
+                    "source": hash_to_hex(pid),
+                    "counterparty": address_to_hex(&position.lender),
+                    "amount_sat": position.amount_sat,
+                })),
+                _ => {}
+            }
+        }
+        Ok(Json(json!({
+            "network_id": network,
+            "subject": hex::encode(agent_id),
+            "events": events,
+            "note": "unsigned event list: have an issuer sign it, then register via /v1/reputation/batch",
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct PassportBatchReq {
+    network_id: String,
+    subject_hex: String,
+    events: Vec<PassportEventReq>,
+    issuer_hex: String,
+    issued_height: u64,
+    expires_height: u64,
+    sig_hex: String,
+}
+
+#[derive(Deserialize)]
+struct PassportEventReq {
+    kind: String,
+    height: u64,
+    source_hex: String,
+    counterparty_hex: String,
+    amount_sat: u64,
+}
+
+fn parse_passport_kind(raw: &str) -> Option<srct_core::passport::PassportEventKind> {
+    use srct_core::passport::PassportEventKind as K;
+    match raw {
+        "TaskCompleted" => Some(K::TaskCompleted),
+        "PaymentCompleted" => Some(K::PaymentCompleted),
+        "DisputeWon" => Some(K::DisputeWon),
+        "RefundIssued" => Some(K::RefundIssued),
+        "LoanRepaid" => Some(K::LoanRepaid),
+        "RefundReceived" => Some(K::RefundReceived),
+        "DisputeLost" => Some(K::DisputeLost),
+        "LoanDefaulted" => Some(K::LoanDefaulted),
+        _ => None,
+    }
+}
+
+/// `POST /v1/reputation/batch` — register an issuer-signed batch. Verifies
+/// the signature, the issuer trust list (`SRCT_PASSPORT_ISSUERS`; empty means
+/// accept any valid signature, dev only), and every event source against
+/// local books: payments must be recorded, loans must match terminal state.
+/// Task/dispute/refund events are issuer-attested (the issuer verified them).
+async fn passport_batch_register(
+    State(state): State<ApiState>,
+    Json(req): Json<PassportBatchReq>,
+) -> ApiResult {
+    let subject = decode_agent(&req.subject_hex)?;
+    let issuer = decode_public_key(&req.issuer_hex, "issuer")?;
+    let sig = decode_bls_sig(&req.sig_hex)?;
+    let mut events = Vec::with_capacity(req.events.len());
+    for e in &req.events {
+        let kind = parse_passport_kind(&e.kind)
+            .ok_or_else(|| bad(format!("unknown event kind: {}", e.kind)))?;
+        events.push(srct_core::passport::PassportEvent {
+            kind,
+            height: e.height,
+            source: decode_hash(&e.source_hex)?,
+            counterparty: decode_agent(&e.counterparty_hex)?,
+            amount_sat: e.amount_sat,
+        });
+    }
+    let batch = srct_core::passport::PassportBatch {
+        network_id: req.network_id.clone(),
+        subject,
+        events,
+        issuer,
+        issued_height: req.issued_height,
+        expires_height: req.expires_height,
+        sig,
+    };
+    batch.validate().map_err(|e| bad(e.to_string()))?;
+    if !batch.verify_sig() {
+        return Err(fail(StatusCode::CONFLICT, "passport_refused", "issuer signature invalid"));
+    }
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        if batch.network_id != network {
+            return Err(fail(StatusCode::CONFLICT, "passport_refused", "batch is for another network"));
+        }
+        let trusted = env_bls_keys("SRCT_PASSPORT_ISSUERS");
+        if !trusted.is_empty() && !trusted.contains(&batch.issuer) {
+            return Err(fail(StatusCode::FORBIDDEN, "passport_untrusted", "issuer is not trusted by this node"));
+        }
+        let height = sh.chain.height();
+        if height < batch.issued_height || height > batch.expires_height {
+            return Err(fail(StatusCode::CONFLICT, "passport_refused", "batch not live at this height"));
+        }
+        use srct_core::passport::PassportEventKind as K;
+        for e in &batch.events {
+            match e.kind {
+                K::PaymentCompleted => {
+                    if !sh.payment_store.contains_key(&e.source) {
+                        return Err(fail(StatusCode::CONFLICT, "passport_refused", format!("payment source {} not recorded", hash_to_hex(&e.source))));
+                    }
+                }
+                K::LoanRepaid => {
+                    match sh.credit.position(&e.source) {
+                        Some(p) if matches!(p.state, srct_core::credit::PositionState::Repaid { .. }) => {}
+                        _ => return Err(fail(StatusCode::CONFLICT, "passport_refused", format!("loan source {} is not a repaid position", hash_to_hex(&e.source)))),
+                    }
+                }
+                K::LoanDefaulted => {
+                    match sh.credit.position(&e.source) {
+                        Some(p) if matches!(p.state, srct_core::credit::PositionState::Defaulted { .. }) => {}
+                        _ => return Err(fail(StatusCode::CONFLICT, "passport_refused", format!("loan source {} is not a defaulted position", hash_to_hex(&e.source)))),
+                    }
+                }
+                _ => {}
+            }
+        }
+        let id = batch.signing_hash();
+        let score = srct_core::passport::score_batch(&batch);
+        let tier = srct_core::passport::access_tier(score);
+        sh.passport_batches.insert(id, batch);
+        audit_push(sh, "passport_batch", Some(id), None, format!("registered score {score}"));
+        Ok(Json(json!({
+            "batch_id": hash_to_hex(&id),
+            "score": score,
+            "tier": format!("{tier:?}"),
+        })))
+    })?
+}
+
+/// `GET /v1/reputation/score/{agent_hex}?role=machine` — combine live batches
+/// for the subject into one score + tier.
+async fn passport_score(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let addr = decode_address(&raw)?;
+    let role = query.get("role").map(|s| s.as_str()).unwrap_or("machine");
+    let agent_role = match role {
+        "machine" => srct_core::agent::AgentRole::Machine,
+        "human" => srct_core::agent::AgentRole::Human,
+        "service" => srct_core::agent::AgentRole::Service,
+        _ => return Err(bad("role must be machine, human or service")),
+    };
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let subject = srct_core::agent::derive_agent_id(&network, agent_role, &addr);
+        let mut total: i64 = 0;
+        let mut batches = 0u64;
+        for batch in sh.passport_batches.values() {
+            if batch.subject != subject || batch.network_id != network {
+                continue;
+            }
+            if height < batch.issued_height || height > batch.expires_height {
+                continue;
+            }
+            total = total.saturating_add(srct_core::passport::score_batch(batch));
+            batches += 1;
+        }
+        let tier = srct_core::passport::access_tier(total);
+        Ok(Json(json!({
+            "subject": hex::encode(subject),
+            "score": total,
+            "tier": format!("{tier:?}"),
+            "live_batches": batches,
+        })))
+    })?
+}
+
+// --- Tiered wallets ---
+
+#[derive(Deserialize)]
+struct WalletTierReq {
+    parent_policy_hex: String,
+    parent_sigs_hex: Option<String>,
+    parent_keys_hex: Option<String>,
+    tier_policy_hex: String,
+    tier_sigs_hex: Option<String>,
+    tier_keys_hex: Option<String>,
+}
+
+/// `POST /v1/wallet/tier` — validate a max/min-spend tier against its parent
+/// and register the lineage. Both policies carry owner signatures; the node
+/// never signs. The child must narrow the parent (caps, recipients, services,
+/// window) and link to the parent agent id.
+async fn wallet_tier(State(state): State<ApiState>, Json(req): Json<WalletTierReq>) -> ApiResult {
+    let parent = decode_owned_policy(&req.parent_policy_hex, "parent_policy", &req.parent_sigs_hex, &req.parent_keys_hex)?;
+    let tier = decode_owned_policy(&req.tier_policy_hex, "tier_policy", &req.tier_sigs_hex, &req.tier_keys_hex)?;
+    if !srct_core::tiers::is_valid_tier(&parent, &tier) {
+        return Err(fail(StatusCode::CONFLICT, "tier_refused", "tier does not narrow its parent"));
+    }
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        if parent.network_id != network || tier.network_id != network {
+            return Err(fail(StatusCode::CONFLICT, "tier_refused", "tier must be scoped to this node's network"));
+        }
+        match sh.delegations.link(&parent, &tier) {
+            Ok(()) => {
+                sh.policy_registry.insert(tier.hash(), tier.clone());
+                audit_push(sh, "tier_registered", None, Some(tier.per_tx_max_sat), format!("tier {} under {}", hash_to_hex(&tier.hash()), hash_to_hex(&parent.hash())));
+                Ok(Json(json!({
+                    "tier_policy_hash": hash_to_hex(&tier.hash()),
+                    "agent_id": hex::encode(tier.agent_id),
+                    "per_tx_max_sat": tier.per_tx_max_sat,
+                    "expires_at_height": tier.expires_at_height,
+                })))
+            }
+            Err(e) => Err(fail(StatusCode::CONFLICT, "tier_refused", e.to_string())),
+        }
+    })?
+}
+
+/// `GET /v1/wallet/tiers/{agent_hex}` — tiers registered under an agent id.
+async fn wallet_tiers(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let agent = decode_agent(&raw)?;
+    with_shared(&state, |sh| {
+        let mut out = Vec::new();
+        for policy in sh.policy_registry.values() {
+            if policy.parent_agent_id == Some(agent) {
+                out.push(json!({
+                    "tier_policy_hash": hash_to_hex(&policy.hash()),
+                    "per_tx_max_sat": policy.per_tx_max_sat,
+                    "cumulative_max_sat": policy.cumulative_max_sat,
+                    "expires_at_height": policy.expires_at_height,
+                }));
+            }
+        }
+        Ok(Json(json!({ "count": out.len(), "tiers": out })))
+    })?
+}
+
+// --- Agent-to-agent jobs ---
+
+#[derive(Deserialize)]
+struct JobOpenReq {
+    hirer_hex: String,
+    worker_hex: String,
+    payer_bls: String,
+    payee_bls: String,
+    arbitrator: String,
+    service_hex: String,
+    amount_sat: u64,
+    deadline_height: u64,
+    nonce: u64,
+}
+
+/// `POST /v1/jobs/open` — hirer locks payment in an escrow and posts the job.
+/// The escrow opens now (funds committed); the worker accepts, delivers, and
+/// the hirer (or arbitrator) releases against the delivered result.
+async fn job_open(State(state): State<ApiState>, Json(req): Json<JobOpenReq>) -> ApiResult {
+    let hirer = decode_address(&req.hirer_hex)?;
+    let worker = decode_address(&req.worker_hex)?;
+    let payer_key = decode_public_key(&req.payer_bls, "payer_bls")?;
+    let payee_key = decode_public_key(&req.payee_bls, "payee_bls")?;
+    let arbitrator = decode_public_key(&req.arbitrator, "arbitrator")?;
+    let service_bytes = decode_hex_bytes(&req.service_hex, "service")?;
+    if service_bytes.len() != 32 {
+        return Err(bad("service must be 32 hex bytes"));
+    }
+    let mut service = [0u8; 32];
+    service.copy_from_slice(&service_bytes);
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let mut job = srct_core::jobs::JobRecord {
+            network_id: network.clone(),
+            hirer,
+            worker,
+            arbitrator,
+            service_id: service,
+            amount_sat: req.amount_sat,
+            result_hash: None,
+            deadline_height: req.deadline_height,
+            escrow_id: None,
+            state: srct_core::jobs::JobState::Offered,
+        };
+        job.validate().map_err(|e| bad(e.to_string()))?;
+        let escrow = srct_core::escrow::ConditionalEscrow::open(
+            network, hirer, payer_key, worker, payee_key, arbitrator, req.amount_sat, req.nonce, height,
+        )
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "escrow_refused", e.to_string()))?;
+        let escrow_id = escrow.id();
+        if sh.escrows.contains_key(&escrow_id) {
+            return Err(fail(StatusCode::CONFLICT, "escrow_exists", "an escrow with this id already exists"));
+        }
+        sh.escrows.insert(escrow_id, escrow);
+        job.escrow_id = Some(escrow_id);
+        let job_id = job.id();
+        if sh.jobs.contains_key(&job_id) {
+            return Err(fail(StatusCode::CONFLICT, "job_exists", "a job with this id already exists"));
+        }
+        sh.jobs.insert(job_id, job);
+        audit_push(sh, "job_open", None, Some(req.amount_sat), format!("job {} escrow {}", hash_to_hex(&job_id), hash_to_hex(&escrow_id)));
+        Ok(Json(json!({
+            "job_id": hash_to_hex(&job_id),
+            "escrow_id": hash_to_hex(&escrow_id),
+            "state": "Offered",
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct JobAcceptReq {
+    worker_sigs_hex: String,
+    worker_keys_hex: String,
+}
+
+/// `POST /v1/jobs/{id}/accept` — worker commits (signature over the job id).
+async fn job_accept(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+    Json(req): Json<JobAcceptReq>,
+) -> ApiResult {
+    let job_id = decode_hash(&raw)?;
+    let sigs = decode_bundle(&req.worker_sigs_hex, "worker_sigs")?;
+    let keys = decode_bundle(&req.worker_keys_hex, "worker_keys")?;
+    with_shared(&state, |sh| {
+        let job = sh.jobs.get(&job_id).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such job"))?;
+        let signer = keys.address().map_err(|e| bad(format!("worker_keys: {e}")))?;
+        if signer != job.worker {
+            return Err(fail(StatusCode::CONFLICT, "job_refused", "acceptance is not signed by the worker"));
+        }
+        srct_core::sig::verify_bundle(&sigs, &keys, &job_id)
+            .map_err(|_| fail(StatusCode::CONFLICT, "job_refused", "worker signature invalid"))?;
+        let mut job = job;
+        let escrow_id = job.escrow_id.ok_or_else(|| fail(StatusCode::CONFLICT, "job_refused", "job has no escrow"))?;
+        srct_core::jobs::accept(&mut job, escrow_id)
+            .map_err(|e| fail(StatusCode::CONFLICT, "job_refused", e.to_string()))?;
+        sh.jobs.insert(job_id, job);
+        audit_push(sh, "job_accept", None, None, format!("job {}", hash_to_hex(&job_id)));
+        Ok(Json(json!({ "job_id": hash_to_hex(&job_id), "state": "Accepted" })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct JobDeliverReq {
+    result_hash_hex: String,
+    receipt_hex: Option<String>,
+}
+
+/// `POST /v1/jobs/{id}/deliver` — worker posts the result (+ optional signed
+/// receipt binding the work product). Release later requires this hash.
+async fn job_deliver(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+    Json(req): Json<JobDeliverReq>,
+) -> ApiResult {
+    let job_id = decode_hash(&raw)?;
+    let result = decode_hash(&req.result_hash_hex)?;
+    let receipt_bytes = req.receipt_hex.as_deref().map(|h| decode_hex_bytes(h, "receipt")).transpose()?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        if let Some(bytes) = receipt_bytes {
+            let receipt = srct_core::receipt::ServiceReceipt::deserialize(&bytes)
+                .map_err(|e| bad(format!("receipt: {e}")))?;
+            receipt.verify(&network).map_err(|e| fail(StatusCode::BAD_REQUEST, "receipt_refused", e.to_string()))?;
+        }
+        let mut job = sh.jobs.get(&job_id).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such job"))?;
+        srct_core::jobs::deliver(&mut job, result, height)
+            .map_err(|e| fail(StatusCode::CONFLICT, "job_refused", e.to_string()))?;
+        sh.jobs.insert(job_id, job);
+        audit_push(sh, "job_deliver", None, None, format!("job {} result {}", hash_to_hex(&job_id), hash_to_hex(&result)));
+        Ok(Json(json!({ "job_id": hash_to_hex(&job_id), "state": "Delivered" })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct JobDisputeReq {
+    by: String,
+    reason: String,
+    sig_hex: String,
+}
+
+/// `POST /v1/jobs/{id}/dispute` — hirer, worker or arbitrator freezes the
+/// funds: release, settlement and auto-refund are refused while held.
+async fn job_dispute(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+    Json(req): Json<JobDisputeReq>,
+) -> ApiResult {
+    let job_id = decode_hash(&raw)?;
+    if req.reason.is_empty() || req.reason.len() > 256 {
+        return Err(bad("reason must be 1..=256 chars"));
+    }
+    let sig = decode_bls_sig(&req.sig_hex)?;
+    with_shared(&state, |sh| {
+        let mut job = sh.jobs.get(&job_id).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such job"))?;
+        let escrow_id = job.escrow_id.ok_or_else(|| fail(StatusCode::CONFLICT, "job_refused", "job has no escrow"))?;
+        let escrow = sh.escrows.get(&escrow_id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "job escrow missing"))?;
+        let key = match req.by.as_str() {
+            "hirer" => escrow.payer_key,
+            "worker" => escrow.payee_key,
+            "arbitrator" => escrow.arbitrator,
+            _ => return Err(bad("by must be hirer, worker or arbitrator")),
+        };
+        let msg = srct_core::jobs::dispute_hash(&job_id, &req.reason);
+        if !srct_core::bls::RealBls::verify(&key, &msg, &sig) {
+            return Err(fail(StatusCode::CONFLICT, "job_refused", "dispute signature is not the named party"));
+        }
+        srct_core::jobs::dispute(&mut job)
+            .map_err(|e| fail(StatusCode::CONFLICT, "job_refused", e.to_string()))?;
+        sh.jobs.insert(job_id, job);
+        sh.held_escrows.insert(escrow_id);
+        audit_push(sh, "job_dispute", None, None, format!("job {} held by {}", hash_to_hex(&job_id), req.by));
+        Ok(Json(json!({ "job_id": hash_to_hex(&job_id), "state": "Disputed", "held": true })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct JobResolveReq {
+    pay_worker: bool,
+    result_hash_hex: Option<String>,
+    arbitrator_sig_hex: String,
+}
+
+/// `POST /v1/jobs/{id}/resolve` — arbitrator decides: pay the worker or
+/// refund the hirer. The signature binds (job, direction, result), and the
+/// hold lifts; the coin moves through the existing escrow release/settle.
+async fn job_resolve(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+    Json(req): Json<JobResolveReq>,
+) -> ApiResult {
+    let job_id = decode_hash(&raw)?;
+    let result = req.result_hash_hex.as_deref().map(decode_hash).transpose()?.unwrap_or([0u8; 32]);
+    let sig = decode_bls_sig(&req.arbitrator_sig_hex)?;
+    with_shared(&state, |sh| {
+        let mut job = sh.jobs.get(&job_id).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such job"))?;
+        let msg = srct_core::jobs::resolve_hash(&job_id, req.pay_worker, &result);
+        if !srct_core::bls::RealBls::verify(&job.arbitrator, &msg, &sig) {
+            return Err(fail(StatusCode::CONFLICT, "job_refused", "resolve signature is not the arbitrator"));
+        }
+        srct_core::jobs::resolve(&mut job, req.pay_worker)
+            .map_err(|e| fail(StatusCode::CONFLICT, "job_refused", e.to_string()))?;
+        if let Some(escrow_id) = job.escrow_id {
+            sh.held_escrows.remove(&escrow_id);
+        }
+        let state = job.state;
+        sh.jobs.insert(job_id, job);
+        audit_push(sh, "job_resolve", None, None, format!("job {} pay_worker={}", hash_to_hex(&job_id), req.pay_worker));
+        Ok(Json(json!({ "job_id": hash_to_hex(&job_id), "state": format!("{state:?}") })))
+    })?
+}
+
+/// `GET /v1/jobs/{id}` — job record + escrow state + hold flag.
+async fn job_get(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let job_id = decode_hash(&raw)?;
+    with_shared(&state, |sh| {
+        let job = sh.jobs.get(&job_id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such job"))?;
+        let (escrow_state, held) = match job.escrow_id {
+            Some(eid) => (
+                sh.escrows.get(&eid).map(|e| escrow_state_name(&e.state)),
+                sh.held_escrows.contains(&eid),
+            ),
+            None => (None, false),
+        };
+        Ok(Json(json!({
+            "job_id": hash_to_hex(&job_id),
+            "hirer": address_to_hex(&job.hirer),
+            "worker": address_to_hex(&job.worker),
+            "service": hex::encode(job.service_id),
+            "amount_sat": job.amount_sat,
+            "result": job.result_hash.map(|h| hash_to_hex(&h)),
+            "deadline_height": job.deadline_height,
+            "escrow_id": job.escrow_id.map(|h| hash_to_hex(&h)),
+            "state": format!("{:?}", job.state),
+            "escrow_state": escrow_state,
+            "held": held,
+        })))
+    })?
+}
+
+// --- Receipt status (every payment gets its receipt) ---
+
+/// `GET /v1/payments/{id}/receipt_status` — is the payment recorded, is its
+/// receipt present, is its settlement bound? Agents poll this and demand the
+/// receipt before treating a payment as complete.
+async fn receipt_status(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let id = decode_hash(&raw)?;
+    with_shared(&state, |sh| {
+        let recorded = sh.payment_store.contains_key(&id);
+        let receipt = sh.receipts.by_payment_id(&id);
+        let settled = sh.payment_tx.get(&id).map(hash512_to_hex);
+        Ok(Json(json!({
+            "payment_id": hash_to_hex(&id),
+            "recorded": recorded,
+            "receipt_present": receipt.is_some(),
+            "receipt_id": receipt.map(|r| hash_to_hex(&r.receipt_id())),
+            "settlement_tx": settled,
+        })))
+    })?
+}
+
+// --- USD quotes + stablecoin-in ---
+
+/// `POST /v1/fx/rates` — register an operator-signed rate. The issuer must be
+/// in `SRCT_FX_ISSUERS` (comma-separated 48-byte hex BLS keys); empty means
+/// no rate is trusted and every registration is refused.
+async fn fx_rate_register(State(state): State<ApiState>, Json(req): Json<Value>) -> ApiResult {
+    let base = req.get("base").and_then(|v| v.as_str()).ok_or_else(|| bad("base required"))?.to_string();
+    let sat_per_minor = req.get("sat_per_minor").and_then(|v| v.as_u64()).ok_or_else(|| bad("sat_per_minor required"))?;
+    let from = req.get("valid_from_height").and_then(|v| v.as_u64()).ok_or_else(|| bad("valid_from_height required"))?;
+    let until = req.get("valid_until_height").and_then(|v| v.as_u64()).ok_or_else(|| bad("valid_until_height required"))?;
+    let source = req.get("source").and_then(|v| v.as_str()).unwrap_or("operator").to_string();
+    let issuer_hex = req.get("issuer_hex").and_then(|v| v.as_str()).ok_or_else(|| bad("issuer_hex required"))?;
+    let sig_hex = req.get("sig_hex").and_then(|v| v.as_str()).ok_or_else(|| bad("sig_hex required"))?;
+    let issuer = decode_public_key(issuer_hex, "issuer")?;
+    let sig = decode_bls_sig(sig_hex)?;
+    let rate = srct_core::fx::FxRate { base, sat_per_minor, valid_from_height: from, valid_until_height: until, source, issuer, sig };
+    rate.validate().map_err(|e| bad(e.to_string()))?;
+    if !rate.verify_sig() {
+        return Err(fail(StatusCode::CONFLICT, "fx_refused", "rate signature invalid"));
+    }
+    with_shared(&state, |sh| {
+        let trusted = env_bls_keys("SRCT_FX_ISSUERS");
+        if trusted.is_empty() {
+            return Err(fail(StatusCode::FORBIDDEN, "no_fx_issuers", "no FX issuer is trusted; set SRCT_FX_ISSUERS"));
+        }
+        if !trusted.contains(&rate.issuer) {
+            return Err(fail(StatusCode::FORBIDDEN, "fx_untrusted", "rate issuer is not trusted by this node"));
+        }
+        sh.fx_rates.insert(rate.base.clone(), rate.clone());
+        audit_push(sh, "fx_rate", None, Some(rate.sat_per_minor), format!("rate {} @ {}", rate.base, rate.sat_per_minor));
+        Ok(Json(json!({ "base": rate.base, "sat_per_minor": rate.sat_per_minor })))
+    })?
+}
+
+/// `GET /v1/fx/rates` — live rates at this height.
+async fn fx_rates(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let rates: Vec<Value> = sh
+            .fx_rates
+            .values()
+            .filter(|r| r.live_at(height))
+            .map(|r| {
+                json!({
+                    "base": r.base,
+                    "sat_per_minor": r.sat_per_minor,
+                    "valid_from_height": r.valid_from_height,
+                    "valid_until_height": r.valid_until_height,
+                    "source": r.source,
+                })
+            })
+            .collect();
+        Ok(Json(json!({ "height": height, "count": rates.len(), "rates": rates })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct FxQuoteReq {
+    base: String,
+    amount_minor: u64,
+    fee_bps: u64,
+    slippage_bps: u64,
+    ttl_blocks: u64,
+}
+
+/// `POST /v1/fx/quote` — lock a dollar (or stablecoin) price into exact
+/// satoshis: amount, fee and slippage stated up front, expiring at a height.
+async fn fx_quote(State(state): State<ApiState>, Json(req): Json<FxQuoteReq>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let rate = sh.fx_rates.get(&req.base).ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", format!("no rate for {}", req.base)))?;
+        let quote = srct_core::fx::quote_usd(rate, req.amount_minor, req.fee_bps, req.slippage_bps, height, req.ttl_blocks)
+            .map_err(|e| fail(StatusCode::CONFLICT, "fx_refused", e.to_string()))?;
+        Ok(Json(json!({
+            "base": quote.base,
+            "amount_minor": quote.amount_minor,
+            "sat_due": quote.sat_due,
+            "fee_sat": quote.fee_sat,
+            "slippage_bps": quote.slippage_bps,
+            "rate_sat_per_minor": quote.rate_sat_per_minor,
+            "expires_height": quote.expires_height,
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct FxSwapReq {
+    payer_hex: String,
+    role: Option<String>,
+    stable_asset: String,
+    stable_minor: u64,
+    sat_due: u64,
+    fee_sat: u64,
+    rate_sat_per_minor: u64,
+    expires_height: u64,
+    stable_ref: String,
+    nonce: u64,
+}
+
+/// `POST /v1/fx/swap` — record a stablecoin-in payment: the agent holds USDC
+/// (or a supported stablecoin) off-protocol and settles in SRCT at the locked
+/// quote. Custody never touches this node; the intent is the audit trail.
+async fn fx_swap(State(state): State<ApiState>, Json(req): Json<FxSwapReq>) -> ApiResult {
+    let payer_addr = decode_address(&req.payer_hex)?;
+    let role = req.role.as_deref().unwrap_or("machine");
+    let agent_role = match role {
+        "machine" => srct_core::agent::AgentRole::Machine,
+        "human" => srct_core::agent::AgentRole::Human,
+        "service" => srct_core::agent::AgentRole::Service,
+        _ => return Err(bad("role must be machine, human or service")),
+    };
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let rate = sh.fx_rates.get(&req.stable_asset).ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", format!("no rate for {}", req.stable_asset)))?;
+        if !rate.live_at(height) || rate.sat_per_minor != req.rate_sat_per_minor {
+            return Err(fail(StatusCode::CONFLICT, "fx_refused", "quote rate is not the live rate"));
+        }
+        let intent = srct_core::fx::SwapIntent {
+            network_id: network,
+            payer: srct_core::agent::derive_agent_id(&sh.chain.params().network_id, agent_role, &payer_addr),
+            stable_asset: req.stable_asset.clone(),
+            stable_minor: req.stable_minor,
+            quote: srct_core::fx::Quote {
+                base: req.stable_asset.clone(),
+                amount_minor: req.stable_minor,
+                sat_due: req.sat_due,
+                fee_sat: req.fee_sat,
+                slippage_bps: 0,
+                rate_sat_per_minor: req.rate_sat_per_minor,
+                expires_height: req.expires_height,
+            },
+            stable_ref: req.stable_ref.clone(),
+            nonce: req.nonce,
+        };
+        intent.validate().map_err(|e| bad(e.to_string()))?;
+        if height > intent.quote.expires_height {
+            return Err(fail(StatusCode::CONFLICT, "fx_refused", "quote expired"));
+        }
+        let id = intent.id();
+        audit_push(sh, "fx_swap", None, Some(intent.quote.sat_due), format!("{} {} -> {} sat", intent.stable_minor, intent.stable_asset, intent.quote.sat_due));
+        Ok(Json(json!({
+            "swap_id": hash_to_hex(&id),
+            "sat_due": intent.quote.sat_due,
+            "fee_sat": intent.quote.fee_sat,
+            "expires_height": intent.quote.expires_height,
+        })))
+    })?
+}
+
+// --- Ramps: fiat / stablecoin on- and off-ramps ---
+
+#[derive(Deserialize)]
+struct RampQuoteReq {
+    network_id: String,
+    provider_hex: String,
+    direction: String,
+    asset: String,
+    asset_minor: u64,
+    sat_amount: u64,
+    fee_sat: u64,
+    expires_height: u64,
+    nonce: u64,
+    provider_sigs_hex: String,
+    provider_keys_hex: String,
+}
+
+/// `POST /v1/ramp/quote` — register a provider-signed ramp quote.
+async fn ramp_quote(State(state): State<ApiState>, Json(req): Json<RampQuoteReq>) -> ApiResult {
+    let provider = decode_address(&req.provider_hex)?;
+    let direction = match req.direction.as_str() {
+        "fiat_to_srct" => srct_core::ramp::RampDirection::FiatToSrct,
+        "srct_to_fiat" => srct_core::ramp::RampDirection::SrctToFiat,
+        "stable_to_srct" => srct_core::ramp::RampDirection::StableToSrct,
+        "srct_to_stable" => srct_core::ramp::RampDirection::SrctToStable,
+        _ => return Err(bad("direction must be fiat_to_srct, srct_to_fiat, stable_to_srct or srct_to_stable")),
+    };
+    let sigs = decode_bundle(&req.provider_sigs_hex, "provider_sigs")?;
+    let keys = decode_bundle(&req.provider_keys_hex, "provider_keys")?;
+    let quote = srct_core::ramp::RampQuote {
+        network_id: req.network_id.clone(),
+        provider,
+        direction,
+        asset: req.asset.clone(),
+        asset_minor: req.asset_minor,
+        sat_amount: req.sat_amount,
+        fee_sat: req.fee_sat,
+        expires_height: req.expires_height,
+        nonce: req.nonce,
+    };
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        if quote.network_id != sh.chain.params().network_id {
+            return Err(fail(StatusCode::CONFLICT, "ramp_refused", "quote is for another network"));
+        }
+        srct_core::ramp::verify_quote(&quote, &sigs, &keys, height)
+            .map_err(|e| fail(StatusCode::CONFLICT, "ramp_refused", e.to_string()))?;
+        let id = quote.id();
+        if sh.ramp_quotes.contains_key(&id) {
+            return Ok(Json(json!({ "quote_id": hash_to_hex(&id), "duplicate": true })));
+        }
+        sh.ramp_quotes.insert(id, (quote, sigs, keys));
+        audit_push(sh, "ramp_quote", None, None, format!("quote {}", hash_to_hex(&id)));
+        Ok(Json(json!({ "quote_id": hash_to_hex(&id), "duplicate": false })))
+    })?
+}
+
+/// `GET /v1/ramp/quotes[?direction=]` — live quotes for entry and exit.
+async fn ramp_quotes(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let mut out = Vec::new();
+        for (id, (q, _, _)) in &sh.ramp_quotes {
+            if q.expires_height < height {
+                continue;
+            }
+            if let Some(dir) = query.get("direction") {
+                let want = match dir.as_str() {
+                    "fiat_to_srct" => srct_core::ramp::RampDirection::FiatToSrct,
+                    "srct_to_fiat" => srct_core::ramp::RampDirection::SrctToFiat,
+                    "stable_to_srct" => srct_core::ramp::RampDirection::StableToSrct,
+                    "srct_to_stable" => srct_core::ramp::RampDirection::SrctToStable,
+                    _ => return Err(bad("bad direction filter")),
+                };
+                if q.direction != want {
+                    continue;
+                }
+            }
+            out.push(json!({
+                "quote_id": hash_to_hex(id),
+                "provider": address_to_hex(&q.provider),
+                "asset": q.asset,
+                "asset_minor": q.asset_minor,
+                "sat_amount": q.sat_amount,
+                "fee_sat": q.fee_sat,
+                "expires_height": q.expires_height,
+            }));
+        }
+        Ok(Json(json!({ "count": out.len(), "quotes": out })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct RampIntentReq {
+    quote_id: String,
+    user_hex: String,
+    fill_ref: String,
+}
+
+/// `POST /v1/ramp/intent` — user accepts a live quote; provider fills out of
+/// band and settles the intent below.
+async fn ramp_intent(State(state): State<ApiState>, Json(req): Json<RampIntentReq>) -> ApiResult {
+    let quote_id = decode_hash(&req.quote_id)?;
+    let user = decode_address(&req.user_hex)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let (quote, _, _) = sh.ramp_quotes.get(&quote_id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such quote"))?;
+        if height > quote.expires_height {
+            return Err(fail(StatusCode::CONFLICT, "ramp_refused", "quote expired"));
+        }
+        let intent = srct_core::ramp::RampIntent {
+            quote_id,
+            user,
+            provider: quote.provider,
+            fill_ref: req.fill_ref.clone(),
+            filled: false,
+            refunded: false,
+        };
+        intent.validate().map_err(|e| bad(e.to_string()))?;
+        let id = intent.id();
+        if sh.ramp_intents.contains_key(&id) {
+            return Ok(Json(json!({ "intent_id": hash_to_hex(&id), "duplicate": true })));
+        }
+        sh.ramp_intents.insert(id, intent);
+        audit_push(sh, "ramp_intent", None, None, format!("intent {}", hash_to_hex(&id)));
+        Ok(Json(json!({ "intent_id": hash_to_hex(&id), "duplicate": false })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct RampSettleReq {
+    outcome: String,
+    fill_ref: String,
+    provider_sigs_hex: String,
+    provider_keys_hex: String,
+}
+
+/// `POST /v1/ramp/intent/{id}/settle` — provider marks filled or refunded,
+/// signed over the intent id + outcome so only the quoted provider closes it.
+async fn ramp_intent_settle(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+    Json(req): Json<RampSettleReq>,
+) -> ApiResult {
+    let id = decode_hash(&raw)?;
+    let sigs = decode_bundle(&req.provider_sigs_hex, "provider_sigs")?;
+    let keys = decode_bundle(&req.provider_keys_hex, "provider_keys")?;
+    with_shared(&state, |sh| {
+        let intent = sh.ramp_intents.get(&id).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such intent"))?;
+        let (quote, _, _) = sh.ramp_quotes.get(&intent.quote_id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "quote missing"))?;
+        let signer = keys.address().map_err(|e| bad(format!("provider_keys: {e}")))?;
+        if signer != quote.provider {
+            return Err(fail(StatusCode::CONFLICT, "ramp_refused", "settle signature is not the provider"));
+        }
+        let mut msg = Vec::with_capacity(64);
+        msg.extend_from_slice(&id);
+        msg.extend_from_slice(req.outcome.as_bytes());
+        let digest = srct_core::hash::sha256_dom(b"srct/ramp-settle/v1", &[&msg]);
+        srct_core::sig::verify_bundle(&sigs, &keys, &digest)
+            .map_err(|_| fail(StatusCode::CONFLICT, "ramp_refused", "provider signature invalid"))?;
+        let mut intent = intent;
+        match req.outcome.as_str() {
+            "filled" => {
+                if intent.filled || intent.refunded {
+                    return Err(fail(StatusCode::CONFLICT, "ramp_refused", "intent already terminal"));
+                }
+                intent.filled = true;
+            }
+            "refunded" => {
+                if intent.filled || intent.refunded {
+                    return Err(fail(StatusCode::CONFLICT, "ramp_refused", "intent already terminal"));
+                }
+                intent.refunded = true;
+            }
+            _ => return Err(bad("outcome must be filled or refunded")),
+        }
+        if req.fill_ref.len() > 128 {
+            return Err(bad("fill ref over cap"));
+        }
+        intent.fill_ref = req.fill_ref.clone();
+        sh.ramp_intents.insert(id, intent);
+        audit_push(sh, "ramp_settle", None, None, format!("intent {} {}", hash_to_hex(&id), req.outcome));
+        Ok(Json(json!({ "intent_id": hash_to_hex(&id), "outcome": req.outcome })))
+    })?
+}
+
+/// `GET /v1/ramp/intents` — the registry trail for entry and exit.
+async fn ramp_intents(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let mut out = Vec::new();
+        for (id, intent) in &sh.ramp_intents {
+            out.push(json!({
+                "intent_id": hash_to_hex(id),
+                "quote_id": hash_to_hex(&intent.quote_id),
+                "user": address_to_hex(&intent.user),
+                "provider": address_to_hex(&intent.provider),
+                "fill_ref": intent.fill_ref,
+                "filled": intent.filled,
+                "refunded": intent.refunded,
+            }));
+        }
+        Ok(Json(json!({ "count": out.len(), "intents": out })))
+    })?
+}
+
+// --- Productive lending ---
+
+#[derive(Deserialize)]
+struct LoanOfferReq {
+    network_id: String,
+    lender_hex: String,
+    min_principal_sat: u64,
+    max_principal_sat: u64,
+    rate_bps_per_window: u64,
+    window_blocks: u64,
+    base_collateral_bps: u32,
+    max_discount_bps: u32,
+    bond_ratio_bps: u32,
+    min_collateral_bps: u32,
+    expires_height: u64,
+    nonce: u64,
+    lender_sigs_hex: String,
+    lender_keys_hex: String,
+}
+
+/// `POST /v1/loans/offers` — lender publishes signed standard terms.
+async fn loan_offer_post(State(state): State<ApiState>, Json(req): Json<LoanOfferReq>) -> ApiResult {
+    let lender = decode_address(&req.lender_hex)?;
+    let sigs = decode_bundle(&req.lender_sigs_hex, "lender_sigs")?;
+    let keys = decode_bundle(&req.lender_keys_hex, "lender_keys")?;
+    let offer = srct_core::lending::LoanOffer {
+        network_id: req.network_id.clone(),
+        lender,
+        min_principal_sat: req.min_principal_sat,
+        max_principal_sat: req.max_principal_sat,
+        rate_bps_per_window: req.rate_bps_per_window,
+        window_blocks: req.window_blocks,
+        base_collateral_bps: req.base_collateral_bps,
+        max_discount_bps: req.max_discount_bps,
+        bond_ratio_bps: req.bond_ratio_bps,
+        min_collateral_bps: req.min_collateral_bps,
+        expires_height: req.expires_height,
+        nonce: req.nonce,
+    };
+    offer.validate().map_err(|e| bad(e.to_string()))?;
+    with_shared(&state, |sh| {
+        if offer.network_id != sh.chain.params().network_id {
+            return Err(fail(StatusCode::CONFLICT, "loan_refused", "offer is for another network"));
+        }
+        let height = sh.chain.height();
+        if height > offer.expires_height {
+            return Err(fail(StatusCode::CONFLICT, "loan_refused", "offer expired"));
+        }
+        let signer = keys.address().map_err(|e| bad(format!("lender_keys: {e}")))?;
+        if signer != offer.lender {
+            return Err(fail(StatusCode::CONFLICT, "loan_refused", "offer signature is not the lender"));
+        }
+        srct_core::sig::verify_bundle(&sigs, &keys, &offer.id())
+            .map_err(|_| fail(StatusCode::CONFLICT, "loan_refused", "lender signature invalid"))?;
+        let id = offer.id();
+        if sh.loan_offers.contains_key(&id) {
+            return Ok(Json(json!({ "offer_id": hash_to_hex(&id), "duplicate": true })));
+        }
+        if sh.loan_offers.len() >= srct_core::lending::MAX_LOAN_OFFERS {
+            return Err(fail(StatusCode::CONFLICT, "loan_refused", "offer book full"));
+        }
+        sh.loan_offers.insert(id, (offer, sigs, keys));
+        audit_push(sh, "loan_offer", None, None, format!("offer {}", hash_to_hex(&id)));
+        Ok(Json(json!({ "offer_id": hash_to_hex(&id), "duplicate": false })))
+    })?
+}
+
+/// `GET /v1/loans/offers?principal=` — discover live offers, cheapest rate
+/// first. Loan discovery without bespoke negotiation.
+async fn loan_offers(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let principal: u64 = query.get("principal").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut out: Vec<(&Hash, &srct_core::lending::LoanOffer)> = sh
+            .loan_offers
+            .iter()
+            .filter(|(_, (o, _, _))| height <= o.expires_height && (principal == 0 || o.fits(principal, height)))
+            .map(|(id, (o, _, _))| (id, o))
+            .collect();
+        out.sort_by_key(|(_, o)| (o.rate_bps_per_window, o.id()));
+        let offers: Vec<Value> = out
+            .iter()
+            .map(|(id, o)| {
+                json!({
+                    "offer_id": hash_to_hex(id),
+                    "lender": address_to_hex(&o.lender),
+                    "min_principal_sat": o.min_principal_sat,
+                    "max_principal_sat": o.max_principal_sat,
+                    "rate_bps_per_window": o.rate_bps_per_window,
+                    "window_blocks": o.window_blocks,
+                    "base_collateral_bps": o.base_collateral_bps,
+                    "max_discount_bps": o.max_discount_bps,
+                    "bond_ratio_bps": o.bond_ratio_bps,
+                    "min_collateral_bps": o.min_collateral_bps,
+                    "expires_height": o.expires_height,
+                })
+            })
+            .collect();
+        Ok(Json(json!({ "count": offers.len(), "offers": offers })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct LoanAcceptReq {
+    offer_id: String,
+    borrower_hex: String,
+    bond_sat: u64,
+    amount_sat: u64,
+    deadline_height: u64,
+}
+
+/// `POST /v1/loans/accept` — borrower takes a standard offer: terms come from
+/// the signed offer, never from the borrower's request. Bond and collateral
+/// must already be funded in the borrower's book balances.
+async fn loan_accept(State(state): State<ApiState>, Json(req): Json<LoanAcceptReq>) -> ApiResult {
+    let offer_id = decode_hash(&req.offer_id)?;
+    let borrower = decode_address(&req.borrower_hex)?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let (offer, _, _) = sh.loan_offers.get(&offer_id).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such offer"))?;
+        if !offer.fits(req.amount_sat, height) {
+            return Err(fail(StatusCode::CONFLICT, "loan_refused", "amount or expiry outside the offer"));
+        }
+        if req.deadline_height <= height {
+            return Err(fail(StatusCode::CONFLICT, "loan_refused", "deadline must be in the future"));
+        }
+        let rate = u32::try_from(offer.rate_bps_per_window)
+            .map_err(|_| bad("offer rate does not fit u32"))?;
+        let agent_id = srct_core::agent::derive_agent_id(&network, srct_core::agent::AgentRole::Machine, &borrower);
+        let mut agent_hash = [0u8; 32];
+        agent_hash[..20].copy_from_slice(&agent_id);
+        let spec = srct_core::credit::PositionSpec {
+            terms: offer.terms(),
+            charge: srct_core::credit::ChargeSchedule {
+                rate_bps_per_window: rate,
+                window_blocks: offer.window_blocks,
+            },
+            borrower,
+            agent_id: agent_hash,
+            lender: offer.lender,
+            amount_sat: req.amount_sat,
+            bond_sat: req.bond_sat,
+            drawn_at_height: height,
+            deadline_height: req.deadline_height,
+        };
+        let required = spec.terms.required_collateral(req.amount_sat, req.bond_sat)
+            .map_err(|e| fail(StatusCode::CONFLICT, "loan_refused", e.to_string()))?;
+        let id = sh.credit.open(&spec)
+            .map_err(|e| fail(StatusCode::CONFLICT, "loan_refused", e.to_string()))?;
+        audit_push(sh, "loan_open", Some(id), Some(req.amount_sat), format!("offer {} collateral {required}", hash_to_hex(&offer_id)));
+        Ok(Json(json!({
+            "position_id": hash_to_hex(&id),
+            "required_collateral_sat": required,
+        })))
+    })?
+}
+
+/// Verified repayment history + a conservative suggested ceiling for one
+/// borrower. The suggestion is advisory: the lender decides, and a default
+/// zeroes it.
+async fn lending_borrower(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let borrower = decode_address(&raw)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let history = srct_core::lending::RepaymentHistory::from_positions(
+            &borrower,
+            sh.credit.positions().map(|(_, p)| p),
+            height,
+        );
+        let network = sh.chain.params().network_id.clone();
+        let subject = srct_core::agent::derive_agent_id(&network, srct_core::agent::AgentRole::Machine, &borrower);
+        let mut score: i64 = 0;
+        for batch in sh.passport_batches.values() {
+            if batch.subject == subject && batch.network_id == network && height >= batch.issued_height && height <= batch.expires_height {
+                score = score.saturating_add(srct_core::passport::score_batch(batch));
+            }
+        }
+        let suggested = srct_core::lending::suggested_limit(&history, score);
+        Ok(Json(json!({
+            "borrower": address_to_hex(&borrower),
+            "repaid_positions": history.repaid_positions,
+            "defaulted_positions": history.defaulted_positions,
+            "total_repaid_sat": history.total_repaid_sat,
+            "total_borrowed_sat": history.total_borrowed_sat,
+            "on_time_rate_bps": history.on_time_rate_bps(),
+            "reputation_score": score,
+            "suggested_max_principal_sat": suggested,
+            "advisory_only": true,
+        })))
+    })?
+}
+
+/// Lender risk dashboard: exposure by lender, positions due soon, defaulted
+/// positions with shortfalls, expected interest. Read-only over the book.
+async fn lending_dashboard(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let due_soon_window: u64 = 100;
+        let mut open = Vec::new();
+        let mut exposure: BTreeMap<String, u64> = BTreeMap::new();
+        let mut due_soon = Vec::new();
+        let mut defaulted = Vec::new();
+        let mut expected_interest: u64 = 0;
+        for (id, p) in sh.credit.positions() {
+            match &p.state {
+                srct_core::credit::PositionState::Drawn { repaid_principal_sat, repaid_interest_sat, .. } => {
+                    let interest = p.charge.accrued_interest(p.amount_sat, p.drawn_at_height, height).unwrap_or(0);
+                    let total = p.amount_sat.saturating_add(interest);
+                    let paid = repaid_principal_sat.saturating_add(*repaid_interest_sat);
+                    let outstanding = total.saturating_sub(paid);
+                    let key = address_to_hex(&p.lender);
+                    let entry = exposure.entry(key).or_insert(0);
+                    *entry = entry.saturating_add(outstanding);
+                    expected_interest = expected_interest.saturating_add(interest);
+                    open.push(json!({
+                        "position_id": hash_to_hex(id),
+                        "borrower": address_to_hex(&p.borrower),
+                        "lender": address_to_hex(&p.lender),
+                        "outstanding_sat": outstanding,
+                        "deadline_height": p.deadline_height,
+                    }));
+                    if p.deadline_height <= height + due_soon_window {
+                        due_soon.push(json!({
+                            "position_id": hash_to_hex(id),
+                            "deadline_height": p.deadline_height,
+                            "outstanding_sat": outstanding,
+                        }));
+                    }
+                }
+                srct_core::credit::PositionState::Defaulted { settlement, .. } => {
+                    defaulted.push(json!({
+                        "position_id": hash_to_hex(id),
+                        "borrower": address_to_hex(&p.borrower),
+                        "lender": address_to_hex(&p.lender),
+                        "debt_sat": settlement.debt_sat,
+                        "shortfall_sat": settlement.shortfall_sat,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(Json(json!({
+            "height": height,
+            "open_positions": open.len(),
+            "exposure_by_lender": exposure,
+            "due_soon": due_soon,
+            "defaulted": defaulted,
+            "expected_interest_sat": expected_interest,
+        })))
+    })?
+}
+
+/// `GET /v1/lending/limit/{borrower}` — suggested ceiling + the factors behind
+/// it. Advisory only; who bears losses is the position's settlement, not this
+/// number (collateral first, then the bond, then the lender absorbs it).
+async fn lending_limit(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let borrower = decode_address(&raw)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let network = sh.chain.params().network_id.clone();
+        let history = srct_core::lending::RepaymentHistory::from_positions(
+            &borrower,
+            sh.credit.positions().map(|(_, p)| p),
+            height,
+        );
+        let subject = srct_core::agent::derive_agent_id(&network, srct_core::agent::AgentRole::Machine, &borrower);
+        let mut score: i64 = 0;
+        for batch in sh.passport_batches.values() {
+            if batch.subject == subject && batch.network_id == network && height >= batch.issued_height && height <= batch.expires_height {
+                score = score.saturating_add(srct_core::passport::score_batch(batch));
+            }
+        }
+        Ok(Json(json!({
+            "borrower": address_to_hex(&borrower),
+            "suggested_max_principal_sat": srct_core::lending::suggested_limit(&history, score),
+            "factors": {
+                "repaid_positions": history.repaid_positions,
+                "defaulted_positions": history.defaulted_positions,
+                "total_repaid_sat": history.total_repaid_sat,
+                "reputation_score": score,
+            },
+            "loss_bearing": "collateral first, then the borrower's posted bond, then the lender absorbs the shortfall",
+        })))
+    })?
+}
+
+/// Live valuation of one position: collateral vs debt + accrued interest.
+async fn lending_collateral(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let id = decode_hash(&raw)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let p = sh.credit.position(&id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such position"))?;
+        let interest = p.charge.accrued_interest(p.amount_sat, p.drawn_at_height, height).unwrap_or(0);
+        let debt = p.amount_sat.saturating_add(interest);
+        let backing = (p.collateral_sat as u128) + (p.bond_sat as u128);
+        let coverage_bps = if debt == 0 {
+            u64::MAX
+        } else {
+            u64::try_from(backing * 10_000 / debt as u128).unwrap_or(u64::MAX)
+        };
+        Ok(Json(json!({
+            "position_id": hash_to_hex(&id),
+            "collateral_sat": p.collateral_sat,
+            "bond_sat": p.bond_sat,
+            "principal_sat": p.amount_sat,
+            "accrued_interest_sat": interest,
+            "debt_sat": debt,
+            "coverage_bps": coverage_bps,
+            "state": format!("{:?}", p.state),
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct AutorepayReq {
+    borrower_hex: String,
+    position_id: String,
+    pct_bps: u64,
+    cap_sat: u64,
+    expires_height: u64,
+    nonce: u64,
+    sigs_hex: String,
+    keys_hex: String,
+}
+
+/// `POST /v1/lending/autorepay` — register the borrower's signed standing
+/// instruction: route a share of each credit deposit to the position.
+/// Revoke by registering an expired replacement.
+async fn lending_autorepay(State(state): State<ApiState>, Json(req): Json<AutorepayReq>) -> ApiResult {
+    let borrower = decode_address(&req.borrower_hex)?;
+    let position_id = decode_hash(&req.position_id)?;
+    let sigs = decode_bundle(&req.sigs_hex, "sigs")?;
+    let keys = decode_bundle(&req.keys_hex, "keys")?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let signer = keys.address().map_err(|e| bad(format!("keys: {e}")))?;
+        if signer != borrower {
+            return Err(fail(StatusCode::CONFLICT, "loan_refused", "instruction is not signed by the borrower"));
+        }
+        let instr = srct_core::lending::StandingRepay {
+            network_id: network.clone(),
+            borrower,
+            position_id,
+            pct_bps: req.pct_bps,
+            cap_sat: req.cap_sat,
+            applied_sat: 0,
+            expires_height: req.expires_height,
+            nonce: req.nonce,
+        };
+        srct_core::lending::verify_standing_repay(&instr, &sigs, &keys, &network, height)
+            .map_err(|e| fail(StatusCode::CONFLICT, "loan_refused", e.to_string()))?;
+        match sh.credit.position(&position_id) {
+            Some(p) if p.borrower == borrower => {}
+            _ => return Err(fail(StatusCode::NOT_FOUND, "not_found", "no such borrower position")),
+        }
+        sh.standing_repay.insert(borrower, (instr, sigs, keys));
+        audit_push(sh, "autorepay_registered", Some(position_id), None, format!("borrower {}", address_to_hex(&borrower)));
+        Ok(Json(json!({ "borrower": address_to_hex(&borrower), "position_id": hash_to_hex(&position_id) })))
+    })?
+}
+
+/// `GET /v1/lending/autorepay/{borrower}` — the live instruction, if any.
+async fn lending_autorepay_get(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let borrower = decode_address(&raw)?;
+    with_shared(&state, |sh| {
+        match sh.standing_repay.get(&borrower) {
+            Some((instr, _, _)) => Ok(Json(json!({
+                "borrower": address_to_hex(&borrower),
+                "position_id": hash_to_hex(&instr.position_id),
+                "pct_bps": instr.pct_bps,
+                "cap_sat": instr.cap_sat,
+                "applied_sat": instr.applied_sat,
+                "expires_height": instr.expires_height,
+            }))),
+            None => Ok(Json(json!({ "borrower": address_to_hex(&borrower), "instruction": Value::Null }))),
+        }
+    })?
+}
+
 // ---------------------------------------------------------------------------
 // Always-on + exposed middleware (SPEC.md §19.2: opt-in, loopback by default)
 // ---------------------------------------------------------------------------
@@ -4754,7 +6730,37 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/payments/unsettled", get(payments_unsettled))
         .route("/v1/receipts/orphans", get(receipts_orphans))
         .route("/v1/audit", get(audit_list))
-        .route("/v1/risk/policy", get(risk_policy));
+        .route("/v1/risk/policy", get(risk_policy))
+        .route("/v1/reputation/passport/attest", post(passport_attest))
+        .route("/v1/reputation/batch", post(passport_batch_register))
+        .route("/v1/reputation/score/{agent_hex}", get(passport_score))
+        .route("/v1/wallet/tier", post(wallet_tier))
+        .route("/v1/wallet/tiers/{agent_hex}", get(wallet_tiers))
+        .route("/v1/jobs/open", post(job_open))
+        .route("/v1/jobs/{job_id}/accept", post(job_accept))
+        .route("/v1/jobs/{job_id}/deliver", post(job_deliver))
+        .route("/v1/jobs/{job_id}/dispute", post(job_dispute))
+        .route("/v1/jobs/{job_id}/resolve", post(job_resolve))
+        .route("/v1/jobs/{job_id}", get(job_get))
+        .route("/v1/payments/{id}/receipt_status", get(receipt_status))
+        .route("/v1/fx/rates", post(fx_rate_register))
+        .route("/v1/fx/rates/list", get(fx_rates))
+        .route("/v1/fx/quote", post(fx_quote))
+        .route("/v1/fx/swap", post(fx_swap))
+        .route("/v1/ramp/quote", post(ramp_quote))
+        .route("/v1/ramp/quotes", get(ramp_quotes))
+        .route("/v1/ramp/intent", post(ramp_intent))
+        .route("/v1/ramp/intent/{id}/settle", post(ramp_intent_settle))
+        .route("/v1/ramp/intents", get(ramp_intents))
+        .route("/v1/loans/offers", post(loan_offer_post))
+        .route("/v1/loans/offers/list", get(loan_offers))
+        .route("/v1/loans/accept", post(loan_accept))
+        .route("/v1/lending/borrower/{addr}", get(lending_borrower))
+        .route("/v1/lending/dashboard", get(lending_dashboard))
+        .route("/v1/lending/limit/{borrower}", get(lending_limit))
+        .route("/v1/lending/collateral/{position_id}", get(lending_collateral))
+        .route("/v1/lending/autorepay", post(lending_autorepay))
+        .route("/v1/lending/autorepay/{borrower}", get(lending_autorepay_get));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
