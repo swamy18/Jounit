@@ -588,7 +588,7 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 6. Every input's `signature` verifies against `msg_k` (§1.1) for the address owning the spent output
 7. Coinbase outputs referencing the same address accumulate — a single miner cannot claim two matured rewards in one block
 8. `coinbase.value ≤ block_reward(height) + tip_total` — miners may **not** over-claim
-9. Standard tx: `lock_time` is advisory in v0.1
+9. Standard tx: `lock_time` is enforced — a transaction with `lock_time > height` is refused, so a timelocked transaction cannot mine early
 10. Bond (`2`): inputs share exactly one signer (the bonder); BLS key valid
      and not already bonded; exactly one output pays the derived bond identity
      `SHA256("srct/bond-identity/v1" ‖ network_id ‖ bonder ‖ bls_pk)[..20]`

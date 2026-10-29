@@ -177,8 +177,8 @@ How it works: `GET /v1/mine/template?miner=<hex>` returns an unsolved block
 {"block_hex": ...}` hands it back. The node re-validates everything —
 template, proof, tip, timestamp — so a stale or forged solution is refused,
 never half-applied. Any HTTP client can do this loop; the binary just does it
-well (multithreaded, `--threads N` with `0` = one per CPU, `--batch N` for
-batched solving, automatic retry with backoff).
+well (multithreaded, `--threads N` with `0` = one per CPU and a cap of 1024,
+`--batch N` for batched solving with a cap of 65536, automatic retry with backoff).
 
 The `--miner` address need not belong to any wallet on the node — it is just
 where the coinbase pays out.
