@@ -1,5 +1,7 @@
 # Solar Cyber Unit (SRCT)
 
+![Solar Cyber Unit coin logo](Solar_Cyber_unit.png)
+
 AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
 **Author and copyright:** Community-owned. The code is open source — no single
