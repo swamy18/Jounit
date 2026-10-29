@@ -2,28 +2,28 @@
   "version": 1,
   "description": "Layer-2 authority and credit scenarios, derived from SPEC.md sections 21 and 22 by sim/l2_authority_reference.py. The Rust suite reads this file and asserts the same outcomes, so the two implementations are compared rather than merely coexisting.",
   "addresses": {
-    "agent": "94e08448c61edd21820bdb90a1a247907033a4df",
-    "borrower": "41de0680f5932e7b25de513c9bb02b7de03f36ab",
-    "lender": "e19244e2cc6bc175fc6cdac43b7e64e5f78d0a4f",
-    "owner": "1c8341416262a909d391ddb0aad5d2bf496b2028",
-    "recipient": "719cc23b5787dda593907008a1c0aa59707773bf",
-    "stranger": "8f1804a0f005c3d31ede1e707a0d2174a78ea899",
-    "trigger": "3895ed8048c9ffb109150135a703fbb42788ecfe"
+    "agent": "f2988a8980709a15036acaa1ed6d39530e080b81",
+    "borrower": "e6110d591258c55a3acd828310b4b4d64a94d50e",
+    "lender": "4a6e6f4d1ccafe01dfc223227a506ef7af79bfdd",
+    "owner": "9dc42e25d33902b8f22d23f69f0a16449de909d3",
+    "recipient": "f865f983721dafb09d7aba78b0818596b50f6ca5",
+    "stranger": "408c5117061ca29c5c3c78cab3998b45ca90739e",
+    "trigger": "a1ab77014e402a6992c10c76b2baa2b9b842771e"
   },
   "scenarios": [
     {
       "name": "caps_and_counters",
       "funding": {
         "owner": 100000000,
-        "recipient": 100000000,
-        "agent": 100000000
+        "agent": 100000000,
+        "recipient": 100000000
       },
       "steps": [
         {
           "op": "policy",
           "policy": {
-            "network_id": "jounit/mini",
-            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "network_id": "srct/mini",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
             "owner": "owner",
             "role": 1,
             "per_tx_max_sat": 10000,
@@ -46,7 +46,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
           "spender": "agent",
           "nonce": 1,
           "recipient": "recipient",
@@ -58,7 +58,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
           "spender": "agent",
           "nonce": 2,
           "recipient": "recipient",
@@ -72,8 +72,8 @@
       "final": {
         "balances": {
           "owner": 99983000,
-          "recipient": 100011000,
-          "agent": 100000000
+          "agent": 100000000,
+          "recipient": 100011000
         },
         "funded_total": 300000000,
         "burned": 3000,
@@ -82,8 +82,8 @@
         "conserved": true,
         "policies": [
           {
-            "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
-            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
             "spender": "agent",
             "revoked": false,
             "window_start_height": 1,
@@ -99,17 +99,17 @@
     {
       "name": "authority_refusals",
       "funding": {
-        "owner": 100000000,
-        "recipient": 100000000,
         "stranger": 100000000,
-        "agent": 100000000
+        "owner": 100000000,
+        "agent": 100000000,
+        "recipient": 100000000
       },
       "steps": [
         {
           "op": "policy",
           "policy": {
-            "network_id": "jounit/mini",
-            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "network_id": "srct/mini",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
             "owner": "owner",
             "role": 1,
             "per_tx_max_sat": 10000,
@@ -132,7 +132,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
           "spender": "agent",
           "nonce": 1,
           "recipient": "recipient",
@@ -145,7 +145,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
           "spender": "agent",
           "nonce": 1,
           "recipient": "stranger",
@@ -158,7 +158,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
           "spender": "stranger",
           "nonce": 1,
           "recipient": "recipient",
@@ -171,7 +171,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
           "spender": "agent",
           "nonce": 1,
           "recipient": "recipient",
@@ -183,7 +183,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
+          "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
           "spender": "agent",
           "nonce": 1,
           "recipient": "recipient",
@@ -210,8 +210,8 @@
         {
           "op": "policy",
           "policy": {
-            "network_id": "jounit/mini",
-            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "network_id": "srct/mini",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
             "owner": "owner",
             "role": 1,
             "per_tx_max_sat": 10000,
@@ -238,8 +238,8 @@
         {
           "op": "policy",
           "policy": {
-            "network_id": "jounit/mini",
-            "agent_id": "f686cd39712f4d6777ec9839cb925ebe29130e31",
+            "network_id": "srct/mini",
+            "agent_id": "ca67d7ad7dba1fe06d848304728afc749dc6e051",
             "owner": "stranger",
             "role": 1,
             "per_tx_max_sat": 10000,
@@ -264,10 +264,10 @@
       ],
       "final": {
         "balances": {
-          "owner": 99995000,
-          "recipient": 100001000,
           "stranger": 100000000,
-          "agent": 100000000
+          "owner": 99995000,
+          "agent": 100000000,
+          "recipient": 100001000
         },
         "funded_total": 400000000,
         "burned": 2000,
@@ -276,8 +276,8 @@
         "conserved": true,
         "policies": [
           {
-            "policy_hash": "45bc8a1622992d02f448610348c34d605c280d1e155681377174db773e7f0557",
-            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "policy_hash": "f5e11f8eb9ff843f25c1a6c708e4e9af6cf145065010a9c2427581f351ed8d97",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
             "spender": "agent",
             "revoked": false,
             "window_start_height": 1,
@@ -294,15 +294,15 @@
       "name": "revocation_reaches_descendants",
       "funding": {
         "owner": 100000000,
-        "recipient": 100000000,
-        "agent": 100000000
+        "agent": 100000000,
+        "recipient": 100000000
       },
       "steps": [
         {
           "op": "policy",
           "policy": {
-            "network_id": "jounit/mini",
-            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "network_id": "srct/mini",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
             "owner": "owner",
             "role": 1,
             "per_tx_max_sat": 100000,
@@ -326,8 +326,8 @@
         {
           "op": "policy",
           "policy": {
-            "network_id": "jounit/mini",
-            "agent_id": "cd4aa993a9cfe9100b9c706677aa1f788db64296",
+            "network_id": "srct/mini",
+            "agent_id": "daf7c5826cff66fbe36ab8d1e520477875613e19",
             "owner": "owner",
             "role": 1,
             "per_tx_max_sat": 100001,
@@ -340,7 +340,7 @@
             "not_before_height": 0,
             "expires_at_height": 1000000,
             "revoked": false,
-            "parent_agent_id": "3ab105423189b67089258596d6a8b9e37a25b096"
+            "parent_agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3"
           },
           "spender": "agent",
           "owner": "owner",
@@ -352,8 +352,8 @@
         {
           "op": "policy",
           "policy": {
-            "network_id": "jounit/mini",
-            "agent_id": "cd4aa993a9cfe9100b9c706677aa1f788db64296",
+            "network_id": "srct/mini",
+            "agent_id": "daf7c5826cff66fbe36ab8d1e520477875613e19",
             "owner": "owner",
             "role": 1,
             "per_tx_max_sat": 1000,
@@ -366,7 +366,7 @@
             "not_before_height": 0,
             "expires_at_height": 1000000,
             "revoked": false,
-            "parent_agent_id": "3ab105423189b67089258596d6a8b9e37a25b096"
+            "parent_agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3"
           },
           "spender": "agent",
           "owner": "owner",
@@ -376,7 +376,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "584087c54715b8d6cab3a996ab240659112e966240e19b36300687df290bcd85",
+          "policy_hash": "72368864326223064dc1be55c6f1b0b12acfcdb85efea7d4e9ead96ac724ed8f",
           "spender": "agent",
           "nonce": 1,
           "recipient": "recipient",
@@ -388,7 +388,7 @@
         },
         {
           "op": "revoke",
-          "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+          "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
           "owner": "owner",
           "outcome": {
             "ok": true
@@ -396,7 +396,7 @@
         },
         {
           "op": "spend",
-          "policy_hash": "584087c54715b8d6cab3a996ab240659112e966240e19b36300687df290bcd85",
+          "policy_hash": "72368864326223064dc1be55c6f1b0b12acfcdb85efea7d4e9ead96ac724ed8f",
           "spender": "agent",
           "nonce": 2,
           "recipient": "recipient",
@@ -411,8 +411,8 @@
       "final": {
         "balances": {
           "owner": 99991500,
-          "recipient": 100000500,
-          "agent": 100000000
+          "agent": 100000000,
+          "recipient": 100000500
         },
         "funded_total": 300000000,
         "burned": 4000,
@@ -421,8 +421,8 @@
         "conserved": true,
         "policies": [
           {
-            "policy_hash": "584087c54715b8d6cab3a996ab240659112e966240e19b36300687df290bcd85",
-            "agent_id": "cd4aa993a9cfe9100b9c706677aa1f788db64296",
+            "policy_hash": "72368864326223064dc1be55c6f1b0b12acfcdb85efea7d4e9ead96ac724ed8f",
+            "agent_id": "daf7c5826cff66fbe36ab8d1e520477875613e19",
             "spender": "agent",
             "revoked": false,
             "window_start_height": 3,
@@ -432,8 +432,8 @@
             "spends": 1
           },
           {
-            "policy_hash": "aa8c73107e6709428f15be8b6b49bfbb9a09b7f32959963e24e4b9902f79fece",
-            "agent_id": "3ab105423189b67089258596d6a8b9e37a25b096",
+            "policy_hash": "74ee6f8d048e5f79537bc663b5bd7af36d8dc31a733b76eb61e83f54a1512c23",
+            "agent_id": "0fc2db1cc89b28f7fd01df380eebf8918d863bb3",
             "spender": "agent",
             "revoked": true,
             "window_start_height": 1,
@@ -449,9 +449,9 @@
     {
       "name": "credit_open_collateralise_repay",
       "funding": {
+        "lender": 100000000,
         "trigger": 100000000,
-        "borrower": 100000000,
-        "lender": 100000000
+        "borrower": 100000000
       },
       "steps": [
         {
@@ -499,9 +499,9 @@
       ],
       "final": {
         "balances": {
+          "lender": 99398000,
           "trigger": 100000000,
-          "borrower": 99096000,
-          "lender": 99398000
+          "borrower": 99096000
         },
         "funded_total": 300000000,
         "burned": 3000,
@@ -511,7 +511,7 @@
         "policies": [],
         "positions": [
           {
-            "position_id": "46a5cd31536ceb6e8e6bd857dcdc99de6cd996ac0b58b33e32f730784d83fad9",
+            "position_id": "33bf6fc9a95a60a9aefff7c049476c4e8d01aef4d18611a28e4bd9b0cc85b6b1",
             "lender": "lender",
             "borrower": "borrower",
             "principal_sat": 1000000,
@@ -526,9 +526,9 @@
     {
       "name": "credit_refusals",
       "funding": {
+        "lender": 100000000,
         "trigger": 100000000,
-        "borrower": 100000000,
-        "lender": 100000000
+        "borrower": 100000000
       },
       "steps": [
         {
@@ -622,9 +622,9 @@
       ],
       "final": {
         "balances": {
+          "lender": 98998000,
           "trigger": 100000000,
-          "borrower": 100000000,
-          "lender": 98998000
+          "borrower": 100000000
         },
         "funded_total": 300000000,
         "burned": 1000,
@@ -634,7 +634,7 @@
         "policies": [],
         "positions": [
           {
-            "position_id": "4448e2b55629657244c244dd194f9509fb623a9d3b0547518b7f234751f0d70c",
+            "position_id": "f0b92156f49db417d11adda18334cb8776b04065edb95760ec62ed7728010dba",
             "lender": "lender",
             "borrower": "borrower",
             "principal_sat": 1000000,
@@ -649,9 +649,9 @@
     {
       "name": "credit_default_after_deadline",
       "funding": {
+        "lender": 100000000,
         "trigger": 100000000,
-        "borrower": 100000000,
-        "lender": 100000000
+        "borrower": 100000000
       },
       "steps": [
         {
@@ -695,9 +695,9 @@
       ],
       "final": {
         "balances": {
+          "lender": 100088000,
           "trigger": 99998000,
-          "borrower": 99910000,
-          "lender": 100088000
+          "borrower": 99910000
         },
         "funded_total": 300000000,
         "burned": 2000,
@@ -707,7 +707,7 @@
         "policies": [],
         "positions": [
           {
-            "position_id": "90bd760aff48ac989b142b9a81e20c6508fe906cd719e017d8d265eece441202",
+            "position_id": "c48d07139ce9ba19eb08b86c9d71ab5561e41c682e2e3f2575e4fddde6a7a24d",
             "lender": "lender",
             "borrower": "borrower",
             "principal_sat": 1000000,

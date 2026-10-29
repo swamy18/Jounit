@@ -660,104 +660,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jnt-core"
-version = "0.1.0"
-dependencies = [
- "blst",
- "hex",
- "k256",
- "ml-dsa",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "zeroize",
-]
-
-[[package]]
-name = "jnt-l2"
-version = "0.1.0"
-dependencies = [
- "hex",
- "jnt-core",
- "serde_json",
-]
-
-[[package]]
-name = "jnt-mcp"
-version = "0.1.0"
-dependencies = [
- "hex",
- "jnt-core",
- "jnt-l2",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "jnt-miner"
-version = "0.1.0"
-dependencies = [
- "hex",
- "jnt-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "jnt-net"
-version = "0.1.0"
-dependencies = [
- "jnt-core",
- "rand",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "jnt-node"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "axum",
- "chacha20poly1305",
- "ctrlc",
- "hex",
- "hyper-util",
- "jnt-core",
- "jnt-l2",
- "jnt-net",
- "jnt-store",
- "jnt-worker",
- "rand",
- "serde",
- "serde_json",
- "subtle",
- "tokio",
- "tower",
- "zeroize",
-]
-
-[[package]]
-name = "jnt-store"
-version = "0.1.0"
-dependencies = [
- "jnt-core",
- "serde_json",
-]
-
-[[package]]
-name = "jnt-worker"
-version = "0.1.0"
-dependencies = [
- "hex",
- "jnt-core",
- "jnt-l2",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "k256"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1207,6 +1109,104 @@ name = "sponge-cursor"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
+
+[[package]]
+name = "srct-core"
+version = "0.1.0"
+dependencies = [
+ "blst",
+ "hex",
+ "k256",
+ "ml-dsa",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
+name = "srct-l2"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "srct-core",
+]
+
+[[package]]
+name = "srct-mcp"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "srct-core",
+ "srct-l2",
+]
+
+[[package]]
+name = "srct-miner"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "srct-core",
+]
+
+[[package]]
+name = "srct-net"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+ "srct-core",
+]
+
+[[package]]
+name = "srct-node"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "chacha20poly1305",
+ "ctrlc",
+ "hex",
+ "hyper-util",
+ "rand",
+ "serde",
+ "serde_json",
+ "srct-core",
+ "srct-l2",
+ "srct-net",
+ "srct-store",
+ "srct-worker",
+ "subtle",
+ "tokio",
+ "tower",
+ "zeroize",
+]
+
+[[package]]
+name = "srct-store"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "srct-core",
+]
+
+[[package]]
+name = "srct-worker"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "srct-core",
+ "srct-l2",
+]
 
 [[package]]
 name = "subtle"

@@ -1,5 +1,5 @@
 [package]
-name = "jnt-core-fuzz"
+name = "srct-core-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -14,20 +14,20 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.jnt-core]
-path = "../crates/jnt-core"
+[dependencies.srct-core]
+path = "../crates/srct-core"
 
-[dependencies.jnt-l2]
-path = "../crates/jnt-l2"
+[dependencies.srct-l2]
+path = "../crates/srct-l2"
 
-[dependencies.jnt-store]
-path = "../crates/jnt-store"
+[dependencies.srct-store]
+path = "../crates/srct-store"
 
-[dependencies.jnt-net]
-path = "../crates/jnt-net"
+[dependencies.srct-net]
+path = "../crates/srct-net"
 
-[dependencies.jnt-worker]
-path = "../crates/jnt-worker"
+[dependencies.srct-worker]
+path = "../crates/srct-worker"
 
 # Avoid the fuzz binary inheriting the workspace's panic="abort" release
 # profile, which is incompatible with libFuzzer's crash handlers.

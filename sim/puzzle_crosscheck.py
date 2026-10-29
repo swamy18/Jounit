@@ -4,7 +4,7 @@ SPEC.md section 12 states that `tests/vectors/*.json` are consumed by both the
 Rust test suite and this script, and that a language implementation is correct
 only if it reproduces them byte for byte.
 
-That second half is the point. `sim/jounit_reference.py` is a second
+That second half is the point. `sim/srct_reference.py` is a second
 implementation written from the prose of SPEC.md, not from the Rust source. If
 the two agree on every vector, that is real evidence the spec is unambiguous --
 if they disagree, the disagreement is in the spec, not in either
@@ -14,7 +14,7 @@ implementation.
 
 Regenerate the vectors from Rust with:
 
-    UPDATE_PUZZLE_VECTORS=1 cargo test -p jnt-core --lib puzzle_vectors
+    UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core --lib puzzle_vectors
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from jounit_reference import (  # noqa: E402
+from srct_reference import (  # noqa: E402
     PuzzleSpec,
     genesis_header,
     run_puzzle,
@@ -45,7 +45,7 @@ def reference_header(height: int, nonce: int, epoch_id: int):
     """Rebuild the exact header the Rust vector generator used.
 
     SPEC.md section 11 defines the genesis header, so this is derivable from
-    the spec: extra_nonce is "jounit-genesis" padded to 16 bytes, the
+    the spec: extra_nonce is "srct-genesis" padded to 16 bytes, the
     merkle root is the single-transaction coinbase root, and difficulty is 1.
     """
     # Leaf hash of the one-transaction genesis coinbase: SHA256(0x00 || tx).
@@ -95,7 +95,7 @@ def reference_header(height: int, nonce: int, epoch_id: int):
 def main() -> int:
     if not VECTORS.exists():
         print(f"missing {VECTORS}")
-        print("regenerate with: UPDATE_PUZZLE_VECTORS=1 cargo test -p jnt-core")
+        print("regenerate with: UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core")
         return 2
 
     data = json.loads(VECTORS.read_text(encoding="utf-8"))
@@ -114,7 +114,7 @@ def main() -> int:
         if want is not None and want != got:
             mismatches.append(f"spec.{key}: rust={want} reference={got}")
 
-    print("=== puzzle cross-check: jnt-core vs independent Python reference ===")
+    print("=== puzzle cross-check: srct-core vs independent Python reference ===")
     print(f"{'case':<22}{'stage':<12}{'result':<8}detail")
     print("-" * 72)
 

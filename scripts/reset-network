@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reset a local multi-node Jounit network: stop it, then delete its data.
+# Reset a local multi-node Solar Cyber Unit network: stop it, then delete its data.
 #
 # Usage:
 #   scripts/reset-network [--data-root DIR]

@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// Fuzz the store's metadata parser (jnt-store meta.rs).
+// Fuzz the store's metadata parser (srct-store meta.rs).
 //
 // `MetaFile::load` reads a text file an operator or a crash may have damaged.
 // The parser must return None (absent), Some (valid), or a named BadMeta
@@ -10,14 +10,14 @@ use libfuzzer_sys::fuzz_target;
 // never accept a structurally impossible metadata (height 0 with non-genesis
 // tip).
 fuzz_target!(|data: &[u8]| {
-    let hex = jnt_core::hash::hash_to_hex(&jnt_core::hash::sha256(&[data]));
-    let dir = std::env::temp_dir().join(format!("jnt-fuzz-meta-{}", &hex[..16]));
+    let hex = srct_core::hash::hash_to_hex(&srct_core::hash::sha256(&[data]));
+    let dir = std::env::temp_dir().join(format!("srct-fuzz-meta-{}", &hex[..16]));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("meta.json");
     std::fs::write(&path, data).unwrap();
 
-    let mf = jnt_store::MetaFile::new(&path);
+    let mf = srct_store::MetaFile::new(&path);
     match mf.load() {
         Ok(None) => {}
         Ok(Some(meta)) => {
@@ -51,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
             let reparsed = mf.load().unwrap().expect("saved metadata must reload");
             assert_eq!(reparsed, meta, "render/parse round-trip must be identity");
         }
-        Err(jnt_store::StoreError::BadMeta { .. }) => {}
+        Err(srct_store::StoreError::BadMeta { .. }) => {}
         Err(e) => panic!("metadata parser returned an unexpected error class: {e:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);

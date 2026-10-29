@@ -9,9 +9,9 @@ use libfuzzer_sys::fuzz_target;
 // holds under adversarial input, and that decode → serialize → decode is
 // stable.
 fuzz_target!(|data: &[u8]| {
-    if let Ok(block) = jnt_core::block::Block::deserialize(data) {
+    if let Ok(block) = srct_core::block::Block::deserialize(data) {
         let re = block.serialize();
-        let again = jnt_core::block::Block::deserialize(&re)
+        let again = srct_core::block::Block::deserialize(&re)
             .expect("a decoded block must decode from its own serialization");
         assert_eq!(
             again.block_hash(),
@@ -22,11 +22,11 @@ fuzz_target!(|data: &[u8]| {
         let _ = block.merkle_root();
     }
     // The header alone is also a peer-controlled parse surface.
-    if data.len() >= jnt_core::block::HEADER_SERIALIZED_LEN {
-        if let Ok(h) = jnt_core::block::Header::deserialize(&data[..jnt_core::block::HEADER_SERIALIZED_LEN]) {
+    if data.len() >= srct_core::block::HEADER_SERIALIZED_LEN {
+        if let Ok(h) = srct_core::block::Header::deserialize(&data[..srct_core::block::HEADER_SERIALIZED_LEN]) {
             let _ = h.block_hash();
             let re = h.serialize();
-            assert_eq!(re.len(), jnt_core::block::HEADER_SERIALIZED_LEN);
+            assert_eq!(re.len(), srct_core::block::HEADER_SERIALIZED_LEN);
         }
     }
 });

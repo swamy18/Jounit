@@ -1,8 +1,8 @@
-"""Jounit Layer-2 authority and credit: independent Python reference (SPEC.md 21, 22).
+"""Solar Cyber Unit Layer-2 authority and credit: independent Python reference (SPEC.md 21, 22).
 
 This exists to answer one question about the newest part of the protocol: is
 the Rust implementation the only implementation? The authority layer (21) and
-the credit layer (22) are the first places in Jounit where a *rule* rather
+the credit layer (22) are the first places in Solar Cyber Unit where a *rule* rather
 than a transfer is the interesting object - a grant says how much an agent may
 spend, to whom, inside which window, and the chain has to enforce all of it
 against state it keeps. A second implementation, written from the specification
@@ -39,11 +39,11 @@ VECTORS_DIR = ROOT / "tests" / "vectors"
 VECTOR_FILE = "l2_authority_vectors.json"
 
 # --- Domain tags (SPEC.md sections 0, 21, 22) ------------------------------
-DOM_AGENT_ID = b"jounit/agent-id/v1"
-DOM_AGENT_ID_SUB = b"jounit/agent-id/sub/v1"
-DOM_AGENT_POLICY = b"jounit/agent-policy/v1"
-DOM_L2_CREDIT_POSITION = b"jounit/l2/credit-position/v1"
-DOM_ADDR = b"jounit/addr/v2"
+DOM_AGENT_ID = b"srct/agent-id/v1"
+DOM_AGENT_ID_SUB = b"srct/agent-id/sub/v1"
+DOM_AGENT_POLICY = b"srct/agent-policy/v1"
+DOM_L2_CREDIT_POSITION = b"srct/l2/credit-position/v1"
+DOM_ADDR = b"srct/addr/v2"
 
 POLICY_VERSION = 2
 MAX_POLICY_RECIPIENTS = 64
@@ -108,7 +108,7 @@ def _compress(pt) -> bytes:
 
 
 def address_of_key_bytes(key: bytes) -> bytes:
-    """The Jounit address of a secp256k1 private key.
+    """The Solar Cyber Unit address of a secp256k1 private key.
 
     The address is the hash of the *hybrid* key bundle (SPEC.md section 1):
     the compressed public key under the ECDSA scheme (33 bytes) and the
@@ -245,7 +245,7 @@ def refuse(error: str) -> None:
 class State:
     """The Layer-2 state, as far as the authority and credit rules touch it."""
 
-    network_id: str = "jounit/mini"
+    network_id: str = "srct/mini"
     accounts: dict = field(default_factory=dict)
     funded_total: int = 0
     burned: int = 0
@@ -695,8 +695,8 @@ def run_scenarios() -> list:
     for a in ("owner", "agent", "recipient"):
         state.credit(ADDR[a], 100_000_000)
     policy = Policy(
-        network_id="jounit/mini",
-        agent_id=derive_agent_id("jounit/mini", ROLE_MACHINE, ADDR["owner"]),
+        network_id="srct/mini",
+        agent_id=derive_agent_id("srct/mini", ROLE_MACHINE, ADDR["owner"]),
         owner=ADDR["owner"],
         role=ROLE_MACHINE,
         per_tx_max_sat=10_000,
@@ -738,8 +738,8 @@ def run_scenarios() -> list:
     for a in ("owner", "agent", "recipient", "stranger"):
         state.credit(ADDR[a], 100_000_000)
     policy = Policy(
-        network_id="jounit/mini",
-        agent_id=derive_agent_id("jounit/mini", ROLE_MACHINE, ADDR["owner"]),
+        network_id="srct/mini",
+        agent_id=derive_agent_id("srct/mini", ROLE_MACHINE, ADDR["owner"]),
         owner=ADDR["owner"],
         role=ROLE_MACHINE,
         per_tx_max_sat=10_000,
@@ -749,8 +749,8 @@ def run_scenarios() -> list:
         allowed_services=[],
     )
     tagged = Policy(
-        network_id="jounit/mini",
-        agent_id=derive_agent_id("jounit/mini", ROLE_MACHINE, ADDR["owner"]),
+        network_id="srct/mini",
+        agent_id=derive_agent_id("srct/mini", ROLE_MACHINE, ADDR["owner"]),
         owner=ADDR["owner"],
         role=ROLE_MACHINE,
         per_tx_max_sat=10_000,
@@ -836,8 +836,8 @@ def run_scenarios() -> list:
         {
             "op": "policy",
             "policy": Policy(
-                network_id="jounit/mini",
-                agent_id=derive_agent_id("jounit/mini", ROLE_MACHINE, ADDR["stranger"]),
+                network_id="srct/mini",
+                agent_id=derive_agent_id("srct/mini", ROLE_MACHINE, ADDR["stranger"]),
                 owner=ADDR["stranger"],
                 role=ROLE_MACHINE,
                 per_tx_max_sat=10_000,
@@ -857,8 +857,8 @@ def run_scenarios() -> list:
     for a in ("owner", "agent", "recipient"):
         state.credit(ADDR[a], 100_000_000)
     parent = Policy(
-        network_id="jounit/mini",
-        agent_id=derive_agent_id("jounit/mini", ROLE_MACHINE, ADDR["owner"]),
+        network_id="srct/mini",
+        agent_id=derive_agent_id("srct/mini", ROLE_MACHINE, ADDR["owner"]),
         owner=ADDR["owner"],
         role=ROLE_MACHINE,
         per_tx_max_sat=100_000,
@@ -868,9 +868,9 @@ def run_scenarios() -> list:
         allowed_services=[],
     )
     child = Policy(
-        network_id="jounit/mini",
+        network_id="srct/mini",
         agent_id=derive_sub_agent_id(
-            "jounit/mini", parent.agent_id, ROLE_MACHINE
+            "srct/mini", parent.agent_id, ROLE_MACHINE
         ),
         owner=ADDR["owner"],
         role=ROLE_MACHINE,
@@ -882,9 +882,9 @@ def run_scenarios() -> list:
         parent_agent_id=parent.agent_id,
     )
     wider = Policy(
-        network_id="jounit/mini",
+        network_id="srct/mini",
         agent_id=derive_sub_agent_id(
-            "jounit/mini", parent.agent_id, ROLE_MACHINE
+            "srct/mini", parent.agent_id, ROLE_MACHINE
         ),
         owner=ADDR["owner"],
         role=ROLE_MACHINE,

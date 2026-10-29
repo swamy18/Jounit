@@ -10,9 +10,9 @@ use libfuzzer_sys::fuzz_target;
 // against a small deterministic UTXO set and asserts the pool's own invariants
 // hold no matter what.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::mempool::Mempool;
-    use jnt_core::params::NetworkParams;
-    use jnt_core::tx::{OutPoint, Output, Transaction};
+    use srct_core::mempool::Mempool;
+    use srct_core::params::NetworkParams;
+    use srct_core::tx::{OutPoint, Output, Transaction};
 
     if data.len() < 2 {
         return;
@@ -24,14 +24,14 @@ fuzz_target!(|data: &[u8]| {
 
     // Deterministic funding UTXO: one output the fuzzer's transaction may or
     // may not spend.
-    let mut utxo = jnt_core::ledger::UtxoSet::default();
+    let mut utxo = srct_core::ledger::UtxoSet::default();
     let funding_txid = [7u8; 64];
     utxo.insert(
         OutPoint {
             txid: funding_txid,
             index: 0,
         },
-        jnt_core::ledger::Utxo {
+        srct_core::ledger::Utxo {
             out: Output {
                 value: 1_000_000_000,
                 address: [3u8; 20],
@@ -55,14 +55,14 @@ fuzz_target!(|data: &[u8]| {
         input.prev_hash = funding_txid;
         input.prev_index = (i as u32) % 2;
         // A non-empty signature bundle keeps the spend path deep in check_tx.
-        input.sigs = jnt_core::sig::Bundle::single(1, vec![0u8; 64]);
+        input.sigs = srct_core::sig::Bundle::single(1, vec![0u8; 64]);
     }
     utxo.insert(
-        jnt_core::tx::OutPoint {
+        srct_core::tx::OutPoint {
             txid: funding_txid,
             index: 1,
         },
-        jnt_core::ledger::Utxo {
+        srct_core::ledger::Utxo {
             out: Output {
                 value: 500_000_000,
                 address: [4u8; 20],
@@ -82,7 +82,7 @@ fuzz_target!(|data: &[u8]| {
         height,
         &params,
         base_fee,
-        &jnt_core::bond::BondLedger::default(),
+        &srct_core::bond::BondLedger::default(),
     );
 
     // Invariants that must hold after ANY admission attempt:

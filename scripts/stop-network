@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop a local multi-node Jounit network started by scripts/start-network.
+# Stop a local multi-node Solar Cyber Unit network started by scripts/start-network.
 #
 # Usage:
 #   scripts/stop-network [--data-root DIR]

@@ -3,18 +3,18 @@
 **Reconciled against code and SPEC on 2026-10-09**, including the approved tail
 (Decisions M-A…M-G in `docs/decisions.md`) and the approved supply anchor
 (Decision 18: the stock cap replaced by a rate rule). This file previously
-described a schedule that exists nowhere in the repository (a 10,000,000 JNT
-cap, a 1 JNT initial reward, 210,000-block halvings, `TARGET_SUPPLY_SAT` /
+described a schedule that exists nowhere in the repository (a 10,000,000 SRCT
+cap, a 1 SRCT initial reward, 210,000-block halvings, `TARGET_SUPPLY_SAT` /
 `MAX_HALVINGS` constants). None of those names or numbers exist in the code.
-The text below is what `crates/jnt-core/src/supply.rs` and
-`crates/jnt-core/src/params.rs` actually implement, pinned by
+The text below is what `crates/srct-core/src/supply.rs` and
+`crates/srct-core/src/params.rs` actually implement, pinned by
 `SPEC.md §7`/`§10`, `sim/supply_schedule_sim.py`, and
 `tests/vectors/supply_vectors.json`. If any of the three ever disagree, the
 tests (`supply::tests::*`, `params::tests::*`) fail first.
 
 ## Design
 
-JNT is a **rate-anchored, time-based issuance** cryptocurrency with **no premine**
+SRCT is a **rate-anchored, time-based issuance** cryptocurrency with **no premine**
 and **no stock cap**: genesis mints nothing, and Decision 18 (2026-10-09)
 removed the numerical supply ceiling entirely. Minting is bounded per height by
 the issuance integral `cumulative_issuance_sat(height)` through the single gate
@@ -41,44 +41,44 @@ over; `period_reward_sat` returns 0 for any epoch ≥ 64 as a hard stop.
 |---|---|---|
 | Stock supply cap | **none** (Decision 18 — the rate anchor below replaced it) | none |
 | Rate anchor | ≤ 1 % of issued supply per halving period (≤ 0.2 %/yr) | same rule |
-| `start_reward_sat` | 76 JNT (7,600,000,000 sat) per block | 76 JNT |
+| `start_reward_sat` | 76 SRCT (7,600,000,000 sat) per block | 76 SRCT |
 | `halving_period` | 262,800 blocks (5 years at 10 min) | 2,000 blocks |
-| Reward ladder | 76, 38, 19, 9, 4, 2, 1 JNT (then the tail) | same ladder |
-| Tail | 0.50 → 0.25 → 0.125 JNT, then a permanent **0.1 JNT** floor | constant **1 sat/block** |
+| Reward ladder | 76, 38, 19, 9, 4, 2, 1 SRCT (then the tail) | same ladder |
+| Tail | 0.50 → 0.25 → 0.125 SRCT, then a permanent **0.1 SRCT** floor | constant **1 sat/block** |
 | `GENESIS_MINT` | 0 (nothing pre-mined) | 0 |
-| `SAT_PER_JNT` | 100,000,000 | 100,000,000 |
+| `SAT_PER_SRCT` | 100,000,000 | 100,000,000 |
 
-The ladder halves in **whole JNT**
-(`period_reward_sat = (start_reward_jnt >> epoch) * SAT_PER_JNT`), not by
-shifting satoshis — shifting would pay 9.5 JNT at epoch 3 and break the
+The ladder halves in **whole SRCT**
+(`period_reward_sat = (start_reward_srct >> epoch) * SAT_PER_SRCT`), not by
+shifting satoshis — shifting would pay 9.5 SRCT at epoch 3 and break the
 issuance arithmetic. Epochs ≥ 7 pay the tail, halved in **satoshis** and clamped by the
 floor (`DecayToFloor`), never zero on any shipped profile.
 
 ## Issuance schedule (mainnet)
 
 ```
-Epoch 0: 262,799 blocks × 76 JNT = 19,972,724 JNT   (genesis mints nothing)
-Epoch 1: 262,800 blocks × 38 JNT =  9,986,400 JNT
-Epoch 2: 262,800 blocks × 19 JNT =  4,993,200 JNT
-Epoch 3: 262,800 blocks ×  9 JNT =  2,365,200 JNT
-Epoch 4: 262,800 blocks ×  4 JNT =  1,051,200 JNT
-Epoch 5: 262,800 blocks ×  2 JNT =    525,600 JNT
-Epoch 6: 262,800 blocks ×  1 JNT =    262,800 JNT
-Epoch 7 (1,839,600): tail begins at 0.50 JNT, decays to the 0.1 JNT floor
+Epoch 0: 262,799 blocks × 76 SRCT = 19,972,724 SRCT   (genesis mints nothing)
+Epoch 1: 262,800 blocks × 38 SRCT =  9,986,400 SRCT
+Epoch 2: 262,800 blocks × 19 SRCT =  4,993,200 SRCT
+Epoch 3: 262,800 blocks ×  9 SRCT =  2,365,200 SRCT
+Epoch 4: 262,800 blocks ×  4 SRCT =  1,051,200 SRCT
+Epoch 5: 262,800 blocks ×  2 SRCT =    525,600 SRCT
+Epoch 6: 262,800 blocks ×  1 SRCT =    262,800 SRCT
+Epoch 7 (1,839,600): tail begins at 0.50 SRCT, decays to the 0.1 SRCT floor
 ────────────────────────────────────────────────
-Ladder-era issuance:  149 × 262,800 − 76 = 39,157,124 JNT
+Ladder-era issuance:  149 × 262,800 − 76 = 39,157,124 SRCT
 Rate anchor (the only ceiling):  ≤ 1 % of issued per halving period
-Tail (steady state):        0.1 JNT/block ≈ 5,260 JNT/yr ≈ 0.013 %/yr
+Tail (steady state):        0.1 SRCT/block ≈ 5,260 SRCT/yr ≈ 0.013 %/yr
 ```
 
 The tail is the approved policy (Decisions M-A…M-C): the ladder's last rung is
-followed by 0.50 → 0.25 → 0.125 JNT and then a **permanent 0.1 JNT floor**, so
+followed by 0.50 → 0.25 → 0.125 SRCT and then a **permanent 0.1 SRCT floor**, so
 issuance never stops. Long-run issuance is therefore unbounded by design; the
 bounds consensus enforces are the per-height issuance integral and the
 per-period rate anchor (Decision 18) — never a stock total.
 
 On `mini`/`testnet` the same ladder over 2,000-block epochs issues **297,924
-JNT** through the ladder era. Their tail is a constant **1 sat/block** (M-C):
+SRCT** through the ladder era. Their tail is a constant **1 sat/block** (M-C):
 the mainnet value on a 1-second profile would mint a four-digit percentage per
 year against its own issued supply, which is why the tails are set
 independently. The largest tail window issues ~0.34 % of supply on mainnet —
@@ -116,7 +116,7 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
 
 - **Genesis escrow (Decision 7, amended by M-E):** `l2_genesis_escrow_sat` is
   bounded by the explicit, validated `escrow_ceiling_sat` — mainnet 100,000
-  JNT, mini/testnet 10 JNT. `params::validate` rejects any profile whose
+  SRCT, mini/testnet 10 SRCT. `params::validate` rejects any profile whose
   escrow exceeds its ceiling (`escrow_respects_the_new_ceiling`).
 - **User deposits (Decision 10):** an ordinary L1 payment to the
   network-bound `l2_deposit_sink` address (unspendable, holds no key) is
@@ -143,7 +143,7 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
 2. The rate anchor refuses a dilutive schedule: `supply::tests::rate_anchor_refuses_a_schedule_that_over_issues_a_window`
 3. Net supply is issuance minus removal: `chain::tests::the_burn_counter_and_net_report_track_removal`
 4. Value conservation in transactions: `ledger::tests::a_transaction_can_never_create_more_value_than_it_spends`
-5. L1 + L2 supply never exceeds the joint bound: `jnt-node` `tests/l2_funding.rs::joint_l1_plus_l2_supply_stays_under_the_joint_bound`
+5. L1 + L2 supply never exceeds the joint bound: `srct-node` `tests/l2_funding.rs::joint_l1_plus_l2_supply_stays_under_the_joint_bound`
    and `GET /v1/conservation` (issuance integral + escrow ceiling)
 6. Escrow respects its own ceiling: `params::tests::escrow_respects_the_new_ceiling`
 
@@ -155,7 +155,7 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
   `l2::tests::fee_mapping_is_the_decided_d3_schedule`. The settle fee is
   fixed; no fee was changed by any Phase-6 milestone.
 - **Decisions M-A…M-G (2026-10-09):** tail shape (E, decay to a floor),
-  0.1 JNT mainnet floor, 1 sat/block on mini/testnet, an explicit
+  0.1 SRCT mainnet floor, 1 sat/block on mini/testnet, an explicit
   `escrow_ceiling_sat`, no fee-burn target (deflation accepted), activation at
   each profile's ladder exhaustion. Implemented in `supply.rs`/`params.rs`/`chain.rs`,
   vectors regenerated, and pinned by `supply::tests::*`, `params::tests::*`,
@@ -174,7 +174,7 @@ sat) and never consult the L1 floor (`l2_fees_do_not_use_the_l1_gas_floor`).
 ## References
 
 - `SPEC.md` §5 (PoW), §7 (supply schedule), §8 (fees), §10 (profiles)
-- `crates/jnt-core/src/supply.rs` (implementation + tests)
-- `crates/jnt-core/src/fees.rs` (M1 fee split)
+- `crates/srct-core/src/supply.rs` (implementation + tests)
+- `crates/srct-core/src/fees.rs` (M1 fee split)
 - `sim/supply_schedule_sim.py` (independent Python reference cross-check)
 - `tests/vectors/supply_vectors.json` (pinned numbers)

@@ -1,0 +1,19 @@
+[package]
+publish = false
+name = "srct-net"
+description = "Solar Cyber Unit peer-to-peer transport: framing, handshake, block/tx/checkpoint relay over TCP (SPEC.md §13)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+rand.workspace = true

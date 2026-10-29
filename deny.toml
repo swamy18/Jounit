@@ -148,7 +148,7 @@ multiple-versions = "warn"
 # dependency lets a future publish change what builds, so it is refused.
 wildcards = "deny"
 # ...except for path dependencies inside our own unpublished crates: the
-# `jnt-*` members depend on each other by path (`jnt-core.workspace = true`
+# `srct-*` members depend on each other by path (`srct-core.workspace = true`
 # resolves to `*` plus a path), which pins them to this directory rather than
 # to a future publish. Refusing those would force version noise onto every
 # intra-workspace edge for no supply-chain gain.

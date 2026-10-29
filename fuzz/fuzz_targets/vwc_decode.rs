@@ -16,12 +16,12 @@ use libfuzzer_sys::fuzz_target;
 //
 // The registry comparison (§17.6 check 4) needs live state, which a raw byte
 // fuzzer does not have; that half is covered deterministically by
-// `crates/jnt-l2/tests/vwc_flow.rs` and the registry assertions in the L2
+// `crates/srct-l2/tests/vwc_flow.rs` and the registry assertions in the L2
 // fuzz-invariant suite.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::bls::RealBls;
-    use jnt_core::bls_checkpoint::{BlsPublicKey, ValidatorSet};
-    use jnt_l2::{VerifiedWorkCertificate, VWC_VERSION};
+    use srct_core::bls::RealBls;
+    use srct_core::bls_checkpoint::{BlsPublicKey, ValidatorSet};
+    use srct_l2::{VerifiedWorkCertificate, VWC_VERSION};
 
     // A well-formed-looking validator set; the real verifier refuses keys that
     // are not curve points, so validation of quorum certificates fails closed

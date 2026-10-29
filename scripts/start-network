@@ -1,10 +1,10 @@
 #!/bin/bash
-# Start a local multi-node Jounit network for development and testing.
+# Start a local multi-node Solar Cyber Unit network for development and testing.
 #
 # Node 1 is the seed: it listens and mines. Nodes 2..N dial the seed with
 # --bootnodes and mine alongside it, exactly as independent operators would.
 # Zero configuration beyond this script is required; every flag it passes is
-# a documented jnt-node flag.
+# a documented srct-node flag.
 #
 # Usage:
 #   scripts/start-network [--nodes N] [--base-port PORT] [--api-base-port PORT]
@@ -12,11 +12,11 @@
 #                         [--no-mine]
 #
 # Defaults: 3 nodes, P2P ports 9833.., API ports 8083.., data under
-# ./localnet/, network mini. JNT_WALLET_PASSPHRASE (default:
+# ./localnet/, network mini. SRCT_WALLET_PASSPHRASE (default:
 # localnet-dev-passphrase) encrypts each node wallet at rest.
 #
 # This is a reproducible local harness, not centralized operation: every
-# node is an ordinary jnt-node process and any of them can be stopped,
+# node is an ordinary srct-node process and any of them can be stopped,
 # restarted or removed without special status.
 set -euo pipefail
 
@@ -27,7 +27,7 @@ DATA_ROOT="./localnet"
 NETWORK="mini"
 BIN=""
 NO_MINE=0
-PASSPHRASE="${JNT_WALLET_PASSPHRASE:-localnet-dev-passphrase}"
+PASSPHRASE="${SRCT_WALLET_PASSPHRASE:-localnet-dev-passphrase}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,8 +47,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 if [ -z "$BIN" ]; then
-    for candidate in "$REPO_ROOT/target/release/jnt-node" \
-                     "$REPO_ROOT/target/release/jnt-node.exe"; do
+    for candidate in "$REPO_ROOT/target/release/srct-node" \
+                     "$REPO_ROOT/target/release/srct-node.exe"; do
         if [ -f "$candidate" ]; then
             BIN="$candidate"
             break
@@ -57,12 +57,12 @@ if [ -z "$BIN" ]; then
 fi
 if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
     if command -v cargo >/dev/null 2>&1; then
-        echo "jnt-node binary not found; building (cargo build --release)..."
+        echo "srct-node binary not found; building (cargo build --release)..."
         cargo build --release
-        BIN="$REPO_ROOT/target/release/jnt-node"
+        BIN="$REPO_ROOT/target/release/srct-node"
         [ -f "$BIN.exe" ] && BIN="$BIN.exe"
     else
-        echo "jnt-node binary not found and cargo is unavailable in this shell." >&2
+        echo "srct-node binary not found and cargo is unavailable in this shell." >&2
         echo "Build it first with: cargo build --release" >&2
         exit 1
     fi
@@ -96,7 +96,7 @@ for i in $(seq 1 "$NODES"); do
     api_port=$((API_BASE_PORT + i - 1))
 
     if [ ! -f "$dir/meta.json" ]; then
-        JNT_WALLET_PASSPHRASE="$PASSPHRASE" \
+        SRCT_WALLET_PASSPHRASE="$PASSPHRASE" \
             "$BIN" init --network "$NETWORK" --data-dir "$dir" --label "miner$i" \
             >"$DATA_ROOT/node$i-init.log" 2>&1 || {
                 echo "init failed for node $i; see $DATA_ROOT/node$i-init.log" >&2
@@ -113,7 +113,7 @@ for i in $(seq 1 "$NODES"); do
         mineargs=(--no-mine)
     fi
 
-    JNT_WALLET_PASSPHRASE="$PASSPHRASE" nohup "$BIN" serve \
+    SRCT_WALLET_PASSPHRASE="$PASSPHRASE" nohup "$BIN" serve \
         --network "$NETWORK" \
         --data-dir "$dir" \
         --listen "127.0.0.1:$p2p_port" \

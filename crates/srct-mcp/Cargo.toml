@@ -1,0 +1,16 @@
+[package]
+publish = false
+name = "srct-mcp"
+description = "Keyless MCP surface over the Solar Cyber Unit payment/service layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+srct-l2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true

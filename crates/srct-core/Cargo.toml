@@ -1,0 +1,25 @@
+[package]
+publish = false
+name = "srct-core"
+description = "Solar Cyber Unit protocol core: hybrid hash+neural PoW puzzle, UTXO ledger, difficulty, supply schedule."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+k256.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+rand.workspace = true
+blst.workspace = true
+ml-dsa.workspace = true
+# Wipes the wallet scalar on drop, so a freed allocation is not left holding
+# a spendable key for its next taker.
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

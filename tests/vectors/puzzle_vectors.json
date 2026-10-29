@@ -1,5 +1,5 @@
 {
-  "_comment": "Generated from jnt-core by puzzle_vectors_are_stable. Do not hand-edit.",
+  "_comment": "Generated from srct-core by puzzle_vectors_are_stable. Do not hand-edit.",
   "spec": { "hash_rounds": 16, "nn_input_dim": 16, "nn_hidden_dim": 16, "nn_layers": 3, "nn_share_bps": 4000 },
   "cases": [
     {
@@ -7,63 +7,63 @@
       "nonce": 0,
       "epoch_id": 0,
       "header_len": 177,
-      "seed": "83541277db6d714b9c97195e87ac469be43a373126b1a2a218f1b396aac42f2b",
-      "activation_digest": "fc72e769775b09a03ec45d961a0b0dfc0e56ea87f0088a47f5bd1037446563a1",
-      "final_hash": "969a0e592cf0bb05d70e662a41a8ae30a31235ca5fdb31e6297de762d376e8b0"
+      "seed": "e6b0f6df33796d4967f573401aa161b720ceb7d53e96775a2d11475969586e84",
+      "activation_digest": "7cc2f2b65b64435e4489f4b4bff546eeef80cb8f4a49093b0ef2438ba7491d6d",
+      "final_hash": "a19dfccfe87a0a9f0a9ec9a52c85f9595c216f3f5d524726ffdf29b60696bfd4"
     },
     {
       "height": 1,
       "nonce": 1,
       "epoch_id": 0,
       "header_len": 177,
-      "seed": "ac2bd0f1cf0cc5bcc367c80eeea59c8828d12f23d3d9e438a08f5ce4aa4987a2",
-      "activation_digest": "b04ed1b699684af73a88f1d077484b419ab349a64ea5866670679c80f3977d28",
-      "final_hash": "0c9fb67766c5af242a81ee07d79019e076198119b88094df2925e47c2774f2a2"
+      "seed": "ff34692e4c5948e00db6f296589c55b056608e61aefa231af332a18fc7855de1",
+      "activation_digest": "329f62670a100668aca276e77dbb9db9fc095c2a4bcf4f26e8259a683d192b8f",
+      "final_hash": "0e54705cf138f63616ac575c9fdeb670ba883f8df365b2a532ad29cc45de071d"
     },
     {
       "height": 2,
       "nonce": 42,
       "epoch_id": 0,
       "header_len": 177,
-      "seed": "455aac6e2d792fb0b5dc13319df6e3c2d17d991502f218e9a0073093cd0ff3b4",
-      "activation_digest": "9b9f7528c90f820b73a734966be47c7e8d6a72f34689d93af2320a6051cac086",
-      "final_hash": "5d14218d676044be0fc0ee30b410de4bb9be4e4d9236d962c2121bb25c599e8c"
+      "seed": "2bce7a9e548223a14e90bfdcd089e08b8a2dd01c307a56c0005b0f27a4c83ae7",
+      "activation_digest": "a3eacf06156fa619229448ed5162a8a580512abbddbba39696820315bda65f13",
+      "final_hash": "a292d8e004062ac370b69c1419712d6b506b5e2031f6a8078a35b21d8db59ab2"
     },
     {
       "height": 100,
       "nonce": 7,
       "epoch_id": 1,
       "header_len": 177,
-      "seed": "0dc10e44bad8a52f49adcfc68b3641333307be868bc5880de922731c56e6d2fd",
-      "activation_digest": "de85525e086c0878bae986539763e7f6849249e19d23b6504cfdd6cac2cb57b9",
-      "final_hash": "01705abb24d0d66a1c042c08e171f165ef8d38a1efac9ad8d42f7b2532118dbc"
+      "seed": "09141177cbb19d6518a02948d020a9bdb69958816a685a1a65f0061a03622b10",
+      "activation_digest": "0003fba686bc3665758b88a3e1e4e62226f7294a7ec463644dd0aadac57d2833",
+      "final_hash": "3f1d4c3a2229102bbb6cf425041b30ee7cba12fe5a0b653c5af27d9a4f7989b9"
     },
     {
       "height": 50000,
       "nonce": 0,
       "epoch_id": 1,
       "header_len": 177,
-      "seed": "bc96378712a0e17cf5b8b366c50f373feb454cd79749fb86f5b3453232ed5404",
-      "activation_digest": "79719fb1f22a9f0a014fe4bc4d495eb7d15168d4aac531a7941024b2c38fd89b",
-      "final_hash": "36cdff4e09e474e6987b117403bcacc342a00208d36938e98874e8c1fd55e1c0"
+      "seed": "86d37c3ba8cfdf00dd20e4accc59f8d252fe17c6d08e807f1153066b1a25060b",
+      "activation_digest": "e63774ca174d85e4dc71d1b78012c9e42714e73ef7e58eecf60a941529d06d46",
+      "final_hash": "a83fa2845c03247e407692daf6d68c369f1a720a38422d5041eb2efadf19e766"
     },
     {
       "height": 50001,
       "nonce": 12345,
       "epoch_id": 2,
       "header_len": 177,
-      "seed": "124d0023dc9155113683b49cea67758bef7c6f1271e9911c9027026cf095e643",
-      "activation_digest": "b011e96bcf3fe6bf22ad8a934d48a0623f9165f2285630a3469ed7af83ea15b5",
-      "final_hash": "19f1661f969893c44f76ee22c13d7de0e50fe105231a545c80566793c06498ef"
+      "seed": "080221c19d57ca803d5e9f874e7cd000ff30e3bd0d5d67a1390a674a4b4699c1",
+      "activation_digest": "dd05bd430975a00523736954a0257336679679a8ae77f9a6944233767b975320",
+      "final_hash": "1d0cef6a0be6153f3679899188ab72aaa38d7894ccd4e3b80ec28c181bd989a1"
     },
     {
       "height": 999999,
       "nonce": 7,
       "epoch_id": 4294967295,
       "header_len": 177,
-      "seed": "10184f4674be0846f15755baa0d83ee93e284e2bedab1b62b768b2f94d7b6c98",
-      "activation_digest": "ef2374e11fec3336fdb4e2bd5c3d8e31e889d21cf270dc89cf1f7748e11f1829",
-      "final_hash": "ad312f8fdd6b4ec841dd76654e8b6109c1f655da708899edb3670638c1ae3e85"
+      "seed": "c1106f5b18c813866f883f77a7a20591b5d84425e4495708c5ae76653bb1bd97",
+      "activation_digest": "8bb51835a88395e769665d61c820b9c9b6c3cb80c28076f37ad50dc6150f2a5c",
+      "final_hash": "2e25462725df9163f50d40c18bc47e2d3943b6e74976657a752ea97e5d5e2823"
     }
   ]
 }

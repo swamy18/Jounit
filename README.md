@@ -1,9 +1,9 @@
-# Jounit (JNT)
+# Solar Cyber Unit (SRCT)
 
 AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
 **Author and copyright:** Community-owned. The code is open source — no single
-person holds it, like Bitcoin. The *Jounit* name, `JNT` ticker and logos are
+person holds it, like Bitcoin. The *Solar Cyber Unit* name, `SRCT` ticker and logos are
 community marks — see [License and trademark](#license-and-trademark).
 
 **Built by:** Swamy Gadila. The project is open for anyone to use,
@@ -38,7 +38,7 @@ The principle every blockchain shares is *solving is hard, verifying is easy*.
 Bitcoin's solution is pure hashing, which leaves GPUs idle and ties no energy to
 anything useful.
 
-Jounit keeps the principle and changes the work. Mining runs three stages
+Solar Cyber Unit keeps the principle and changes the work. Mining runs three stages
 (`hybrid-v1`, `puzzle_id = 1` — the active mining puzzle on every profile):
 
 1. **A SHA-256 hash chain** — carries the security. This is what a quantum
@@ -66,7 +66,7 @@ epoch starts.
 
 Mining is hardware-universal by construction, not GPU-only. There are no
 floats anywhere in the PoW, so CPU, GPU, NPU, TPU, photonic chips and domestic
-accelerators all compute bit-identical results. The `jnt-miner` crate exposes
+accelerators all compute bit-identical results. The `srct-miner` crate exposes
 one `ComputeBackend` contract with two in-tree implementations — the reference
 `CpuBackend` and an independently written `PortableBackend` that silicon
 vendors port — pinned equal by differential tests. The three stages also pull
@@ -81,26 +81,26 @@ Requires **Rust 1.75+** (developed and tested against 1.99) and **Python 3.11+**
 for the simulations.
 
 ```sh
-git clone https://github.com/swamy18/Jounit.git
-cd Jounit
+git clone https://github.com/swamy18/Solar-Cyber-Unit.git
+cd Solar-Cyber-Unit
 cargo build --release
 ```
 
 ```sh
 # Wallet keys are encrypted at rest: set a passphrase for this shell, or add
 # --allow-plaintext-wallet to init if you deliberately want a plaintext file.
-export JNT_WALLET_PASSPHRASE=change-me
+export SRCT_WALLET_PASSPHRASE=change-me
 
 # Create a chain directory and a miner wallet.
-./target/release/jnt-node init   --network testnet --data-dir ./chain
+./target/release/srct-node init   --network testnet --data-dir ./chain
 
 # Mine blocks, then check the chain agrees with itself.
-./target/release/jnt-node mine   --network testnet --data-dir ./chain --blocks 25
-./target/release/jnt-node status --network testnet --data-dir ./chain
-./target/release/jnt-node verify --network testnet --data-dir ./chain
+./target/release/srct-node mine   --network testnet --data-dir ./chain --blocks 25
+./target/release/srct-node status --network testnet --data-dir ./chain
+./target/release/srct-node verify --network testnet --data-dir ./chain
 
 # Run a P2P node. It mines by default, so it settles matured exits.
-./target/release/jnt-node serve  --network testnet --data-dir ./chain \
+./target/release/srct-node serve  --network testnet --data-dir ./chain \
                                   --listen 127.0.0.1:9833
 ```
 
@@ -108,7 +108,7 @@ export JNT_WALLET_PASSPHRASE=change-me
 supply, bond ledger and binding-finalized point against stored state. It is the
 check worth running after any change.
 
-Run `jnt-node help` for the full command list; every command accepts `--help`.
+Run `srct-node help` for the full command list; every command accepts `--help`.
 
 To stand up a local multi-node network (deterministic genesis, separate data
 dirs, node 1 as seed, the rest dialing it via `--bootnodes`):
@@ -128,9 +128,9 @@ and pay the same coinbase — the difference is only where the grinding happens.
 
 **Where the reward goes.** Every block pays its coinbase to one address: the
 node's miner wallet for in-node mining, or the `--miner` address you pass to
-`jnt-miner`. New coins are **immature** first — spendable after 100 blocks on
+`srct-miner`. New coins are **immature** first — spendable after 100 blocks on
 mainnet, 10 on testnet/mini — then they are ordinary UTXOs. Check them with
-`jnt-node balance --address <addr>` or `status`.
+`srct-node balance --address <addr>` or `status`.
 
 **Difficulty, honest numbers.** Every profile starts at difficulty 1 (trivially
 mineable — a laptop mines block after block on a fresh chain) and retargets
@@ -144,9 +144,9 @@ difficulty does the hardening, not special hardware.
 ### Option A — mine inside the node (simplest start)
 
 ```sh
-export JNT_WALLET_PASSPHRASE=change-me
-./target/release/jnt-node init --network testnet --data-dir ./chain
-./target/release/jnt-node serve --network testnet --data-dir ./chain \
+export SRCT_WALLET_PASSPHRASE=change-me
+./target/release/srct-node init --network testnet --data-dir ./chain
+./target/release/srct-node serve --network testnet --data-dir ./chain \
   --listen 127.0.0.1:9833
 ```
 
@@ -156,15 +156,15 @@ is small.
 
 ### Option B — mine with the standalone miner (recommended)
 
-Run the node relay-only and grind on any machine with the `jnt-miner` binary:
+Run the node relay-only and grind on any machine with the `srct-miner` binary:
 
 ```sh
 # 1. Node side: no built-in mining, templates on loopback.
-./target/release/jnt-node serve --network testnet --data-dir ./chain \
+./target/release/srct-node serve --network testnet --data-dir ./chain \
   --no-mine --api-listen 127.0.0.1:8080
 
 # 2. Miner side: fetch a template, solve it, submit the block — repeat forever.
-./target/release/jnt-miner --node 127.0.0.1:8080 \
+./target/release/srct-miner --node 127.0.0.1:8080 \
   --miner <20-byte-hex-address> --threads 0 --backend auto
 ```
 
@@ -187,14 +187,14 @@ almost nothing — 512 MB RAM and a few GB of persistent disk are enough —
 because it relays and validates but never grinds. Run it relay-only:
 
 ```sh
-./target/release/jnt-node serve --network mainnet --data-dir ./chain \
+./target/release/srct-node serve --network mainnet --data-dir ./chain \
   --no-mine --listen 0.0.0.0:9833
 ```
 
 Three things matter here: `--no-mine` (no CPU burn), `--data-dir` on a disk
 that survives restarts (lose it and the node resyncs from genesis), and port
 `9833` reachable from the internet so other nodes can dial in. Point
-`jnt-miner --node` at this box's API port and your laptop keeps mining while
+`srct-miner --node` at this box's API port and your laptop keeps mining while
 the box keeps the chain.
 
 ### Option C — mine through a pool
@@ -218,13 +218,13 @@ Anything. The PoW is integer-only — no floats anywhere — so CPU, GPU, NPU,
 TPU, photonic chips and domestic accelerators all compute bit-identical
 results, and the three stages pull in different directions (hash throughput,
 matrix-vector units, memory bandwidth), so no single exotic chip dominates.
-`jnt-miner` exposes one `ComputeBackend` contract with two in-tree backends:
+`srct-miner` exposes one `ComputeBackend` contract with two in-tree backends:
 
 | Flag | Backend | Meaning |
 |---|---|---|
 | `--backend cpu` | `CpuBackend` | Reference implementation. Default. |
 | `--backend portable` | `PortableBackend` | Independently written implementation; differential-tested equal to the reference on every candidate. The template silicon vendors port. |
-| `--backend auto` | — | Same as `cpu` today; picks the best available backend. Also via `JNT_MINER_BACKEND`. |
+| `--backend auto` | — | Same as `cpu` today; picks the best available backend. Also via `SRCT_MINER_BACKEND`. |
 
 A new chip joins by implementing the same contract and passing the
 differential test — never by forking consensus. (SPEC §5.3 names the exact
@@ -237,27 +237,27 @@ kernel surface; SPEC §13.1/§19.2 specify the template and pool protocols.)
 There is **no stock cap**. That is a deliberate change — see
 [Decision 18](docs/decisions.md) — and the current bounds are different in kind.
 
-**The ladder** halves in whole JNT every 262 800 blocks (~5 years at a 10-minute
+**The ladder** halves in whole SRCT every 262 800 blocks (~5 years at a 10-minute
 block):
 
 ```
-76, 38, 19, 9, 4, 2, 1 JNT
+76, 38, 19, 9, 4, 2, 1 SRCT
 ```
 
-Whole JNT, not shifted satoshis: halving 9.5 → 4.75 would break the arithmetic.
+Whole SRCT, not shifted satoshis: halving 9.5 → 4.75 would break the arithmetic.
 
 **Premine is 0%**, enforced in code rather than in prose. Genesis mints nothing.
 
-**The ladder totals exactly 39 157 124 JNT.** Not the 39 157 200 a geometric
+**The ladder totals exactly 39 157 124 SRCT.** Not the 39 157 200 a geometric
 shortcut suggests — genesis occupies a rung-0 height without minting, so the
-first rung is paid by `H − 1` blocks rather than `H`. That 76 JNT is the
+first rung is paid by `H − 1` blocks rather than `H`. That 76 SRCT is the
 difference between the design document's approximation and what the chain can
 actually reach, and `supply::max_issuance_sat` reports the real figure.
 
 **The tail** takes over after the ladder (height 1 839 600) and never stops:
 
 ```
-0.50 → 0.25 → 0.125 JNT, then a permanent 0.1 JNT floor
+0.50 → 0.25 → 0.125 SRCT, then a permanent 0.1 SRCT floor
 ```
 
 So issuance continues forever, reaching the floor at height 2 628 000 (~50 years)
@@ -362,7 +362,7 @@ delegation of computation, with the blockchain as the escrow and the arbiter.
 ## Machines, agents and robots
 
 There is a full policy layer for software acting on someone's behalf. It lives in
-`jnt-core/src/agent.rs` and is **pure and deterministic** — no clock, no
+`srct-core/src/agent.rs` and is **pure and deterministic** — no clock, no
 randomness, no I/O — so a wallet and a service reaching the same inputs reach the
 same answer.
 
@@ -419,7 +419,7 @@ fail-closed — exact amounts, strictly ordered, non-future settlements, accrual
 checked for wraparound. Settlement rides the ordinary payment path with the
 stream id as the reference, so there is no new transaction type.
 
-**MCP.** `jnt-mcp` is a keyless MCP surface over agent identity, payments,
+**MCP.** `srct-mcp` is a keyless MCP surface over agent identity, payments,
 receipts and reputation, and over the agent authority and credit layer:
 `inspect.policy`, `inspect.agent_spend` and `inspect.credit` read the terms an
 agent is about to sign and the hash to sign.
@@ -655,7 +655,7 @@ fee is not paid to the block producer. Burnt gets the odd satoshi on ties
    address, principal amount, collateral amount, interest rate, window length,
    deadline height and a per-lender nonce. The payload is sealed by a hybrid
    ECDSA + Schnorr `Auth` bundle (`CreditOpenPayload::build`).
-2. The transaction is submitted (via `jnt-node credit` on the CLI, or by
+2. The transaction is submitted (via `srct-node credit` on the CLI, or by
    serializing the `L2Transaction` to hex and POSTing it to
    `/v1/l2/broadcast`). Consensus checks: the lender has `principal + fee`, the
    borrower has `collateral`, the derived position ID is new, and the terms pass
@@ -830,18 +830,18 @@ lender.
 ```sh
 # Open a loan: you are the lender, --to is the borrower.
 # --collateral defaults to the principal amount (100% collateralization).
-jnt-node credit --to <borrower-address> --amount <JNT> \
+srct-node credit --to <borrower-address> --amount <SRCT> \
                 --collateral <sat> --rate-bps <bps> \
                 --window <blocks> --deadline <height> --nonce <n>
 
 # Repay (interest first). Use --amount-sat for exact satoshis.
-jnt-node credit --repay --position <id> --amount <JNT>
+srct-node credit --repay --position <id> --amount <SRCT>
 
 # Default a position at or after its deadline (permissionless).
-jnt-node credit --default --position <id>
+srct-node credit --default --position <id>
 
 # List all positions.
-jnt-node credit --list
+srct-node credit --list
 ```
 
 The `credit` subcommand uses a wallet. The lender signs `CreditOpen`; the
@@ -861,21 +861,21 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 |---|---|
 | [`SPEC.md`](SPEC.md) | **Normative.** Where a disagreement exists, this wins. |
 | [`AGENTS.md`](AGENTS.md) | Lint, type-check and test commands for this session. |
-| `crates/jnt-core/` | Protocol implementation. All consensus logic. |
-| `crates/jnt-net/` | P2P wire protocol, sync and relay. |
-| `crates/jnt-store/` | Append-only checksummed block log, crash recovery. |
-| `crates/jnt-l2/` | Layer 2: contracts, disputes, certificates, exits. |
-| `crates/jnt-node/` | CLI and node daemon. |
-| `crates/jnt-miner/` | Standalone CPU miner: template grinder, stratum-lite pool server with PPLNS payouts, universal compute backends. |
-| `crates/jnt-worker/` | Worker-side SDK. Client only, no consensus. |
-| `crates/jnt-mcp/` | Keyless MCP surface over agent identity and payments. |
+| `crates/srct-core/` | Protocol implementation. All consensus logic. |
+| `crates/srct-net/` | P2P wire protocol, sync and relay. |
+| `crates/srct-store/` | Append-only checksummed block log, crash recovery. |
+| `crates/srct-l2/` | Layer 2: contracts, disputes, certificates, exits. |
+| `crates/srct-node/` | CLI and node daemon. |
+| `crates/srct-miner/` | Standalone CPU miner: template grinder, stratum-lite pool server with PPLNS payouts, universal compute backends. |
+| `crates/srct-worker/` | Worker-side SDK. Client only, no consensus. |
+| `crates/srct-mcp/` | Keyless MCP surface over agent identity and payments. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `sim/` | Independent Python reference and attack simulations. |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
 | `docs/` | Design records, verification status and readiness reports. |
-| `paper/` | The Jounit protocol paper (LaTeX + PDF). |
+| `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
-Eight crates in one workspace. **All consensus logic lives in `jnt-core`**, which
+Eight crates in one workspace. **All consensus logic lives in `srct-core`**, which
 has no I/O, no clock and no network. The `mini` profile is the same code with
 different parameters — never a second implementation — so anything tested on
 `mini` is the production code path.
@@ -895,7 +895,7 @@ Same code, different numbers.
 |---|---|---|---|
 | Block time | 600 000 ms | 1 000 ms | 1 000 ms |
 | Halving period | 262 800 | 2 000 | 2 000 |
-| Start reward | 76 JNT | 76 JNT | 76 JNT |
+| Start reward | 76 SRCT | 76 SRCT | 76 SRCT |
 | Finality depth | 100 | 20 | 20 |
 | Coinbase maturity | 100 | 10 | 10 |
 | Genesis validators | 21 public bootstrap (quorum 15) | 4 deterministic | 4 deterministic |
@@ -926,7 +926,7 @@ can join.
 ## Commands
 
 ```
-jnt-node <COMMAND> [OPTIONS]
+srct-node <COMMAND> [OPTIONS]
 
   init        Create a chain directory, a miner wallet and the genesis block
   mine        Mine blocks and extend the chain
@@ -946,7 +946,7 @@ jnt-node <COMMAND> [OPTIONS]
 ```
 
 ```
-jnt-miner --node 127.0.0.1:PORT --miner <20-byte-hex> [--threads N] [--batch N] [--backend cpu|portable|auto]
+srct-miner --node 127.0.0.1:PORT --miner <20-byte-hex> [--threads N] [--batch N] [--backend cpu|portable|auto]
 ```
 Full mining guide — three ways to mine, where rewards go, hardware backends,
 pool protocol — is in [Mining](#mining) above; the node endpoints
@@ -959,29 +959,29 @@ on chain, so every node enforces it:
 
 ```sh
 # The deposit address: an ordinary L1 payment to it credits your L2 balance.
-jnt-node l2 --deposit-address
-jnt-node send --to <deposit-address> --amount 5
+srct-node l2 --deposit-address
+srct-node send --to <deposit-address> --amount 5
 
-# Publish a grant: this key may spend up to 0.01 JNT per payment and
-# 0.05 JNT per window, to this recipient only.
-jnt-node policy --spender <spender> --per-tx 1000000 --cumulative 5000000 \
+# Publish a grant: this key may spend up to 0.01 SRCT per payment and
+# 0.05 SRCT per window, to this recipient only.
+srct-node policy --spender <spender> --per-tx 1000000 --cumulative 5000000 \
                 --recipients <recipient>
 
 # The agent spends under it.
-jnt-node agent-spend --policy <policy-hash> --to <recipient> --amount 0.002 --nonce 1
+srct-node agent-spend --policy <policy-hash> --to <recipient> --amount 0.002 --nonce 1
 
 # The owner kills it; every descendant of the grant dies with it.
-jnt-node policy --revoke --agent-id <agent-id>
-jnt-node policy --list
+srct-node policy --revoke --agent-id <agent-id>
+srct-node policy --list
 ```
 
 Credit works the same way — the **lender** signs, the principal really moves,
 and the collateral answers for the debt:
 
 ```sh
-jnt-node credit --to <borrower> --amount 1 --collateral 100000000
-jnt-node credit --repay --position <position-hash> --amount 1
-jnt-node credit --list
+srct-node credit --to <borrower> --amount 1 --collateral 100000000
+srct-node credit --repay --position <position-hash> --amount 1
+srct-node credit --list
 ```
 
 Every one of these commands checks the transaction against the state the chain
@@ -997,8 +997,8 @@ Common options: `--network <mainnet|testnet|mini>` (default `mini`) and
 ADDR gossip, so bootnodes plus `peers.json` are the only peer sources).
 `--credit-issuer` lists the BLS keys trusted to sign credit attestations for
 `POST /v1/credit/mint` (comma-separated 48-byte hex keys; with none listed,
-every mint is refused). `send --amount` takes JNT (`--amount-sat` takes satoshis); printed balances
-are in JNT.
+every mint is refused). `send --amount` takes SRCT (`--amount-sat` takes satoshis); printed balances
+are in SRCT.
 
 The API defaults to loopback and needs no credentials. Binding anything
 non-loopback is refused unless a token is supplied:
@@ -1006,11 +1006,11 @@ non-loopback is refused unless a token is supplied:
 ```sh
 # Non-loopback: a bearer token is mandatory (§19.2). Pass it through the
 # environment, not --api-token: flags are visible in `ps`.
-export JNT_API_TOKEN="..."
-jnt-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080
+export SRCT_API_TOKEN="..."
+srct-node serve --network testnet --data-dir ./chain --api-listen 0.0.0.0:8080
 
 # Loopback: unchanged, and unauthenticated.
-jnt-node serve --network testnet --data-dir ./chain --api-listen 127.0.0.1:8080
+srct-node serve --network testnet --data-dir ./chain --api-listen 127.0.0.1:8080
 ```
 
 Every request to an exposed bind must carry `Authorization: Bearer <token>`
@@ -1018,7 +1018,7 @@ Every request to an exposed bind must carry `Authorization: Bearer <token>`
 `Host` header (DNS-rebinding defense): a loopback bind accepts loopback names
 only, while a non-loopback bind additionally accepts any IP literal, the bound
 address, and hostnames listed via `--api-allowed-host` (comma-separated) or
-`JNT_API_ALLOWED_HOSTS`. A missing, unknown, or bracket-malformed `Host` is
+`SRCT_API_ALLOWED_HOSTS`. A missing, unknown, or bracket-malformed `Host` is
 403. Exposed binds also rate-limit per remote address, and every bind caps a
 request at 10 seconds, 64 requests in flight, 128 open connections, and 30
 seconds to finish sending request headers (the slowloris bound).
@@ -1048,21 +1048,21 @@ single source of truth — run it and paste the total rather than hand-editing.
 Targeted suites for the fast loops:
 
 ```sh
-cargo test -p jnt-core --lib arbitration::    # fraud-arbitration votes
-cargo test -p jnt-core --test cp_signing_nodes # quorum, conflicts, restart
-cargo test -p jnt-core --test bond_stake      # bonded-stake attacks
-cargo test -p jnt-core --test committee_rotation # seed-epoch committees + reorg rollback
-cargo test -p jnt-miner                       # solver, stratum, payouts, backends
-cargo test -p jnt-node --test api external_miner # template/submit over HTTP
-cargo test -p jnt-l2  --test unverified_result # the unchallenged-result rule
-cargo test -p jnt-node --test arbitration_path # full fraud lifecycle
-cargo test -p jnt-net  --test arbitration_votes # 3 nodes, real TCP
-cargo test -p jnt-node --test exit_crank_api   # withdrawal flow over HTTP
-cargo test -p jnt-node --test state_persist    # books survive restart
-cargo test -p jnt-node --test api escrow       # escrow open/settle over HTTP
-cargo test -p jnt-core --test redteam          # adversarial regressions
-cargo test -p jnt-core --test redteam_round2   # round-2 credit regressions
-cargo test -p jnt-core --test pq_signature     # post-quantum bundle attacks
+cargo test -p srct-core --lib arbitration::    # fraud-arbitration votes
+cargo test -p srct-core --test cp_signing_nodes # quorum, conflicts, restart
+cargo test -p srct-core --test bond_stake      # bonded-stake attacks
+cargo test -p srct-core --test committee_rotation # seed-epoch committees + reorg rollback
+cargo test -p srct-miner                       # solver, stratum, payouts, backends
+cargo test -p srct-node --test api external_miner # template/submit over HTTP
+cargo test -p srct-l2  --test unverified_result # the unchallenged-result rule
+cargo test -p srct-node --test arbitration_path # full fraud lifecycle
+cargo test -p srct-net  --test arbitration_votes # 3 nodes, real TCP
+cargo test -p srct-node --test exit_crank_api   # withdrawal flow over HTTP
+cargo test -p srct-node --test state_persist    # books survive restart
+cargo test -p srct-node --test api escrow       # escrow open/settle over HTTP
+cargo test -p srct-core --test redteam          # adversarial regressions
+cargo test -p srct-core --test redteam_round2   # round-2 credit regressions
+cargo test -p srct-core --test pq_signature     # post-quantum bundle attacks
 ```
 
 CI (`.github/workflows/ci.yml`) runs format, clippy, the full suite, a release
@@ -1082,7 +1082,7 @@ is an owner step (`cargo update -p <crate>` plus `cargo audit`). Security
 *alerts* are unaffected: those come from the advisory database, not from PRs.
 
 **Vectors.** `tests/vectors/` holds the consensus byte layouts, generated only
-from the implementation. `sim/jounit_reference.py` is a second PoW implementation
+from the implementation. `sim/srct_reference.py` is a second PoW implementation
 written from `SPEC.md` rather than from the Rust, and it reproduces all 21 puzzle
 digests — that agreement is the evidence the spec is unambiguous rather than
 merely self-consistent.
@@ -1092,7 +1092,7 @@ checkpoints; L2 codec, disputes, state and certificates; and the worker. They
 assert capability invariants — decode/encode inversion, bounded allocation, value
 conservation under adversarial transaction programs — not just panic-freedom.
 
-**Red team.** `crates/jnt-core/tests/redteam*.rs` holds 21 adversarial integration
+**Red team.** `crates/srct-core/tests/redteam*.rs` holds 21 adversarial integration
 tests across four files (`redteam`, `redteam_credit`, `redteam_delegation`,
 `redteam_round2`), each confirmed to fail against the code it now guards. The full
 record of defects found and fixed is in [docs/status.md](docs/status.md).
@@ -1101,7 +1101,7 @@ record of defects found and fixed is in [docs/status.md](docs/status.md).
 
 ## License and trademark
 
-**Copyright © 2026 The Jounit developers.** The code is open — no single
+**Copyright © 2026 The Solar Cyber Unit developers.** The code is open — no single
 person holds it, like Bitcoin.
 
 **Code: MIT** — the same permissive licence Bitcoin Core uses. The full text
@@ -1109,7 +1109,7 @@ ships at the repo root (`LICENSE-MIT`). You may use, copy, modify, merge,
 publish, distribute, sublicense, and/or sell copies of the software, and permit
 persons to whom it is furnished to do so, including commercially.
 
-**Name and marks: community-owned.** The *Jounit* name, the `JNT` ticker and
+**Name and marks: community-owned.** The *Solar Cyber Unit* name, the `SRCT` ticker and
 the project's logos are community marks — not part of the code licence and not
 held by any single person.
 
@@ -1117,8 +1117,8 @@ This follows the same arrangement Bitcoin uses: **the code is open so anyone
 can run it, and the name belongs to the community.** Nothing in an open-source
 licence can stop someone from using the code — that is deliberate, and it is
 how the ecosystem works. You are free to fork the code and ship it under your
-own name; the only thing we ask is that you do not call your fork "Jounit" or
-use the `JNT` ticker, so that users holding real value are never confused
+own name; the only thing we ask is that you do not call your fork "Solar Cyber Unit" or
+use the `SRCT` ticker, so that users holding real value are never confused
 about what chain they are on. That is a community norm, not a gate requiring
 permission — there is no trademark file to read and no application to file.
 
@@ -1128,7 +1128,7 @@ permission — there is no trademark file to read and no application to file.
 
 [`SECURITY.md`](SECURITY.md) is the disclosure policy: what counts as a
 vulnerability, the severity model, the 90-day window, and the intake channel
-(GitHub Security Advisory, or `security@jounit.org`). Do not open a public
+(GitHub Security Advisory, or `security@Solar Cyber Unit.org`). Do not open a public
 issue for a security defect.
 
 ---

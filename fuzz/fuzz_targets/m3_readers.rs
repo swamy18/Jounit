@@ -10,8 +10,8 @@ use libfuzzer_sys::fuzz_target;
 // must be bounded before it drives an allocation (SPEC.md §15.1). The invariant
 // is the same as every other codec here: no panic, and an exact inverse.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::compute_ir::{ComputeAttestation, ComputeTask};
-    use jnt_core::ser::Reader;
+    use srct_core::compute_ir::{ComputeAttestation, ComputeTask};
+    use srct_core::ser::Reader;
 
     if let Ok(task) = ComputeTask::from_reader(&mut Reader::new(data)) {
         let bytes = task.serialize();

@@ -6,7 +6,7 @@ relying on anything here.
 ## Scope
 
 Layer 1 (base layer) implementation per SPEC.md. Includes the P2P networking layer
-(`jnt-net`) supporting multi-peer block relay, locator-based sync, handshake
+(`srct-net`) supporting multi-peer block relay, locator-based sync, handshake
 isolation, ban scoring and side-branch pruning. Also defines the five core
 protocol mechanisms — **M1 is consensus-active everywhere, and M5's binding
 finality is consensus-active on activated profiles** (Decisions 11–12, §14.7–
@@ -32,25 +32,25 @@ rules in code would have been the wrong order.
 - `cargo test --workspace` — **1,307 tests pass, 0 failures, 1 ignored** across the workspace.
   (this file quote counts as of their own dates — 242, then 263, then 293 —
   kept as history):
-  - 227 unit tests in `jnt-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in
+  - 227 unit tests in `srct-core` (M1–M5 suites, the 21-test validator-set suite, the 30-test real-BLS suite in
     `bls.rs`, the 10-case mempool attack suite, the 2 pinned L2 fee-schedule
     tests, and the rest)
   - 18 adversarial checkpoint tests against the real BLS verifier
     (`tests/bls_checkpoint_attack.rs`)
-  - 10 mempool↔chain integration tests in `crates/jnt-core/tests/mempool_l1.rs`
-  - 11 red-team integration tests in `crates/jnt-core/tests/redteam.rs`
-  - 30 persistent-storage tests in `crates/jnt-store` (torn tails, corruption
+  - 10 mempool↔chain integration tests in `crates/srct-core/tests/mempool_l1.rs`
+  - 11 red-team integration tests in `crates/srct-core/tests/redteam.rs`
+  - 30 persistent-storage tests in `crates/srct-store` (torn tails, corruption
     refusal, reorg+restart, migration)
-  - unit + integration tests in `jnt-net` (framing, codecs, sync, bounds,
+  - unit + integration tests in `srct-net` (framing, codecs, sync, bounds,
     tx-relay socket tests), including a real-socket end-to-end sync between
     two `P2pNode`s
-  - 2 wire-vector tests in `crates/jnt-net/tests/net_vectors.rs`
+  - 2 wire-vector tests in `crates/srct-net/tests/net_vectors.rs`
   - 24 tests for the machine/agent authorization layer
     (`src/agent.rs` unit suite + `tests/agent_policy.rs`): policy encoding,
     identity binding, per-transaction and cumulative limits, tumbling window
     rollover, replay-refusing nonces, revocation, rotation independence,
     bounded policy book, and offline authorization verification
-- **Persistent storage is implemented** (`crates/jnt-store`, appendix below):
+- **Persistent storage is implemented** (`crates/srct-store`, appendix below):
   append-only checksummed block log, atomic metadata, crash-safe reopen;
   replaces the old whole-chain JSON rewrite.
 - **P2P transaction relay is implemented** (SPEC.md §13.14): wallet → mempool →
@@ -75,11 +75,11 @@ rules in code would have been the wrong order.
   does NOT make finality consensus-active.
 - `cargo clippy --workspace --all-targets` clean under `-D warnings`.
 - `cargo fmt --check` clean across all crates.
-- Two real `jnt-node serve` processes on the `mini` profile completed a full
+- Two real `srct-node serve` processes on the `mini` profile completed a full
   handshake, synced, reorged onto the heavier branch and kept relaying; both
-  data directories then passed `jnt-node verify` (replay from genesis, UTXO +
+  data directories then passed `srct-node verify` (replay from genesis, UTXO +
   supply + PSCB match).
-- An independent Python implementation of the PoW puzzle (`sim/jounit_reference.py`),
+- An independent Python implementation of the PoW puzzle (`sim/srct_reference.py`),
   written from the prose of SPEC.md rather than from the Rust source, reproduces
   all 21 puzzle digests in `tests/vectors/puzzle_vectors.json`. This is the only
   real evidence that SPEC.md is unambiguous rather than merely consistent with the
@@ -98,10 +98,10 @@ rules in code would have been the wrong order.
   passing over them silently.
 - Node CLI end to end on the `mini` profile: init, mine 31 blocks, spend, verify
   (replays from genesis and diffs UTXO + supply), status. Fee burn reconciles
-  exactly — 31 blocks issue 2356 JNT, live supply is 2355.99825 JNT, the
-  0.00175 JNT difference being the destroyed base fee.
+  exactly — 31 blocks issue 2356 SRCT, live supply is 2355.99825 SRCT, the
+  0.00175 SRCT difference being the destroyed base fee.
 - External mining end to end: `Chain::build_template_with` hands an unsolved
-  template to `jnt-miner` (multithread nonce + `extra_nonce` grind, `--backend
+  template to `srct-miner` (multithread nonce + `extra_nonce` grind, `--backend
   cpu|portable`), the node serves it at `GET /v1/mine/template` and accepts
   the solution at `POST /v1/mine/submit`, and pools get the same flow over
   stratum-lite JSON-lines with PPLNS accounting (fee, windowed split,
@@ -109,13 +109,13 @@ rules in code would have been the wrong order.
   wire `getjob`/`submit` tests and the cpu-vs-portable differential tests;
   measured ~114k H/s release on 4 threads (`bench_hashrate` example).
 - Supply schedule matches design doc §16. There is **no stock cap** (Decision
-  18): the ladder totals 39 157 124 JNT and the tail pays a permanent 0.1 JNT
+  18): the ladder totals 39 157 124 SRCT and the tail pays a permanent 0.1 SRCT
   floor (1 sat on testnet/mini), enforced by the issuance integral and the
   rate anchor — not by an unmintable remainder. (An earlier revision of this
-  line described a 304 000 JNT mini cap with permanently unmintable remainder;
+  line described a 304 000 SRCT mini cap with permanently unmintable remainder;
   that language predates Decision 18 and is superseded by
   `docs/monetary-policy.md`.)
-- The mempool (`jnt-core/src/mempool.rs`) has a 10-case attack suite. Each case
+- The mempool (`srct-core/src/mempool.rs`) has a 10-case attack suite. Each case
   names the rule it enforces and the attack it stops: double spending one output
   twice, spending a nonexistent output, a byte-cap flood, overshooting the gas
   cap, ordering by fee *rate* rather than fee total, selection determinism
@@ -126,7 +126,7 @@ rules in code would have been the wrong order.
   itself was rebuilt — see the note below.
 
 **The mempool is now wired into L1 (Step 1A).** `Chain` gained three things, all
-of them in `jnt-core` — no networking or storage concern leaked into consensus:
+of them in `srct-core` — no networking or storage concern leaked into consensus:
 
 - `mine_from_pool` selects from the pool at the next block's height and base fee
   and evicts exactly what the block contains. Evicting the whole *selection*
@@ -138,7 +138,7 @@ of them in `jnt-core` — no networking or storage concern leaked into consensus
 - `reconcile_mempool(pool, from_height)` is the whole operation: evict what the
   chain confirms, re-admit what a reorg un-confirmed, report what moved.
 
-Ten integration tests in `crates/jnt-core/tests/mempool_l1.rs` attack the seam
+Ten integration tests in `crates/srct-core/tests/mempool_l1.rs` attack the seam
 rather than the pool: local tx → pool → block, eviction by a peer's block,
 double spend, malformed and forged transactions, a full pool, a degenerate byte
 cap, fee-rate ordering reaching the block, and two reorg cases (a disconnected
@@ -151,7 +151,7 @@ from the tip: there is nothing to recover and nothing stale to distrust. The
 cursor is therefore only needed within a run. This is honest rather than
 complete — a production node would persist the pool — and it is recorded here so
 nobody mistakes it for an oversight. Persisting it belongs with Step 2
-(`jnt-store`), not before.
+(`srct-store`), not before.
 
 ## Known bugs found and fixed
 
@@ -253,7 +253,7 @@ value at that spacing.
 
 ## Red-team pass: consensus and ledger defects
 
-A later adversarial pass (`crates/jnt-core/tests/redteam.rs`, written
+A later adversarial pass (`crates/srct-core/tests/redteam.rs`, written
 attack-first and each confirmed to fail against the pre-fix code) found six
 more defects, all in the state layer. None of them were visible to the
 arithmetic audit above, and none touched hashing, the puzzle, the retarget or
@@ -380,7 +380,7 @@ to separate them.
 
 ## P2P defects found and fixed
 
-Every other `jnt-net` test drove `SyncManager` directly, so the event loop, the
+Every other `srct-net` test drove `SyncManager` directly, so the event loop, the
 peer threads and the sync continuation were untested. Driving them from a real
 socket found all of the following.
 
@@ -421,7 +421,7 @@ socket found all of the following.
   one-per-hour decay.
 - **The locator could exceed `max_locator_len`.** Genesis was appended on top of
   an already-full locator, making 501 entries. The slot is now reserved.
-- **`jnt-node serve` lost everything it synced.** It persisted only on its own
+- **`srct-node serve` lost everything it synced.** It persisted only on its own
   mining path, so blocks that arrived from peers were never written and a restart
   replayed genesis and discarded the entire sync. It also looped with no delay,
   pegging a core on mining and O(n) JSON writes. Both fixed; `--interval`
@@ -457,7 +457,7 @@ socket found all of the following.
   the buffer holds, wire round-trip stability, output-encoding injectivity, and
   `undo_tx` proven an exact inverse over a 64-step spend sequence. Each was
   checked to fail when the property it names is broken. The red-team suite in
-  `crates/jnt-core/tests/redteam.rs` is the same idea applied to consensus and
+  `crates/srct-core/tests/redteam.rs` is the same idea applied to consensus and
   ledger invariants rather than parsers.
 - Vector coverage is finite by construction. The crosscheck exercises seven
   header/epoch combinations; it does not cover every field permutation, and a
@@ -467,18 +467,18 @@ socket found all of the following.
 ## Known rough edges
 
 - `--amount` on `send` is denominated in satoshis while every other printed
-  figure is in JNT. This bit me during verification and is documented in the
+  figure is in SRCT. This bit me during verification and is documented in the
   command's error message, but it should probably gain a unit suffix.
   (**Fixed in Phase 7:** a fractional `--amount` - the form the README
   documents - was refused outright, because the fraction was padded with
-  spaces instead of zeros. `parse_jnt_sat` now zero-pads, and
-  `cargo test -p jnt-node --bin jnt-node` pins it.)
+  spaces instead of zeros. `parse_srct_sat` now zero-pads, and
+  `cargo test -p srct-node --bin srct-node` pins it.)
 
 ## Reproducing the difficulty work
 
 ```
 cargo test --workspace                                 # 139 tests
-cargo test -p jnt-core --test redteam                   # red-team regression suite
+cargo test -p srct-core --test redteam                   # red-team regression suite
 cargo clippy --workspace --all-targets -- -D warnings # clean
 cargo fmt --all --check                               # clean
 python sim/difficulty_attack_sim.py                     # attack containment
@@ -491,9 +491,9 @@ python sim/verify_vectors.py --check                    # all four vector files
 # Regenerate vectors (puzzle/difficulty/ser digests must come from Rust;
 # supply is arithmetic and is done in Python):
 python sim/verify_vectors.py
-UPDATE_PUZZLE_VECTORS=1 cargo test -p jnt-core --lib puzzle_vectors_are_stable
-UPDATE_DIFFICULTY_VECTORS=1 cargo test -p jnt-core --lib difficulty_vectors_are_stable
-UPDATE_SER_VECTORS=1 cargo test -p jnt-core --lib serialization_vectors_are_stable
+UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core --lib puzzle_vectors_are_stable
+UPDATE_DIFFICULTY_VECTORS=1 cargo test -p srct-core --lib difficulty_vectors_are_stable
+UPDATE_SER_VECTORS=1 cargo test -p srct-core --lib serialization_vectors_are_stable
 ```
 
 A second implementation that disagrees with these vectors has a consensus split,
@@ -507,7 +507,7 @@ recorded here rather than left as a list of things nobody has answered.
 **D1 / D4 — Who are the validators?** The M5 BLS validator set **is** the L2
 dispute-arbitrator set. One set, one epoch, one governance system; designing a
 second would have been the more expensive mistake. Validator entry is
-permissionless by staking a minimum JNT amount, and the active set is the top 21
+permissionless by staking a minimum SRCT amount, and the active set is the top 21
 stakers per epoch. Genesis is bootstrapped by founder nodes, since there is no
 stake to rank before any exists.
 
@@ -551,7 +551,7 @@ transaction as underpaid. The inspector's finding is confirmed against the code,
 and the options are these:
 
 1. **Raise the flat fees above the floor.** Simplest and wrong: it makes an L2
-   task post cost more than a JNT transfer, which contradicts the reason D3 chose
+   task post cost more than a SRCT transfer, which contradicts the reason D3 chose
    flat fees at all.
 2. **Exempt the five L2 types from the gas floor.** Rejected as stated: an
    exemption is a second fee rule, and one written as an exception is the easiest
@@ -569,18 +569,18 @@ and the options are these:
 
 **Not decided, and deliberately not implemented.** This needs writing into
 SPEC.md before any L2 transaction type is coded, and it needs the user's sign-off
-because it changes what a JNT price *means* for L2 work. The test
+because it changes what a SRCT price *means* for L2 work. The test
 `l2_flat_fees_sit_below_the_gas_floor` fails the moment the gap closes, so the
 question cannot be silently settled by a later commit.
 
 ## Build order
 
-1. Mempool (`jnt-core/src/mempool.rs`) — **done**, and wired into L1 (Step 1A)
-2. Transaction relay over P2P (`jnt-net`) — **done**
-3. Persistent storage (`jnt-store/`)
+1. Mempool (`srct-core/src/mempool.rs`) — **done**, and wired into L1 (Step 1A)
+2. Transaction relay over P2P (`srct-net`) — **done**
+3. Persistent storage (`srct-store/`)
 4. Real BLS pairing — replace `MockBls` with `blst`
 5. `cargo-fuzz` harness
-6. L2 (`jnt-l2/`) — only after 1–4
+6. L2 (`srct-l2/`) — only after 1–4
 
 Each step uses the red-team discipline from session 1: write the attack, confirm
 it fails against the current code, then fix the cause.
@@ -601,12 +601,12 @@ reserved and started being used. §13.8 gained `tx_request_timeout`.
 
 | Piece | Where |
 |---|---|
-| `MessageType::Tx = 10`, `INV_TYPE_TX = 0`, bounded `Message::Tx` | `jnt-net/src/msg.rs` |
-| Relay bookkeeping: requests, pending, known set, rate window, expiry | `jnt-net/src/relay.rs` |
-| Announce / request / serve / admit / ban, peer registration | `jnt-net/src/net.rs`, `peer.rs` |
-| Mine from the pool, unconditional reconcile, relay counters | `jnt-node/src/main.rs` |
-| Wallet → node: `send --relay <addr>` | `jnt-node/src/main.rs` |
-| Follower node: `serve --no-mine` | `jnt-node/src/main.rs` |
+| `MessageType::Tx = 10`, `INV_TYPE_TX = 0`, bounded `Message::Tx` | `srct-net/src/msg.rs` |
+| Relay bookkeeping: requests, pending, known set, rate window, expiry | `srct-net/src/relay.rs` |
+| Announce / request / serve / admit / ban, peer registration | `srct-net/src/net.rs`, `peer.rs` |
+| Mine from the pool, unconditional reconcile, relay counters | `srct-node/src/main.rs` |
+| Wallet → node: `send --relay <addr>` | `srct-node/src/main.rs` |
+| Follower node: `serve --no-mine` | `srct-node/src/main.rs` |
 
 ### Bugs found and fixed
 
@@ -642,7 +642,7 @@ announces the txid next.
 
 ### Tests
 
-- `crates/jnt-net/tests/tx_relay.rs` — 10 real-socket tests against a hand-rolled
+- `crates/srct-net/tests/tx_relay.rs` — 10 real-socket tests against a hand-rolled
   peer, not our own client: the whole path (pool → `INV` → `GETDATA` → `TX` →
   peer pool → mined → block back → eviction on both nodes); announce/request/serve
   round trip; forbidden signature; repeated invalid transactions reaching the ban
@@ -650,7 +650,7 @@ announces the txid next.
   spend refused without a ban; oversized transaction refused by the pool;
   repeated announcement drawing one request; unanswered request expiring;
   one-shot submitter served and released.
-- `crates/jnt-net/src/relay.rs` — 11 unit tests for the bookkeeping, including the
+- `crates/srct-net/src/relay.rs` — 11 unit tests for the bookkeeping, including the
   stall scenario and both response budgets.
 - `tests/vectors/net_vectors.json` regenerated with `TX` and `kind = 0` bytes, plus
   the five new §13.14 bounds; `sim/net_reference.py` re-derives all of them from
@@ -666,7 +666,7 @@ then `send --relay` from a third process:
 ```
 relay          accepted 1 refused 0 (pool holds 1)
 B chain: block 75 holds 2 txs, outputs [1000000000, 6599824000]
-B balance: 8d0e399eaf9cb1f3:0  10.00000000 JNT  height 75  spendable
+B balance: 8d0e399eaf9cb1f3:0  10.00000000 SRCT  height 75  spendable
 ```
 
 The wallet's signed transaction crossed a real handshake and a real TCP link into
@@ -688,15 +688,15 @@ output as spendable. Exactly one block on B's chain contains it.
   on connect, so a pool larger than 500 entries is not fully announced to a new
   peer. Bounded and honest, but incomplete.
 
-## Step 3 — Persistent storage (crates/jnt-store): DONE
+## Step 3 — Persistent storage (crates/srct-store): DONE
 
-The node no longer rewrites the whole chain as JSON. `crates/jnt-store` is an
-append-only, checksummed block log plus atomic metadata, and `jnt-node` uses it
+The node no longer rewrites the whole chain as JSON. `crates/srct-store` is an
+append-only, checksummed block log plus atomic metadata, and `srct-node` uses it
 for every command.
 
 ### Design (no consensus rules live here)
 
-- One log file (`store/blocks.log`): magic `JNTS`, version 1, then records of
+- One log file (`store/blocks.log`): magic `SRCTS`, version 1, then records of
   `len(4 LE) ‖ digest(4, first bytes of SHA256(payload)) ‖ payload`. Every
   record is tagged (`0x00` block, `0x01` UTXO snapshot) — the tag byte exists
   because a block's first serialized byte is its version (1), which is
@@ -750,13 +750,13 @@ for every command.
 ## Step 4 — Real BLS verification (blst): crypto core DONE, gadget NOT active
 
 SPEC.md gained §14.5, normative for real-BLS builds: min-pk BLS12-381 (keys
-G1/48B, signatures G2/96B), DST `JNT_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_`,
+G1/48B, signatures G2/96B), DST `SRCT_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_`,
 IETF KeyGen derivation for deterministic fixtures, validator-set identity
 `sha256_dom([0xB2], [n ‖ sorted keys])`, bitmap padding bits declared
 malformed, replay ruled out by construction, and set rotation explicitly
 deferred to §14.6 (unresolved: D1 economics).
 
-`crates/jnt-core/src/bls.rs` adds `SecretKey::derive`, `sign`, `RealBls`
+`crates/srct-core/src/bls.rs` adds `SecretKey::derive`, `sign`, `RealBls`
 (single verify, aggregate, fast-aggregate verify), `validator_set_hash`, and
 point validation that rejects infinity/non-subgroup/garbage keys and
 signatures without panicking. `bls_checkpoint::verify_checkpoint` now runs
@@ -858,7 +858,7 @@ an `Ok` arbitration can never be `Inconclusive`; the design is precisely that it
 was corrected to assert the real contract (inconclusive ⇒ no wire verdict ⇒ no
 settle payload ⇒ nothing slashed), after which the target fuzzed clean. No
 product-code change resulted. The deterministic counterpart is
-`crates/jnt-l2/tests/fuzz_invariants.rs` (7 tests, run on every `cargo test`).
+`crates/srct-l2/tests/fuzz_invariants.rs` (7 tests, run on every `cargo test`).
 
 | target            | execs     | result |
 |-------------------|-----------|--------|
@@ -869,18 +869,18 @@ product-code change resulted. The deterministic counterpart is
 | **total (new)**   | **7.2M**  | 0 crashes |
 
 The deterministic counterparts run on every `cargo test`: three
-`fuzz_invariants.rs` suites (jnt-core, jnt-net, jnt-store) feed hand-built
+`fuzz_invariants.rs` suites (srct-core, srct-net, srct-store) feed hand-built
 adversarial inputs — every truncation and bitflip of a valid tx/block, hostile
 length fields, binary garbage metadata, forged/replayed/lying-count
 checkpoints — through the same invariants. They found two real bugs before the
 fuzzer ran, both fixed with regression tests:
 
-1. **jnt-net `Message::Unknown` grew 5 bytes per decode→encode cycle.** Decode
+1. **srct-net `Message::Unknown` grew 5 bytes per decode→encode cycle.** Decode
    stores the payload verbatim (§13.5 freeze rule); encode re-framed it as
    `ty + len + raw`. Encode is now the exact inverse of decode. Wire
    correctness only — unknowns are never relayed — but the asymmetry would
    have bitten the first non-Rust peer implementation.
-2. **jnt-store `MetaFile::load` leaked a raw `InvalidData` IO error on
+2. **srct-store `MetaFile::load` leaked a raw `InvalidData` IO error on
    non-UTF-8 meta.json** (a crash or disk-damage outcome, exactly what
    `BadMeta` exists to name). Now reads bytes and maps the utf-8 failure to
    `BadMeta`.
@@ -894,7 +894,7 @@ the invariant suites as a regression test.
 green. No consensus rule touched: `Chain::submit` still never references
 validators.rs, supply/mining/rewards unchanged.
 
-## Phase 2 — L2 task contracts: SHIPPED (`crates/jnt-l2`) — 2026-10-06
+## Phase 2 — L2 task contracts: SHIPPED (`crates/srct-l2`) — 2026-10-06
 
 The first L2 slice is built. SPEC.md §15 is its normative text. **No L1
 consensus rule changed**: an L2 transaction is a payload type that is not yet
@@ -903,18 +903,18 @@ and the L1 vectors are byte-identical.
 
 **What exists**
 
-- `jnt_core::l2` — the five payload types (`PostTask`, `ClaimTask`,
+- `srct_core::l2` — the five payload types (`PostTask`, `ClaimTask`,
   `SubmitResult`, `Dispute`, `Settle`) with wire codes `0x10`–`0x14`, canonical
   encode/decode (exact inverses, bounded length prefixes), domain-separated
   signing hashes, hybrid actor authorization, and `L2TxType::fee_sat()` returning
   the D3 schedule. `derive_task_id` binds submitter + nonce + task hash.
-- `jnt_core::fees::split_flat_fee` — the D3 fee path: the whole flat fee is
+- `srct_core::fees::split_flat_fee` — the D3 fee path: the whole flat fee is
   `full_base`, split 50/50 burn/PSCB with `tip = 0`, odd satoshi to `burned` to
   match `split_fees`. The L1 gas floor is untouched.
-- `jnt_core::compute_ir` — `ComputeTask::from_reader` and
+- `srct_core::compute_ir` — `ComputeTask::from_reader` and
   `ComputeAttestation::from_reader`, so the M3 envelope round-trips inside an L2
   payload (the attestation signature length is bounded before allocation).
-- `crates/jnt-l2` — `TaskContract` + `ContractState`
+- `crates/srct-l2` — `TaskContract` + `ContractState`
   (`Open → InProgress → ResultSubmitted → Disputed → Settled/Expired`) with
   authorization, state-validation and replay rules, and `L2State`: accounts,
   per-contract escrow, the M2 `SlashVault`, D3 fee collection, replay refusal by
@@ -925,9 +925,9 @@ and the L1 vectors are byte-identical.
 `SlashVault` (M2), `ValidatorSet`/`BlsVerifier`/`BlsSignature` (M5),
 `fees`/`params` (M1 + D3), and the hybrid wallet signing path.
 
-**Verification.** 410 workspace tests (was 360): +15 `jnt_core::l2` unit tests,
-+2 M3 decoder tests, +2 flat-split tests, +18 `jnt-l2` state-machine tests, +17
-`jnt-l2` integration tests (real wallet signatures, the quorum gate, a
+**Verification.** 410 workspace tests (was 360): +15 `srct_core::l2` unit tests,
++2 M3 decoder tests, +2 flat-split tests, +18 `srct-l2` state-machine tests, +17
+`srct-l2` integration tests (real wallet signatures, the quorum gate, a
 rejecting-verifier seam test, and a two-node determinism check that also asserts
 conservation). fmt clean, clippy `-D warnings` clean, release build clean, all
 five sims green, L1 vectors unchanged.
@@ -970,18 +970,18 @@ and validator economics are untouched.
   (same length as the filing window, **lapse** settles as `Correct` with no fee
   and burns the challenger deposit), and the **whistleblower bounty** (25% of the
   slashed amount, drawn from PSCB, capped by the reserve; a transfer, not a mint).
-- `crates/jnt-l2/src/dispute.rs` — `DisputeEvidence` (read from a `Disputed`
+- `crates/srct-l2/src/dispute.rs` — `DisputeEvidence` (read from a `Disputed`
   contract, `validate` with named errors), `Arbiter`, `DisputeVerdict`,
   `DisputeEngine::{arbitrate, resolve}`. The engine is pure and total: it compares
   result *hashes*, never executes IR, never verifies BLS (quorum is the existing
   settle path's job), and never moves value. `Inconclusive` produces no settle
   payload (`InconclusiveDispute`) — a malformed or unexecutable task fails to
   convict rather than defaulting to guilt.
-- `crates/jnt-l2/src/task_contract.rs` — `DisputeChallenge` now stores
+- `crates/srct-l2/src/task_contract.rs` — `DisputeChallenge` now stores
   `against_attestation`, so a `Disputed` contract is self-describing; `L2Config`
   gained `whistleblower_bounty_percent` (25); `due_for_dispute_lapse` and
   `lapse_dispute` implement the resolution window.
-- `crates/jnt-l2/src/state.rs` — `L2Effect::Settled` gained `challenger_bonus`;
+- `crates/srct-l2/src/state.rs` — `L2Effect::Settled` gained `challenger_bonus`;
   `apply_settlement` returns the bounty paid, credits the submitter refunds and
   the challenger refund, computes the bounty as
   `min(slashed × percent / 100, pscb)` against the reserve *before* this
@@ -1022,7 +1022,7 @@ in the new suite, including the bounty path.
 Phase 4 (Verified Work Certificates) — a settled verdict and `vwc_hash` are what
 a certificate certifies.
 
-## Phase 4 — Verified Work Certificates: SHIPPED (`jnt-l2::vwc`) — 2026-10-06
+## Phase 4 — Verified Work Certificates: SHIPPED (`srct-l2::vwc`) — 2026-10-06
 
 The VWC layer is built on top of the existing TaskContract, dispute engine and
 settlement path. SPEC.md §17 is its normative text. **No L1 consensus rule
@@ -1031,25 +1031,25 @@ validation tightening, not an economic change.
 
 **What exists**
 
-- `crates/jnt-l2/src/vwc.rs` — `VerifiedWorkCertificate` + `VwcVerification`.
+- `crates/srct-l2/src/vwc.rs` — `VerifiedWorkCertificate` + `VwcVerification`.
   Canonical, exact-inverse encoding (version, task, worker, result hash,
   settled height, payment, and — for `Quorum` — the settle payload's own BLS
   aggregate, bitmap and count). The id is *derived* (`DOM_L2_VWC`, §17.3) and
   never serialized, so a tampered certificate cannot carry a matching id.
   `validate` fails closed: identity, sanity, then the quorum threshold and a
   real aggregate check over the exact settle decision.
-- `crates/jnt-l2/src/state.rs` — the registry (`task_id → certificate`),
+- `crates/srct-l2/src/state.rs` — the registry (`task_id → certificate`),
   issuance wired into **both** settlement paths: an explicit `Settle` issues
   `Quorum` (reusing the payload aggregate), an implicit auto-settle/lapse issues
   `WindowElapsed`. Issuance happens *before* value moves, so a refusal leaves
   the state untouched. Only `Correct` settlements certify; `Fraudulent` issues a
   `SlashRecord` and `Expired` issues nothing. `L2Effect::Settled` gained
   `vwc_id`.
-- `crates/jnt-l2/src/task_contract.rs` — **the Phase-4 product fix:** a worker
+- `crates/srct-l2/src/task_contract.rs` — **the Phase-4 product fix:** a worker
   can no longer submit the all-zero result hash, because that hash is
   `VWC_HASH_EXPIRED` and would collide with the expired-placeholder record
   (`BadAttestation`, regression-tested).
-- `crates/jnt-core/src/l2.rs` — `DOM_L2_VWC` (`jounit/l2/vwc/v1`), frozen like
+- `crates/srct-core/src/l2.rs` — `DOM_L2_VWC` (`srct/l2/vwc/v1`), frozen like
   the other tags.
 
 **Reused, not reimplemented:** the M5 `ValidatorSet`/`BlsVerifier`/aggregate path
@@ -1106,7 +1106,7 @@ for re-measurement.
 unblocked:** Phase 5 (Worker SDK) — task discovery, claim/execute/submit,
 attestation, VWC handling, wallet integration.
 
-## Phase 5 — Worker SDK: SHIPPED (`crates/jnt-worker`) — 2026-10-07
+## Phase 5 — Worker SDK: SHIPPED (`crates/srct-worker`) — 2026-10-07
 
 The worker-facing SDK is built on top of Phases 2–4's task, dispute and VWC
 machinery. It adds no consensus logic and no new payment path: it builds the
@@ -1117,7 +1117,7 @@ fields. SPEC.md §18 is the normative text (17 subsections).
 **Architecture.** Node connection is two injected traits — `L2NodeView`
 (read: `l2_state` + `chain_height`) and `L2Broadcaster` (write: hand over a
 signed `L2Transaction`) — because this build has no L2 wire transport and
-inventing one would be a guess (`jnt-net` carries only the §13 P2P set; the
+inventing one would be a guess (`srct-net` carries only the §13 P2P set; the
 roadmap §13 REST API is unbuilt). A future REST/WS client implements the
 traits; nothing in the SDK changes. `WorkerClient` composes the lifecycle:
 discover → claim → execute → submit, plus reconcile/dispute/VWC/earnings
@@ -1135,7 +1135,7 @@ restart-after-submit shape (`Submitted` vs `InProgress`) is
 regression-pinned after being caught and fixed pre-push this phase.
 
 **Testing.** 500 workspace tests, 0 failures (was 468):
-- 5 `jnt-worker` unit tests (retry classification, reconciliation totals).
+- 5 `srct-worker` unit tests (retry classification, reconciliation totals).
 - 12 `claim_flow` integration tests over a real-BLS single-node harness:
   full claim→submit→auto/explicit-settle→VWC→earnings chain, discovery
   filters and financing, restart-after-claim/submit, timeout-then-reconcile,
@@ -1150,7 +1150,7 @@ regression-pinned after being caught and fixed pre-push this phase.
   variant's Display and Debug scanned against the key's hex — never present;
   plan/config Debug never embeds the wallet; failed-transaction error text
   carries no signing material).
-- `jnt-l2` gained one additive accessor: `L2State::tasks()` (sorted, mirroring
+- `srct-l2` gained one additive accessor: `L2State::tasks()` (sorted, mirroring
   `vwcs()`), the enumeration discovery is defined on.
 
 **Fuzzing.** New target `worker_flows` (13th total): deterministic wallet
@@ -1178,11 +1178,11 @@ testing, mainnet readiness).
 
 Phase 6 opened with an audit (`docs/phase6-plan.md`) because the phase did not
 turn out to be the one the roadmap describes. The headline finding: L2 was not
-merely unintegrated but **unreachable from consensus** — `jnt-node` did not
-depend on `jnt-l2`, `Chain::submit` took only a `Block`, and `L2State` held a
+merely unintegrated but **unreachable from consensus** — `srct-node` did not
+depend on `srct-l2`, `Chain::submit` took only a `Block`, and `L2State` held a
 private balance ledger whose only entry point (`credit`) no production path
 called. The validator set had no stake ledger to derive from, finality had no
-message type, L2 state was unrecoverable across restart (no serde in `jnt-l2`),
+message type, L2 state was unrecoverable across restart (no serde in `srct-l2`),
 and the node had no transport at all.
 
 Four decisions were required and made (Decisions 6–9 in `docs/decisions.md`):
@@ -1199,7 +1199,7 @@ genesis committee; the transport is the roadmap §13 REST API.
   domain tag, so the *existing* `MerkleRootMismatch` rule already refuses a
   block whose L2 section was stripped or altered. `Chain::submit` was not made
 to know about L2 — no new L1 consensus rule.
-- L2 state is **derived, not stored**: `jnt_l2::replay::ChainL2` rebuilds it by
+- L2 state is **derived, not stored**: `srct_l2::replay::ChainL2` rebuilds it by
   replaying the stored chain (`advance_block(h)` then the block's payloads), so
   restart recovery and reorg both need no undo bookkeeping. The incremental path
   (`empty` + `apply_block`) is asserted equal to full replay.
@@ -1226,13 +1226,13 @@ machinery is verified against a chain holding no value and no validators. SPEC
 ## Phase 6 � M1 node integration: SHIPPED � 2026-10-07
 
 M1 carriage/replay (above) left L2 unreachable from the running node:
-`jnt-node` did not depend on `jnt-l2` and no production path replayed a block.
+`srct-node` did not depend on `srct-l2` and no production path replayed a block.
 That gap is now closed. **No L1 consensus rule changed, no wire format changed,
 no L2 semantic changed.**
 
-**What was added** (`crates/jnt-node/src/l2.rs`, `SPEC.md �19.1`):
+**What was added** (`crates/srct-node/src/l2.rs`, `SPEC.md �19.1`):
 
-- `jnt-node` depends on `jnt-l2` and consumes `ChainL2` through a thin `NodeL2`
+- `srct-node` depends on `srct-l2` and consumes `ChainL2` through a thin `NodeL2`
   wrapper. The node holds no second state machine: every payload is applied by
   `L2State::apply`.
 - Sync rule, called after every batch of accepted blocks (mined or received �
@@ -1251,7 +1251,7 @@ no L2 semantic changed.**
   `verify` asserts replay determinism (two replays agree, incremental agrees
   with replay) and names each skipped payload with height, txid and reason.
 
-**Tests:** 20 node integration tests (`crates/jnt-node/tests/l2_node.rs`):
+**Tests:** 20 node integration tests (`crates/srct-node/tests/l2_node.rs`):
 no-L2 / valid-unfunded / multiple / bad-auth / no-quorum-settle /
 present-but-empty trailer / stripped trailer / modified payload / double-sync
 no-op / sequential incremental / two-view determinism / restart through a real
@@ -1283,11 +1283,11 @@ amounts and grantees are parameters under that decision, listed below.
 **The model.** The escrow fits in the sats the L1 ladder provably can never
 the explicit `escrow_ceiling_sat` parameter per profile. There is no unmintable
 M-E it is bounded by the explicit `escrow_ceiling_sat`, not by the gap rule).
-`NetworkParams` fixes per profile: `l2_genesis_escrow_sat` (`mini` 10 JNT,
-`mainnet` 100,000 JNT, no mainnet grants) and `l2_genesis_grants` (`mini`:
-1 JNT each to three deterministic operator identities, seeds 1–3). The 7 JNT
+`NetworkParams` fixes per profile: `l2_genesis_escrow_sat` (`mini` 10 SRCT,
+`mainnet` 100,000 SRCT, no mainnet grants) and `l2_genesis_grants` (`mini`:
+1 SRCT each to three deterministic operator identities, seeds 1–3). The 7 SRCT
 remainder parks with the derived protocol escrow identity
-(`SHA256("jounit/l2-escrow/v1" ‖ network_id)[..20]`), inert until a later
+(`SHA256("srct/l2-escrow/v1" ‖ network_id)[..20]`), inert until a later
 milestone authorises disbursement. `validate()` refuses zero/over-total/
 duplicate/escrow-named/zero grants and any escrow above `escrow_ceiling_sat` — so combined
 L1 + L2 money can never exceed the cap, with zero L1 rule change.
@@ -1333,7 +1333,7 @@ M3 code) authorises it with seven explicit parameters. This builds exactly
 that — nothing more.
 
 **The mechanism.** An ordinary STANDARD payment to the params-derived sink
-(`SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]`, distinct from the
+(`SHA256("srct/l2-deposit-sink/v1" ‖ network_id)[..20]`, distinct from the
 escrow identity, network-bound) is interpreted by L2 replay as a deposit. No
 new L1 transaction type; L1 consensus, layouts, fees, issuance and cap rules
 all untouched. Recipient = common input owner derived from key bundles (which
@@ -1346,7 +1346,7 @@ state consumed set: credited once, ever. A matured deposit sits below the
 finality line, so it is as irremovable as its block by existing consensus.
 
 **Processing.** Detection is a pure function of one block
-(`jnt_l2::deposits::scan_block`); crediting is `L2State::apply_deposit`
+(`srct_l2::deposits::scan_block`); crediting is `L2State::apply_deposit`
 (exactly-once, counted into `funded_total` and `deposited_total`);
 `ChainL2` evaluates maturity against the tip and exposes pending/ignored;
 `NodeL2` rebuilds by full replay when an old pending deposit matures
@@ -1503,7 +1503,7 @@ checkpoint view. The node's sync also re-evaluates maturity when a checkpoint
 moves the floor **without moving the tip** — otherwise a finality-held deposit
 would sit pending until some unrelated block arrived.
 
-**L2 settlement seam (Decision 15, SPEC §15.1).** `jnt_node::l2::validator_set`
+**L2 settlement seam (Decision 15, SPEC §15.1).** `srct_node::l2::validator_set`
 returns the profile's declared active committee. Decision 27 later split this
 into the separate `l2_settlement_validators` field: mini/testnet use the same
 four keys as their L1 committee, while mainnet leaves the settlement set empty
@@ -1513,14 +1513,14 @@ Correct settle → VWC issued); foreign keys are refused by name
 (`BadBlsSignature`). `WindowElapsed` semantics and all existing VWC
 verification are untouched.
 
-**Tests:** 37 new, all M5-scoped — 25 in `jnt-core/tests/m5_finality.rs`
+**Tests:** 37 new, all M5-scoped — 25 in `srct-core/tests/m5_finality.rs`
 (profile matrix, activation, the nine-case conflict matrix, the critical reorg
 below/above/at the finalized height, equivocation determinism + bounds,
 restore-refuses-lies, fresh==incremental finality), 4 in
-`jnt-l2/tests/m5_deposit_finality.rs` (pre-activation + Cases A/B/C/D), 6 in
-`jnt-node/tests/m5_node_finality.rs` (declared-committee settlement, foreign
+`srct-l2/tests/m5_deposit_finality.rs` (pre-activation + Cases A/B/C/D), 6 in
+`srct-node/tests/m5_node_finality.rs` (declared-committee settlement, foreign
 refusal, empty-committee fail-closed, checkpoint-without-tip maturity,
-restart determinism), 2 in `jnt-store/tests/m5_finality.rs` (persisted point
+restart determinism), 2 in `srct-store/tests/m5_finality.rs` (persisted point
 survives reopen; every lying row refused).
 
 **Verified:** 625 workspace tests / 0 failed / 1 ignored (was 588; +37); fmt
@@ -1553,7 +1553,7 @@ ignored test is the intentional `vwc_perf_probe` performance re-measurement poin
 New tests added this phase:
 - 15 deterministic chaos/failure tests (`chaos.rs`) covering node, L2, chain, accounting
 - 15 API integration tests (`api.rs`) including `GET /v1/reputation/{id}` (2 tests)
-- 1 two-process E2E test (`e2e_two_process.rs`) — real `jnt-node serve` over TCP
+- 1 two-process E2E test (`e2e_two_process.rs`) — real `srct-node serve` over TCP
 - 14 fuzz targets (added `checkpoint_codec`, all CI-listed targets now covered)
 
 **Security audit:** `docs/security_audit.md` — no critical or high-severity findings.
@@ -1561,7 +1561,7 @@ All identified threat surfaces covered by tests and/or fuzzing. Fuzz report:
 `docs/fuzz.md` — 17 targets, 9,352,161 executions, 0 crashes (WSL2 nightly + ASan, measured 2026-10-09).
 
 **SPEC reconciliation:** `docs/roadmap.md` updated — 14/14 Phase 6 items implemented.
-SPEC.md §14.2 L2 payload types now match `crates/jnt-core/src/l2.rs` exactly.
+SPEC.md §14.2 L2 payload types now match `crates/srct-core/src/l2.rs` exactly.
 SPEC.md §19.2 (opt-in service API) specifies the REST surface (health, tx build,
 reputation and the L2/task/payment/receipt endpoints).
 
@@ -1666,7 +1666,7 @@ fields) and is pinned by `mainnet_genesis_is_frozen_for_the_version_bump`.
   implementation of the same rules, written from SPEC.md §21-§22 in Python: it
   derives secp256k1 addresses, the agent identities, the grant hashes and the
   position ids itself. It emits `tests/vectors/l2_authority_vectors.json`, and
-  `crates/jnt-l2/tests/l2_authority_vectors.rs` replays those scenarios and
+  `crates/srct-l2/tests/l2_authority_vectors.rs` replays those scenarios and
   asserts the same verdict, the same reason and the same final state. Building
   it found two divergences in the *reference* (the replay guard has to come
   before the state checks; the height an advance step leaves behind is the
@@ -1679,11 +1679,11 @@ fields) and is pinned by `mainnet_genesis_is_frozen_for_the_version_bump`.
   that a default is not early, and that interest is charged once per period.
   Every registered target is now in the CI smoke loop - `deliverable_codec`
   had been registered but never run.
-- **A hardening suite** (`crates/jnt-l2/tests/authority_hardening.rs`): replay,
+- **A hardening suite** (`crates/srct-l2/tests/authority_hardening.rs`): replay,
   forged and tampered signatures, duplicate publication, duplicate opening,
   double revocation, malformed grants, overflowing amounts, the validity
   window, a height running backwards, overpayment, and the two restart cases.
-- **A terminal suite** (`crates/jnt-node/tests/cli_authority.rs`): the whole
+- **A terminal suite** (`crates/srct-node/tests/cli_authority.rs`): the whole
   flow against a real chain - deposit, publish, spend, revoke, the refusal of a
   spend under a revoked grant, and the credit flow - plus the property that a
   command the chain would skip mines nothing.
@@ -1696,8 +1696,8 @@ fields) and is pinned by `mainnet_genesis_is_frozen_for_the_version_bump`.
   Layer-2 state, and the checkpoint a committee signs is not part of a block, so
   the reward cannot be a function of chain state alone without a rule that says
   which checkpoint counts.
-- **No exchange.** No second asset, no order book, no price oracle. JNT's
-  economic usage is meant to come from JNT network usage.
+- **No exchange.** No second asset, no order book, no price oracle. SRCT's
+  economic usage is meant to come from SRCT network usage.
 - **The service-layer books** (the payment book, the receipt book, the credit
   admission gate) are still node-local. They are gates, not sources of
   spendable balance - a settlement still needs a real transaction - but they

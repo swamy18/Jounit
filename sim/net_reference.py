@@ -1,6 +1,6 @@
-"""Independent Python implementation of the Jounit wire format (SPEC.md section 13).
+"""Independent Python implementation of the Solar Cyber Unit wire format (SPEC.md section 13).
 
-This is the same discipline as ``sim/jounit_reference.py`` for the PoW puzzle:
+This is the same discipline as ``sim/srct_reference.py`` for the PoW puzzle:
 a second implementation written from the *prose* of the specification rather
 than from the Rust source, so that a disagreement points at the spec instead of
 at either implementation.
@@ -53,8 +53,8 @@ NETWORK_MAGIC = {
     "mini": bytes([0x6A, 0x4E, 0x54, 0x03]),
 }
 NETWORK_ID = {
-    "mainnet": b"jounit/mainnet",
-    "mini": b"jounit/mini",
+    "mainnet": b"srct/mainnet",
+    "mini": b"srct/mini",
 }
 
 # --- SPEC.md section 13.8: resource bounds --------------------------------
@@ -115,7 +115,7 @@ def version_payload(
     network: str,
     height: int,
     tip_hash: bytes,
-    user_agent: bytes = b"/jnt-net:0.2",
+    user_agent: bytes = b"/srct-net:0.2",
     nonce: int = 0x0123_4567_89AB_CDEF,
     services: int = 1,
 ) -> bytes:
@@ -286,7 +286,7 @@ TIP = bytes([0x5A]) * 64
 def derived_items() -> dict[str, str]:
     mini = NETWORK_MAGIC["mini"]
     items: dict[str, str] = {}
-    items["frame_inv_type7_len3"] = frame(mini, MSG_BLOCK, b"jnt").hex()
+    items["frame_inv_type7_len4"] = frame(mini, MSG_BLOCK, b"srct").hex()
     for net in ("mainnet", "mini"):
         items[f"version_{net}"] = version_payload(net, 42, TIP).hex()
     items["msg_verack"] = nonce_payload(0xDEAD).hex()
@@ -375,7 +375,7 @@ SKIPPED = {
 
 def crosscheck() -> int:
     if not VECTORS.exists():
-        print(f"missing {VECTORS}\nregenerate with UPDATE_NET_VECTORS=1 cargo test -p jnt-net")
+        print(f"missing {VECTORS}\nregenerate with UPDATE_NET_VECTORS=1 cargo test -p srct-net")
         return 1
     doc = json.loads(VECTORS.read_text())
     pinned = {e["name"]: e["hex"] for e in doc["items"]}

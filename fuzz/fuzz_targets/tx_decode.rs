@@ -9,12 +9,12 @@ use libfuzzer_sys::fuzz_target;
 // controls these bytes on the wire.
 fuzz_target!(|data: &[u8]| {
     // The public deserialize entry point.
-    if let Ok(tx) = jnt_core::tx::Transaction::deserialize(data) {
+    if let Ok(tx) = srct_core::tx::Transaction::deserialize(data) {
         // Round-trip invariant: a successfully decoded transaction must
         // re-serialize to at least the input length with no panic, and must
         // decode again from its own serialization (parser consistency).
         let re = tx.serialize();
-        let again = jnt_core::tx::Transaction::deserialize(&re)
+        let again = srct_core::tx::Transaction::deserialize(&re)
             .expect("a decoded transaction must decode from its own serialization");
         assert_eq!(again.txid(), tx.txid(), "re-serialization must preserve txid");
     }

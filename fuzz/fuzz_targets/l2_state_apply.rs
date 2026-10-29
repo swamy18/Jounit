@@ -23,15 +23,15 @@ use libfuzzer_sys::fuzz_target;
 // dispute / settle-by-arbitration / advance) whose amounts are bounded so the
 // arithmetic stays in range.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
-    use jnt_core::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
-    use jnt_core::hash::Hash;
-    use jnt_core::l2::{
+    use srct_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
+    use srct_core::compute_ir::{ComputeAttestation, ComputeBackend, ComputeTask};
+    use srct_core::hash::Hash;
+    use srct_core::l2::{
         ClaimTaskPayload, DisputePayload, L2Payload, L2Transaction, PostTaskPayload,
         SubmitResultPayload,
     };
-    use jnt_core::wallet::Wallet;
-    use jnt_l2::{ContractState, DisputeEngine, L2Config, L2State};
+    use srct_core::wallet::Wallet;
+    use srct_l2::{ContractState, DisputeEngine, L2Config, L2State};
 
     if data.len() < 100 {
         return;
@@ -159,7 +159,7 @@ fuzz_target!(|data: &[u8]| {
                     if disputed {
                         if let Ok(v) = DisputeEngine::resolve(state.task(&id).unwrap()) {
                             if let Ok(payload) = v.settle_payload(
-                                "jounit/mini",
+                                "srct/mini",
                                 height,
                                 [0xAAu8; 96],
                                 vec![0b0000_0111],

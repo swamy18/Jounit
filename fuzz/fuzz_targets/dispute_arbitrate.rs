@@ -14,10 +14,10 @@ use libfuzzer_sys::fuzz_target;
 //   2. Arbitration is deterministic: the same evidence and reference give the
 //      same verdict, every time. The engine is called twice and compared.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::compute_ir::{ComputeAttestation, ComputeBackend};
-    use jnt_core::hash::Hash;
-    use jnt_core::ser::Reader;
-    use jnt_l2::{Arbiter, DisputeEngine, DisputeEvidence};
+    use srct_core::compute_ir::{ComputeAttestation, ComputeBackend};
+    use srct_core::hash::Hash;
+    use srct_core::ser::Reader;
+    use srct_l2::{Arbiter, DisputeEngine, DisputeEvidence};
 
     if data.len() < 128 {
         return;
@@ -75,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
                     assert_eq!(v.verdict(), None, "inconclusive is not a wire verdict");
                     assert_eq!(v.vwc_hash(), None, "inconclusive settles nothing");
                     assert!(
-                        v.settle_payload("jounit/mini", 0, [0u8; 96], vec![0xFF], 1, Vec::new())
+                        v.settle_payload("srct/mini", 0, [0u8; 96], vec![0xFF], 1, Vec::new())
                             .is_err(),
                         "an inconclusive arbitration must have no settle payload"
                     );
@@ -84,7 +84,7 @@ fuzz_target!(|data: &[u8]| {
                     assert!(v.verdict().is_some());
                     assert_eq!(v.vwc_hash(), Some(reference));
                     assert!(v
-                        .settle_payload("jounit/mini", 0, [0u8; 96], vec![0xFF], 1, Vec::new())
+                        .settle_payload("srct/mini", 0, [0u8; 96], vec![0xFF], 1, Vec::new())
                         .is_ok());
                 }
             }

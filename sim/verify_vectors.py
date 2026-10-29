@@ -77,7 +77,7 @@ def check_supply_values() -> None:
             problems.append(f"supply_vectors.json is missing the {network} section")
             continue
         sec = data[network]
-        ladder = sec["ladder_jnt"]
+        ladder = sec["ladder_srct"]
         if ladder != [76, 38, 19, 9, 4, 2, 1, 0]:
             problems.append(f"{network}: ladder is {ladder}, expected [76,38,19,9,4,2,1,0]")
 
@@ -89,9 +89,9 @@ def check_supply_values() -> None:
         expected_reachable = (
             sum((76 >> k) * period for k in range(8) if (76 >> k) > 0) - 76
         )
-        if sec["max_reachable_jnt"] != expected_reachable:
+        if sec["max_reachable_srct"] != expected_reachable:
             problems.append(
-                f"{network}: reachable issuance {sec['max_reachable_jnt']} "
+                f"{network}: reachable issuance {sec['max_reachable_srct']} "
                 f"!= {expected_reachable}"
             )
         if sec.get("rate_anchor_max_pct_per_period") != 1.0:
@@ -142,7 +142,7 @@ def check_net_against_reference() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="verify or regenerate Jounit test vectors")
+    parser = argparse.ArgumentParser(description="verify or regenerate Solar Cyber Unit test vectors")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -154,11 +154,11 @@ def main() -> int:
         # Puzzle and difficulty digests must come from the implementation
         # that defines them. Supply is pure arithmetic and is done in Python.
         run(
-            ["cargo", "test", "-p", "jnt-core", "--lib", "puzzle_vectors_are_stable"],
+            ["cargo", "test", "-p", "srct-core", "--lib", "puzzle_vectors_are_stable"],
             env={"UPDATE_PUZZLE_VECTORS": "1"},
         )
         run(
-            ["cargo", "test", "-p", "jnt-core", "--lib", "difficulty_vectors_are_stable"],
+            ["cargo", "test", "-p", "srct-core", "--lib", "difficulty_vectors_are_stable"],
             env={"UPDATE_DIFFICULTY_VECTORS": "1"},
         )
         run([sys.executable, str(ROOT / "sim" / "supply_schedule_sim.py")])

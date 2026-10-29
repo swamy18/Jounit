@@ -15,9 +15,9 @@ use libfuzzer_sys::fuzz_target;
 /// the signer bitmap. Validation must return Ok or a named clause error —
 /// never panic, never accept a structurally impossible checkpoint.
 fn run_checkpoint_validation(data: &[u8]) {
-    use jnt_core::bls::RealBls;
-    use jnt_core::bls_checkpoint::{BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload};
-    use jnt_core::validators::{
+    use srct_core::bls::RealBls;
+    use srct_core::bls_checkpoint::{BlsPublicKey, BlsSignature, Checkpoint, CheckpointPayload};
+    use srct_core::validators::{
         derive_set, validate_checkpoint_against_set, SelectionRule, ValidatorError,
     };
 
@@ -38,10 +38,10 @@ fn run_checkpoint_validation(data: &[u8]) {
     let bitmap: Vec<u8> = data.get(104..).unwrap_or(&[]).to_vec();
 
     // The set the verifier derives (candidates: seeds 1..=n, real keys).
-    let candidates: Vec<jnt_core::validators::ValidatorRecord> = (1..=n_validators as u8)
+    let candidates: Vec<srct_core::validators::ValidatorRecord> = (1..=n_validators as u8)
         .map(|i| {
-            let sk = jnt_core::bls::SecretKey::derive(&[i; 32]).unwrap();
-            jnt_core::validators::ValidatorRecord {
+            let sk = srct_core::bls::SecretKey::derive(&[i; 32]).unwrap();
+            srct_core::validators::ValidatorRecord {
                 stake_address: [i; 20],
                 bls_pk: sk.public_key(),
                 stake_sat: u64::from(i) * 100,
@@ -56,8 +56,8 @@ fn run_checkpoint_validation(data: &[u8]) {
 
     let payload = CheckpointPayload {
         height,
-        block_hash: jnt_core::hash::sha512(&[b"fuzz", &height.to_le_bytes()]),
-        network_id: "jounit/mini".into(),
+        block_hash: srct_core::hash::sha512(&[b"fuzz", &height.to_le_bytes()]),
+        network_id: "srct/mini".into(),
         epoch,
     };
 
@@ -71,7 +71,7 @@ fn run_checkpoint_validation(data: &[u8]) {
 
     let finalized = 0;
     let epoch_blocks = 100;
-    let set_for_epoch = |e: u64| -> Result<jnt_core::validators::EpochSet, ValidatorError> {
+    let set_for_epoch = |e: u64| -> Result<srct_core::validators::EpochSet, ValidatorError> {
         if e == epoch {
             Ok(set.clone())
         } else {
@@ -119,10 +119,10 @@ fn run_checkpoint_validation(data: &[u8]) {
 /// - evidence construction over arbitrary payloads is total: Some exactly when
 ///   the payloads differ, None otherwise, and never panics.
 fn run_finality_state(data: &[u8]) {
-    use jnt_core::bls_checkpoint::{BlsSignature, Checkpoint, CheckpointPayload, MockBls};
-    use jnt_core::finality::{FinalityManager, MAX_EQUIVOCATION_EVIDENCE};
-    use jnt_core::params::NetworkParams;
-    use jnt_core::validators::equivocation_evidence;
+    use srct_core::bls_checkpoint::{BlsSignature, Checkpoint, CheckpointPayload, MockBls};
+    use srct_core::finality::{FinalityManager, MAX_EQUIVOCATION_EVIDENCE};
+    use srct_core::params::NetworkParams;
+    use srct_core::validators::equivocation_evidence;
     use std::collections::HashMap;
 
     if data.len() < 12 {
@@ -131,7 +131,7 @@ fn run_finality_state(data: &[u8]) {
     let params = NetworkParams::testnet(); // deterministic committee, activation 20
     let mut fm = FinalityManager::new(&params);
     // Local model of what accept() has actually returned Ok for.
-    let mut accepted: HashMap<u64, jnt_core::hash::Hash512> = HashMap::new();
+    let mut accepted: HashMap<u64, srct_core::hash::Hash512> = HashMap::new();
 
     let mut off = 0usize;
     while off + 12 <= data.len() {
@@ -143,14 +143,14 @@ fn run_finality_state(data: &[u8]) {
         let canonical_mode = data[off + 5] % 3; // 0 = exact, 1 = other hash, 2 = absent
         let count = data[off + 6];
 
-        let block_hash = jnt_core::hash::sha512(&[&[variant], &height.to_le_bytes()]);
+        let block_hash = srct_core::hash::sha512(&[&[variant], &height.to_le_bytes()]);
         let payload = CheckpointPayload {
             height,
             block_hash,
             network_id: if wrong_network {
-                "jounit/another-network".into()
+                "srct/another-network".into()
             } else {
-                "jounit/testnet".into()
+                "srct/testnet".into()
             },
             epoch: height / params.checkpoint_interval_blocks,
         };
@@ -163,7 +163,7 @@ fn run_finality_state(data: &[u8]) {
         };
         let canonical = match canonical_mode {
             0 => Some(block_hash),
-            1 => Some(jnt_core::hash::sha512(&[b"other", &height.to_le_bytes()])),
+            1 => Some(srct_core::hash::sha512(&[b"other", &height.to_le_bytes()])),
             _ => None,
         };
 
@@ -215,8 +215,8 @@ fn run_finality_state(data: &[u8]) {
         let cp2 = Checkpoint {
             payload: CheckpointPayload {
                 height,
-                block_hash: jnt_core::hash::sha512(&[&[variant ^ 0xFF], &height.to_le_bytes()]),
-                network_id: "jounit/testnet".into(),
+                block_hash: srct_core::hash::sha512(&[&[variant ^ 0xFF], &height.to_le_bytes()]),
+                network_id: "srct/testnet".into(),
                 epoch: height / params.checkpoint_interval_blocks,
             },
             aggregate_sig: sig,

@@ -1,8 +1,8 @@
 {
-  "sat_per_jnt": 100000000,
+  "sat_per_srct": 100000000,
   "mainnet": {
     "network": "mainnet",
-    "ladder_jnt": [
+    "ladder_srct": [
       76,
       38,
       19,
@@ -14,21 +14,21 @@
     ],
     "halving_period_blocks": 262800,
     "halving_period_years": 4.997,
-    "issued_after_first_period_jnt": 19972762,
-    "issued_after_two_periods_jnt": 29959143,
-    "max_reachable_jnt": 39157124,
+    "issued_after_first_period_srct": 19972762,
+    "issued_after_two_periods_srct": 29959143,
+    "max_reachable_srct": 39157124,
     "rate_anchor_max_pct_per_period": 1.0,
     "largest_tail_window_pct_of_issued": 0.33557112110685144,
-    "final_reward_jnt": 0,
+    "final_reward_srct": 0,
     "tail_activation_height": 1839600,
     "tail_floor_sat": 50000000,
-    "tail_floor_jnt": 0.5,
+    "tail_floor_srct": 0.5,
     "tail_reward_at_exhaustion_sat": 50000000,
     "tail_is_constant": false
   },
   "mini": {
     "network": "mini",
-    "ladder_jnt": [
+    "ladder_srct": [
       76,
       38,
       19,
@@ -40,15 +40,15 @@
     ],
     "halving_period_blocks": 2000,
     "halving_period_years": 0.0,
-    "issued_after_first_period_jnt": 151962,
-    "issued_after_two_periods_jnt": 227943,
-    "max_reachable_jnt": 297924,
+    "issued_after_first_period_srct": 151962,
+    "issued_after_two_periods_srct": 227943,
+    "max_reachable_srct": 297924,
     "rate_anchor_max_pct_per_period": 1.0,
     "largest_tail_window_pct_of_issued": 6.7131214672198276e-09,
-    "final_reward_jnt": 0,
+    "final_reward_srct": 0,
     "tail_activation_height": 14000,
     "tail_floor_sat": 1,
-    "tail_floor_jnt": 1e-08,
+    "tail_floor_srct": 1e-08,
     "tail_reward_at_exhaustion_sat": 1,
     "tail_is_constant": true
   }

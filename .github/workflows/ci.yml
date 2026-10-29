@@ -63,7 +63,7 @@ jobs:
         # against them. A disagreement here is a spec ambiguity, not a
         # formatting difference -- see SPEC.md section 12.
         run: |
-          cargo test -p jnt-core --lib vectors
+          cargo test -p srct-core --lib vectors
           python sim/puzzle_crosscheck.py
           python sim/verify_vectors.py --check
           python sim/l2_authority_reference.py --check

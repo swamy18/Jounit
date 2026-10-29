@@ -319,7 +319,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jnt-core"
+name = "jlnt-core"
 version = "0.1.0"
 dependencies = [
  "blst",
@@ -334,48 +334,48 @@ dependencies = [
 ]
 
 [[package]]
-name = "jnt-core-fuzz"
+name = "jlnt-core-fuzz"
 version = "0.0.0"
 dependencies = [
- "jnt-core",
- "jnt-l2",
- "jnt-net",
- "jnt-store",
- "jnt-worker",
+ "jlnt-core",
+ "jlnt-l2",
+ "jlnt-net",
+ "jlnt-store",
+ "jlnt-worker",
  "libfuzzer-sys",
 ]
 
 [[package]]
-name = "jnt-l2"
+name = "jlnt-l2"
 version = "0.1.0"
 dependencies = [
- "jnt-core",
+ "jlnt-core",
 ]
 
 [[package]]
-name = "jnt-net"
+name = "jlnt-net"
 version = "0.1.0"
 dependencies = [
- "jnt-core",
+ "jlnt-core",
  "rand",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "jnt-store"
+name = "jlnt-store"
 version = "0.1.0"
 dependencies = [
- "jnt-core",
+ "jlnt-core",
 ]
 
 [[package]]
-name = "jnt-worker"
+name = "jlnt-worker"
 version = "0.1.0"
 dependencies = [
  "hex",
- "jnt-core",
- "jnt-l2",
+ "jlnt-core",
+ "jlnt-l2",
  "serde",
  "serde_json",
 ]

@@ -1,7 +1,7 @@
-# JOUNIT PROTOCOL SPECIFICATION
+# SOLAR CYBER UNIT PROTOCOL SPECIFICATION
 
 **Version:** 0.1.0 (the workspace version in `Cargo.toml`)
-**Status:** Draft — §0–§12 normative for `jnt-core`; §13 normative for `jnt-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `jnt-l2`; §18 for `jnt-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `jnt-core::escrow` and `jnt-node::api`; coin settlement runs via `POST /v1/escrow/{id}/settle` (§20.2).
+**Status:** Draft — §0–§12 normative for `srct-core`; §13 normative for `srct-net`; §14 records the M1–M5 protocol mechanisms and, for each, whether it is consensus-active today; §15–§17 normative for `srct-l2`; §18 for `srct-worker`; §19 for L1↔L2 integration. §19.1, §19.2, §19.4, §19.5 and §19.6 are implemented and tested. §20 (conditional escrow) is implemented as a non-consensus node-records-state surface in `srct-core::escrow` and `srct-node::api`; coin settlement runs via `POST /v1/escrow/{id}/settle` (§20.2).
 **Scope:** Layer 1 (base layer, §0–§13), the M1–M5 protocol mechanisms (§14), Layer 2 and the worker SDK (§15–§18), and L1↔L2 integration including deposits and exits (§19). §13 covers block and transaction relay between nodes.
 
 This document is the **normative reference**. Any implementation in any language must produce identical byte-level output for the vectors in `tests/vectors/`. Five vector files exist today — the four covering §0–§12, plus `net_vectors.json` (§13.12) for the wire format.
@@ -17,7 +17,7 @@ This document is the **normative reference**. Any implementation in any language
 | Signature | secp256k1, ECDSA, compact 64-byte `r‖s`, low-`s` enforced |
 | Integer arithmetic | Signed/unsigned integers only. **No floating point anywhere in consensus.** |
 | Byte order | Explicit `LE` (little-endian) or raw (byte sequence as written) on every field |
-| Amounts | Satoshis (smallest unit). `1 JNT = 100,000,000 sat` (8 decimals) |
+| Amounts | Satoshis (smallest unit). `1 SRCT = 100,000,000 sat` (8 decimals) |
 | Difficulty | `u128`, always `≥ 1` |
 | Difficulty ceiling | `MAX_DIFFICULTY = 2^96` (keeps target division overflow-free in any language) |
 | U256 | Big-endian 32-byte unsigned integer; `U256_BE(bytes)` is the primary comparison form |
@@ -26,19 +26,19 @@ This document is the **normative reference**. Any implementation in any language
 
 | Tag | Bytes |
 |---|---|
-| `DOM_BLOCK` | `jounit/blockhash/v1` |
-| `DOM_BLOCK512` | `jounit/blockhash512/v1` |
-| `DOM_TX` | `jounit/txid/v1` |
-| `DOM_TX512` | `jounit/txid512/v1` |
-| `DOM_TXBODY` | `jounit/txbody/v1` |
-| `DOM_SIG` | `jounit/sig/v1` |
-| `DOM_ADDR` | `jounit/addr/v2` |
-| `DOM_S1` | `jounit/puzzle/stage1/v1` |
-| `DOM_S2` | `jounit/puzzle/stage2/v1` |
-| `DOM_S3` | `jounit/puzzle/stage3/v1` |
-| `DOM_W` | `jounit/puzzle/weights/v1` |
-| `DOM_GENESIS` | `jounit/genesis/v1` |
-| `DOM_NET_HANDSHAKE` | `jounit/net/handshake/v1` |
+| `DOM_BLOCK` | `srct/blockhash/v1` |
+| `DOM_BLOCK512` | `srct/blockhash512/v1` |
+| `DOM_TX` | `srct/txid/v1` |
+| `DOM_TX512` | `srct/txid512/v1` |
+| `DOM_TXBODY` | `srct/txbody/v1` |
+| `DOM_SIG` | `srct/sig/v1` |
+| `DOM_ADDR` | `srct/addr/v2` |
+| `DOM_S1` | `srct/puzzle/stage1/v1` |
+| `DOM_S2` | `srct/puzzle/stage2/v1` |
+| `DOM_S3` | `srct/puzzle/stage3/v1` |
+| `DOM_W` | `srct/puzzle/weights/v1` |
+| `DOM_GENESIS` | `srct/genesis/v1` |
+| `DOM_NET_HANDSHAKE` | `srct/net/handshake/v1` |
 
 Single-byte tags for the M3/M5 envelopes (§14). They are one byte rather than an
 ASCII string because they tag a fixed-shape payload, not a message family:
@@ -343,9 +343,9 @@ Accumulator bound: `|s| ≤ 16 × 128 × 128 + 62 = 262 206 < 2^63`, so `i64` ca
 `ACTIVATION_SHIFT = 2`. ReLU is applied *after* the shift.
 
 `ACTIVATION_SHIFT`, `fold32` and `PuzzleSpec::in_dim` are the portable kernel
-surface (`jnt-core::puzzle`): every compute backend — CPU, GPU, NPU, TPU,
+surface (`srct-core::puzzle`): every compute backend — CPU, GPU, NPU, TPU,
 photonic, domestic accelerators — implements exactly these primitives, so all
-substrates compute bit-identical digests. The `jnt-miner` differential tests
+substrates compute bit-identical digests. The `srct-miner` differential tests
 pin a reference backend against an independently written one
 candidate-for-candidate; a new substrate joins by passing that test, never by
 renegotiating the math.
@@ -371,7 +371,7 @@ solve(header) = ( U256_BE(final) ≤ target(header.difficulty) )
 ```
 
 That predicate is the whole validity rule, and it is also the conformance
-rule for miner backends: a batched or device implementation (`jnt-miner`
+rule for miner backends: a batched or device implementation (`srct-miner`
 `ComputeBackend`, §19.2) is conformant iff it returns this predicate's answer
 on every header — byte-identical `final`, never a tolerance.
 
@@ -452,32 +452,32 @@ Design doc §28.9 reports that a two-hour allowance let a 40% attacker reach ~10
 
 ## 7. Supply schedule
 
-Per Section 16. `SAT_PER_JNT = 100_000_000`.
+Per Section 16. `SAT_PER_SRCT = 100_000_000`.
 
 | Parameter | Value |
 |---|---|
 | `halving_period` | `262 800` blocks (5 years at 10 min) |
-| `start_reward` | `76 JNT` = `7_600_000_000 sat` |
+| `start_reward` | `76 SRCT` = `7_600_000_000 sat` |
 | `supply_cap` | **none** — Decision 18 (2026-10-09) replaced the stock cap with the rate anchor below |
-| `tail_emission` | **approved + implemented** — mainnet `0.50`, `0.25`, `0.125` JNT then the permanent `0.1` JNT floor; `mini`/`testnet` a constant `1 sat`/block (Decisions M-A…M-C) |
+| `tail_emission` | **approved + implemented** — mainnet `0.50`, `0.25`, `0.125` SRCT then the permanent `0.1` SRCT floor; `mini`/`testnet` a constant `1 sat`/block (Decisions M-A…M-C) |
 
 ```
 halvings  = height / halving_period
-rung(p)   = start_reward_jnt >> p                         // whole-JNT halving
-reward(h) = rung(halvings) * SAT_PER_JNT                  // while rung > 0
-tail(p)   = max(tail_floor_sat, 1 JNT >> (p − exhaustion_period + 1))
+rung(p)   = start_reward_srct >> p                         // whole-SRCT halving
+reward(h) = rung(halvings) * SAT_PER_SRCT                  // while rung > 0
+tail(p)   = max(tail_floor_sat, 1 SRCT >> (p − exhaustion_period + 1))
 reward(h) = tail(halvings)                                // once rung == 0
 
-// The ladder is halved in **whole JNT**, not by shifting satoshis:
-// `start_reward_sat >> halvings` would pay 9.5 JNT at halving 3 and
-// contradict the ladder below. Shifting whole JNT keeps every rung a
-// whole number of JNT and keeps the issuance arithmetic exact.
+// The ladder is halved in **whole SRCT**, not by shifting satoshis:
+// `start_reward_sat >> halvings` would pay 9.5 SRCT at halving 3 and
+// contradict the ladder below. Shifting whole SRCT keeps every rung a
+// whole number of SRCT and keeps the issuance arithmetic exact.
 // The tail is halved in **satoshis** and clamped by its floor.
 ```
 
 Reward ladder: `76, 38, 19, 9, 4, 2, 1`, then the approved tail (Decisions
-M-A…M-C, `docs/decisions.md`): mainnet `0.50, 0.25, 0.125` JNT and the
-permanent `0.1 JNT` floor; mini/testnet a constant `1 sat` per block. The tail
+M-A…M-C, `docs/decisions.md`): mainnet `0.50, 0.25, 0.125` SRCT and the
+permanent `0.1 SRCT` floor; mini/testnet a constant `1 sat` per block. The tail
 activates at each profile's ladder exhaustion (mainnet `1 839 600`, mini and
 testnet `14 000`) and leaves **every historical block byte-identical** — the
 reward stays a pure function of height.
@@ -487,7 +487,7 @@ issuance integral at the height — `cumulative_issuance_sat(height)`.
 `supply::check_mint_at_height` is the only mint gate and `Chain::apply_block`
 calls it. Because the first rung is paid by `halving_period − 1` blocks
 (genesis occupies a height without minting), the ladder era issues
-`149 × 262 800 − 76 = 39 157 124 JNT`. There is no stock cap any more
+`149 × 262 800 − 76 = 39 157 124 SRCT`. There is no stock cap any more
 (Decision 18): with a tail, long-run issuance is unbounded by design, so the
 bound is per-height, never a single total. `sim/supply_schedule_sim.py`
 regenerates these numbers and `tests/vectors/supply_vectors.json` pins them.
@@ -591,8 +591,8 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 9. Standard tx: `lock_time` is advisory in v0.1
 10. Bond (`2`): inputs share exactly one signer (the bonder); BLS key valid
      and not already bonded; exactly one output pays the derived bond identity
-     `SHA256("jounit/bond-identity/v1" ‖ network_id ‖ bonder ‖ bls_pk)[..20]`
-     with a positive value (no minimum stake threshold — Jounit is permissionless);
+     `SHA256("srct/bond-identity/v1" ‖ network_id ‖ bonder ‖ bls_pk)[..20]`
+     with a positive value (no minimum stake threshold — Solar Cyber Unit is permissionless);
      that output is consumed into the bond ledger by
     the applying block (it never rests in the UTXO set, so a later release
     cannot double-count it)
@@ -622,13 +622,13 @@ Mainnet: maturity `100`, finality `100`, activation `100`. Mini: `10`, `20`,
 
 ## 10. Network profiles (Section 17: mini version = same code, different config)
 
-The mini version is **not** a second codebase. It is the same `jnt-core` with a different `NetworkParams`. Non-consensus constants live in code; consensus constants live in `params.rs` and are mirrored by `sim/` cross-checks.
+The mini version is **not** a second codebase. It is the same `srct-core` with a different `NetworkParams`. Non-consensus constants live in code; consensus constants live in `params.rs` and are mirrored by `sim/` cross-checks.
 
 | Parameter | `mainnet` | `mini` | `testnet` |
 |---|---|---|---|
 | `target_block_time_ms` | `600 000` | `1 000` | `1 000` |
 | `halving_period` | `262 800` | `2 000` | `2 000` |
-| `start_reward_jnt` | `76` | `76` | `76` |
+| `start_reward_srct` | `76` | `76` | `76` |
 | `rate_anchor_pct` | `1 %` of issued per `halving_period` (all profiles) | | |
 | `difficulty_window` | `60` | `60` | `60` |
 | `change_limit_bps` | `1000` | `1000` | `1000` |
@@ -643,7 +643,7 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `base_fee_max_sat` | `50 000 000` | `1 000 000` | `1 000 000` |
 | `nn_epoch_blocks` | `50 000` | `2 000` | `2 000` |
 | `puzzle_id` | `1` | `1` | `1` |
-| `network_id` | `jounit/mainnet` | `jounit/mini` | `jounit/testnet` |
+| `network_id` | `srct/mainnet` | `srct/mini` | `srct/testnet` |
 | `network_magic` | `6A 4E 54 02` | `6A 4E 54 03` | `6A 4E 54 04` |
 | `checkpoint_interval_blocks` | `100` | `10` | `10` |
 | `finality_activation_height` | `100` | `0` | `20` |
@@ -651,8 +651,8 @@ The mini version is **not** a second codebase. It is the same `jnt-core` with a 
 | `genesis_validators` | `21` (bootstrap, quorum 15) | `4` (quorum 3) | `4` (quorum 3) |
 | `l2_settlement_validators` | `0` (fails closed) | `4` (quorum 3) | `4` (quorum 3) |
 | `exit_activation_height` | `1` | `1` | `1` |
-| `l2_genesis_escrow_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
-| `escrow_ceiling_sat` | `100 000 JNT` | `10 JNT` | `10 JNT` |
+| `l2_genesis_escrow_sat` | `100 000 SRCT` | `10 SRCT` | `10 SRCT` |
+| `escrow_ceiling_sat` | `100 000 SRCT` | `10 SRCT` | `10 SRCT` |
 
 `testnet` shares the mini ladder and block schedule but has its own magic/id,
 its own deterministic committee (distinct derivation), and the §14.8
@@ -683,7 +683,7 @@ header.difficulty   = params.genesis_difficulty        // 1 ⇒ any hash valid
 header.nonce        = 0
 header.puzzle_id    = 1
 header.epoch_id     = 0
-header.extra_nonce  = "jounit-genesis" padded to 16 bytes
+header.extra_nonce  = "srct-genesis" padded to 16 bytes
 header.sig_scheme   = 1
 coinbase            = version 1, tx_type 1, lock_time 0,
                       input { prev_hash = 64 zeros, index = 0, sig = 64 zeros, pubkey = 33 zeros },
@@ -700,13 +700,13 @@ The genesis block is **not** a premine: it contains zero value and no spendable 
 
 | File | Covers | Generated by | Consumed by |
 |---|---|---|---|
-| `puzzle_vectors.json` | header serialization, stage 1 seed, stage 2 activation digest, stage 3 final, work-share accounting | `UPDATE_PUZZLE_VECTORS=1 cargo test -p jnt-core` | `puzzle_vectors_are_stable`, `sim/puzzle_crosscheck.py` |
-| `ser_vectors.json` | input / output / tx / header byte layouts | `UPDATE_SER_VECTORS=1 cargo test -p jnt-core` | `serialization_vectors_are_stable` |
+| `puzzle_vectors.json` | header serialization, stage 1 seed, stage 2 activation digest, stage 3 final, work-share accounting | `UPDATE_PUZZLE_VECTORS=1 cargo test -p srct-core` | `puzzle_vectors_are_stable`, `sim/puzzle_crosscheck.py` |
+| `ser_vectors.json` | input / output / tx / header byte layouts | `UPDATE_SER_VECTORS=1 cargo test -p srct-core` | `serialization_vectors_are_stable` |
 | `supply_vectors.json` | reward ladder, cumulative issuance integral, rate-anchor allowance | `sim/supply_schedule_sim.py` | `a_supply_vector_file_exists_to_show_the_pattern`, `sim/verify_vectors.py` |
-| `difficulty_vectors.json` | LWMA next-difficulty, timestamp clamp behaviour | `UPDATE_DIFFICULTY_VECTORS=1 cargo test -p jnt-core` | `difficulty_vectors_are_stable` |
-| `net_vectors.json` | frame envelope, every `msg_type` payload, `VERSION` layout, locator construction (§13.12) | `UPDATE_NET_VECTORS=1 cargo test -p jnt-net` | `net_vectors_are_stable` |
+| `difficulty_vectors.json` | LWMA next-difficulty, timestamp clamp behaviour | `UPDATE_DIFFICULTY_VECTORS=1 cargo test -p srct-core` | `difficulty_vectors_are_stable` |
+| `net_vectors.json` | frame envelope, every `msg_type` payload, `VERSION` layout, locator construction (§13.12) | `UPDATE_NET_VECTORS=1 cargo test -p srct-net` | `net_vectors_are_stable` |
 
-`sim/puzzle_crosscheck.py` is the important one: it re-derives every puzzle digest with `sim/jounit_reference.py`, a second implementation written from the prose of this document rather than from the Rust source. If the two disagree, the disagreement is in the spec, not in either implementation.
+`sim/puzzle_crosscheck.py` is the important one: it re-derives every puzzle digest with `sim/srct_reference.py`, a second implementation written from the prose of this document rather than from the Rust source. If the two disagree, the disagreement is in the spec, not in either implementation.
 
 Regenerate and verify everything with `python sim/verify_vectors.py` (`--check` to verify without writing).
 
@@ -714,9 +714,9 @@ Regenerate and verify everything with `python sim/verify_vectors.py` (`--check` 
 
 ## 13. Peer-to-peer layer (v0.2)
 
-**Status: implemented in `jnt-net`, with the two §13.10 MUSTs (incremental
+**Status: implemented in `srct-net`, with the two §13.10 MUSTs (incremental
 cumulative work, side-branch pruning) and the §13.8 resource bounds in place.**
-This section is normative for the network layer and describes what `jnt-net`
+This section is normative for the network layer and describes what `srct-net`
 MUST do. It was written before the code, per the same discipline as §5: where
 the wire format is ambiguous, every implementation will disagree and the
 disagreement will look like a consensus split.
@@ -757,7 +757,7 @@ hold `Arc<Mutex<Chain>>`: template construction and submission mutate the tip,
 and a lock held across them would stall every peer thread. Instead
 there is one **chain thread** owning the `Chain`, and peer threads exchange
 messages with it over channels. The chain thread is the only writer. (The
-unbounded solving loop lives outside it, in `jnt-miner` or any pool speaking
+unbounded solving loop lives outside it, in `srct-miner` or any pool speaking
 the §19.2 mining endpoints.)
 
 ```
@@ -773,7 +773,7 @@ peer threads (N)                   chain thread (1)
 Mining runs **beside** the chain thread, not on it. `Chain::build_template_with`
 builds an unsolved block against the current tip — everything fixed except
 `nonce`/`extra_nonce`, which both commit into the proof through the serialized
-header — and an external miner (`jnt-miner`, or any pool speaking the §19.2
+header — and an external miner (`srct-miner`, or any pool speaking the §19.2
 mining endpoints) grinds the template and hands the solved block to `submit`,
 which re-validates everything including the proof. The template path and the
 in-process `mine_block` path share the same header construction, so a template
@@ -830,7 +830,7 @@ Each profile therefore declares a `network_magic` and a `network_id` string.
 | Parameter | `mainnet` | `mini` |
 |---|---|---|
 | `network_magic` | `0x6A 0x4E 0x54 0x02` | `0x6A 0x4E 0x54 0x03` |
-| `network_id` | `jounit/mainnet` | `jounit/mini` |
+| `network_id` | `srct/mainnet` | `srct/mini` |
 
 A new profile MUST pick a magic no existing profile uses. Magic reuse across two
 live networks is the failure this rule exists to prevent.
@@ -1081,7 +1081,7 @@ a quadratic amplifier — the cheapest possible way to burn a node's CPU.
    unwind block by block. Not a DoS vector on its own: a reorg crossing
    `finality_depth` is refused outright (§9.3), which bounds how often this runs.
 4. ~~**SHOULD:** persist blocks append-only rather than rewriting the whole chain
-   file per block.~~ **Resolved (v0.3).** `crates/jnt-store` is an append-only,
+   file per block.~~ **Resolved (v0.3).** `crates/srct-store` is an append-only,
    checksummed record log with atomically-replaced metadata; the node appends
    O(new blocks) per mined block and rebuilds its index by scanning at open.
    See the crate documentation for the crash semantics (torn tails are
@@ -1335,11 +1335,11 @@ implementation behind Ethereum consensus) performs all pairing checks.
 
 **Domain separation tag (DST).** All hashing-to-curve uses the DST
 
-    "JNT_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_"
+    "SRCT_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_"
 
 — the IETF `BLS12381G2_XMD:SHA-256_SSWU_RO_` suite string prefixed with the
-protocol namespace `JNT_SIG_`. No other message type may sign under this DST;
-future BLS-signed protocol messages get their own `JNT_`-prefixed DST. The
+protocol namespace `SRCT_SIG_`. No other message type may sign under this DST;
+future BLS-signed protocol messages get their own `SRCT_`-prefixed DST. The
 `0xB1` domain tag in `signing_hash` (§14.4) remains as a pre-image domain tag:
 the message presented to BLS is `sha256_dom([0xB1], [payload_bytes])`, and that
 32-byte hash — not the raw payload — is hashed to curve under the DST.
@@ -1429,7 +1429,7 @@ byte.
 
 > **Amendment (Decision 20 — consensus-active):** the economics below are now
 > decided and implemented. **No minimum stake** — any positive bond is accepted
-> (Jounit is permissionless); the committee
+> (Solar Cyber Unit is permissionless); the committee
 > is the **first 21 eligible bonds by `(bond_height, bond_index)`** (bond
 > order, not stake weight; no genesis-fixed identities, no privileged seats);
 > unbonding is **1008 blocks, fixed**; equivocation burns the **full bond**
@@ -1584,7 +1584,7 @@ question). Handover rules:
 - It does not wire checkpoints into `Chain::submit`, fork choice, or
   `finalized_height` reporting.
 
-**Implementation note.** `crates/jnt-core/src/validators.rs` implements this
+**Implementation note.** `crates/srct-core/src/validators.rs` implements this
 section as a pure library: `ValidatorRecord`, `SelectionRule::TopN`,
 `derive_set`, `set_hash`, `EpochSetCache` (holds current + previous epoch,
 with the grace-period drop), and the checkpoint clause checks as
@@ -1615,7 +1615,7 @@ mainnet-gated, exactly as Decision 8 set out, and M4 builds only what Decisions
   certificates only. A receiver verifies against its local committee and relays
   if valid; consensus never consults it. `Checkpoint`/`CheckpointPayload`
   gained bounded `deserialize`.
-- **Observation, before activation (Decision 11).** `jnt_core::finality::FinalityManager`
+- **Observation, before activation (Decision 11).** `srct_core::finality::FinalityManager`
   records what the committee signed and reports it, and at that stage
   `finalized_height` and fork choice did not consult it. **Superseded by §14.8:**
   once a profile's `finality_activation_height` is reached, `adopt()` refuses any
@@ -1631,7 +1631,7 @@ mainnet-gated, exactly as Decision 8 set out, and M4 builds only what Decisions
 M4 (§14.7) built the committee machinery and deliberately left it
 observation-only. This section is the rule that makes it *binding* under an
 explicit activation condition, the profile that exercises it, and the conflict
-policy that bounds it. It is normative for `jnt_core::finality`,
+policy that bounds it. It is normative for `srct_core::finality`,
 `Chain::{apply_checkpoint, restore_finality, finalized_height, adopt}`, the
 store's finalized metadata fields, and the `testnet` profile.
 
@@ -1702,7 +1702,7 @@ in-memory (diagnostic until slashing exists).
 
 | Property | Value |
 |---|---|
-| network id | `jounit/testnet` (unique) |
+| network id | `srct/testnet` (unique) |
 | network magic | `6A 4E 54 04` (unique) |
 | genesis validator committee | 4 deterministic keys (public test material, distinct derivation from `mini`'s), canonically sorted |
 | quorum | `ceil(4 × 6667 / 10000) = 3` |
@@ -1720,7 +1720,7 @@ items).
 
 **Mainnet bootstrap (Decision 27).** `NetworkParams::mainnet()` declares 21
 deterministic public keys derived under
-`jounit/mainnet-validator-seed/v1`, canonically sorted, with quorum
+`srct/mainnet-validator-seed/v1`, canonically sorted, with quorum
 `ceil(21 × 6667 / 10000) = 15`. Binding finality activates at height `100` on
 the `100`-block grid. The keys are public material: any node can produce a
 valid certificate before a bond exists. That is the accepted cold-start
@@ -1745,7 +1745,7 @@ a locked payment, a worker claims and runs it, and settlement releases the
 payment against a verdict. A sixth payload type, `ExitQueue`, moves value the
 other way — out of L2 and back to L1 (§19.6). This section specifies the payload
 types, the task state machine, and the fee path. It is **normative for the
-`jnt-l2` crate and `jnt_core::l2`**, and it deliberately stops short of L1
+`srct-l2` crate and `srct_core::l2`**, and it deliberately stops short of L1
 consensus:
 
 - These payloads are carried inside L1 blocks as a length-prefixed trailer
@@ -2061,7 +2061,7 @@ Consequences, stated so they are not discovered later:
 
 ### 16.5 Non-goals
 
-- No on-chain IR execution, and no interpreter in `jnt-core` or `jnt-l2`.
+- No on-chain IR execution, and no interpreter in `srct-core` or `srct-l2`.
 - No gas metering of IR here — out of scope for the shipped worker SDK too.
 - Floating point is never introduced, in the reference or any backend.
 - The reference does not replace attestation or hardware proof; it determines
@@ -2140,7 +2140,7 @@ certificate are byte-identical.
 ### 17.3 Identity
 
 ```
-vwc_id = SHA256("jounit/l2/vwc/v1" ‖ body)
+vwc_id = SHA256("srct/l2/vwc/v1" ‖ body)
 ```
 
 where `body` is the entire encoding above (version included). The id is a
@@ -2261,11 +2261,11 @@ behaviour.
 
 ---
 
-## 18. Worker SDK (Phase 6, `crates/jnt-worker`)
+## 18. Worker SDK (Phase 6, `crates/srct-worker`)
 
 A worker is any actor that claims tasks from the L2 marketplace, executes them,
 and submits results: a human-operated process, an AI agent, an autonomous
-machine. This section is **normative for the worker-facing crate** `jnt-worker`.
+machine. This section is **normative for the worker-facing crate** `srct-worker`.
 It defines what the SDK MAY do on the protocol's behalf and what it MUST never
 do. Unless stated, failure is always fail-closed: an SDK error never creates a
 protocol effect that the L2 state machine did not authorize.
@@ -2274,11 +2274,11 @@ protocol effect that the L2 state machine did not authorize.
 
 - **The SDK is a client, not a validator.** It contains no consensus logic. It
   does not apply, order or accept transactions; it constructs already-specified
-  payloads ([`jnt_core::l2`](§15)) and reads the authoritative state the
+  payloads ([`srct_core::l2`](§15)) and reads the authoritative state the
   protocol produces (§15.3, §17.7).
 - **No second implementation.** TaskContract rules, dispute arbitration,
   VWC validation, wallet signing, settlement economics and fee routing are
-  reused from `jnt-core` and `jnt-l2` verbatim. The SDK MUST NOT reimplement,
+  reused from `srct-core` and `srct-l2` verbatim. The SDK MUST NOT reimplement,
   re-derive or relax any of them.
 - **No new transaction type, fee, or authorization path.** Every wire artifact
   the SDK produces is one of the L2 payloads of §15.1, signed by the
@@ -2298,7 +2298,7 @@ protocol effect that the L2 state machine did not authorize.
   external identity reference (attestation `worker_address`, registry account)
   is reported as `WorkerError::IdentityMismatch` and aborts the operation.
 
-### 18.2.1 Delegated agent identities and policy chains (normative for `jnt_core::agent` and `jnt_core::delegation`)
+### 18.2.1 Delegated agent identities and policy chains (normative for `srct_core::agent` and `srct_core::delegation`)
 
 **This section changes no consensus rule.** It amends the derivation scheme for
 *agent policy identities* — an offline, non-consensus object (the owner-signed
@@ -2312,7 +2312,7 @@ its id from its **parent**, never from the funds it is trusted with:
 agent_id  = sha256_dom(DOM_AGENT_ID_SUB, network_id || parent_agent_id || role)[..20]
 ```
 
-`DOM_AGENT_ID_SUB` is a new domain tag (`"jounit/agent-id/sub/v1"`), the treatment
+`DOM_AGENT_ID_SUB` is a new domain tag (`"srct/agent-id/sub/v1"`), the treatment
 `DOM_ADDR/v2` received: two derivations over one tag are two meanings over one
 byte string, and a collision between them would be an identity confusion, not a
 bug. A root policy (no parent) derives as before, with `DOM_AGENT_ID` from
@@ -2367,8 +2367,8 @@ delegation inherits that status unchanged. Delegation decides no block's validit
       fn broadcast(&mut self, tx: &L2Transaction) -> Result<(), BroadcastError>;
   }
   ```
-- Rationale: the seams keep the SDK transport-agnostic. `jnt-net` carries only
-  the §13 P2P message set, so the shipped transport is `jnt_worker::HttpNode`
+- Rationale: the seams keep the SDK transport-agnostic. `srct-net` carries only
+  the §13 P2P message set, so the shipped transport is `srct_worker::HttpNode`
   over the node's opt-in REST API (§19.2). A local node or an embedded `L2State`
   can implement the same traits instead, without changing the SDK, which keeps
   every protocol rule testable without a socket.
@@ -2582,7 +2582,7 @@ regression tests assert that over every public error and debug path.
 
 ### 18.17 Non-goals
 
-- No REST/WS transport of its own. The shipped transport, `jnt_worker::HttpNode`,
+- No REST/WS transport of its own. The shipped transport, `srct_worker::HttpNode`,
   is a *client* of the node's opt-in REST API (§19.2) and implements §18.3's
   traits; the SDK itself stays transport-agnostic, so a local node or an
   embedded `L2State` can implement the same traits instead.
@@ -2658,7 +2658,7 @@ conclusion, because `apply` is a pure function of state and the rejection is
 deterministic — so a miner that wastes block space on an unapplicable payload
 causes no divergence. Making L2 validity a block rule is a separate change that
 would require `Chain` to consult L2, which the dependency direction
-(`jnt-l2 → jnt-core`) forbids by construction.
+(`srct-l2 → srct-core`) forbids by construction.
 
 **Derivation, not storage.** L2 state is rebuilt by replaying the stored chain,
 not persisted alongside it. A restart therefore cannot recover a *stale* L2
@@ -2667,15 +2667,15 @@ chain that won is replayed. `L2State`'s equality is derived over all of its
 fields, so "two nodes agree" is a total comparison rather than a hand-picked
 summary.
 
-**Implementations.** `jnt_core::block` (carriage, commitment),
-`jnt_core::chain::Chain::mine_block_with_l2` (producing a block that carries
-L2), `jnt_l2::replay::{ChainL2, SkippedL2}` (replay and the incremental path),
-`jnt_node::l2::NodeL2` (the node's view: replay on startup, incremental while
+**Implementations.** `srct_core::block` (carriage, commitment),
+`srct_core::chain::Chain::mine_block_with_l2` (producing a block that carries
+L2), `srct_l2::replay::{ChainL2, SkippedL2}` (replay and the incremental path),
+`srct_node::l2::NodeL2` (the node's view: replay on startup, incremental while
 the tip extends, full replay when history is rewritten; settlements verified
 against the profile's declared `l2_settlement_validators` committee with the
 production BLS verifier — empty on `mainnet`, which therefore refuses every
-settlement by name, see §15.1). `jnt-node status` reports L2 height/applied/skipped;
-`jnt-node verify` asserts replay determinism (two replays agree, incremental
+settlement by name, see §15.1). `srct-node status` reports L2 height/applied/skipped;
+`srct-node verify` asserts replay determinism (two replays agree, incremental
 agrees with replay) and names the skipped payloads.
 
 ### 19.2 Worker↔node transport — IMPLEMENTED (reads + broadcast), loopback-bound
@@ -2684,7 +2684,7 @@ Decision 9 selects the roadmap §13 REST API. That document remains the authorit
 for its L1 endpoints; this subsection records the additive part the worker SDK
 needs, so §13 itself is not edited.
 
-- The server is `jnt-node`, opt-in via `--api-listen`, disabled by default.
+- The server is `srct-node`, opt-in via `--api-listen`, disabled by default.
 - The worker SDK's §18.3 seams are implemented as a client of it:
   `L2NodeView` reads, `L2Broadcaster` writes. The SDK is not modified to
   accommodate the transport.
@@ -2698,7 +2698,7 @@ needs, so §13 itself is not edited.
   included), bearer-token authentication (constant-time compare) with a
   per-IP token bucket on exposed binds, and a per-request deadline plus a
   global in-flight cap on every bind. The bearer token SHOULD come from the
-  `JNT_API_TOKEN` environment variable rather than `--api-token`, because
+  `SRCT_API_TOKEN` environment variable rather than `--api-token`, because
   command-line flags are visible in `ps`.
 - Binding is loopback by default; exposing it beyond that is an operator
   decision, and the API is not a consensus surface: nothing it accepts may
@@ -2711,9 +2711,9 @@ needs, so §13 itself is not edited.
 `vwc_hex`) and `POST /v1/l2/broadcast`. `GET /v1/conservation` additionally
 serves the live joint-supply report of §19.4–§19.5 (L1 live + L2 held −
 deposit sink, against the joint bound (issuance integral + escrow ceiling), with all three check verdicts) — the same
-arithmetic `jnt-node verify` prints — and the `jnt-worker run` verb gates on
+arithmetic `srct-node verify` prints — and the `srct-worker run` verb gates on
 it before its first pass, recomputing the verdict from the terms rather than
-trusting the node's `ok` flag. `jnt-worker::HttpNode` is a client of the API
+trusting the node's `ok` flag. `srct-worker::HttpNode` is a client of the API
 that implements both §18.3 seams, `L2NodeView` (reads) and `L2Broadcaster`
 (writes). The state a node hands a remote observer is a **versioned,
 deterministic encoding** (`L2_STATE_WIRE_VERSION = 5`): sorted maps so two
@@ -2745,7 +2745,7 @@ difficulty, tip and timestamp rules included — so external mining adds no
 trust. Hex request fields are capped at 16 MiB (consensus caps blocks at 4
 MB, so nothing legitimate approaches it); the pool wire caps lines at the
 same 16 MiB with a read deadline, and duplicate solutions are refused, so one
-proof counts as one share. The reference miner is `jnt-miner --node ADDR:PORT --miner HEX
+proof counts as one share. The reference miner is `srct-miner --node ADDR:PORT --miner HEX
 [--threads N] [--batch N] [--backend cpu|portable|auto]`, which loops
 template → solve → submit; pool operators get the same flow as stratum-lite
 JSON-lines (`getjob`/`submit` over TCP, single-use job ids, submissions
@@ -2783,25 +2783,25 @@ type for funding: user deposits ride an ordinary L1 payment to the derived sink
 **The allocation.** Two `NetworkParams` fields fix it per profile:
 
 - `l2_genesis_escrow_sat`: the total L2 genesis allocation. `mini` allocates
-  10 JNT; `mainnet` allocates 100,000 JNT and no grants.
+  10 SRCT; `mainnet` allocates 100,000 SRCT and no grants.
 - `l2_genesis_grants`: named `(address, amount)` balances released at genesis.
-  `mini` grants 1 JNT each to three deterministic operator identities; an
+  `mini` grants 1 SRCT each to three deterministic operator identities; an
   empty list is legal (that is mainnet today).
 
 The remainder (`escrow − grants`) parks with the protocol escrow identity:
-`SHA256("jounit/l2-escrow/v1" ‖ network_id)[..20]`, derived per network, holding
+`SHA256("srct/l2-escrow/v1" ‖ network_id)[..20]`, derived per network, holding
 no key. It is inert in M2 — no disbursement rule exists for it yet — which is
 stated so its balance cannot be misread as spendable supply.
 
 **The backing rule.** The escrow is bounded by its own explicit, validated
 parameter: `l2_genesis_escrow_sat ≤ escrow_ceiling_sat`, enforced by
 `NetworkParams::validate` (Decision M-E). The shipped ceilings are exactly the
-allocations (mini/testnet 10 JNT; mainnet 100 000 JNT) — tight, so the
+allocations (mini/testnet 10 SRCT; mainnet 100 000 SRCT) — tight, so the
 parameter constrains rather than rubber-stamps. Because L1 can never hold more
 than its issuance integral and L2 can never hold more than its escrow ceiling,
 combined L1 + L2 money can never exceed `cumulative_issuance_sat(height) +
 escrow_ceiling_sat` — the joint bound `GET /v1/conservation` reports and the
-`jnt-worker run` gate checks. `validate` additionally refuses a zero escrow,
+`srct-worker run` gate checks. `validate` additionally refuses a zero escrow,
 zero grants, duplicate grantees, grants
 naming the escrow identity, and grants summing above the total.
 
@@ -2817,7 +2817,7 @@ no block-carried funding to replay twice.
 (genesis, or a unit-test credit); `conservation_total` counts every satoshi
 still in the system. Their equality is checked after every transition: fees,
 burns, slashes, bounties and refunds move value between buckets but never
-change the sum. `jnt-node verify` additionally asserts `funded_total` equals the profile's
+change the sum. `srct-node verify` additionally asserts `funded_total` equals the profile's
 escrow total plus credited deposits minus `exited_total` (no unauthorized
 funding happened) and that live L1 supply plus L2 held stays under
 `cumulative_issuance_sat(height) + escrow_ceiling_sat`.
@@ -2830,9 +2830,9 @@ what is accepted.
 
 **Implementations.** `NetworkParams::{l2_genesis_escrow_sat, l2_genesis_grants,
 l2_escrow_address}` + `validate` (gap-fit and shape rules),
-`jnt_l2::genesis::L2Genesis` (allocation view), `L2State::{apply_genesis,
+`srct_l2::genesis::L2Genesis` (allocation view), `L2State::{apply_genesis,
 funded_total, check_conservation}`, `ChainL2::{empty, replay}` (genesis-first
-construction), `jnt-node verify` (joint conservation checks).
+construction), `srct-node verify` (joint conservation checks).
 
 ### 19.5 User L1 → L2 deposits (Decision 10) — IMPLEMENTED, normative
 
@@ -2840,7 +2840,7 @@ A STANDARD L1 payment carrying an output to the deposit sink is a deposit. L1
 validates it as a payment like any other — no L1 rule changed, no new
 transaction type — and L2 replay reads the deposit out of the accepted block.
 
-**Sink.** `SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]`
+**Sink.** `SHA256("srct/l2-deposit-sink/v1" ‖ network_id)[..20]`
 (`NetworkParams::l2_deposit_sink`): deterministic per profile, distinct from
 the escrow identity, holding no key. Another network's sink on this chain is
 an ordinary burn.
@@ -2914,11 +2914,11 @@ accepted.
 **Exits.** Defined normatively in §19.6.
 
 **Implementations.** `NetworkParams::{l2_deposit_sink, l2_deposit_minimum_sat}`
-+ `validate`, `jnt_l2::deposits::{DepositParams, scan_block, DetectedDeposit,
++ `validate`, `srct_l2::deposits::{DepositParams, scan_block, DetectedDeposit,
 PendingDeposit, IgnoredDeposit}` (detection is a pure function of one block),
 `L2State::{apply_deposit, deposited_total, deposit_credited}`,
 `ChainL2::{pending_deposits, ignored_deposits, has_pending_matured}`,
-`jnt-node` sync (maturation-triggered replay) + `status`/`verify` (deposit
+`srct-node` sync (maturation-triggered replay) + `status`/`verify` (deposit
 pipeline and sink-aware joint check).
 
 ---
@@ -2998,14 +2998,14 @@ payment `+a` and the L2 debit `−a` cancel, while the sink term falls by the sa
 `a`. `joint_sat` therefore needs no exit term — that is the strongest available
 evidence the accounting was done right, and `tests/conservation.rs` keeps passing
 untouched. `exited_sat` is reported (`/v1/status`, `/v1/conservation`,
-`jnt-node verify`) so an operator can confirm the two directions balanced.
+`srct-node verify`) so an operator can confirm the two directions balanced.
 
-**Implementations.** `jnt_core::exit::ExitClaim` (+ codec, identity, gas,
-proof verification), `jnt_core::l2::ExitQueuePayload`, `L2State::{queue_exit,
+**Implementations.** `srct_core::exit::ExitClaim` (+ codec, identity, gas,
+proof verification), `srct_core::l2::ExitQueuePayload`, `L2State::{queue_exit,
 exit_proof, exit_is_mature, note_release, exited_total, exit_queue_is_active}`,
 `ChainL2::{pending_exits, ExitWatch}` (absorb releases and captures proofs),
 `Chain::{exit_active_at, exit_released, mine_from_pool_with_exits}`,
-`NodeL2::{pending_exits, crank_claims, simulate_root}`, `jnt_worker::{queue_exit,
+`NodeL2::{pending_exits, crank_claims, simulate_root}`, `srct_worker::{queue_exit,
 queue_exit_plan, ExitPlan}`.
 
 ---
@@ -3013,7 +3013,7 @@ queue_exit_plan, ExitPlan}`.
 ## 20. Conditional Escrow with Contract-Selected Arbitrators (Item 4)
 
 This section is non-consensus: the escrow is a *state machine recorded by the node*
-(`jnt-core::escrow::ConditionalEscrow`), and the actual coin move at release reuses the
+(`srct-core::escrow::ConditionalEscrow`), and the actual coin move at release reuses the
 ordinary L1 exit path (§19.4). It lets a payer lock value subject to a condition that is
 resolved either by **both parties** signing (mutual release) or by a **single designated
 arbitrator** signing (arbiter release).
@@ -3021,7 +3021,7 @@ arbitrator** signing (arbiter release).
 ### 20.1 Design
 
 - The payer opens an escrow with `ConditionalEscrow::open(...)` naming an arbitrator's
-  BLS public key **in the contract**. The arbitrator is *not* a Jounit key: the protocol
+  BLS public key **in the contract**. The arbitrator is *not* a Solar Cyber Unit key: the protocol
   never holds an "arbitrator key," and there is no committee. The contract selects one
   independently-operated BLS public key per escrow; a quorum of one is the point.
 - Both parties also record a BLS public key (`payer_key`, `payee_key`), so a mutual
@@ -3073,7 +3073,7 @@ Released{Arbiter,Mutual}
 
 ### 20.5 Rationale
 
-- *Why contract-selected arbitrators, not a Jounit committee?* So Jounit holds no power of
+- *Why contract-selected arbitrators, not a Solar Cyber Unit committee?* So Solar Cyber Unit holds no power of
   attorney over users' funds and cannot unilaterally release. The user picks the
   arbitrator they trust; the protocol only enforces the signature against the key the
   contract recorded. This corresponds to Decision 9 and ends the prior custody blocker.
@@ -3086,12 +3086,12 @@ Released{Arbiter,Mutual}
 
 ### 20.6 Implemented surface
 
-`jnt-core::escrow` (`ConditionalEscrow`, `EscrowState`, `EscrowVerdict`,
+`srct-core::escrow` (`ConditionalEscrow`, `EscrowState`, `EscrowVerdict`,
 `release_signing_hash`, `verify_mutual_release`, `verify_arbiter_release`,
 `BlsVerifier` trait + `RealBls`, encode/decode) is unit-tested including: non-designated
 arbiter signature refused, non-party key refused for mutual, arity rule, round-trip
-codec, zero-key/self-party refusal. The HTTP surface in `jnt-node::api` is covered by
-`crates/jnt-node/tests/api.rs` (open, unauthorized arbiter refused, authorized arbiter
+codec, zero-key/self-party refusal. The HTTP surface in `srct-node::api` is covered by
+`crates/srct-node/tests/api.rs` (open, unauthorized arbiter refused, authorized arbiter
 accept, replay of a decided escrow refused, mutual accept, one-sided sig refused,
 unknown-id 404, zero-key open refused). Coin settlement runs through
 `POST /v1/escrow/{id}/settle`: the call binds a released escrow to the L2 exit
@@ -3246,10 +3246,10 @@ Same tier as `ClaimTask` / `ExitQueue`: a signed record, no arbitration.
 
 ### 21.9 Implemented surface
 
-`jnt-core::l2` carries the three payload types and their wire codes;
-`jnt-core::agent` carries `PolicyEntry` (the grant, the spender, the counters)
-and its leaf; `jnt-l2::state` applies them and commits them.
-`crates/jnt-l2/tests/policy_flow.rs` pins: publication changes the committed
+`srct-core::l2` carries the three payload types and their wire codes;
+`srct-core::agent` carries `PolicyEntry` (the grant, the spender, the counters)
+and its leaf; `srct-l2::state` applies them and commits them.
+`crates/srct-l2/tests/policy_flow.rs` pins: publication changes the committed
 root; a grant naming another owner is refused; an agent has one live grant at a
 time; a spend moves value from the grant owner; the per-transaction cap binds;
 the window cap binds and the window rolls over; an empty allow-list allows
@@ -3304,7 +3304,7 @@ the chain holds the agreement.
 The position id is derived from the terms:
 
 ```
-position_id = SHA256("jounit/l2/credit-position/v1" ‖
+position_id = SHA256("srct/l2/credit-position/v1" ‖
                       lender ‖ borrower ‖ amount ‖ collateral ‖ rate ‖
                       window ‖ deadline ‖ nonce)
 ```
@@ -3395,11 +3395,11 @@ conservation sum: it is in the system, but not spendable. The invariant
 
 ### 22.8 Implemented surface
 
-`jnt-core::l2` carries the four payload types and their wire codes;
-`jnt-core::credit` keeps the arithmetic (the collateral rule and the interest
-rule) so there is one implementation of each; `jnt-l2::state` applies them,
+`srct-core::l2` carries the four payload types and their wire codes;
+`srct-core::credit` keeps the arithmetic (the collateral rule and the interest
+rule) so there is one implementation of each; `srct-l2::state` applies them,
 holds the positions and commits them.
-`crates/jnt-l2/tests/credit_flow.rs` pins: the principal moves to the borrower
+`crates/srct-l2/tests/credit_flow.rs` pins: the principal moves to the borrower
 and the collateral locks; a loan the lender did not sign is refused; an
 undercollateralised loan is refused; an unusable term is refused; a repayment
 pays interest first and then principal; a fully repaid position returns the

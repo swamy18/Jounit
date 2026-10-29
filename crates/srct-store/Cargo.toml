@@ -1,0 +1,15 @@
+[package]
+publish = false
+name = "srct-store"
+description = "Solar Cyber Unit persistent storage: an append-only block log, canonical index and crash-safe metadata. Holds no consensus rules."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

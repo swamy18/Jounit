@@ -95,7 +95,7 @@ def retarget(
 ) -> float:
     """LWMA over `solve_times` (newest first), newest weighted most.
 
-    Mirrors `jnt_core::difficulty::next_difficulty`: the tip's own solve
+    Mirrors `srct_core::difficulty::next_difficulty`: the tip's own solve
     time carries weight `window^2`, and the retarget is multiplicative
     from the previous difficulty,
 
@@ -395,7 +395,7 @@ def ablation_table(blocks: int, seed: int, start_difficulty: float) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Jounit difficulty attack simulation")
+    parser = argparse.ArgumentParser(description="Solar Cyber Unit difficulty attack simulation")
     parser.add_argument("--blocks", type=int, default=3_000)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(

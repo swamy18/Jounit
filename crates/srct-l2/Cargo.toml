@@ -1,0 +1,16 @@
+[package]
+publish = false
+name = "srct-l2"
+description = "Solar Cyber Unit Layer 2: TaskContract state machine, six L2 transaction types (incl. ExitQueue), D3 fee routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+hex.workspace = true

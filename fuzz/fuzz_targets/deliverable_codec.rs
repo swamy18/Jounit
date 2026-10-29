@@ -25,10 +25,10 @@ use libfuzzer_sys::fuzz_target;
 // existing `l2_payload_decode` and `dispute_arbitrate` targets; this target
 // covers the layer underneath them.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::deliverable::{
+    use srct_core::deliverable::{
         assert_predicate_discipline, Attestation, Deliverable, SortAttestation, SortDeliverable,
     };
-    use jnt_core::ser;
+    use srct_core::ser;
 
     for chunk in data.chunks(64) {
         // --- the deliverable itself ---------------------------------------

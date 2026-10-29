@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// Fuzz the L2 transaction codec (SPEC.md §15.1, `jnt_core::l2`).
+// Fuzz the L2 transaction codec (SPEC.md §15.1, `srct_core::l2`).
 //
 // The decoder is an attacker-controlled boundary: every field is length-prefixed
 // or count-driven, and an `L2Transaction` arrives from a peer. Two properties
@@ -12,13 +12,13 @@ use libfuzzer_sys::fuzz_target;
 //   2. `deserialize` -> `serialize` -> `deserialize` is the identity, so an
 //      accepted payload cannot be silently re-encoded differently. That is the
 //      property that failed once before in this project on
-//      `jnt_net::Message::Unknown`, which is why it is asserted here by fuzzing
+//      `srct_net::Message::Unknown`, which is why it is asserted here by fuzzing
 //      rather than only by a fixed vector.
 //
 // Authorization is checked for *panics* only: a decoded payload is unsigned
 // garbage by construction, so `verify_auth` is expected to refuse it.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::l2::L2Transaction;
+    use srct_core::l2::L2Transaction;
 
     let Ok(tx) = L2Transaction::deserialize(data) else {
         return;

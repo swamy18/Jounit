@@ -1,5 +1,5 @@
 {
-  "_comment": "Generated from jnt-core by difficulty_vectors_are_stable. Do not hand-edit.",
+  "_comment": "Generated from srct-core by difficulty_vectors_are_stable. Do not hand-edit.",
   "target_block_time_ms": 600000,
   "difficulty_window": 60,
   "change_limit_bps": 1000,

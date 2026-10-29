@@ -44,7 +44,7 @@ flat fee is split by the existing M1 mechanism, not bypassed.**
   else to the gas floor. The existing tripwire test
   (`l2_flat_fees_sit_below_the_gas_floor`) is then replaced by positive tests
   that L2 txs pay exactly the flat fee and are split 50/50.
-- Sanity: 20 000 sats (max L2 fee) = 0.0002 JNT. At the mini profile this is
+- Sanity: 20 000 sats (max L2 fee) = 0.0002 SRCT. At the mini profile this is
   cheap for workers; the schedule can be re-parameterised at mainnet without a
   consensus-format change (values live in `params.rs` constants).
 
@@ -55,7 +55,7 @@ five tx types today.
 
 **Scope note:** D3 fixes *transaction fees only*. It does not decide task
 *payments* (what a submitter pays a worker for compute) — that is a market
-price set per-TaskContract by the participants (`payment_jnt`), never a
+price set per-TaskContract by the participants (`payment_srct`), never a
 protocol rule.
 
 ---
@@ -65,7 +65,7 @@ protocol rule.
 The five open items are decided as follows, values parameterised in
 `NetworkParams` at implementation time, none wired into consensus now:
 
-1. **Minimum stake: none.** Any positive bond amount is accepted — Jounit
+1. **Minimum stake: none.** Any positive bond amount is accepted — Solar Cyber Unit
    is permissionless. The committee is stake-weighted (TopN), so smaller bonds
    simply rank lower and fail to make the top 21. Bonded with
    unbonding after a full finality window (`finality_depth` blocks) so a
@@ -116,8 +116,8 @@ build it now.
 # Gap audit — 6-phase L2 roadmap vs. what exists today
 
 Audited 2026-10-06 against `docs/roadmap.md` §8 build order and the actual
-crate tree (`jnt-core`, `jnt-net`, `jnt-store`, `jnt-node` — no `jnt-l2`,
-no `jnt-worker` yet). Verdict per phase, with only genuinely-missing work
+crate tree (`srct-core`, `srct-net`, `srct-store`, `srct-node` — no `srct-l2`,
+no `srct-worker` yet). Verdict per phase, with only genuinely-missing work
 listed as remaining.
 
 > **This section is a dated snapshot — it records what was true on
@@ -128,20 +128,20 @@ listed as remaining.
 ## Phase 1 — L1 production-ready (Steps 1+2): **DONE**
 - Mempool (`mempool.rs`): byte-bounded, fee-rate ordered, conflict-checked,
   integrated into `Chain` (`mine_from_pool`, reorg re-admission). 20+ tests.
-- Persistent storage (`jnt-store`): append-only record log, crash recovery with
+- Persistent storage (`srct-store`): append-only record log, crash recovery with
   reported torn tails, canonical height index, UTXO snapshots, adversarial
   fuzz/invariant coverage.
 - Transaction relay over P2P (§13.14, `Tx` message) — shipped earlier in the
-  session, tests in `jnt-net/tests/tx_relay.rs`.
+  session, tests in `srct-net/tests/tx_relay.rs`.
 - Real BLS via blst (`bls.rs`), storage fuzzing, checkpoint envelope (§14.4),
   validator-set machinery as an inert library (§14.6).
 **Remaining: nothing for Phase 1 itself.**
 
 ## Phase 2 — TaskContract + state machine (Step 3) + Step 6 tx types: **NOT STARTED**
-Requires crate `crates/jnt-l2/`:
+Requires crate `crates/srct-l2/`:
 - `TaskContract` struct + `ContractState` machine (Open → InProgress →
   ResultSubmitted → Disputed → Settled/Expired) with the 7 listed methods.
-- The 5 L2 transaction types in `jnt-core/src/tx.rs` (TxPostTask, TxClaimTask,
+- The 5 L2 transaction types in `srct-core/src/tx.rs` (TxPostTask, TxClaimTask,
   TxSubmitResult, TxDispute, TxSettle): Writer/Reader serialization,
   domain-separated signing hashes, validation rules, round-trip tests.
 - **Unblocked now** by Decision 1 (fee path) — first thing to build.
@@ -150,7 +150,7 @@ mempool, store, fee schedule constants.
 
 ## Phase 3 — Dispute engine + M2/M1 wiring (Step 4): **NOT STARTED**
 - `DisputeChallenge`, `DisputeVerdict`, `DisputeEngine::arbitrate/apply_verdict`
-  in `crates/jnt-l2/src/dispute.rs`.
+  in `crates/srct-l2/src/dispute.rs`.
 - Wiring (all primitives exist): `SlashVault` (slash.rs — vested SlashRecords,
   exhaustion), PSCB reserve on `Chain` (per-block undo maps for reorg
   correctness), whistleblower bonus from PSCB.
@@ -158,7 +158,7 @@ mempool, store, fee schedule constants.
   (roadmap §11 open question 2) — small spec item to write before coding.
 **Blocked by Phase 2** (contracts must exist to dispute).
 
-## Phase 4 — VWC issuance + tx types in jnt-core (Steps 5+6): **NOT STARTED**
+## Phase 4 — VWC issuance + tx types in srct-core (Steps 5+6): **NOT STARTED**
 - `VerifiedWorkCertificate` (`vwc.rs`): signing_hash over all fields,
   canonical serialization, quorum-gated `verify`, store lookup by task/worker.
 - Note: the Step-6 tx-type work is listed under Phase 2 above (roadmap lists
@@ -166,18 +166,18 @@ mempool, store, fee schedule constants.
 **Blocked by Phase 3** (a settled outcome is what a certificate certifies).
 
 ## Phase 5 — Worker client / SDK (Step 7): **NOT STARTED**
-- New crate `crates/jnt-worker/`: node connection via jnt-net, task scanning,
+- New crate `crates/srct-worker/`: node connection via srct-net, task scanning,
   claim/execute/submit loop, M4 HBM proof (hbm_pow.rs exists), earnings.
-- CLI (`jnt-worker run/status/earnings`) + `WorkerClient` SDK struct.
+- CLI (`srct-worker run/status/earnings`) + `WorkerClient` SDK struct.
 **Blocked by Phases 2+4** (nothing to claim or certify until then).
 
 ## Phase 6 — Integration + public testnet: **PARTIALLY PREPARED, NOT STARTED**
-Already in place: jnt-node CLI with serve/relay, P2P networking with ban
+Already in place: srct-node CLI with serve/relay, P2P networking with ban
 scoring and keepalives, storage recovery, fuzz-smoke CI, difficulty-attack
 sims, 360 tests (historical snapshot; current counts come from
 scripts/test_count.sh).
 Remaining for testnet:
-- Wire all modules end-to-end in jnt-node (L2 tx handling, dispute flow,
+- Wire all modules end-to-end in srct-node (L2 tx handling, dispute flow,
   checkpoint relay message type — §13.5 addition, needs a vector-stable
   decision).
 - Multi-node testnet tooling (compose/systemd scripts, seeds), chaos testing
@@ -204,7 +204,7 @@ Remaining for testnet:
 | 5 — Worker SDK | NOT STARTED (needs Phases 2+4) |
 | 6 — Testnet + finality activation | PREPARED, gated on 2–5 |
 
-Recommended next: **Phase 2** — `jnt-l2` crate skeleton + TaskContract state
+Recommended next: **Phase 2** — `srct-l2` crate skeleton + TaskContract state
 machine + the five L2 tx types with D3 fee routing, in that order, with the
 M3-CPU-reference spec note written before Phase 3 starts.
 
@@ -218,7 +218,7 @@ record of what was true when it was written.
 **Decision 1 (D3) is now consumed, exactly as recorded.** The five flat fees are
 implemented and routed through the M1 split:
 
-- `jnt_core::l2` defines the five payload types, their wire codes, canonical
+- `srct_core::l2` defines the five payload types, their wire codes, canonical
   codecs, domain-separated signing hashes, and `L2TxType::fee_sat()` returning
   the D3 schedule. Round-trip, signing-hash-coverage, and bounded-decode tests
   live with it.
@@ -229,7 +229,7 @@ implemented and routed through the M1 split:
   the positive test `l2_fees_do_not_use_the_l1_gas_floor`, which pins the
   separation instead of the question. **The L1 floor is untouched.**
 
-**Phase 2 is complete.** `crates/jnt-l2` exists with `TaskContract` + the
+**Phase 2 is complete.** `crates/srct-l2` exists with `TaskContract` + the
 `Open → InProgress → ResultSubmitted → Disputed → Settled/Expired` machine, and
 `L2State` with accounts, escrow, the M2 slash vault, replay protection, and the
 conservation invariant. SPEC.md §15 is the normative text. Dependencies reused
@@ -251,7 +251,7 @@ Two implementation notes worth carrying into Phase 3:
 2. **The `vwc_hash` convention before Phase 4.** `Correct` settles on the
    submitted `result_hash`, `Fraudulent` on the challenger's counter-result, and
    `Expired` on all-zero. Phase 4 replaces this with a real VWC hash; the
-   convention is documented in `jnt_core::l2` (`VWC_HASH_EXPIRED`) so it is a
+   convention is documented in `srct_core::l2` (`VWC_HASH_EXPIRED`) so it is a
    named, replaceable constant rather than a magic zero.
 
 Still gated on its own step, unchanged by this work: **M5/BLS finality
@@ -274,7 +274,7 @@ existing trait, but no checkpoint finalizes an L1 block.
 Phase 3 (dispute engine + M2/M1 integration) is built. **No L1 consensus rule
 changed**, and no Phase-1/Phase-2 decision changed: the D3 fee schedule, the flat
 fee = `full_base` rule, the M1 50/50 burn/PSCB split, the untouched L1 gas floor,
-`payment_jnt` as a market payment, and the §14.6 validator economics are all
+`payment_srct` as a market payment, and the §14.6 validator economics are all
 exactly as recorded above. Phase 3 consumes two of them (`split_flat_fee` for the
 settle fee, and the PSCB reserve as the bounty source) and adds one new value,
 recorded below rather than chosen quietly.
@@ -318,7 +318,7 @@ note in §16):**
 
 **Explicitly unchanged:** the 5 000-sat post / 2 000 claim / 2 000 submit /
 10 000 dispute / 20 000 settle schedule; the M1 50/50 burn/PSCB split; L2 fee =
-`full_base`; the L1 gas floor; `payment_jnt` as a market price; no validator
+`full_base`; the L1 gas floor; `payment_srct` as a market price; no validator
 rewards/fee share; no minimum bond amount; TopN 21; full-bond equivocation burn;
 binding finality only at the end of Phase 6.
 
@@ -385,7 +385,7 @@ schedule is untouched, and the M1 50/50 split still routes every L2 fee. SPEC.md
 
 **Explicitly unchanged:** D3 fees (post 5 000 / claim 2 000 / submit 2 000 /
 dispute 10 000 / settle 20 000 sats), flat fee = `full_base`, the M1 50/50
-burn/PSCB split, the L1 gas floor, `payment_jnt` as a market price, validator
+burn/PSCB split, the L1 gas floor, `payment_srct` as a market price, validator
 economics, binding finality only at the end of Phase 6.
 
 | Phase | Status |
@@ -405,7 +405,7 @@ Phase 5 (Worker SDK) is built as a pure *client* over the Phase-2/3/4 L2
 machinery. **No economic decision changed**: the D3 fee schedule
 (post 5 000 / claim 2 000 / submit 2 000 / dispute 10 000 / settle 20 000
 sats), flat fee = `full_base`, the M1 50/50 burn/PSCB split, the L1 gas
-floor, `payment_jnt` as a market price, the §14.6 validator economics, and
+floor, `payment_srct` as a market price, the §14.6 validator economics, and
 binding finality only at the end of Phase 6 are all exactly as recorded
 above. SPEC.md §18 is the normative worker-facing text.
 
@@ -414,7 +414,7 @@ above. SPEC.md §18 is the normative worker-facing text.
 **Chosen, and now normative in SPEC.md §18.3/§18.17:**
 
 1. **The worker SDK defines `L2NodeView`/`L2Broadcaster` traits instead of
-   inventing a wire protocol.** This build has no L2 transport (`jnt-net`
+   inventing a wire protocol.** This build has no L2 transport (`srct-net`
    carries only the §13 P2P message set; the roadmap §13 REST API is
    unbuilt). Guessing one would bake in an unreviewed design; traits let a
    local node, an embedded state, or the Phase-6 REST client implement the
@@ -505,7 +505,7 @@ skipped during replay, so nodes still agree. Recording an invalid L2 payload in
 an L1 block is therefore a waste of block space, not a divergence or a
 consensus break. Tightening this into a block rule is a separate, reviewable
 change (M2/M4), and would require `Chain` to consult L2 — which today's
-dependency direction forbids by design (`jnt-l2` depends on `jnt-core`).
+dependency direction forbids by design (`srct-l2` depends on `srct-core`).
 
 ## Decision 7 — L2 value enters through a genesis-funded protocol escrow
 
@@ -557,7 +557,7 @@ through the existing M2 slash path.
 
 ## Decision 9 — The worker↔node transport is the roadmap §13 REST API
 
-**Chosen: build §13's REST API in `jnt-node` (axum + tokio, opt-in via
+**Chosen: build §13's REST API in `srct-node` (axum + tokio, opt-in via
 `--api-listen`) and implement the Phase 5 seams (`L2NodeView`,
 `L2Broadcaster`) as an HTTP client over it.**
 
@@ -616,7 +616,7 @@ any M3 code, per the M3 instruction to stop until the decision is explicit.
 is interpreted by L2 replay as a deposit. No new L1 transaction type; existing
 L1 machinery is unchanged.**
 
-1. **Sink derivation.** `SHA256("jounit/l2-deposit-sink/v1" ‖ network_id)[..20]`
+1. **Sink derivation.** `SHA256("srct/l2-deposit-sink/v1" ‖ network_id)[..20]`
    (`NetworkParams::l2_deposit_sink`). Deterministic per profile, distinct from
    the escrow identity (different domain tag), holding no key. A different
    network's sink on this chain is an ordinary burn, never a deposit.
@@ -627,7 +627,7 @@ L1 machinery is unchanged.**
    without UTXO history. Inputs with different owners, and coinbase
    transactions (unsigned inputs), are **not deposits**: the value stays burned
    and nothing is credited. No third-party recipient field exists in M3.
-3. **Minimum deposit amount.** 1,000,000 sat (0.01 JNT) per sink output, both
+3. **Minimum deposit amount.** 1,000,000 sat (0.01 SRCT) per sink output, both
    profiles (`NetworkParams::l2_deposit_minimum_sat`). Below-minimum sink
    outputs are burns without credit. Rationale: 50× the largest D3 fee, a
    dust/bloat floor — every credited deposit leaves permanent unspendable UTXO
@@ -809,12 +809,12 @@ and continues to fail closed.
 
 ## Decision 16 — Machine/agent identity + authorization policy (roadmap items 3, 4, 6, 10)
 
-**Chosen: a deterministic, non-consensus policy library, `crates/jnt-core/src/agent.rs`.
+**Chosen: a deterministic, non-consensus policy library, `crates/srct-core/src/agent.rs`.
 No consensus rule changes; until a later decision wires it into `submit_at`, it
 cannot move a coin.**
 
 1. **Identity is derived, never assigned.**
-   `agent_id = SHA256("jounit/agent-id/v1" ‖ network_id ‖ role ‖ owner)[..20]`,
+   `agent_id = SHA256("srct/agent-id/v1" ‖ network_id ‖ role ‖ owner)[..20]`,
    where `owner` is an ordinary §1 address derived from the owner's key bundle.
    The identity is therefore cryptographically owned (only the key holder can
    produce `owner`), network-bound (a testnet identity is not a mini identity)
@@ -826,7 +826,7 @@ cannot move a coin.**
    the existing issuance schedule. No second currency, no second ledger, no
    parallel monetary base (roadmap item 18).
 3. **Policy is owner-signed and total.** `SpendPolicy::signing_hash` is
-   domain-separated (`jounit/agent-policy/v1`) over a bounded canonical
+   domain-separated (`srct/agent-policy/v1`) over a bounded canonical
    encoding: version `1`, network id ≤ 64 bytes, ≤ 64 recipients, ≤ 64 service
    tags, explicit per-transaction limit, tumbling window length, cumulative
    limit, validity range, and a revoke flag. The test suite mutates **every**
@@ -851,7 +851,7 @@ cannot move a coin.**
    `revoked` flag. `PolicyBook` is bounded (`DEFAULT_MAX_POLICIES`) and refuses
    a new policy rather than grow without limit.
 8. **Offline verification.** `Authorization` has its own domain-separated
-   signing hash (`jounit/agent-auth/v1`) and `verify_authorization` checks it
+   signing hash (`srct/agent-auth/v1`) and `verify_authorization` checks it
    against public key bundles through the existing §1 signature path
    (`sig::verify_bundle`). A third party — a service, a bridge — verifies with
    public material only: no policy, no network, no private key. Mutating the
@@ -871,7 +871,7 @@ validation (that would be a consensus change and needs its own decision);
 seam they will build on.
 
 **Follow-up, no new decision:** streaming micro-payments
-(`crates/jnt-core/src/stream.rs`, roadmap item 30) build on this layer's seam
+(`crates/srct-core/src/stream.rs`, roadmap item 30) build on this layer's seam
 without changing it — a payer-signed `PaymentStream` plus payer-signed
 `StreamSettlement` receipts against a fail-closed `StreamBook`, settled
 through the ordinary payment path. No consensus rule is touched, so no
@@ -906,7 +906,7 @@ therefore needs a **new L1 rule**. Decision 19 is that rule.
 
 ### The constraint was proven in code, then satisfied by a rule
 
-`crates/jnt-core/tests/sink_unspendable.rs` drives the real L1 spend rule
+`crates/srct-core/tests/sink_unspendable.rs` drives the real L1 spend rule
 (`ledger::check_tx` → `tx.verify_input(k, &held.out.address, …)`) against a real
 mined deposit and shows:
 
@@ -949,27 +949,27 @@ replaced by a validator-threshold escrow (E-1 option (b) rejected).
 
 ### What is already implemented
 
-**Proof half:** `crates/jnt-core/src/state_root.rs` builds and verifies account
+**Proof half:** `crates/srct-core/src/state_root.rs` builds and verifies account
 inclusion proofs (`account_leaf`, `state_root`, `prove_inclusion`,
 `verify_inclusion`), exposed over real L2 state by `L2State::{state_root,
 account_proof, verify_account}`, `exit_proof` and
-`crates/jnt-l2/tests/state_root_proof.rs`.
+`crates/srct-l2/tests/state_root_proof.rs`.
 
-**Release half (Decision 19):** `crates/jnt-core/src/exit.rs` (claim codec,
+**Release half (Decision 19):** `crates/srct-core/src/exit.rs` (claim codec,
 identity, gas, proof verification), `Chain::{check_claim, apply_one_claim,
 exit_active_at, exit_released, mine_from_pool_with_exits}`, `L2State::{queue_exit,
 exit_is_mature, note_release, exited_total}`, `ChainL2::{pending_exits,
 ExitWatch}`, `NodeL2::{crank_claims, simulate_root}`,
-`crates/jnt-worker/src/exit.rs`, and the tests
-`crates/jnt-l2/tests/{exit_flow,exit_claim}.rs`,
-`crates/jnt-node/tests/exit_crank.rs`.
+`crates/srct-worker/src/exit.rs`, and the tests
+`crates/srct-l2/tests/{exit_flow,exit_claim}.rs`,
+`crates/srct-node/tests/exit_crank.rs`.
 
 ### The migration checklist, as executed
 
-`crates/jnt-core/tests/sink_unspendable.rs` was **kept** — its claim is about
-signatures, which still cannot spend a sink output. `crates/jnt-l2/tests/
+`crates/srct-core/tests/sink_unspendable.rs` was **kept** — its claim is about
+signatures, which still cannot spend a sink output. `crates/srct-l2/tests/
 exit_unavailable.rs` (the "exactly five type bytes" assertion) was **deleted**
-and replaced by `exit_flow.rs` / `exit_claim.rs`. `crates/jnt-node/tests/
+and replaced by `exit_flow.rs` / `exit_claim.rs`. `crates/srct-node/tests/
 conservation.rs` passes **unchanged**, which is the strongest available evidence
 the accounting was right: the joint check needed no exit term at all, because the
 L1 payment and the L2 debit cancel while the sink term falls by the same amount.
@@ -977,7 +977,7 @@ L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 ## Decision 17 — Conservation-breach response: freeze funding paths, alarm (2026-10-09)
 
 Owner-approved companion to the live conservation surface (`GET
-/v1/conservation`, the `/metrics` gauges, and the `jnt-worker run` gate).
+/v1/conservation`, the `/metrics` gauges, and the `srct-worker run` gate).
 When a node detects that the joint-supply bound is broken (L2 not closed, L2
 funding anomaly, or joint supply over its bound), it must:
 
@@ -1006,7 +1006,7 @@ iteration because the loop spins with `--interval-ms 0` and a whole-UTXO scan
 per spin would stall a breached node; it reprints every second for as long as
 the breach lasts, so it cannot pass silently, and prints a clearing line when
 the condition goes away. Nothing is cached or discarded. Pinned by
-`crates/jnt-node/tests/breach_response.rs` (4 tests through real HTTP with a
+`crates/srct-node/tests/breach_response.rs` (4 tests through real HTTP with a
 real signed deposit) and the pre-existing `api`/`conservation_api` suites.
 
 ## P2 — Bonded stake / mainnet validator committee (mainnet blocker)
@@ -1065,12 +1065,12 @@ fail closed rather than collecting a partial fee — the safe direction.
 
 ## P6 — Mainnet L2 genesis escrow scale (not a blocker, a confirmation)
 
-Decision 7 sets `mainnet` `l2_genesis_escrow_sat = 100,000 JNT`, bounded by the
+Decision 7 sets `mainnet` `l2_genesis_escrow_sat = 100,000 SRCT`, bounded by the
 explicit `escrow_ceiling_sat` that `NetworkParams::validate` checks (approved
 M-E) — currently set tight to the allocation. If the protocol owner intends a
 different scale, that is a one-value change.
 
-(The original wording justified this as a slice of "the 788,476 JNT that can
+(The original wording justified this as a slice of "the 788,476 SRCT that can
 never be minted". That figure died with the stock cap in Decision 18: with a tail
 there is no fixed quantity that can never be minted, so the ceiling is now the
 `escrow_ceiling_sat` parameter alone.)
@@ -1087,21 +1087,21 @@ under them is the tail (M-A…M-C), the escrow ceiling (M-E) and — via
 **Decision 18** — the deletion of the stock cap (M-D, superseded the same day).
 
 State before Decision 18 (historical, kept so the arithmetic can be checked):
-stock cap **39,945,600 JNT**; ladder-era issuance **39,157,124 JNT** (the earlier
+stock cap **39,945,600 SRCT**; ladder-era issuance **39,157,124 SRCT** (the earlier
 39,157,200 was the geometric shortcut `149 × 262 800`, which over-states the
-schedule by 76 JNT because genesis occupies a rung-0 height without minting);
-**788,476 JNT** of that cap permanently unmintable; ladder
-`76, 38, 19, 9, 4, 2, 1` in whole JNT; `halving_period` 262,800; ladder exhausts
+schedule by 76 SRCT because genesis occupies a rung-0 height without minting);
+**788,476 SRCT** of that cap permanently unmintable; ladder
+`76, 38, 19, 9, 4, 2, 1` in whole SRCT; `halving_period` 262,800; ladder exhausts
 at height **1,839,600**.
 
-**After Decision 18 there is no cap and no unmintable figure.** 39,157,124 JNT is
+**After Decision 18 there is no cap and no unmintable figure.** 39,157,124 SRCT is
 simply what the ladder *pays out*; the rate anchor (≤ 1 % of issued supply per
 post-ladder window) is the only ceiling, and the tail then issues forever.
 
 | # | Question | Options | Consequence if changed | Status |
 |---|---|---|---|---|
 | **M-A** | Tail emission shape at ladder exhaustion | **(A)** retain zero tail · **(D)** flat tail · **(E)** declining tail to a floor | Any tail **requires a supply-rule change** and a new issuance anchor; `cap − max_issuance_sat` can no longer be the escrow backing rule (see M-D/M-E) | **APPROVED — (E) decay tail** |
-| **M-B** | Tail floor value | proposed **0.1 JNT/block** · 1.00 · 0.50 · other | Sets steady-state dilution (0.10 JNT ≈ 0.0134 %/yr); the proposal derives this from a security-floor argument, **not** from any repository constant | **APPROVED — 0.1 JNT/block mainnet floor** |
+| **M-B** | Tail floor value | proposed **0.1 SRCT/block** · 1.00 · 0.50 · other | Sets steady-state dilution (0.10 SRCT ≈ 0.0134 %/yr); the proposal derives this from a security-floor argument, **not** from any repository constant | **APPROVED — 0.1 SRCT/block mainnet floor** |
 | **M-C** | Per-network tail | mainnet value · testnet/mini value (proposed **1 sat/block**) | Applying the mainnet value to mini would mint **>1,000 %/yr** (proposal F5); the two profiles must be set independently | **APPROVED — 1 sat/block on mini/testnet** |
 | **M-D** | Fate of `supply_cap_sat` | **keep** as a sanity ceiling · **replace** with an explicit invariant | `supply_cap_sat` is currently the *joint L1/L2 conservation anchor* **and** the escrow backing rule, not just a ceiling. Deleting it without a replacement silently removes both checks. The proposal rejects deletion-for-convenience | **APPROVED — cap retained; SUPERSEDED the same day by [Decision 18](#decision-18--supply-anchor-a-rate-rule-replaces-the-stock-cap-approved-and-implemented-2026-10-09), which deleted `supply_cap_sat` entirely and replaced it with the rate anchor** |
 | **M-E** | Meaning of `escrow_ceiling` | define an explicit, validated parameter · keep the implicit `cap − max_issuance_sat` gap | No `escrow_ceiling` symbol exists in code or SPEC today. It is the proposal's replacement for the gap rule once a tail changes issuance. Ownership, release rules, reorg behaviour and interaction with spendable supply are **all unspecified** | **APPROVED — explicit validated `escrow_ceiling` parameter** |
@@ -1109,7 +1109,7 @@ post-ladder window) is the only ceiling, and the tail then issues forever.
 | **M-G** | Activation mechanism | network-upgrade flag/height · historical-compatibility expectation · vector changes | Proposal §5.4 argues activation at exhaustion (1,839,600) leaves existing history byte-identical. **No mainnet activation until M-A…M-F are approved**; vector changes are only legitimate once an approved rule actually changes consensus | **APPROVED — activation at each profile's ladder exhaustion (mainnet 1,839,600; mini/testnet 14,000)** |
 
 **Approved 2026-10-09 (owner), item by item:** M-A = (E) decay tail; M-B =
-0.1 JNT/block mainnet floor; M-C = 1 sat/block on mini/testnet; M-D =
+0.1 SRCT/block mainnet floor; M-C = 1 sat/block on mini/testnet; M-D =
 `supply_cap_sat` retained as a sanity ceiling only — **superseded the same day
 by Decision 18, which deleted the field and `Error::SupplyCapExceeded` and put
 the rate anchor in their place**; M-E = an explicit validated `escrow_ceiling`
@@ -1132,10 +1132,10 @@ verified, not asserted.
 | Milestone | Delivered |
 |---|---|
 | **M1 (decision recorded)** | M-A…M-G recorded above; Decisions 7/10 amended for issuance and the escrow rule only. Commit `e3a5713`. |
-| **M2 (model)** | `sim/supply_schedule_sim.py` exits 0 and regenerated `tests/vectors/supply_vectors.json`; `sim/tail_emission_sim.py --selftest` exits 0; `sim/verify_vectors.py` exits 0. The two sims and `supply.rs` agree to the satoshi, including the period-boundary off-by-one that both previously carried and the exact ladder-era total (39,157,124.5 JNT at the first tail block). |
+| **M2 (model)** | `sim/supply_schedule_sim.py` exits 0 and regenerated `tests/vectors/supply_vectors.json`; `sim/tail_emission_sim.py --selftest` exits 0; `sim/verify_vectors.py` exits 0. The two sims and `supply.rs` agree to the satoshi, including the period-boundary off-by-one that both previously carried and the exact ladder-era total (39,157,124.5 SRCT at the first tail block). |
 | **M3 (consensus)** | `supply::check_mint_at_height` is the single mint gate and `Chain::apply_block` calls it; `params::validate` refuses a zero tail floor/constant and an escrow above its ceiling; §6.1 tests 1–14 exist (`historical_replay_is_unchanged_by_the_tail` = `historical_heights_keep_their_ladder_rungs_under_the_tail`, `reward_step_at_the_ladder_tail_boundary_is_at_most_a_halving` = `every_tail_step_is_at_most_a_halving_and_reaches_the_floor`); `cargo test --workspace` 0 failures; clippy `-D warnings` clean; fmt clean. |
 | **M4 (spec/docs)** | SPEC §7 and §19.4, this file, `docs/monetary-policy.md`, `docs/mainnet-readiness.md` and `README.md` re-stated to the shipped function; no document still claims a frozen zero tail or the `cap − max_issuance_sat` backing rule. |
-| **M5 (ops)** | Vectors frozen in git; `jnt-node verify` and `/v1/conservation` report the joint bound; `jnt-worker run` gates on it (older nodes fall back to the sanity cap, i.e. a stricter check). |
+| **M5 (ops)** | Vectors frozen in git; `srct-node verify` and `/v1/conservation` report the joint bound; `srct-worker run` gates on it (older nodes fall back to the sanity cap, i.e. a stricter check). |
 
 Milestones **not** claimed here: M-F owns no numeric fee-burn target (deflation
 accepted and documented in `monetary-policy.md`), and the exit rule (P1) remains
@@ -1143,7 +1143,7 @@ a separate, unimplemented mainnet blocker.
 
 ## Decision 18 — Supply anchor: a rate rule replaces the stock cap (APPROVED AND IMPLEMENTED 2026-10-09)
 
-**Raised by the owner 2026-10-09:** should JNT have a fixed numerical cap, no
+**Raised by the owner 2026-10-09:** should SRCT have a fixed numerical cap, no
 cap, or a mechanism of a different kind, given the goal of a currency for AI,
 robotics and humans that works at today's scale and at a Mars-scale one?
 
@@ -1155,7 +1155,7 @@ burns kept on the net side.
 
 The decisive finding is that **the cap and the already-approved permanent tail
 contradict each other**: with policy E, the cap binds at block **8,213,259**
-(≈ **156.2 years**) and issuance then stops forever, so "permanent 0.1 JNT
+(≈ **156.2 years**) and issuance then stops forever, so "permanent 0.1 SRCT
 floor" really means 156 years. A rate anchor cannot be repealed that way: a
 constant absolute trickle becomes *less* dilutive as supply grows (0.0132 %/yr
 today, 0.0013 % at 10× supply), while a stock cap only grows more binding.
@@ -1188,7 +1188,7 @@ regenerated with the anchor fields (`rate_anchor_max_pct_per_period`,
 `largest_tail_window_pct_of_issued` ≈ 0.34 % on mainnet). Net supply
 (gross issuance minus burned + PSCB removal, both rewound on reorg) is reported
 by `status`, `GET /v1/conservation` and the `/metrics` gauges. Touched suites
-green (`jnt-core` lib, `redteam`, node conservation/api/l2 suites, worker
+green (`srct-core` lib, `redteam`, node conservation/api/l2 suites, worker
 http/cli), both sim selftests pass, `verify_vectors.py --check` passes,
 clippy `-D warnings` and `fmt --check` clean.
 
@@ -1275,8 +1275,8 @@ no rewards, no fee share); this decision supplies what Decision 8 deliberately
 left unbuilt.
 
 1. **No minimum stake.** Any positive bond amount is accepted into the bond
-   ledger. The 5,000 JNT minimum stake from the original Decision 2 design has
-   been **removed**: Jounit is permissionless. The committee is stake-weighted
+   ledger. The 5,000 SRCT minimum stake from the original Decision 2 design has
+   been **removed**: Solar Cyber Unit is permissionless. The committee is stake-weighted
    (TopN by stake), so smaller bonds simply rank lower and fail to make the top
    21. This is fixed in the consensus rules — not a tunable.
 2. **Committee: stake-weighted TopN, capped at 21.** Eligibility = a valid
@@ -1329,7 +1329,7 @@ then chain security rests on §5 alone. Design shape recorded in
 activation checklist, open questions — still no code, still not activated.
 
 > **Update 2026-10-12 / 2026-10-28:** the code now exists — `hbm_pow.rs`
-> verified and reviewed, registered as `puzzle_id = 2`, and `jnt-miner` carries
+> verified and reviewed, registered as `puzzle_id = 2`, and `srct-miner` carries
 > an HBM solver arm (`PowMode::Hbm`) — but activation is still **not** set on
 > any profile, and the `production()` parameter defect plus the missing panic
 > guard (`docs/security-review-hbm-2026-10-12.md` §§5–6) still block mainnet
@@ -1446,7 +1446,7 @@ vote from the future is refused at apply. What is still absent is a maximum
 vote *age*, so the question was asked directly: can an old aggregate change
 state it was not intended to change?
 
-`crates/jnt-l2/tests/settle_stale_quorum.rs` tries the three shapes that
+`crates/srct-l2/tests/settle_stale_quorum.rs` tries the three shapes that
 could matter, each against a real quorum aggregate over a disputed task:
 
 1. **The same task and the same decision, again.** Identical bytes are
@@ -1607,7 +1607,7 @@ and L2 settlement keeps its own fail-closed set.**
 
 1. **Twenty-one bootstrap keys.** `NetworkParams::mainnet().genesis_validators`
    carries 21 keys derived from seeds 1..=21 under
-   `jounit/mainnet-validator-seed/v1`, canonically sorted by BLS public-key
+   `srct/mainnet-validator-seed/v1`, canonically sorted by BLS public-key
    bytes. Quorum is `ceil(21 * 6667 / 10000) = 15`.
 2. **Active at height 100.** Mainnet keeps `finality_activation_height = 100`
    and `checkpoint_interval_blocks = 100`, so a fresh chain can bind finality at
@@ -1621,13 +1621,13 @@ and L2 settlement keeps its own fail-closed set.**
    only for the bonded-stake cold start; it is not a claim of decentralisation,
    and the first bond ends it.
 5. **L2 settlement is separate.** `NetworkParams::l2_settlement_validators` is a
-   distinct declaration consumed by `jnt_node::l2::validator_set` and the
+   distinct declaration consumed by `srct_node::l2::validator_set` and the
    worker. Mainnet leaves it empty and therefore refuses every settlement by
    name. Mini/testnet use the same four keys for both sets.
 6. **Genesis bytes do not change.** The committee is not part of the genesis
    block, so populating it does not alter the genesis hash.
 
-**Operational path.** `jnt-node validator --bootstrap` writes the 21 declared
+**Operational path.** `srct-node validator --bootstrap` writes the 21 declared
 keys as encrypted files on a fresh mainnet node. Checkpoint signatures are not
 gossiped as partial shares, so a node needs quorum 15 locally to produce the
 first certificate; the command provisions the complete committee. The keys are
@@ -1642,3 +1642,62 @@ height 100.
 **Supersedes.** Decision 20 item 5 and P2 item 6 ("choosing the bootstrap
 committee is a decision"); Decision 15's "declared active committee" for L2 is
 now the separate `l2_settlement_validators` field.
+
+## Decision 28 - Mainnet L2 settlement authority follows the live committee
+
+**Status: APPROVED 2026-10-29, IMPLEMENTED 2026-10-29.** Resolves the
+blocker left by Decision 27 item 5: mainnet's declared settlement set was
+empty, so every mainnet `Settle` failed with `BadQuorum` through the real
+node path — no settlement workflow (task, VWC, dispute) could complete on
+the profile that matters.
+
+**The decision: the declared set names the 21 bootstrap keys, and
+verification resolves the live L1 committee per block height.**
+
+1. **Declared set is populated.** `NetworkParams::mainnet().l2_settlement_validators`
+   is the same 21 bootstrap keys that secure L1 pre-bond (quorum 15) — the
+   mini/testnet precedent of reusing the L1 keys. The declaration is what
+   offline verifiers use: the worker binary and one-shot checks, which have
+   no chain to resolve against.
+2. **Verification resolves, it does not read the declaration.**
+   `Chain::settlement_committee_at(height)` returns the live L1 committee at
+   that height — seed-snapshot records (lattice keys ride along) with the
+   same live-ledger fallback `committee_keys` uses, genesis bootstrap when
+   no bonds exist. `ChainL2::replay`/`replay_to`, `NodeL2::sync`'s
+   incremental arm, `check` and `simulate_root` all resolve the set for the
+   block being applied. No `NodeL2` field, no construction-time capture.
+3. **Rotation revokes, exactly once.** The first bond rotates L2 authority to
+   the bonded TopN under the existing seed rule — the same rule the
+   settlement *builder* (miner crank, `committee_keys` at the tip) already
+   used, so construction and verification agree. Bootstrap keys authorize
+   nothing further: a 15-of-21 bootstrap aggregate for a post-bond task is
+   refused with `BadQuorum`.
+4. **Resolution is by block height, never by payload height.** The payload's
+   declared height is attacker-chosen; resolving by it would let anyone cite
+   a pre-rotation height and verify forever under the public bootstrap keys.
+   Resolving by the applying block's height keeps every replay — whenever it
+   runs — on the committee that was live when the block was built. The price
+   is a liveness edge: a settle formed just before a rotation but included
+   just after it is skipped deterministically (the miner rebuilds it under
+   the new committee).
+5. **Determinism preserved.** Replay-after-rotation verifies pre-bond history
+   against the pre-bond committee, so a node that synced continuously and a
+   node that replays from scratch reach identical L2 state — pinned by
+   `mainnet_settlement_rotates_to_the_bonded_committee`.
+
+**What this does not change.** No bond economics; no quorum formula; no new
+transaction type; lattice sidecar enforcement is exactly as before
+(BLS-only unless members registered keys — the resolution change is
+membership only). The worker still verifies against the static declared set,
+so after a mainnet rotation its local certificate observation goes stale
+until it learns the new committee; serving the live committee over HTTP is
+follow-up work, not part of this decision.
+
+**Supersedes.** Decision 27 item 5 (the empty mainnet settlement set).
+
+**Tests.**
+`m5_node_finality::mainnet_settlement_applies_under_the_bootstrap_committee`
+(pre-bond 15-of-21 settle applies through mined blocks; replay==replay),
+`m5_node_finality::mainnet_settlement_rotates_to_the_bonded_committee`
+(post-bond 1-of-1 bonded settle applies; pre-bond history replays
+identically; bootstrap-only post-bond settle refused with `BadQuorum`).

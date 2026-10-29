@@ -1,0 +1,18 @@
+[package]
+publish = false
+name = "srct-miner"
+description = "Solar Cyber Unit standalone CPU miner: multithreaded nonce grinder over srct-core block templates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+srct-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+srct-core.workspace = true

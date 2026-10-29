@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 
 // Invariant fuzzer over the agent-authority layer (SPEC.md §21).
 //
-// The policy layer is the first place in Jounit where a *rule* rather than a
+// The policy layer is the first place in Solar Cyber Unit where a *rule* rather than a
 // *transfer* is the interesting object: a grant says how much an agent may
 // spend, to whom, inside which window, and the chain has to enforce all of it
 // against state it keeps. This target drives real, validly signed grants and
@@ -31,14 +31,14 @@ use libfuzzer_sys::fuzz_target;
 // revoke / spend / advance) whose amounts are bounded so the arithmetic stays
 // in range and the interesting boundaries are still reachable.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::agent::{derive_agent_id, derive_sub_agent_id, AgentRole, SpendPolicy};
-    use jnt_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
-    use jnt_core::hash::Hash;
-    use jnt_core::l2::{
+    use srct_core::agent::{derive_agent_id, derive_sub_agent_id, AgentRole, SpendPolicy};
+    use srct_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
+    use srct_core::hash::Hash;
+    use srct_core::l2::{
         AgentSpendPayload, L2Payload, L2Transaction, PolicyPayload, PolicyRevokePayload,
     };
-    use jnt_core::wallet::Wallet;
-    use jnt_l2::{L2Config, L2Error, L2State};
+    use srct_core::wallet::Wallet;
+    use srct_l2::{L2Config, L2Error, L2State};
 
     if data.len() < 100 {
         return;
@@ -52,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
     let oa = owner.address().unwrap_or([0u8; 20]);
     let aa = agent.address().unwrap_or([1u8; 20]);
     let xa = other.address().unwrap_or([2u8; 20]);
-    let network = "jounit/mini";
+    let network = "srct/mini";
 
     const FUND: u64 = 1_000_000_000;
     let credited = FUND * 3;
@@ -74,7 +74,7 @@ fuzz_target!(|data: &[u8]| {
 
     let root_agent = derive_agent_id(network, AgentRole::Machine, &oa);
     let grant = |parent: Option<[u8; 20]>, per_tx: u64, cumulative: u64| SpendPolicy {
-        version: jnt_core::agent::POLICY_VERSION,
+        version: srct_core::agent::POLICY_VERSION,
         network_id: network.to_string(),
         agent_id: match parent {
             Some(p) => derive_sub_agent_id(network, &p, AgentRole::Machine),

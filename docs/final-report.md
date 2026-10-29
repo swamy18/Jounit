@@ -66,8 +66,8 @@ Intel Core i5-8365U (8 logical), Windows, release build, 2026-10-09:
 | Path | Measured |
 |---|---|
 | Mine 300 mini blocks (PoW included) | 225,824 ms (~753 ms/block, PoW-bound — **not** validation) |
-| `jnt-node verify` (replay+validate 301 blocks) | 304 ms (~1.0 ms/block, incl. process start) |
-| `jnt-node status` (storage reopen) | 193 ms |
+| `srct-node verify` (replay+validate 301 blocks) | 304 ms (~1.0 ms/block, incl. process start) |
+| `srct-node status` (storage reopen) | 193 ms |
 | VWC encode / decode / validate | 4.16 µs / 3.21 µs / 2,630.15 µs (real BLS) |
 | `GET /v1/health` / `/v1/status` / `/v1/fees` | 9.1 ms / 2.0–3.0 ms / 2.4 ms |
 
@@ -79,20 +79,20 @@ now explicitly listed as **not measured**.
 
 ## 6. Chaos / network results
 
-- `crates/jnt-node/tests/chaos.rs` — 15 adversarial tests (invalid L2 payload
+- `crates/srct-node/tests/chaos.rs` — 15 adversarial tests (invalid L2 payload
   skipped by name, unknown-task claim with no partial write, settle without
   quorum refused, rejected block never mutates L2 state, restart through the
   store, torn-tail recovery, invalid block not counted as work, future
   timestamp, fork choice by work, conservation). **Pass.**
-- `crates/jnt-node/tests/e2e_two_process.rs` — spawns a real `jnt-node serve`
+- `crates/srct-node/tests/e2e_two_process.rs` — spawns a real `srct-node serve`
   subprocess and drives a real `WorkerClient` over HTTP/TCP through the whole L2
   lifecycle. **Pass** (true multi-process, not mocked).
-- `crates/jnt-net/tests/tx_relay.rs` — 10 real-socket relay tests. **Pass.**
+- `crates/srct-net/tests/tx_relay.rs` — 10 real-socket relay tests. **Pass.**
 
 ## 7. SPEC / code mismatches found
 
 1. **Supply arithmetic error in SPEC §7:** the unmintable remainder was written
-   `787 400 JNT`. The figure went through two corrections: first to **788 400**
+   `787 400 SRCT`. The figure went through two corrections: first to **788 400**
    (39,945,600 − 39,157,200), then — once the approved tail forced the exact
    block-by-block semantics — to **788 476** (39,945,600 − 39,157,124), because
    genesis occupies a rung-0 height without minting. `supply::tests`,
@@ -100,13 +100,13 @@ now explicitly listed as **not measured**.
    the exact figure.
 2. **SPEC reward formula matched nothing in code:** SPEC said
    `start_reward_sat >> halvings`, but `supply::period_reward_sat` halves
-   **whole JNT** (`(start_reward_jnt >> period) * SAT_PER_JNT`). Fixed to match
-   the implementation, with the reason (sat-shifting pays 9.5 JNT at epoch 3).
+   **whole SRCT** (`(start_reward_srct >> period) * SAT_PER_SRCT`). Fixed to match
+   the implementation, with the reason (sat-shifting pays 9.5 SRCT at epoch 3).
 3. **SPEC §8 capped the fee at a `BASE_FEE_MAX` name that does not exist** and
    omitted the floor values. Corrected to `base_fee_min_sat`/`base_fee_max_sat`
    and their per-profile values (100/50,000,000 mainnet; 10/1,000,000 mini/testnet).
 4. **`docs/monetary-policy.md` described a schedule that exists nowhere** (a
-   10,000,000 JNT cap, 1 JNT initial reward, 210,000-block halving,
+   10,000,000 SRCT cap, 1 SRCT initial reward, 210,000-block halving,
    `TARGET_SUPPLY_SAT`/`MAX_HALVINGS`). Rewritten from the code.
 5. **`docs/l2-exit-design.md` cited a non-existent "Decision 21"** and further
    assumed the deposit sink could release funds — it cannot (no key). Rewritten.
@@ -148,7 +148,7 @@ Recorded as blockers (not choices) in `docs/decisions.md` → *Pending*:
 ## 9. Implementation work still remaining
 
 None of it was authorised, so none was started: L2 exits, stake/bond ledger,
-M2/M4 activation rules, a `jnt-worker` run daemon verb, and the unmeasured
+M2/M4 activation rules, a `srct-worker` run daemon verb, and the unmeasured
 benchmark harnesses. **No line of product code changed this session.**
 
 ## 10. Operational work still remaining
@@ -163,7 +163,7 @@ reproducible-build tooling.
    implemented (SPEC.md §19.6), so testnet value is withdrawable wherever
    `exit_activation_height > 0`. Operators should still confirm that value before
    assuming it.
-2. ~~**No worker daemon binary**~~ — `jnt-worker run` ships the daemon loop over
+2. ~~**No worker daemon binary**~~ — `srct-worker run` ships the daemon loop over
    the node's REST API, gated on `/v1/conservation`.
 3. **API is unauthenticated** — loopback/tunnel only.
 4. **No metrics/log shipping** — monitoring is `/v1/status` polling.
@@ -233,20 +233,20 @@ not; every fabricate-able number was replaced with a measurement or a labelled
 Three statements above are superseded by work landed after this report was
 written, and are recorded here rather than edited silently:
 
-- **§9/§11: the `jnt-worker run` daemon verb shipped** (discover → claim →
-  execute → submit over the node's REST API, covered by `crates/jnt-worker/
+- **§9/§11: the `srct-worker run` daemon verb shipped** (discover → claim →
+  execute → submit over the node's REST API, covered by `crates/srct-worker/
 tests/cli_run.rs` and the two-process E2E), and **`/metrics` shipped**
   (Prometheus text gauges, §10's first item).
 - **The conservation-enforcement gap closed.** `GET /v1/conservation` serves
   the three-check verdict live from the one implementation
-  (`jnt_node::conservation::conservation_report`) that `jnt-node verify`
-  prints from; `/metrics` exports `jounit_joint_supply_sat` and
-  `jounit_conservation_ok`; and `jnt-worker run` gates on that report before
+  (`srct_node::conservation::conservation_report`) that `srct-node verify`
+  prints from; `/metrics` exports `Solar Cyber Unit_joint_supply_sat` and
+  `Solar Cyber Unit_conservation_ok`; and `srct-worker run` gates on that report before
   its first pass — a breach or unreadable numbers are refused with a
   non-zero exit naming the terms, an unreachable or non-reporting node warns
   and continues. The worker recomputes the verdict from the report's own
   terms (`ConservationReport::holds`), never the node's `ok` flag. Tests:
-  `crates/jnt-node/tests/conservation_api.rs` (3), http.rs unit tests (2),
+  `crates/srct-node/tests/conservation_api.rs` (3), http.rs unit tests (2),
   `cli_run.rs` fake-node gate tests (3), `ConservationReport` ordering test.
 - **What this does not do:** detection is on-demand (endpoint, scrape,
   worker startup), not a serve-loop halt. What a node that detects value

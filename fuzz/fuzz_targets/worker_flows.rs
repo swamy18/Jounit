@@ -23,9 +23,9 @@ use libfuzzer_sys::fuzz_target;
 // deterministically.
 
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::compute_ir::ComputeBackend;
-    use jnt_core::l2::L2Transaction;
-    use jnt_worker::{
+    use srct_core::compute_ir::ComputeBackend;
+    use srct_core::l2::L2Transaction;
+    use srct_worker::{
         claim_plan, reconcile_claimed, reconcile_submitted, discover_tasks, dispute_plan,
         submit_plan, WorkerConfig,
     };
@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 32 {
         return;
     }
-    let wallet = match jnt_core::wallet::Wallet::from_private_key_bytes(
+    let wallet = match srct_core::wallet::Wallet::from_private_key_bytes(
         &data[..32],
         "fuzz-worker",
     ) {
@@ -54,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
     // passes and the deeper paths are reached (a zero-balance state would
     // refuse everything at the same spot, which is a valid but degenerate
     // fuzzing domain).
-    let mut state = jnt_l2::L2State::new(jnt_l2::L2Config::mini());
+    let mut state = srct_l2::L2State::new(srct_l2::L2Config::mini());
     let _ = state.credit(address, u64::from(data[0]) * 1_000_000);
 
     // Heights covering the deadline shapes: past / at / future.
@@ -104,15 +104,15 @@ fuzz_target!(|data: &[u8]| {
 });
 
 struct EmbeddedView {
-    state: jnt_l2::L2State,
+    state: srct_l2::L2State,
     height: u64,
 }
 
-impl jnt_worker::L2NodeView for EmbeddedView {
-    fn l2_state(&self) -> jnt_worker::WorkerResult<jnt_l2::L2State> {
+impl srct_worker::L2NodeView for EmbeddedView {
+    fn l2_state(&self) -> srct_worker::WorkerResult<srct_l2::L2State> {
         Ok(self.state.clone())
     }
-    fn chain_height(&self) -> jnt_worker::WorkerResult<u64> {
+    fn chain_height(&self) -> srct_worker::WorkerResult<u64> {
         Ok(self.height)
     }
 }

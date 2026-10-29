@@ -9,7 +9,7 @@ use libfuzzer_sys::fuzz_target;
 // length-bounded and both must return Ok or Err — never panic, never allocate
 // an unbounded amount from a crafted length field.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::bls_checkpoint::{Checkpoint, CheckpointPayload};
+    use srct_core::bls_checkpoint::{Checkpoint, CheckpointPayload};
 
     // A payload is always allowed to fail; it must never panic.
     let _ = CheckpointPayload::deserialize(data);

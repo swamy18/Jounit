@@ -1,7 +1,7 @@
 # Security review — HBM scratchpad PoW (`hbm_pow.rs`, M4)
 
 **Date:** 2026-10-12
-**Scope:** `crates/jnt-core/src/hbm_pow.rs` + its dependency `crates/jnt-core/src/u256.rs` (`target_for_difficulty`, `U256::from_be_bytes`).
+**Scope:** `crates/srct-core/src/hbm_pow.rs` + its dependency `crates/srct-core/src/u256.rs` (`target_for_difficulty`, `U256::from_be_bytes`).
 **Purpose:** Gate the registration of HBM as `puzzle_id = 2` in `PuzzleRegistry::genesis()` (README §"M4 HBM puzzle — Deliberately unregistered", `docs/decisions.md` P4).
 
 Verdict: **passes review for registration as a *testnet* puzzle**, with one documentation/parameter defect that MUST be resolved before any mainnet production parameters are derived from `HbmConfig::production()`.
@@ -63,7 +63,7 @@ The module doc (`hbm_pow.rs:30-34`) states production uses **8–64 MiB** scratc
 
 - **Accept HBM for testnet registration** as `puzzle_id = 2` with the `test()` config (8 KiB / 8) used in tests and a documented non-production `HbmConfig`. This unblocks wiring (`puzzle.rs` already supports a second `PuzzleSpec` registration; `HybridPuzzleSolver` would need an HBM solver arm).
   - *Update 2026-10-28:* registration is done (`PuzzleSpec::hbm_v1`,
-    `puzzle_id = 2`) and `jnt-miner` now carries the HBM solver arm
+    `puzzle_id = 2`) and `srct-miner` now carries the HBM solver arm
     (`PowMode::Hbm`, `hbm_satisfies_cfg`); it is still **not active** on any
     profile, and the §5/§6 items below still gate mainnet use.
 - **FIX before mainnet:** item 5 (parameter config) and item 6 (panic guard). Record the large-config parameters as a `NetworkParams` field, not a compile-time constant, so they are governance-upgradeable per `docs/decisions.md` P4 ("only puzzle parameters are upgradeable, and only through the governance timelock").

@@ -1,0 +1,20 @@
+[package]
+publish = false
+name = "srct-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Worker SDK for the Solar Cyber Unit L2 task marketplace (SPEC.md §18)"
+
+[dependencies]
+srct-core = { path = "../srct-core" }
+srct-l2 = { path = "../srct-l2" }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "srct-worker"
+path = "src/bin/main.rs"

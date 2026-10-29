@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 
 // Invariant fuzzer over the credit layer (SPEC.md §22).
 //
-// A loan is the only place in Jounit where one party's money is committed to
+// A loan is the only place in Solar Cyber Unit where one party's money is committed to
 // another party's promise, so the accounting here is the most delicate in the
 // protocol. This target drives real, validly signed credit transactions through
 // `L2State` and asserts the properties that must never break:
@@ -31,14 +31,14 @@ use libfuzzer_sys::fuzz_target;
 // repay / default / advance) whose amounts are bounded so the arithmetic stays
 // in range and the interesting boundaries are still reachable.
 fuzz_target!(|data: &[u8]| {
-    use jnt_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
-    use jnt_core::hash::Hash;
-    use jnt_core::l2::{
+    use srct_core::bls_checkpoint::{BlsPublicKey, MockBls, ValidatorSet};
+    use srct_core::hash::Hash;
+    use srct_core::l2::{
         CreditCollateralPayload, CreditDefaultPayload, CreditOpenPayload, CreditRepayPayload,
         L2Payload, L2Transaction,
     };
-    use jnt_core::wallet::Wallet;
-    use jnt_l2::{CreditPositionState, L2Config, L2Error, L2State};
+    use srct_core::wallet::Wallet;
+    use srct_l2::{CreditPositionState, L2Config, L2Error, L2State};
 
     if data.len() < 100 {
         return;

@@ -11,7 +11,7 @@ satoshi, which is the cross-check that makes a disagreement a defect rather
 than a formatting difference.
 
 The approved tail (`docs/decisions.md` M-A..M-G, 2026-10-09) is modelled here:
-mainnet decays to a 0.1 JNT floor, mini/testnet pay a constant 1 sat/block.
+mainnet decays to a 0.1 SRCT floor, mini/testnet pay a constant 1 sat/block.
 """
 
 from __future__ import annotations
@@ -20,23 +20,23 @@ import json
 import sys
 from pathlib import Path
 
-SAT_PER_JNT = 100_000_000
+SAT_PER_SRCT = 100_000_000
 
-# Tail emission, approved 2026-10-09 (M-A decay tail, M-B 0.1 JNT floor,
+# Tail emission, approved 2026-10-09 (M-A decay tail, M-B 0.1 SRCT floor,
 # M-C 1 sat/block on the fast profiles). `decay_to_floor` is the mainnet rule:
-# the first tail period pays 0.5 JNT and each later period halves in satoshis
+# the first tail period pays 0.5 SRCT and each later period halves in satoshis
 # until the floor clamps it; `constant_sat` is the fast-profile rule.
 MAINNET = {
     "name": "mainnet",
     "halving_period": 262_800,
-    "start_reward_jnt": 76,
+    "start_reward_srct": 76,
     "block_time_s": 600,
     "tail_decay_to_floor_sat": 10_000_000,
 }
 MINI = {
     "name": "mini",
     "halving_period": 2_000,
-    "start_reward_jnt": 76,
+    "start_reward_srct": 76,
     "block_time_s": 1,
     "tail_constant_sat": 1,
 }
@@ -49,7 +49,7 @@ RATE_ANCHOR_MAX_PCT_PER_PERIOD = 1.0
 
 def exhaustion_period(params: dict) -> int:
     """First period whose ladder rung is zero, i.e. where the tail begins."""
-    start = params["start_reward_jnt"]
+    start = params["start_reward_srct"]
     for p in range(64):
         if (start >> p) == 0:
             return p
@@ -64,28 +64,28 @@ def tail_reward_sat(params: dict, period: int) -> int:
     k = max(0, period - (exhaustion_period(params) - 1))
     if k >= 64:
         return floor
-    return max(floor, SAT_PER_JNT >> k)
+    return max(floor, SAT_PER_SRCT >> k)
 
 
 def halvings(params: dict, height: int) -> int:
     return height // params["halving_period"]
 
 
-def reward_jnt(params: dict, height: int) -> int:
-    """Halved in whole JNT, never in satoshis (see supply.rs for why)."""
-    return params["start_reward_jnt"] >> halvings(params, height)
+def reward_srct(params: dict, height: int) -> int:
+    """Halved in whole SRCT, never in satoshis (see supply.rs for why)."""
+    return params["start_reward_srct"] >> halvings(params, height)
 
 
 def reward_sat(params: dict, height: int) -> int:
     """The shipped reward function, in satoshis: ladder rung, then tail."""
-    rung = reward_jnt(params, height)
+    rung = reward_srct(params, height)
     if rung > 0:
-        return rung * SAT_PER_JNT
+        return rung * SAT_PER_SRCT
     return tail_reward_sat(params, halvings(params, height))
 
 
 def reward_ladder(params: dict) -> list[int]:
-    return [reward_jnt(params, p * params["halving_period"]) for p in range(8)]
+    return [reward_srct(params, p * params["halving_period"]) for p in range(8)]
 
 
 def cumulative_sat(params: dict, mined_blocks: int) -> int:
@@ -107,17 +107,17 @@ def cumulative_sat(params: dict, mined_blocks: int) -> int:
     return total
 
 
-def max_issuance_jnt(params: dict) -> int:
+def max_issuance_srct(params: dict) -> int:
     """The ladder-era integral: the reporting figure, not a bound (long-run
     issuance is unbounded by design, so the bound is per-height).
 
     Genesis occupies a rung-0 height without minting, so the first rung is paid
-    by `H - 1` blocks: the exact figure is `149H - 76` JNT, 76 JNT below the
+    by `H - 1` blocks: the exact figure is `149H - 76` SRCT, 76 SRCT below the
     `149H` geometric shortcut the design doc quotes.
     """
     return (
         cumulative_sat(params, exhaustion_period(params) * params["halving_period"] - 1)
-        // SAT_PER_JNT
+        // SAT_PER_SRCT
     )
 
 
@@ -126,7 +126,7 @@ def largest_tail_window_pct(params: dict, windows: int = 6) -> float:
     issued at that window's start.
 
     This is the figure the rate anchor must sit above: with the approved tail
-    it is ~0.34 % on mainnet (the 0.5-JNT first tail period), so the 1 %
+    it is ~0.34 % on mainnet (the 0.5-SRCT first tail period), so the 1 %
     ceiling never binds in normal operation.
     """
     start_period = exhaustion_period(params)
@@ -149,33 +149,33 @@ def year_of(height: int, params: dict) -> float:
 
 def report(params: dict) -> dict:
     ladder = reward_ladder(params)
-    reachable = max_issuance_jnt(params)
+    reachable = max_issuance_srct(params)
     periods = params["halving_period"]
     return {
         "network": params["name"],
-        "ladder_jnt": ladder,
+        "ladder_srct": ladder,
         "halving_period_blocks": periods,
         "halving_period_years": round(year_of(periods, params), 3),
-        "issued_after_first_period_jnt": whole_jnt(
+        "issued_after_first_period_srct": whole_srct(
             params, cumulative_sat(params, periods), "one period"
         ),
-        "issued_after_two_periods_jnt": whole_jnt(
+        "issued_after_two_periods_srct": whole_srct(
             params, cumulative_sat(params, 2 * periods), "two periods"
         ),
-        "max_reachable_jnt": reachable,
+        "max_reachable_srct": reachable,
         # Decision 18: no stock cap. The anchor is the only ceiling: at most
         # 1 % of issued supply per halving period, and the approved schedule
         # sits ~3x under it (see `largest_tail_window_pct_of_issued`).
         "rate_anchor_max_pct_per_period": RATE_ANCHOR_MAX_PCT_PER_PERIOD,
         "largest_tail_window_pct_of_issued": largest_tail_window_pct(params),
-        "final_reward_jnt": next((r for r in ladder if r == 0), None),
+        "final_reward_srct": next((r for r in ladder if r == 0), None),
         # The approved tail (M-A..M-G). `tail_activation_height` is where the
         # ladder gives way to it; the floor is what the decay clamps to. Both
         # units are carried deliberately: satoshis are what the code uses, and
-        # JNT is what a reader checks.
+        # SRCT is what a reader checks.
         "tail_activation_height": exhaustion_period(params) * periods,
         "tail_floor_sat": tail_reward_sat(params, exhaustion_period(params)),
-        "tail_floor_jnt": tail_reward_sat(params, exhaustion_period(params)) / SAT_PER_JNT,
+        "tail_floor_srct": tail_reward_sat(params, exhaustion_period(params)) / SAT_PER_SRCT,
         "tail_reward_at_exhaustion_sat": tail_reward_sat(
             params, exhaustion_period(params)
         ),
@@ -183,16 +183,16 @@ def report(params: dict) -> dict:
     }
 
 
-def whole_jnt(params: dict, sat: int, what: str) -> int:
-    """Convert an issuance figure to JNT, refusing a fraction.
+def whole_srct(params: dict, sat: int, what: str) -> int:
+    """Convert an issuance figure to SRCT, refusing a fraction.
 
-    Both reported horizons are pre-tail (the ladder pays whole JNT), so a
+    Both reported horizons are pre-tail (the ladder pays whole SRCT), so a
     remainder means the schedule changed shape and the vector would silently
     carry a truncated number.
     """
-    if sat % SAT_PER_JNT:
-        raise AssertionError(f"{params['name']}: {what} is not a whole number of JNT")
-    return sat // SAT_PER_JNT
+    if sat % SAT_PER_SRCT:
+        raise AssertionError(f"{params['name']}: {what} is not a whole number of SRCT")
+    return sat // SAT_PER_SRCT
 
 
 def check_design_doc_claims() -> list[str]:
@@ -201,17 +201,17 @@ def check_design_doc_claims() -> list[str]:
     m = report(MAINNET)
 
     # Section 16: the ladder start and shape (no stock cap since Decision 18).
-    if m["ladder_jnt"] != [76, 38, 19, 9, 4, 2, 1, 0]:
-        problems.append(f"reward ladder is {m['ladder_jnt']}, expected [76,38,19,9,4,2,1,0]")
+    if m["ladder_srct"] != [76, 38, 19, 9, 4, 2, 1, 0]:
+        problems.append(f"reward ladder is {m['ladder_srct']}, expected [76,38,19,9,4,2,1,0]")
     if abs(m["halving_period_years"] - 5.0) > 0.01:
         problems.append(f"halving period is {m['halving_period_years']}y, expected 5y")
 
     # The geometric-series shortcut over-states issuance: floor division means
-    # the ladder issues 149H - 76 JNT (genesis eats a rung-0 height without
+    # the ladder issues 149H - 76 SRCT (genesis eats a rung-0 height without
     # minting).
-    if m["max_reachable_jnt"] != 149 * 262_800 - 76:
+    if m["max_reachable_srct"] != 149 * 262_800 - 76:
         problems.append(
-            f"reachable issuance is {m['max_reachable_jnt']}, expected {149 * 262_800 - 76}"
+            f"reachable issuance is {m['max_reachable_srct']}, expected {149 * 262_800 - 76}"
         )
     # Decision 18: the rate anchor replaces the stock cap. The approved
     # schedule must fit under it with headroom (~3x on mainnet), never bind.
@@ -222,8 +222,8 @@ def check_design_doc_claims() -> list[str]:
             f"largest tail window {m['largest_tail_window_pct_of_issued']}% must sit under the 1 % anchor"
         )
 
-    # The tail (M-A/M-B): 0.5 JNT at activation, then 0.25, 0.125, then the
-    # 0.1 JNT floor held forever — every step at most a halving, the step into
+    # The tail (M-A/M-B): 0.5 SRCT at activation, then 0.25, 0.125, then the
+    # 0.1 SRCT floor held forever — every step at most a halving, the step into
     # the floor the smallest of the series.
     if m["tail_activation_height"] != 1_839_600:
         problems.append(
@@ -231,7 +231,7 @@ def check_design_doc_claims() -> list[str]:
         )
     first_tail = exhaustion_period(MAINNET)
     path = [
-        tail_reward_sat(MAINNET, first_tail + i) / SAT_PER_JNT for i in range(4)
+        tail_reward_sat(MAINNET, first_tail + i) / SAT_PER_SRCT for i in range(4)
     ]
     if path != [0.5, 0.25, 0.125, 0.1]:
         problems.append(f"mainnet tail path is {path}, expected [0.5, 0.25, 0.125, 0.1]")
@@ -246,7 +246,7 @@ def check_design_doc_claims() -> list[str]:
 
     # Issuance keeps growing forever under a tail — the whole point of M-A.
     late = cumulative_sat(MAINNET, 64 * 262_800)
-    if late <= m["max_reachable_jnt"] * SAT_PER_JNT:
+    if late <= m["max_reachable_srct"] * SAT_PER_SRCT:
         problems.append("the tail did not add any issuance past the ladder era")
     # …and it stays a trickle: the mainnet floor mints ~0.013 %/yr of the
     # supply issued at exhaustion, far under the 0.2 %/yr the anchor implies.
@@ -288,7 +288,7 @@ def main() -> int:
     out.write_text(
         json.dumps(
             {
-                "sat_per_jnt": SAT_PER_JNT,
+                "sat_per_srct": SAT_PER_SRCT,
                 "mainnet": report(MAINNET),
                 "mini": report(MINI),
             },
