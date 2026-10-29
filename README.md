@@ -1038,6 +1038,8 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 
 ---
 
+## Repository layout
+
 | Path | What it is |
 |---|---|
 | [`SPEC.md`](SPEC.md) | **Normative.** Where a disagreement exists, this wins. |
@@ -1227,7 +1229,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1360 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1367 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
