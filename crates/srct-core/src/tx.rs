@@ -513,12 +513,28 @@ impl Transaction {
     }
 
     /// Exact bytes signed for input `k`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k` is out of bounds. Callers with a wire-supplied index
+    /// must use [`Self::try_message_for_input`] instead.
     pub fn message_for_input(&self, k: usize) -> Hash {
+        self.try_message_for_input(k)
+            .expect("message_for_input index out of bounds")
+    }
+
+    /// Fallible form of [`Self::message_for_input`] for wire-supplied indices:
+    /// a bad index is `Malformed`, never a panic.
+    pub fn try_message_for_input(&self, k: usize) -> crate::error::Result<Hash> {
+        let input = self
+            .inputs
+            .get(k)
+            .ok_or(crate::error::Error::Malformed("input index out of bounds"))?;
+        let k32 = u32::try_from(k)
+            .map_err(|_| crate::error::Error::Malformed("input index overflows u32"))?;
         let mut w = Writer::with_capacity(48);
-        w.u32le(k as u32)
-            .fixed(&self.sighash())
-            .u32le(self.inputs[k].prev_index);
-        sha256_dom(DOM_SIG, &[w.as_slice()])
+        w.u32le(k32).fixed(&self.sighash()).u32le(input.prev_index);
+        Ok(sha256_dom(DOM_SIG, &[w.as_slice()]))
     }
 
     /// Total value of all outputs.

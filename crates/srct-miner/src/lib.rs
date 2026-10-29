@@ -145,6 +145,10 @@ pub fn solve_header(
     let found = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
     let solution: Arc<Mutex<Option<Header>>> = Arc::new(Mutex::new(None));
+    // First verification error, if any: a swallowed `Err` (e.g.
+    // `TargetOverflow`) would otherwise masquerade as "no solution", sending
+    // the miner back for a template that was never the problem.
+    let first_err: Arc<Mutex<Option<srct_core::error::Error>>> = Arc::new(Mutex::new(None));
     let per_thread = max_attempts.div_ceil(n_threads as u64);
 
     std::thread::scope(|s| {
@@ -154,6 +158,7 @@ pub fn solve_header(
             let solution = solution.clone();
             let template = template.clone();
             let mode = mode.clone();
+            let first_err = first_err.clone();
             s.spawn(move || {
                 let spec_owned = match &mode {
                     PowMode::Hybrid(spec) => Some(spec.clone()),
@@ -185,7 +190,13 @@ pub fn solve_header(
                         local += 1;
                         let ok = match satisfies(&mode, &mut solver, &header) {
                             Ok(ok) => ok,
-                            Err(_) => return,
+                            Err(e) => {
+                                // Record, signal, stop: the error is global
+                                // (bad spec or target), not this nonce.
+                                *first_err.lock().unwrap() = Some(e);
+                                found.store(true, Ordering::Relaxed);
+                                return;
+                            }
                         };
                         if ok {
                             if !found.swap(true, Ordering::Relaxed) {
@@ -210,6 +221,11 @@ pub fn solve_header(
         }
     });
 
+    // A recorded verification error outranks "no solution": the caller must
+    // see the broken spec/target, not an empty nonce space.
+    if let Some(e) = first_err.lock().unwrap().take() {
+        return Err(e);
+    }
     let header = solution.lock().unwrap().clone();
     match header {
         Some(header) => Ok(Some(MineSolution {

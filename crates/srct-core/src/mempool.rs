@@ -288,7 +288,29 @@ impl Mempool {
             });
         }
         if self.bytes + size > self.max_bytes {
-            return Err(MempoolError::Full);
+            // Fee-pinning guard: a full pool must not let the first filler
+            // lock out every higher-fee transaction behind it. Evict the
+            // single lowest-fee-rate entry when the newcomer strictly
+            // outbids it, so spam is displaced rather than entrenched.
+            // Ties keep the incumbent (first-seen wins, no churn).
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| (e.fee_rate, e.accepted_at))
+                .map(|(id, e)| (*id, e.fee_total, e.fee_rate));
+            match victim {
+                Some((vid, _, vrate)) if entry.fee_rate > vrate => {
+                    if let Some(evicted) = self.entries.remove(&vid) {
+                        self.forget(&vid, &evicted);
+                    }
+                }
+                _ => return Err(MempoolError::Full),
+            }
+            // Re-check after eviction: a single huge transaction may still
+            // not fit even with the cheapest entry gone.
+            if self.bytes + size > self.max_bytes {
+                return Err(MempoolError::Full);
+            }
         }
 
         for input in &entry.tx.inputs {

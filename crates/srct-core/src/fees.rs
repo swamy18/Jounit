@@ -32,8 +32,19 @@ pub fn next_base_fee(params: &NetworkParams, current: u64, gas_used: u64) -> u64
 }
 
 /// Fee a transaction must pay: the burned portion for its own gas usage.
+///
+/// Saturates rather than wraps: a `base_fee * gas` product past `u64::MAX`
+/// reads as `u64::MAX` (an unpayable fee, refused downstream) instead of a
+/// small wrapped figure that could masquerade as cheap. Callers that need to
+/// distinguish overflow from a genuinely huge fee use [`checked_required_fee`].
 pub fn required_fee(base_fee: u64, gas_used: u64) -> u64 {
     base_fee.saturating_mul(gas_used)
+}
+
+/// Fallible form of [`required_fee`] for consensus paths: overflow is
+/// `ValueOverflow`, never a silently clamped figure.
+pub fn checked_required_fee(base_fee: u64, gas_used: u64) -> Result<u64> {
+    base_fee.checked_mul(gas_used).ok_or(Error::ValueOverflow)
 }
 
 pub fn exceeds_base_fee(base_fee: u64, fee: u64, gas_used: u64) -> bool {
@@ -53,7 +64,11 @@ pub fn exceeds_base_fee(base_fee: u64, fee: u64, gas_used: u64) -> bool {
 ///
 /// Invariant: burned + pscb + tip == total_fees.
 pub fn split_fees(total_gas: u64, total_fees: u64, base_fee: u64) -> Result<FeeSplit> {
-    let full_base = base_fee.saturating_mul(total_gas);
+    // Checked: a saturated product would either over-charge (clamped high) or
+    // mislabel a DoS-sized gas declaration as a plain underpayment.
+    let full_base = base_fee
+        .checked_mul(total_gas)
+        .ok_or(Error::ValueOverflow)?;
     if full_base > total_fees {
         return Err(Error::BadFee("fees below required base fee"));
     }

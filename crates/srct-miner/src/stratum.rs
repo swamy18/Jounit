@@ -45,7 +45,9 @@ use srct_core::block::{Block, Header};
 use srct_core::error::{Error, Result};
 use srct_core::hash::Address;
 use srct_core::hbm_pow::HbmConfig;
-use srct_core::puzzle::{PuzzleSolver, PuzzleSpec};
+#[cfg(test)]
+use srct_core::puzzle::PuzzleSolver;
+use srct_core::puzzle::PuzzleSpec;
 
 use crate::payout::{FinalizedRound, PaymentReceipt, RoundTracker, PPLNS_MAX_WINDOW};
 
@@ -403,17 +405,28 @@ impl Pool {
         // miners past the cap are refused up front, so a full pool neither
         // records debt it cannot track nor forwards work it will not pay.
         {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| Error::Malformed("pool lock"))?;
-            let payouts = self
-                .payouts
-                .lock()
-                .map_err(|_| Error::Malformed("pool lock"))?;
-            let known = inner.stats.contains_key(&miner) || payouts.is_tracked(&miner);
-            if !known && inner.stats.len() >= inner.max_miners {
-                return Err(Error::Malformed("miner table full"));
+            // One lock at a time, always: `inner` then `payouts` nested here
+            // would deadlock against any future `payouts` -> `inner` path.
+            // (Same rule as the `encode_state` copy-under-each-lock pattern.)
+            let (known_in_stats, table_full) = {
+                let inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| Error::Malformed("pool lock"))?;
+                (
+                    inner.stats.contains_key(&miner),
+                    inner.stats.len() >= inner.max_miners,
+                )
+            };
+            if !known_in_stats {
+                let tracked = self
+                    .payouts
+                    .lock()
+                    .map_err(|_| Error::Malformed("pool lock"))?
+                    .is_tracked(&miner);
+                if !tracked && table_full {
+                    return Err(Error::Malformed("miner table full"));
+                }
             }
         }
         // The solution identity, computed before the block moves into the
@@ -765,9 +778,14 @@ impl Pool {
         self.decode_state(&bytes)
     }
 
-    /// Check the header's proof against an arbitrary bar by re-running the
-    /// consensus rule with the difficulty field swapped. The header's own
-    /// difficulty is untouched, so this never weakens what `submit` enforces.
+    /// Check the header's proof against an arbitrary share bar.
+    ///
+    /// The header is evaluated **as-is**: the share bar only selects the
+    /// target the resulting hash is compared against. The header's own
+    /// difficulty field is part of the hashed preimage (`stage1_seed` /
+    /// `memory_hash` both serialize it), so swapping it would evaluate a
+    /// different puzzle instance — valid shares refused, invalid ones
+    /// accepted. This never weakens what `submit` enforces.
     ///
     /// Dispatch is on the *header's* puzzle id, not the pool's spec: a pool
     /// serving both puzzles (hybrid spec + HBM config) must verify an HBM
@@ -779,18 +797,22 @@ impl Pool {
         }
         // A bar harder than the representable target (u128::MAX) can never
         // be met by any proof: that is a refused share, not an error.
-        if srct_core::u256::target_for_difficulty(difficulty).is_err() {
-            return Ok(false);
-        }
-        let mut probe = header.clone();
-        probe.difficulty = difficulty;
-        match probe.puzzle_id {
-            1 => PuzzleSolver::new(self.spec.clone()).satisfies(&probe),
+        let target = match srct_core::u256::target_for_difficulty(difficulty) {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        match header.puzzle_id {
+            1 => {
+                let run = srct_core::puzzle::run_puzzle(&self.spec, header);
+                Ok(srct_core::u256::U256::from_be_bytes(run.final_hash) <= target)
+            }
             2 => {
                 let cfg = self.hbm.as_ref().ok_or_else(|| {
                     Error::BadPuzzleSpec("hbm proof without an hbm config".into())
                 })?;
-                srct_core::hbm_pow::hbm_satisfies_cfg(&probe, difficulty, cfg)
+                cfg.validate()?;
+                let mh = srct_core::hbm_pow::memory_hash(header, cfg.lanes, cfg.accesses);
+                Ok(srct_core::u256::U256::from_be_bytes(mh) <= target)
             }
             other => Err(Error::BadPuzzleSpec(format!(
                 "pool cannot verify puzzle {other}"

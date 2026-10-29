@@ -304,12 +304,16 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
     let found = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
     let solution: Arc<Mutex<Option<Header>>> = Arc::new(Mutex::new(None));
+    // First backend refusal, if any: same rule as the sequential path — a
+    // poisoned backend must surface as an error, never as "no solution".
+    let first_err: Arc<Mutex<Option<srct_core::error::Error>>> = Arc::new(Mutex::new(None));
 
     std::thread::scope(|s| {
         for t in 0..n_threads {
             let found = found.clone();
             let attempts = attempts.clone();
             let solution = solution.clone();
+            let first_err = first_err.clone();
             let template = template.clone();
             let mode = mode.clone();
             let spec = spec.clone();
@@ -328,36 +332,43 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
                 let mut chunk: Vec<Header> = Vec::with_capacity(batch);
                 // Evaluate one filled chunk in nonce order.
                 // Ok(Some(h)) = solution found; Ok(None) = keep grinding;
-                // Err(()) = solver refused (poisoned backend) — stop, never spin.
-                let mut flush =
-                    |chunk: &mut Vec<Header>| -> std::result::Result<Option<Header>, ()> {
-                        if chunk.is_empty() {
-                            return Ok(None);
-                        }
-                        if let Some(bs) = batch_solver.as_mut() {
-                            let runs = match bs.evaluate(chunk) {
-                                Ok(runs) => runs,
-                                Err(_) => return Err(()),
-                            };
-                            for (h, run) in chunk.iter().zip(runs.iter()) {
-                                if srct_core::u256::U256::from_be_bytes(run.final_hash) <= target {
-                                    return Ok(Some(h.clone()));
-                                }
+                // Err(e) = solver refused (poisoned backend) — record, stop,
+                // never spin and never report "no solution" for it.
+                let mut flush = |chunk: &mut Vec<Header>| -> std::result::Result<
+                    Option<Header>,
+                    srct_core::error::Error,
+                > {
+                    if chunk.is_empty() {
+                        return Ok(None);
+                    }
+                    if let Some(bs) = batch_solver.as_mut() {
+                        let runs = match bs.evaluate(chunk) {
+                            Ok(runs) => runs,
+                            Err(e) => {
+                                return Err(srct_core::error::Error::BadPuzzleSpec(format!(
+                                    "compute backend refused: {e}"
+                                )))
                             }
-                            Ok(None)
-                        } else if let Some(solver) = seq_solver.as_mut() {
-                            for h in chunk.iter() {
-                                match solver.satisfies(h) {
-                                    Ok(true) => return Ok(Some(h.clone())),
-                                    Ok(false) => {}
-                                    Err(_) => return Err(()),
-                                }
+                        };
+                        for (h, run) in chunk.iter().zip(runs.iter()) {
+                            if srct_core::u256::U256::from_be_bytes(run.final_hash) <= target {
+                                return Ok(Some(h.clone()));
                             }
-                            Ok(None)
-                        } else {
-                            Ok(None)
                         }
-                    };
+                        Ok(None)
+                    } else if let Some(solver) = seq_solver.as_mut() {
+                        for h in chunk.iter() {
+                            match solver.satisfies(h) {
+                                Ok(true) => return Ok(Some(h.clone())),
+                                Ok(false) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Ok(None)
+                    } else {
+                        Ok(None)
+                    }
+                };
                 loop {
                     let mut nonce = t as u64;
                     let mut wrapped = false;
@@ -391,7 +402,11 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
                             }
                         }
                         let won = match flush(&mut chunk) {
-                            Err(()) => return,
+                            Err(e) => {
+                                *first_err.lock().unwrap() = Some(e);
+                                found.store(true, Ordering::Relaxed);
+                                return;
+                            }
                             Ok(hit) => hit,
                         };
                         if let Some(h) = won {
@@ -417,6 +432,10 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
         }
     });
 
+    // A recorded backend refusal outranks "no solution" (see `lib.rs`).
+    if let Some(e) = first_err.lock().unwrap().take() {
+        return Err(e);
+    }
     let header = solution.lock().unwrap().clone();
     match header {
         Some(header) => Ok(Some(crate::MineSolution {

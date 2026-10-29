@@ -94,6 +94,22 @@ impl UtxoSet {
     pub fn apply_tx(&mut self, tx: &Transaction, height: u64) -> Result<Undo> {
         let mut undo = Undo::default();
 
+        // Overwrite guard, checked before anything mutates: outputs are keyed
+        // by txid, and a blind `insert` would silently destroy the existing
+        // coins at a colliding outpoint with an undo record that cannot
+        // restore them. A collision is only ever a replay or a txid reuse —
+        // both are refused, never merged.
+        let txid = tx.txid();
+        for (index, _) in tx.outputs.iter().enumerate() {
+            let op = OutPoint {
+                txid,
+                index: u32::try_from(index).map_err(|_| Error::ValueOverflow)?,
+            };
+            if self.contains(&op) {
+                return Err(Error::Malformed("transaction output already exists"));
+            }
+        }
+
         // Resolve first, mutate second.
         for input in &tx.inputs {
             let op = input.outpoint();
@@ -110,8 +126,8 @@ impl UtxoSet {
 
         for (index, out) in tx.outputs.iter().enumerate() {
             let op = OutPoint {
-                txid: tx.txid(),
-                index: index as u32,
+                txid,
+                index: u32::try_from(index).map_err(|_| Error::ValueOverflow)?,
             };
             self.map
                 .insert((op.txid, op.index), Utxo { out: *out, height });
@@ -206,6 +222,12 @@ pub fn check_tx(
     if tx.value_out_overflows() {
         return Err(Error::ValueOverflow);
     }
+    // Timelock: a transaction whose lock_time is in the future is not yet
+    // spendable. Serialized and signed but never enforced — without this gate
+    // any timelocked transaction mines immediately.
+    if tx.lock_time > height {
+        return Err(Error::Malformed("lock_time in the future"));
+    }
 
     let mut seen: HashSet<Key> = HashSet::new();
     let mut value_in = 0u64;
@@ -215,10 +237,16 @@ pub fn check_tx(
             return Err(Error::DuplicateInput);
         }
         let held = utxo.get(&op).ok_or(Error::UnknownOutPoint)?;
-        if held.height + coinbase_maturity > height {
+        // `checked_add`: a plain `+` wraps in release and would let a
+        // near-`u64::MAX` creation height bypass maturity.
+        let required = held
+            .height
+            .checked_add(coinbase_maturity)
+            .ok_or(Error::ValueOverflow)?;
+        if required > height {
             return Err(Error::ImmatureCoinbase {
                 height: held.height,
-                required: held.height + coinbase_maturity,
+                required,
             });
         }
         if held.out.value == 0 {
@@ -249,6 +277,9 @@ pub fn check_tx(
     }
 
     let value_out = tx.value_out();
+    // `ValueOverflow` here means conservation failure (inputs do not cover
+    // outputs), not an arithmetic wrap — the checked arithmetic above makes
+    // a wrap unrepresentable by this point.
     if value_in < value_out {
         return Err(Error::ValueOverflow);
     }

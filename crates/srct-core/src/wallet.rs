@@ -60,11 +60,20 @@ pub enum SignMode {
 impl Wallet {
     pub fn new_random(label: impl Into<String>) -> Self {
         use rand::RngCore;
-        let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        Wallet {
-            label: label.into(),
-            private_key: bytes,
+        let label = label.into();
+        // Loop until the bytes are a valid secp256k1 scalar: all-zero or
+        // >= n is unspendable, and a wallet that cannot sign must never be
+        // constructed by chance (negligible probability, fatal outcome).
+        loop {
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let w = Wallet {
+                label: label.clone(),
+                private_key: bytes,
+            };
+            if w.signing_key().is_ok() {
+                return w;
+            }
         }
     }
 
@@ -90,10 +99,11 @@ impl Wallet {
 
     pub fn pubkey(&self) -> Result<[u8; 33]> {
         let sk = self.signing_key()?;
-        // invariant: a compressed secp256k1 verifying key is always 33 bytes.
-        Ok(sk.verifying_key().to_encoded_point(true).as_bytes()[..33]
+        // Invariant: a compressed secp256k1 verifying key is always 33 bytes.
+        // Fallible conversion instead of unwrap: library code must not panic.
+        sk.verifying_key().to_encoded_point(true).as_bytes()[..33]
             .try_into()
-            .unwrap())
+            .map_err(|_| Error::BadPubkey)
     }
 
     /// The address funds from this wallet.
@@ -269,12 +279,12 @@ impl Wallet {
 
     /// BIP-340 Schnorr signing key over the same 32-byte scalar.
     pub fn schnorr_signing_key(&self) -> Result<k256::schnorr::SigningKey> {
-        let mut raw = [0u8; 32];
+        // `Zeroizing` so the stack copy is wiped even on the error path:
+        // `from_bytes` returning `Err` must not leave the scalar behind.
+        let mut raw = zeroize::Zeroizing::new([0u8; 32]);
         raw.copy_from_slice(&self.private_key);
-        let sk = k256::schnorr::SigningKey::from_bytes(&raw)
-            .map_err(|_| Error::BadKey("scalar out of range"))?;
-        raw.zeroize();
-        Ok(sk)
+        k256::schnorr::SigningKey::from_bytes(&raw[..])
+            .map_err(|_| Error::BadKey("scalar out of range"))
     }
 
     /// BIP-340 x-only public key, 32 bytes.

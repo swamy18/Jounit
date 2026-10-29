@@ -1688,6 +1688,48 @@ fields) and is pinned by `mainnet_genesis_is_frozen_for_the_version_bump`.
   spend under a revoked grant, and the credit flow - plus the property that a
   command the chain would skip mines nothing.
 
+### 2026-10-29 hardening pass (no new features)
+
+Security/quality review of wallet, mining and core code, fixing only
+existing behavior — no new transaction types, endpoints or issuance:
+
+- Wallet: `new_random` loops until the scalar is valid; `schnorr_signing_key`
+  wipes its stack copy on the error path; `pubkey` returns `BadPubkey`
+  instead of unwrapping; `cmd_wallet --new` refuses duplicate labels
+  (shadowed wallets); validator labels are allowlisted (`[A-Za-z0-9._-]`,
+  max 64, no `.`/`..`); validator keys go through the atomic 0600
+  `write_private` path with an explicit exists-check; plaintext saves keep
+  the `Zeroizing` wrapper to the write; Argon2id parameters are pinned
+  explicitly (19 MiB, 2 passes, 1 lane) so a crate upgrade cannot lock
+  operators out of existing wallets.
+- Mining: pool `proof_meets` no longer mutates `header.difficulty` before
+  hashing — the share bar selects the target, the header is evaluated
+  as-is (mutating it evaluated a different puzzle instance, so valid
+  shares could be refused and invalid ones accepted); solver verification
+  errors propagate instead of masquerading as "no solution" (sequential
+  and batched paths); `--threads`/`--batch` are clamped
+  (1024/65 536, `0` keeps its existing meanings); miner HTTP responses are
+  capped at 16 MiB with malformed responses refused; pool lock ordering
+  is one-lock-at-a-time (no `inner` -> `payouts` nesting); payout
+  `record_share` saturates and ledger decode caps rounds at
+  `MAX_ROUNDS_KEPT`.
+- Core: `lock_time` is now enforced in `check_tx` (future-locked
+  transactions no longer mine immediately); maturity uses `checked_add`;
+  overwrite guards before every consensus `UtxoSet::insert` (apply,
+  coinbase, unbond release, exit claims) so a colliding outpoint is
+  refused instead of silently destroying coins; `u32::try_from` for output
+  indices; checked PSCB/burned reserve credit and undo; checked
+  `split_fees` product; `message_for_input` gains a fallible
+  `try_message_for_input` for wire-supplied indices; mempool evicts the
+  lowest-fee-rate entry when a strictly higher-rate transaction arrives
+  full (ties keep the incumbent); exit claims refuse zero amounts.
+- Verified: revocation is checked node-side before both `admit_payment`
+  call sites (`payment_submit` and the shared x402 admission), matching
+  the documented design — no change needed there.
+- `cargo clippy --workspace --all-targets` clean; `srct-core --lib`
+  (522), `srct-miner` (47), redteam suites, `srct-node --test api`
+  (47) + `agent_economy`/`micro_safety`/`x402`, L2 `credit_flow` — all green.
+
 ### 2026-10-29 service-layer additions (no consensus change)
 
 Three feature commits landed on top of the consensus described above. All are

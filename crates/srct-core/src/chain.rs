@@ -722,6 +722,12 @@ impl Chain {
             index: 0,
         };
         if minted > 0 {
+            // Overwrite guard (see `UtxoSet::apply_tx`): the coinbase input
+            // commits to its height, so a live output here is a duplicate
+            // block, never a coincidence.
+            if self.utxo.contains(&cb_op) {
+                return Err(Error::Malformed("coinbase output already exists"));
+            }
             body_undo.created.push(cb_op);
             self.utxo.insert(
                 cb_op,
@@ -749,10 +755,11 @@ impl Chain {
                     .ok_or(Error::ValueOverflow)?;
             }
         }
-        // Credit the PSCB reserve (M1). Saturate rather than panic: on a
-        // pathologically congested chain the accumulated PSCB could notionally
-        // exceed u64::MAX over millions of blocks, though in practice the
-        // hard-capped fee schedule makes this unreachable.
+        // Credit the PSCB reserve (M1). Checked, not saturating: after
+        // saturation an undo would subtract the delta from a clamped total
+        // and permanently corrupt the reserve — fail the block instead.
+        // In practice the hard-capped fee schedule makes this unreachable,
+        // which is exactly why refusing is safe.
         //
         // Vesting payouts fold into the same delta: they are reserve-bound
         // value like the fee half, so reorgs rewind them together.
@@ -760,7 +767,10 @@ impl Chain {
             .pscb
             .checked_add(vault_payouts)
             .ok_or(Error::ValueOverflow)?;
-        self.pscb_reserve = self.pscb_reserve.saturating_add(pscb_delta);
+        self.pscb_reserve = self
+            .pscb_reserve
+            .checked_add(pscb_delta)
+            .ok_or(Error::ValueOverflow)?;
         self.pscb_undo.insert(hash, pscb_delta);
         // The destroyed half, tracked the same way (Stage SA-4): the two
         // halves together are the removal term net-supply reporting needs.
@@ -769,7 +779,10 @@ impl Chain {
             .burned
             .checked_add(stake_apply.slash_burned)
             .ok_or(Error::ValueOverflow)?;
-        self.burned_fees_total = self.burned_fees_total.saturating_add(burned_delta);
+        self.burned_fees_total = self
+            .burned_fees_total
+            .checked_add(burned_delta)
+            .ok_or(Error::ValueOverflow)?;
         self.burned_undo.insert(hash, burned_delta);
         // Bond inverses for reorgs, rewound exactly like the UTXO undo
         // records, for the same reason.
@@ -939,6 +952,12 @@ impl Chain {
                     txid: tx.txid(),
                     index: u32::try_from(tx.outputs.len()).map_err(|_| Error::ValueOverflow)?,
                 };
+                // Overwrite guard (see `UtxoSet::apply_tx`): an unbond release
+                // is unique per transaction, so a live output here is a
+                // replay, never a coincidence.
+                if self.utxo.contains(&release) {
+                    return Err(Error::Malformed("unbond release output already exists"));
+                }
                 self.utxo.insert(
                     release,
                     Utxo {
@@ -1317,6 +1336,20 @@ impl Chain {
         if self.released_exits.contains(&(claim.owner, claim.nonce)) {
             return Err(Error::Malformed("exit already released"));
         }
+        // A zero-amount claim would create an unspendable index-0 output
+        // (`check_tx` refuses to spend zero-value outputs): state bloat with
+        // no holder. Refused like any other zero-value output.
+        if claim.amount_sat == 0 {
+            return Err(Error::Malformed("exit claim amount must be nonzero"));
+        }
+        // Overwrite guard (see `UtxoSet::apply_tx`): release outputs are
+        // keyed by claim id, and a blind insert would destroy live coins.
+        if utxo.contains(&OutPoint {
+            txid: claim.claim_id(),
+            index: 0,
+        }) {
+            return Err(Error::Malformed("exit release output already exists"));
+        }
         // The anchor: the queue block's committed root must exist and the
         // record proof must verify against it. A queue in a block that
         // committed no root cannot be proven — which is why post-activation
@@ -1535,13 +1568,22 @@ impl Chain {
         }
         self.undo.remove(hash);
         // Undo the PSCB credit for this block (M1 reorg correctness).
+        // Checked pairing with the checked credit above: the reserve can
+        // never hold less than a canonical block credited, so an underflow
+        // here means state corruption, not an edge to clamp through.
         if let Some(delta) = self.pscb_undo.remove(hash) {
-            self.pscb_reserve = self.pscb_reserve.saturating_sub(delta);
+            self.pscb_reserve = self
+                .pscb_reserve
+                .checked_sub(delta)
+                .ok_or(Error::ValueOverflow)?;
         }
         // Undo the burn debit the same way, or a reorg would leave phantom
         // removal behind and net-supply reporting would drift from replay.
         if let Some(delta) = self.burned_undo.remove(hash) {
-            self.burned_fees_total = self.burned_fees_total.saturating_sub(delta);
+            self.burned_fees_total = self
+                .burned_fees_total
+                .checked_sub(delta)
+                .ok_or(Error::ValueOverflow)?;
         }
         // Unmark this block's releases (approved P1 reorg correctness): a
         // rolled-back release never happened, so its identity is spendable

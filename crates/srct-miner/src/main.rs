@@ -102,6 +102,22 @@ fn parse_args() -> Args {
                 .ok()
         })
         .unwrap_or_default();
+    // Clamp resource use at the CLI boundary: thread and batch counts are
+    // operator input, and an unbounded count is a local OOM (`--threads
+    // 1000000` spawns a million OS threads; `--batch 100000000` sizes a
+    // per-thread buffer). `0` keeps its existing meanings: one thread per
+    // CPU, and sequential (batch 1) solving.
+    const MAX_THREADS: usize = 1024;
+    const MAX_BATCH: usize = 65_536;
+    if threads > MAX_THREADS {
+        eprintln!("--threads capped at {MAX_THREADS}");
+        usage();
+    }
+    if batch > MAX_BATCH {
+        eprintln!("--batch capped at {MAX_BATCH}");
+        usage();
+    }
+    let batch = if batch == 0 { 1 } else { batch };
     Args {
         node,
         miner,
@@ -136,20 +152,26 @@ fn http(
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
+    // Cap the response: a compromised node must not be able to OOM the miner
+    // with an unbounded body. 16 MiB matches the pool/API line caps.
+    const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
     let mut buf = Vec::new();
     // A refusal may arrive before the whole body is written; that is the
     // server doing its job, not a failure of this client.
-    let _ = stream.read_to_end(&mut buf);
+    let _ = stream.take(MAX_RESPONSE_BYTES + 1).read_to_end(&mut buf);
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err("response over the 16 MiB cap".to_string());
+    }
     let text = String::from_utf8_lossy(&buf).into_owned();
     let status = text
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .ok_or_else(|| "malformed HTTP status line".to_string())?;
     let body = text
         .split_once("\r\n\r\n")
         .map(|(_, b)| b.to_string())
-        .unwrap_or_default();
+        .ok_or_else(|| "malformed HTTP response (no header terminator)".to_string())?;
     Ok((status, body))
 }
 

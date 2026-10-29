@@ -165,7 +165,15 @@ impl RoundTracker {
         if self.log.len() > PPLNS_MAX_WINDOW {
             self.log.pop_front();
         }
-        *self.lifetime_shares.entry(*miner).or_insert(0) += 1;
+        // Saturating: a wrapping counter would eventually credit a miner
+        // with fewer shares than earned; clamping keeps the ledger monotonic.
+        // `Pool` additionally bounds the miner table at `MAX_MINERS`.
+        *self.lifetime_shares.entry(*miner).or_insert(0) = self
+            .lifetime_shares
+            .get(miner)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
     }
 
     /// Close the open round on a found block: split `coinbase_sat`
@@ -382,7 +390,7 @@ impl RoundTracker {
         let carry_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
         let operator_earned_sat = r.u64le().map_err(|e| format!("ledger: {e}"))?;
         let rounds_len = r.u32le().map_err(|e| format!("ledger: {e}"))? as usize;
-        if rounds_len > MAX_ROUNDS_KEPT + 1 {
+        if rounds_len > MAX_ROUNDS_KEPT {
             return Err(format!("ledger: {rounds_len} rounds over the cap"));
         }
         let mut rounds = Vec::with_capacity(rounds_len);

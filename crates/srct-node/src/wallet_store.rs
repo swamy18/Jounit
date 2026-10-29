@@ -61,10 +61,15 @@ pub fn is_encrypted(blob: &[u8]) -> bool {
 /// scope rather than sitting in a freed allocation for the next taker.
 fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
     let mut key = Zeroizing::new([0u8; 32]);
-    // Argon2id at the crate's defaults (RFC 9106 second recommended option):
-    // memory-hard on purpose, so an attacker with the file cannot brute-force
-    // a human passphrase at the speed of a GPU hash.
-    Argon2::default()
+    // Argon2id pinned to explicit parameters (RFC 9106 second recommended
+    // option: 19 MiB, 2 passes, 1 lane): memory-hard on purpose, so an
+    // attacker with the file cannot brute-force a human passphrase at the
+    // speed of a GPU hash. Pinned rather than `Argon2::default()` so a crate
+    // upgrade cannot silently change the KDF and lock operators out of
+    // wallets encrypted under today's parameters.
+    let params =
+        argon2::Params::new(19 * 1024, 2, 1, None).map_err(|e| format!("argon2 params: {e}"))?;
+    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
         .hash_password_into(passphrase.as_bytes(), salt, &mut key[..])
         .map_err(|e| format!("key derivation failed: {e}"))?;
     Ok(key)

@@ -51,7 +51,6 @@ use srct_net::syncer::SyncManager;
 use srct_node::l2::NodeL2;
 use srct_node::wallet_store;
 use srct_store::{AppendOutcome, BlockStore, StateFile};
-use std::io::Write as _;
 
 const USAGE: &str = "\
 srct-node - Solar Cyber Unit base-layer node
@@ -501,14 +500,16 @@ impl Store {
     fn save_wallets(&self, wallets: &[Wallet]) -> Result<(), String> {
         fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         // The serialized wallets hold secrets, so the buffer wipes on drop.
+        // The plaintext path keeps the `Zeroizing` wrapper to the write:
+        // moving the inner `Vec` out would leave a plain buffer that is
+        // never wiped.
         let text =
             zeroize::Zeroizing::new(serde_json::to_vec_pretty(wallets).map_err(|e| e.to_string())?);
-        let mut text = text;
-        let payload = match wallet_store::passphrase_from_env() {
-            Some(passphrase) => wallet_store::encrypt(&passphrase, &text)?,
+        let payload: zeroize::Zeroizing<Vec<u8>> = match wallet_store::passphrase_from_env() {
+            Some(passphrase) => zeroize::Zeroizing::new(wallet_store::encrypt(&passphrase, &text)?),
             // Explicit operator opt-in: the plaintext file is the accepted
-            // risk, so move the buffer out rather than copying it again.
-            None if self.allow_plaintext_wallet => std::mem::take(&mut *text),
+            // risk, but the in-memory copy is still wiped after the write.
+            None if self.allow_plaintext_wallet => text,
             None => {
                 return Err(format!(
                     "refusing to write plaintext private keys to {}: set {} to \
@@ -1730,10 +1731,18 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
     }
 
     let label = args.str_or("label", "validator");
-    // The label becomes a filename (`validators/<label>.json`): refuse path
-    // separators and the Windows drive/ADS colon so `--label ../x` or
-    // `C:\x` cannot place a key file outside the validators directory.
-    if label.is_empty() || label.contains('/') || label.contains('\\') || label.contains(':') {
+    // The label becomes a filename (`validators/<label>.json`): allowlist it
+    // so `--label ../x`, `C:\x`, control characters and `.`/`..` cannot place
+    // a key file outside the validators directory. Blocklist checks miss
+    // dotfiles and unicode separators; the allowlist cannot.
+    if label.is_empty()
+        || label.len() > 64
+        || !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        || label == "."
+        || label == ".."
+    {
         return Err(format!(
             "invalid label `{label}`: letters, digits, dot, dash and underscore only"
         ));
@@ -1786,17 +1795,18 @@ fn write_validator_key(
 
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{label}.json"));
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // `create_new` refuses to overwrite an existing key file: a silent replace
+    // would orphan the public key an operator may already have bonded. Check
+    // first so the error names the conflict rather than an OS open failure.
+    if path.exists() {
+        return Err(format!(
+            "{}: refusing to overwrite an existing validator key",
+            path.display()
+        ));
     }
-    let mut f = opts
-        .open(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    f.write_all(&bytes).map_err(|e| e.to_string())?;
+    // Same atomic 0600 write the wallet file gets: temp + fsync + rename, so
+    // a torn validator key is impossible the same way a torn wallet is.
+    crate::wallet_store::write_private(&path, &bytes)?;
     Ok(path)
 }
 
@@ -1853,6 +1863,12 @@ fn cmd_wallet(args: &Args) -> Result<(), String> {
         return Ok(());
     }
     let label = args.str_or("label", &format!("w{}", wallets.len()));
+    // Duplicate labels shadow: `acting_wallet`/`cmd_send`/`cmd_mine` resolve
+    // by first match, so a second wallet under the same label is unreachable
+    // and its funds look lost through the CLI. Refuse rather than shadow.
+    if wallets.iter().any(|w| w.label == label) {
+        return Err(format!("a wallet named `{label}` already exists"));
+    }
     let w = Wallet::new_random(&label);
     println!("created `{}`", w.label);
     println!(
