@@ -22,6 +22,9 @@ and redistribute — no single person owns it.
 - [What the chain is for](#what-the-chain-is-for)
 - [Use cases](#use-cases)
 - [Machines, agents and robots](#machines-agents-and-robots)
+- [Agent payments (x402)](#agent-payments-x402)
+- [Micro-payments and wallet safety](#micro-payments-and-wallet-safety)
+- [Agent economy](#agent-economy)
 - [How fraud is detected](#how-fraud-is-detected)
 - [How withdrawals work](#how-withdrawals-work)
 - [Validators and finality](#validators-and-finality)
@@ -443,6 +446,177 @@ depends on them.
 
 ---
 
+## Agent payments (x402)
+
+SRCT speaks the x402 challenge/response shape with no second payment system.
+A client calls a paid resource, gets `402 Payment Required` plus a
+`PAYMENT-REQUIRED` envelope, and retries with a `PAYMENT-SIGNATURE`. The node
+verifies by reusing the ordinary payment admission path
+(`service::admit_payment` + the node-local `CreditBook`), so there is no
+consensus change.
+
+```
+Agent ──GET /v1/paid/weather──▶ 402 + PAYMENT-REQUIRED (exact, srct:mini, 500 sat)
+Agent ──budget check (max, allow-lists)──▶ PaymentRequest → Authorization → MachinePayment
+Agent ──GET + PAYMENT-SIGNATURE──▶ verify → admit → 200 + PAYMENT-RESPONSE + weather
+```
+
+- `GET /v1/paid/weather` — demo paid resource (500 sat, fixed recipient and
+  service `x402-weather-v1`). Missing signature returns `402`; a valid
+  signature admits the payment and returns `200` with the report.
+- `POST /v1/x402/verify` — facilitator verify (offline checks, no state change).
+- `POST /v1/x402/settle` — facilitator settle (same admission as
+  `POST /v1/payment/submit`).
+- Client budget (`X402Budget { max_amount_sat, allowed_recipients,
+  allowed_services }`) is enforced *before* signing — a server asking for
+  more is refused locally.
+- `scheme` is `exact` only; `network` is CAIP-2 `srct:<reference>`
+  (`srct_core::x402::srct_network_caip2` / `parse_srct_network`); `amount` is
+  a decimal satoshi string.
+
+Full mapping, curl flow and limits: [`docs/x402.md`](docs/x402.md). Demo:
+`python sim/x402_paid_api_demo.py`.
+
+---
+
+## Micro-payments and wallet safety
+
+Per-call billing without a manual transaction per call. Three primitives,
+none of which changes consensus — all reuse `MachinePayment`, `SpendPolicy`
+and the credit path. Full guide: [`docs/micropayments.md`](docs/micropayments.md).
+
+| Primitive | Endpoint | What it does |
+|---|---|---|
+| Batch quotes | `POST /v1/payments/aggregate` | Same payer, N recorded payments → one `PaymentBatch` with per-recipient merged outputs. Returns gas, required fee, per-payment cost and savings vs N separate transactions. Read-only quote. |
+| Stream channels | `POST /v1/streams/open`, `POST /v1/streams/settle`, `GET /v1/streams/{id}` | Open once (rate per block, expiry, hard cap); each unit of work mints an off-chain voucher; only the final voucher settles on chain as a `MachinePayment` with `reference` = stream id. `StreamBook` enforces exact, ordered, in-cap settlement; accounting persists in `state.bin` (v5). |
+| Sponsored intents | library `srct_core::micro::SponsoredIntent` | A sponsor signs fee coverage (`sign_sponsor_intent` / `verify_sponsor_intent`, bound to sponsor + batch hash + fee + expiry). Auditable fee-attribution record — deliberately not a consensus fee-payer, so a sponsor can cover a priced quote but never mint authority. |
+
+Benchmark (`python sim/micropayment_benchmark.py`): 10 payments to one
+provider cost one base fee instead of ten; a 100-unit stream settles once
+instead of 100 times. Latency follows the same curve — fewer transactions is
+fewer confirmation waits.
+
+The wallet around them is safer than a normal crypto wallet by construction
+(full operator guide: [`docs/wallet-safety.md`](docs/wallet-safety.md)):
+
+1. **Spend policy** — per-tx cap, tumbling window + cumulative cap,
+   recipient/service allow-lists (empty allows nothing), validity heights,
+   strict nonce increase, owner revocation. Fail-closed.
+2. **Session budget** (`safety::SessionBook`) — per-agent aggregate across
+   rotated policies, so spend cannot be split across N policies.
+   `SRCT_SESSION_WINDOW_BLOCKS` + `SRCT_SESSION_CAP_SAT` (both zero = gate off).
+3. **Risk checks** (`safety::RiskPolicy`) — high-value human-approval advisory
+   (`SRCT_HIGH_VALUE_THRESHOLD_SAT`; `payment_submit` answers
+   `requires_human_approval: true` — the agent pauses, the chain never
+   decides), per-payer velocity cap (`SRCT_MAX_PAYMENTS_PER_PAYER`), mainnet
+   guard in test mode (`SRCT_TEST_MODE=1` refuses `srct/mainnet` spends).
+4. **Idempotency** — `PaymentTracker` (exact replay → `duplicate: true`
+   before admission), `ReceiptBook` (same receipt → `duplicate`; conflicting
+   receipt → `receipt_conflict` 409), strictly increasing policy nonces.
+5. **Receipts + reconciliation** — every admission holds a credit reservation
+   until its receipt settles it; `GET /v1/payments/unsettled` lists
+   recorded-but-unbound payments (retry these, do not rebuild);
+   `GET /v1/receipts/orphans` lists receipts claiming unrecorded payments.
+6. **Audit trail** — every grant, admission, refusal, revocation, stream and
+   receipt appends to a bounded hash-chained `AuditLog`
+   (`GET /v1/audit` reports `chain_valid`; `GET /v1/risk/policy` exports the
+   live envelope).
+
+---
+
+## Agent economy
+
+Portable reputation, tiered spend power, job escrow with result binding,
+dollar pricing with SRCT settlement, auditable fiat ramps, and productive
+lending. Service-layer (node-local books), not consensus — except the L2
+credit positions in [`Credit and lending`](#credit-and-lending), which stay
+the collateralized on-chain primitive underneath.
+
+### Portable reputation + tiered wallets
+
+[`docs/reputation.md`](docs/reputation.md).
+
+- History travels with the agent: receipts record task completions and
+  payments, credit positions record repayments and defaults
+  (`POST /v1/reputation/passport/attest` assembles a subject's events from
+  node books). An issuer that verified the events signs a `PassportBatch`
+  (`POST /v1/reputation/batch`; the node re-verifies every payment and loan
+  source against its own books). Any service scores it
+  (`GET /v1/reputation/score/{agent}?role=machine` →
+  `Deny | Throttled | Standard | Preferred`).
+- Sybil resistance: every positive event is backed by a real payment, settled
+  receipt, posted collateral or repaid loan; repeat business with one
+  counterparty counts as its integer square root; stake-backed events weigh
+  more (repaid collateralized loan +4 vs bare task +1); negatives are sticky
+  and never dampen (dispute lost −4, default −8; any default zeroes the
+  suggested credit limit). Wallet age and raw tx count are deliberately unused.
+- Tiered wallets: one funding split into narrowed child policies
+  (`tiers::build_tier_pair`) — e.g. 20/tx for trusted services, 1/tx for
+  experiments. A tier can never exceed its parent; they nest; revoking the
+  root stops the whole tree. `POST /v1/wallet/tier`,
+  `GET /v1/wallet/tiers/{agent}`.
+
+### Agent-to-agent job escrow
+
+[`docs/agent-jobs.md`](docs/agent-jobs.md).
+
+```
+POST /v1/jobs/open → POST /v1/jobs/{id}/accept → POST /v1/jobs/{id}/deliver
+→ POST /v1/jobs/{id}/resolve|release (against the delivered result hash)
+— or — POST /v1/jobs/{id}/dispute (freezes funds until the arbitrator resolves)
+```
+
+Release binds the result hash — it pays for *this* dataset, not any dataset.
+The resolve signature binds (job id, direction, result hash) to the
+arbitrator key named at open. Dispute locks are node-enforced
+(`held_escrows`, persisted in `state.bin` v6): release, settlement binding
+and the timeout auto-refund all refuse while disputed.
+`GET /v1/jobs/{id}` reports the record plus escrow state and held flag.
+`GET /v1/payments/{id}/receipt_status` reports
+`{recorded, receipt_present, settlement_tx}` — treating a payment as complete
+before its receipt appears is a client bug.
+
+### Dollar prices, SRCT settlement
+
+[`docs/usd-settlement.md`](docs/usd-settlement.md). SRCT is a mined coin, not
+a peg — services quote in USD (or a supported stablecoin) and settle in SRCT
+at a transparent locked rate. `POST /v1/fx/rates` (issuer must be in
+`SRCT_FX_ISSUERS`), `GET /v1/fx/rates/list`,
+`POST /v1/fx/quote` (amount, sat due, fee, slippage, rate, expiry stated up
+front; stale or expired quotes refused), `POST /v1/fx/swap` (stablecoin-in
+intent as audit trail — custody never touches the node).
+
+### Entering and exiting SRCT
+
+[`docs/ramps.md`](docs/ramps.md). The node is the auditable registry for
+entry/exit; custody and compliance live with the ramp provider off-protocol.
+`POST /v1/ramp/quote` (provider-signed, either direction),
+`GET /v1/ramp/quotes`, `POST /v1/ramp/intent`,
+`POST /v1/ramp/intent/{id}/settle` (only the quoted provider closes its own
+intent; terminal: filled or refunded, never both), `GET /v1/ramp/intents`.
+
+### Productive lending
+
+[`docs/lending.md`](docs/lending.md). Credit for working capital on top of
+the on-chain positions: lenders publish standard terms
+(`POST /v1/loans/offers`, rate ≤ 10%/window, full-collateral terms),
+borrowers discover (`GET /v1/loans/offers/list`, cheapest first) and accept
+(`POST /v1/loans/accept` — terms come from the offer; bond and collateral
+must already be funded). History prices risk
+(`GET /v1/lending/borrower/{addr}`, `GET /v1/lending/limit/{borrower}` —
+advisory only; any default zeroes it; no history means zero),
+`GET /v1/lending/dashboard` (exposure, due-soon, shortfalls),
+`GET /v1/lending/collateral/{position_id}` (live coverage in bps). Loss order:
+collateral first, then the borrower's posted bond, then the lender absorbs
+the shortfall — never minted. Borrowers can authorize automatic repayment
+from revenue (`POST /v1/lending/autorepay`, revocable, capped, expiring;
+`credit/deposit` routes the authorized share first).
+
+Demo covering reputation, tiers, jobs, USD quotes, ramps and lending:
+`python sim/agent_economy_demo.py`.
+
+---
+
 ## How fraud is detected
 
 The canonical CPU reference decides. Nothing else is authoritative, and no
@@ -857,6 +1031,13 @@ Adding collateral to an open position (`CreditCollateral`, `0x1A`) is available
 via the same `/v1/l2/broadcast` endpoint — the CLI's `credit` subcommand does
 not expose it directly, but the worker SDK does (`add_credit_collateral`).
 
+> **On-chain positions vs the lending marketplace.** This section is the
+> consensus primitive: collateralized loans as chain state. The loan offers,
+> borrower history, credit limits, dashboard, collateral-valuation and
+> auto-repay endpoints in [Agent economy](#agent-economy) are the node-local
+> marketplace built on top of it — they price and discover loans, they never
+> replace collateral. `credit` in the API never reads a reputation score.
+
 ---
 
 | Path | What it is |
@@ -872,20 +1053,30 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-worker/` | Worker-side SDK. Client only, no consensus. |
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity and payments. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
-| `sim/` | Independent Python reference and attack simulations. |
+| `sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `x402.md`, `micropayments.md`, `wallet-safety.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
 Eight crates in one workspace. **All consensus logic lives in `srct-core`**, which
-has no I/O, no clock and no network. The `mini` profile is the same code with
-different parameters — never a second implementation — so anything tested on
-`mini` is the production code path.
+has no I/O, no clock and no network. The service-layer feature modules added
+most recently live beside it without touching consensus: `x402.rs` (x402
+adapter), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
+risk guards, audit log), `passport.rs` + `tiers.rs` (portable reputation,
+tiered wallets), `jobs.rs` (agent job escrow), `fx.rs` (USD quotes),
+`ramp.rs` (entry/exit registry), `lending.rs` (loan marketplace). The `mini`
+profile is the same code with different parameters — never a second
+implementation — so anything tested on `mini` is the production code path.
 
 Key documents: [`docs/decisions.md`](docs/decisions.md) for design decisions,
 [`docs/status.md`](docs/status.md) for the verification record,
 [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md) for what blocks launch,
-[`docs/monetary-policy.md`](docs/monetary-policy.md) for the supply analysis.
+[`docs/monetary-policy.md`](docs/monetary-policy.md) for the supply analysis,
+and the feature guides listed in the `docs/` row above
+([x402](docs/x402.md), [micro-payments](docs/micropayments.md),
+[wallet safety](docs/wallet-safety.md), [reputation](docs/reputation.md),
+[jobs](docs/agent-jobs.md), [USD settlement](docs/usd-settlement.md),
+[ramps](docs/ramps.md), [lending](docs/lending.md)).
 
 ---
 
@@ -1050,6 +1241,10 @@ single source of truth — run it and paste the total rather than hand-editing.
 Targeted suites for the fast loops:
 
 ```sh
+cargo test -p srct-core --test x402           # x402 challenge/budget/authorize/pay/admit roundtrip
+cargo test -p srct-node --test x402           # 402 → verify → settle → retry over real HTTP
+cargo test -p srct-node --test micro_safety   # batch quotes, streams, sponsor intents, session/risk/audit
+cargo test -p srct-node --test agent_economy  # passport, tiers, jobs, FX quotes, ramps, lending marketplace
 cargo test -p srct-core --lib arbitration::    # fraud-arbitration votes
 cargo test -p srct-core --test cp_signing_nodes # quorum, conflicts, restart
 cargo test -p srct-core --test bond_stake      # bonded-stake attacks

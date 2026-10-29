@@ -1688,6 +1688,34 @@ fields) and is pinned by `mainnet_genesis_is_frozen_for_the_version_bump`.
   spend under a revoked grant, and the credit flow - plus the property that a
   command the chain would skip mines nothing.
 
+### 2026-10-29 service-layer additions (no consensus change)
+
+Three feature commits landed on top of the consensus described above. All are
+node-local service layer over the existing primitives (`MachinePayment`,
+`SpendPolicy`, credit path, escrow) — no new transaction type, no issuance,
+mint or settlement-rule change:
+
+- **x402 adapter** (`srct-core/src/x402.rs`, `GET /v1/paid/weather`,
+  `POST /v1/x402/verify|settle`, `docs/x402.md`, `sim/x402_paid_api_demo.py`).
+  Tests: `srct-core --test x402`, `srct-node --test x402`.
+- **Micro-payments + wallet safety** (`micro.rs`: batch quotes, stream
+  channels, sponsored intents; `safety.rs`: session budgets, risk guards,
+  hash-chained audit log, unsettled/orphan reconciliation;
+  `docs/micropayments.md`, `docs/wallet-safety.md`,
+  `sim/micropayment_benchmark.py`). Tests: `srct-node --test micro_safety`.
+- **Agent economy** (`passport.rs`: portable reputation with issuer-signed
+  batches and score tiers; `tiers.rs`: narrowed tier wallets; `jobs.rs`: job
+  escrow with result binding and dispute holds; `fx.rs`: signed USD/stablecoin
+  rates with locked quotes; `ramp.rs`: provider-signed entry/exit registry;
+  `lending.rs`: standard loan offers, borrower history, limits, dashboard,
+  collateral valuation, autorepay; `docs/reputation.md`, `docs/agent-jobs.md`,
+  `docs/usd-settlement.md`, `docs/ramps.md`, `docs/lending.md`,
+  `sim/agent_economy_demo.py`). Tests: `srct-node --test agent_economy`.
+- Also today: `Jolunit/JLNT` rebrand to Solar Cyber Unit/SRCT, SRCT coin logo
+  in README, `l2_credit_apply` fuzz-target fix (debt-monotonicity invariant;
+  target-only, see `docs/fuzz.md`), and pool/release hardening carried over
+  from the mining review.
+
 ### What is still not done
 
 - **No validator yield.** The decision is recorded (Option B: the reward comes
