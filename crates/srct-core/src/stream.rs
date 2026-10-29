@@ -795,6 +795,22 @@ impl StreamBook {
         Ok(id)
     }
 
+    /// Restore one stream's accounting (restart recovery only). Refuses a
+    /// duplicate id or a full book; the caller must have verified the stream
+    /// bytes hash to `stream_id` before calling.
+    pub fn restore(&mut self, stream_id: Hash, state: StreamState) -> Result<(), StreamError> {
+        if self.states.contains_key(&stream_id) {
+            return Err(StreamError::DuplicateStream);
+        }
+        if self.states.len() >= self.max_streams {
+            return Err(StreamError::BookFull {
+                cap: self.max_streams,
+            });
+        }
+        self.states.insert(stream_id, state);
+        Ok(())
+    }
+
     /// Accept one settlement receipt. Checks, in order: the stream is known;
     /// the receipt names this stream; the signature; a strictly increasing
     /// nonce; a strictly increasing, non-future `through_height`; and the

@@ -58,6 +58,14 @@
 //! POST /v1/payment/{id}/settle bind it to the tx that paid the recipient
 //! POST /v1/receipt             verify + record a service receipt
 //! GET  /v1/receipt/{id}        receipt by id (or by payment id)
+//! POST /v1/payments/aggregate  quote one shared settlement for N payments
+//! POST /v1/streams/open        open a pay-as-you-use stream channel
+//! POST /v1/streams/settle      accept one stream voucher receipt
+//! GET  /v1/streams/{id}        stream accounting + claimable at this height
+//! GET  /v1/payments/unsettled  recorded payments with no settlement bound
+//! GET  /v1/receipts/orphans    receipts claiming unrecorded payments
+//! GET  /v1/audit               tamper-evident audit ring + chain check
+//! GET  /v1/risk/policy         safety knobs: thresholds, velocity, test mode
 //! GET  /v1/exit/crankable      the exit claims this node could settle now
 //! POST /v1/escrow/open         open a conditional escrow with a chosen arbitrator
 //! POST /v1/escrow/{id}/release arbiter- or mutual-release a live escrow (non-consensus)
@@ -153,7 +161,12 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// [`SharedNode::encode_state`]. A build that writes a different format writes
 /// a different value, so an old file is refused by name instead of misread
 /// field by field.
-const STATE_ENVELOPE_VERSION: u8 = 4;
+///
+/// Version 5 adds the stream opens/settlement accounting and the session
+/// budgets (micro-payment channels + wallet safety). The audit ring is
+/// intentionally not persisted: it restarts empty, full history stays in the
+/// payment/receipt stores.
+const STATE_ENVELOPE_VERSION: u8 = 5;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -352,6 +365,22 @@ pub struct SharedNode {
     /// lineage that was actually permitted. `link` enforces domination on every
     /// field and the depth cap in the same pass, reusing `delegation::dominates`.
     pub delegations: srct_core::delegation::DelegationBook,
+    /// Stream opens this node tracks (pay-as-you-use channels): id -> the
+    /// signed open. Settlement receipts are checked against the open plus
+    /// [`StreamBook`] accounting. Node-local and persisted like receipts.
+    pub stream_store: BTreeMap<Hash, srct_core::stream::PaymentStream>,
+    /// Per-stream settlement accounting. Persisted with the opens above: losing
+    /// it across a restart would reopen the double-withdrawal window the book
+    /// exists to close.
+    pub streams: srct_core::stream::StreamBook,
+    /// Per-agent aggregate spend across rotated policies (tumbling window).
+    /// A policy rotation starts a fresh policy window by design; the session
+    /// book is what stops spend being split across N policies.
+    pub sessions: srct_core::safety::SessionBook,
+    /// Bounded in-memory audit ring (hash-chained, tamper-evident). The full
+    /// history lives in the payment/receipt stores this ring references;
+    /// intentionally not persisted, so a restart starts a fresh chain.
+    pub audit: srct_core::safety::AuditLog,
     /// Conditional-escrow store for Item 4 (contract-selected arbitrators).
     /// Non-consensus: the ledger tracks the state machine, and the actual coin
     /// release reuses the §1 L1 exit / §19.4 path.
@@ -403,6 +432,10 @@ impl SharedNode {
             policies: srct_core::agent::PolicyBook::default(),
             credit: srct_core::credit::CreditBook::new(),
             delegations: srct_core::delegation::DelegationBook::new(),
+            stream_store: BTreeMap::new(),
+            streams: srct_core::stream::StreamBook::default(),
+            sessions: srct_core::safety::SessionBook::default(),
+            audit: srct_core::safety::AuditLog::default(),
             escrows: BTreeMap::new(),
             escrow_exit: BTreeMap::new(),
             policy_registry: BTreeMap::new(),
@@ -469,6 +502,47 @@ impl SharedNode {
             used.fixed(id).u64le(*expires);
         }
         put_section(&mut w, &used.into_vec());
+        // Stream opens + settlement accounting (v5): id -> stream bytes + state.
+        // The id must equal the stream's signing hash; checked on decode.
+        let mut streams = Writer::with_capacity(4 + self.stream_store.len() * 160);
+        streams.u32le(self.stream_store.len() as u32);
+        for (id, stream) in &self.stream_store {
+            let bytes = stream.serialize();
+            let st = self
+                .streams
+                .state(id)
+                .copied()
+                .unwrap_or(srct_core::stream::StreamState {
+                    settled_sat: 0,
+                    last_settled_height: None,
+                    last_nonce: 0,
+                    settlements: 0,
+                });
+            streams.fixed(id);
+            streams.u32le(bytes.len() as u32).raw(&bytes);
+            streams.u64le(st.settled_sat);
+            match st.last_settled_height {
+                Some(h) => {
+                    streams.u8(1).u64le(h);
+                }
+                None => {
+                    streams.u8(0);
+                }
+            }
+            streams.u64le(st.last_nonce).u64le(st.settlements);
+        }
+        put_section(&mut w, &streams.into_vec());
+        // Session budgets (v5): agent -> window_start + spent + total.
+        let mut sessions = Writer::with_capacity(4 + self.sessions.len() * 44);
+        sessions.u32le(self.sessions.len() as u32);
+        for (agent, st) in self.sessions.iter() {
+            sessions.fixed(agent);
+            sessions
+                .u64le(st.window_start_height)
+                .u64le(st.spent_in_window_sat)
+                .u64le(st.total_spent_sat);
+        }
+        put_section(&mut w, &sessions.into_vec());
         w.into_vec()
     }
 
@@ -590,6 +664,78 @@ impl SharedNode {
             }
             Ok(map)
         })?;
+        let (stream_store, streams) = decode_section(&mut r, "streams", |sr| {
+            let count = sr.u32le().map_err(|e| format!("streams: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "streams: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut store = BTreeMap::new();
+            let mut book = srct_core::stream::StreamBook::default();
+            for _ in 0..count {
+                let id: Hash = sr.fixed().map_err(|e| format!("streams: {e}"))?;
+                let len = sr.u32le().map_err(|e| format!("streams: {e}"))? as usize;
+                if len > 4 * 1024 {
+                    return Err("streams: stream bytes over the 4 KiB cap".into());
+                }
+                let bytes = sr.fixed_slice(len).map_err(|e| format!("streams: {e}"))?;
+                let stream = srct_core::stream::PaymentStream::deserialize(bytes)
+                    .map_err(|e| format!("streams: {e}"))?;
+                if stream.signing_hash() != id {
+                    return Err("streams: id is not the stream signing hash".into());
+                }
+                let settled_sat = sr.u64le().map_err(|e| format!("streams: {e}"))?;
+                let has_height = sr.u8().map_err(|e| format!("streams: {e}"))?;
+                let last_settled_height = match has_height {
+                    0 => None,
+                    1 => Some(sr.u64le().map_err(|e| format!("streams: {e}"))?),
+                    _ => return Err("streams: bad height flag".into()),
+                };
+                let last_nonce = sr.u64le().map_err(|e| format!("streams: {e}"))?;
+                let settlements = sr.u64le().map_err(|e| format!("streams: {e}"))?;
+                book.restore(
+                    id,
+                    srct_core::stream::StreamState {
+                        settled_sat,
+                        last_settled_height,
+                        last_nonce,
+                        settlements,
+                    },
+                )
+                .map_err(|e| format!("streams: {e}"))?;
+                if store.insert(id, stream).is_some() {
+                    return Err("streams: duplicate id".into());
+                }
+            }
+            Ok((store, book))
+        })?;
+        let sessions = decode_section(&mut r, "sessions", |sr| {
+            let count = sr.u32le().map_err(|e| format!("sessions: {e}"))? as usize;
+            if count > MAX_STATE_ENTRIES {
+                return Err(format!(
+                    "sessions: {count} entries over the {MAX_STATE_ENTRIES} cap"
+                ));
+            }
+            let mut book = srct_core::safety::SessionBook::default();
+            for _ in 0..count {
+                let agent: srct_core::agent::AgentId =
+                    sr.fixed().map_err(|e| format!("sessions: {e}"))?;
+                let window_start_height = sr.u64le().map_err(|e| format!("sessions: {e}"))?;
+                let spent_in_window_sat = sr.u64le().map_err(|e| format!("sessions: {e}"))?;
+                let total_spent_sat = sr.u64le().map_err(|e| format!("sessions: {e}"))?;
+                book.restore(
+                    agent,
+                    srct_core::safety::SessionState {
+                        window_start_height,
+                        spent_in_window_sat,
+                        total_spent_sat,
+                    },
+                )
+                .map_err(|e| format!("sessions: {e}"))?;
+            }
+            Ok(book)
+        })?;
         // Anything after the last section means the envelope is malformed.
         r.expect_end().map_err(|e| format!("state envelope: {e}"))?;
 
@@ -606,6 +752,9 @@ impl SharedNode {
         self.attestations_used = attestations_used;
         self.policy_registry = policy_registry;
         self.revoked_policies = revoked_policies;
+        self.stream_store = stream_store;
+        self.streams = streams;
+        self.sessions = sessions;
         Ok(())
     }
 
@@ -2182,6 +2331,13 @@ async fn authorize(State(state): State<ApiState>, Json(req): Json<AuthorizeReq>)
         // admission later can check the payment names a policy this engine
         // actually issued under. Idempotent: the same bytes hash the same.
         sh.policy_registry.insert(auth.policy_hash, policy.clone());
+        audit_push(
+            sh,
+            "authorize",
+            None,
+            Some(auth.amount_sat),
+            format!("grant {} nonce {}", hash_to_hex(&auth.policy_hash), auth.nonce),
+        );
         // Unsigned: the *owner* signs `signing_hash` with their wallet. The
         // API never signs and never sees a key.
         Ok(Json(json!({
@@ -2302,6 +2458,103 @@ fn session_err(e: SessionError) -> (StatusCode, Json<ErrorBody>) {
         SessionError::Binding(_) => fail(StatusCode::CONFLICT, "session_binding", e.to_string()),
         _ => bad(e.to_string()),
     }
+}
+
+/// Append one audit entry; a full ring never fails the payment it records —
+/// the full history lives in the payment/receipt stores, the ring is the
+/// tamper-evident index over them.
+fn audit_push(
+    sh: &mut SharedNode,
+    kind: &'static str,
+    payment_id: Option<Hash>,
+    amount_sat: Option<u64>,
+    detail: String,
+) {
+    let _ = sh.audit.push(kind, payment_id, amount_sat, detail);
+}
+
+/// Wallet-safety pre-admission gates shared by `payment_submit` and the x402
+/// settle path: test-mode mainnet refusal + per-payer velocity cap. Returns
+/// the human-approval advisory. No state change on any path.
+fn risk_gate(
+    sh: &mut SharedNode,
+    payment: &MachinePayment,
+    network: &str,
+    id: Hash,
+) -> Result<bool, (StatusCode, Json<ErrorBody>)> {
+    let risk = srct_core::safety::RiskPolicy::from_env();
+    let recent = sh
+        .payment_store
+        .values()
+        .filter(|p| p.payer == payment.payer)
+        .count();
+    match risk.check(network, payment.amount_sat, recent) {
+        Ok(v) => Ok(v == srct_core::safety::RiskVerdict::RequireHumanApproval),
+        Err(e) => {
+            use srct_core::safety::SafetyError as SE;
+            let (status, error) = match &e {
+                SE::MainnetBlockedInTestMode => (StatusCode::CONFLICT, "test_mode"),
+                SE::VelocityLimited { .. } => (StatusCode::CONFLICT, "velocity_limited"),
+                _ => (StatusCode::BAD_REQUEST, "risk_refused"),
+            };
+            audit_push(
+                sh,
+                "payment_risk_refused",
+                Some(id),
+                Some(payment.amount_sat),
+                e.to_string(),
+            );
+            Err(fail(status, error, e.to_string()))
+        }
+    }
+}
+
+/// Session-budget gate shared by both admission paths. Runs after credit
+/// admission so a refusal can release the reservation it just took. Off by
+/// default (cap 0).
+fn session_gate(
+    sh: &mut SharedNode,
+    payment: &MachinePayment,
+    height: u64,
+    id: Hash,
+    reservation: &srct_core::credit::Reservation,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let (session_window, session_cap) = session_envelope();
+    if session_cap == 0 {
+        return Ok(());
+    }
+    if let Err(e) = sh.sessions.record(
+        &payment.agent_id,
+        height,
+        payment.amount_sat,
+        session_window.max(1),
+        session_cap,
+    ) {
+        let _ = sh.credit.release(reservation);
+        audit_push(
+            sh,
+            "payment_session_refused",
+            Some(id),
+            Some(payment.amount_sat),
+            e.to_string(),
+        );
+        return Err(fail(StatusCode::CONFLICT, "session_budget", e.to_string()));
+    }
+    Ok(())
+}
+
+/// Session-budget envelope from the environment: window and cap, both zero
+/// (the default) meaning the session gate is off and only policy windows apply.
+fn session_envelope() -> (u64, u64) {
+    let window = std::env::var("SRCT_SESSION_WINDOW_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let cap = std::env::var("SRCT_SESSION_CAP_SAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    (window, cap)
 }
 
 #[derive(Deserialize)]
@@ -2454,11 +2707,22 @@ async fn payment_submit(
         // the second reservation would be refused for a payment that is already
         // recorded. Replay is not a refusal; it is a repeat of the first answer.
         if sh.payment_tracker.contains(&id) {
+            audit_push(
+                sh,
+                "payment_duplicate",
+                Some(id),
+                Some(payment.amount_sat),
+                format!("replay of {}", hash_to_hex(&id)),
+            );
             return Ok(Json(json!({
                 "payment_id": hash_to_hex(&id),
                 "duplicate": true,
             })));
         }
+        // Wallet-safety gates (no state change): test mode refuses mainnet,
+        // velocity caps bursts per payer. Both are operator-configured and
+        // off by default, so existing flows are unaffected.
+        let requires_human_approval = risk_gate(sh, &payment, &network, id)?;
         // Admission first: the payment must be what an authentic, live policy
         // granted. A payment that names a policy this node never authorized
         // under — or one that has since expired, or one whose authorization is
@@ -2508,6 +2772,11 @@ async fn payment_submit(
                  through a receipt: fund the free balance or repay the position first",
             ));
         }
+        // Session budget: the per-agent aggregate across rotated policies.
+        // Runs after admission so a refusal can release the reservation it
+        // just took; off by default (cap 0), so only operators who set
+        // SRCT_SESSION_CAP_SAT/SRCT_SESSION_WINDOW_BLOCKS are affected.
+        session_gate(sh, &payment, height, id, &reservation)?;
         match sh.payment_tracker.accept(&payment, &network, height) {
             Ok(id) => {
                 // The payment is recorded, so the reservation it holds is real:
@@ -2515,9 +2784,20 @@ async fn payment_submit(
                 // released because the payment never committed.
                 sh.payment_store.insert(id, payment);
                 sh.reservations.insert(id, reservation);
-                Ok(Json(
-                    json!({ "payment_id": hash_to_hex(&id), "duplicate": false }),
-                ))
+                audit_push(
+                    sh,
+                    "payment_admitted",
+                    Some(id),
+                    Some(sh.payment_store.get(&id).map(|p| p.amount_sat).unwrap_or(0)),
+                    format!(
+                        "admitted requires_human_approval={requires_human_approval}"
+                    ),
+                );
+                Ok(Json(json!({
+                    "payment_id": hash_to_hex(&id),
+                    "duplicate": false,
+                    "requires_human_approval": requires_human_approval,
+                })))
             }
             // Same bytes, same id: an idempotent re-submission, not an error.
             Err(srct_core::payment::PaymentError::AlreadySeen) => {
@@ -2606,13 +2886,22 @@ async fn receipt_submit(
             }
         }
         match sh.receipts.accept(&receipt, &network) {
-            Ok(outcome) => Ok(Json(json!({
-                "receipt_id": hash_to_hex(&receipt.receipt_id()),
-                "outcome": match outcome {
-                    ReceiptOutcome::Inserted => "inserted",
-                    ReceiptOutcome::Duplicate => "duplicate",
-                },
-            }))),
+            Ok(outcome) => {
+                audit_push(
+                    sh,
+                    "receipt_settled",
+                    Some(receipt.payment_id),
+                    Some(receipt.amount_sat),
+                    format!("receipt {}", hash_to_hex(&receipt.receipt_id())),
+                );
+                Ok(Json(json!({
+                    "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                    "outcome": match outcome {
+                        ReceiptOutcome::Inserted => "inserted",
+                        ReceiptOutcome::Duplicate => "duplicate",
+                    },
+                })))
+            }
             Err(srct_core::receipt::ReceiptError::PaymentConflict { existing }) => Err(fail(
                 StatusCode::CONFLICT,
                 "receipt_conflict",
@@ -3743,6 +4032,8 @@ fn admit_machine_payment_inner(
     if sh.payment_tracker.contains(&id) {
         return Ok(id);
     }
+    // Same wallet-safety gates as `payment_submit`.
+    let _approval = risk_gate(sh, &payment, &network, id)?;
     let policy = match sh.policy_registry.get(&payment.policy_hash).cloned() {
         Some(policy) => policy,
         None => {
@@ -3779,10 +4070,18 @@ fn admit_machine_payment_inner(
             "the payer's free balance cannot cover this payment and the remainder would draw on position headroom, which never settles through a receipt: fund the free balance or repay the position first",
         ));
     }
+    session_gate(sh, &payment, height, id, &reservation)?;
     match sh.payment_tracker.accept(&payment, &network, height) {
         Ok(id) => {
             sh.payment_store.insert(id, payment);
             sh.reservations.insert(id, reservation);
+            audit_push(
+                sh,
+                "payment_admitted",
+                Some(id),
+                Some(sh.payment_store.get(&id).map(|p| p.amount_sat).unwrap_or(0)),
+                "admitted via x402 settle".to_string(),
+            );
             Ok(id)
         }
         Err(srct_core::payment::PaymentError::AlreadySeen) => {
@@ -4090,6 +4389,305 @@ async fn paid_weather(State(state): State<ApiState>, headers: HeaderMap) -> impl
 }
 
 // ---------------------------------------------------------------------------
+// Micro-payments: batch quotes, stream channels, sponsored intents
+// ---------------------------------------------------------------------------
+//
+// Batching and streaming change *how many* chain transactions N payments
+// cost, not what a payment is: every payment in a batch still verifies, and
+// every stream voucher still settles exactly the newly accrued amount.
+
+#[derive(Deserialize)]
+struct AggregateReq {
+    payment_ids: Vec<String>,
+}
+
+/// `POST /v1/payments/aggregate` — price one shared settlement for recorded
+/// payments. Read-only: verifies each payment, merges same-payer payments
+/// into one `PaymentBatch`, and quotes gas/fee/savings at the current base
+/// fee. The caller builds and broadcasts the batch transaction out of band;
+///
+/// a quote is not a settlement.
+async fn payments_aggregate(
+    State(state): State<ApiState>,
+    Json(req): Json<AggregateReq>,
+) -> ApiResult {
+    if req.payment_ids.is_empty() || req.payment_ids.len() > 256 {
+        return Err(bad("payment_ids must name 1..=256 recorded payments"));
+    }
+    let mut ids = Vec::with_capacity(req.payment_ids.len());
+    for raw in &req.payment_ids {
+        ids.push(decode_hash(raw)?);
+    }
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        let base_fee = sh.chain.expected_base_fee_for_next_block();
+        let mut payments = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match sh.payment_store.get(id) {
+                Some(p) => payments.push(p.clone()),
+                None => {
+                    return Err(fail(
+                        StatusCode::NOT_FOUND,
+                        "not_found",
+                        format!("no recorded payment {}", hash_to_hex(id)),
+                    ))
+                }
+            }
+        }
+        let (batch, quote) =
+            srct_core::micro::quote_batch(&payments, &network, height, base_fee, 1)
+                .map_err(|e| bad(format!("aggregate: {e}")))?;
+        Ok(Json(json!({
+            "payer": address_to_hex(&batch.payer),
+            "payments": batch.payment_ids.iter().map(hash_to_hex).collect::<Vec<_>>(),
+            "outputs": batch.outputs.iter().map(|(a, s)| json!({
+                "recipient": address_to_hex(a),
+                "amount_sat": s,
+            })).collect::<Vec<_>>(),
+            "total_amount_sat": batch.total_amount_sat,
+            "declared_fee_sat": batch.declared_fee_sat,
+            "gas_used": quote.gas_used,
+            "required_fee_sat": quote.required_fee_sat,
+            "fee_per_payment_sat": quote.fee_per_payment_sat,
+            "separate_total_fee_sat": quote.separate_total_fee_sat,
+            "savings_sat": quote.savings_sat,
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct StreamOpenReq {
+    stream_hex: String,
+}
+
+/// `POST /v1/streams/open` — open a pay-as-you-use channel. The open locks
+/// nothing on chain; the cap is enforced by exact-settlement accounting.
+async fn stream_open(State(state): State<ApiState>, Json(req): Json<StreamOpenReq>) -> ApiResult {
+    let bytes = decode_hex_bytes(&req.stream_hex, "stream")?;
+    let stream = srct_core::stream::PaymentStream::deserialize(&bytes)
+        .map_err(|e| bad(format!("stream: {e}")))?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let id = sh
+            .streams
+            .open(&stream, &network)
+            .map_err(|e| fail(StatusCode::CONFLICT, "stream_refused", e.to_string()))?;
+        sh.stream_store.insert(id, stream.clone());
+        audit_push(
+            sh,
+            "stream_open",
+            None,
+            Some(stream.max_total_sat),
+            format!("stream {} cap {}", hash_to_hex(&id), stream.max_total_sat),
+        );
+        Ok(Json(json!({
+            "stream_id": hash_to_hex(&id),
+            "rate_sat_per_block": stream.rate_sat_per_block,
+            "max_total_sat": stream.max_total_sat,
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct StreamSettleReq {
+    stream_hex: String,
+    settlement_hex: String,
+}
+
+/// `POST /v1/streams/settle` — accept one off-chain voucher receipt. The
+/// voucher must settle exactly the newly accrued amount; the coin itself
+/// still moves via `POST /v1/payment/submit` with `reference` = stream id.
+async fn stream_settle(
+    State(state): State<ApiState>,
+    Json(req): Json<StreamSettleReq>,
+) -> ApiResult {
+    let stream_bytes = decode_hex_bytes(&req.stream_hex, "stream")?;
+    let stream = srct_core::stream::PaymentStream::deserialize(&stream_bytes)
+        .map_err(|e| bad(format!("stream: {e}")))?;
+    let settle_bytes = decode_hex_bytes(&req.settlement_hex, "settlement")?;
+    let settlement =
+        srct_core::stream::StreamSettlement::deserialize(&settle_bytes, &stream)
+            .map_err(|e| bad(format!("settlement: {e}")))?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        if stream.network_id != network {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "stream_refused",
+                "stream is for another network",
+            ));
+        }
+        let id = stream.signing_hash();
+        if !sh.stream_store.contains_key(&id) {
+            return Err(fail(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "stream is not open on this node",
+            ));
+        }
+        let settled = sh
+            .streams
+            .settle(&stream, &settlement, height)
+            .map_err(|e| fail(StatusCode::CONFLICT, "stream_refused", e.to_string()))?;
+        let claimable = sh.streams.claimable(&stream, height).unwrap_or(0);
+        audit_push(
+            sh,
+            "stream_settle",
+            None,
+            Some(settlement.amount_sat),
+            format!("stream {} settled {settled}", hash_to_hex(&id)),
+        );
+        Ok(Json(json!({
+            "stream_id": hash_to_hex(&id),
+            "settled_sat": settled,
+            "claimable_sat": claimable,
+        })))
+    })?
+}
+
+/// `GET /v1/streams/{stream_id}` — channel accounting at the current height.
+async fn stream_get(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+    let id = decode_hash(&raw)?;
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let stream = sh.stream_store.get(&id).ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("no stream {}", hash_to_hex(&id)),
+            )
+        })?;
+        let st = sh.streams.state(&id).copied().unwrap_or(
+            srct_core::stream::StreamState {
+                settled_sat: 0,
+                last_settled_height: None,
+                last_nonce: 0,
+                settlements: 0,
+            },
+        );
+        Ok(Json(json!({
+            "stream_id": hash_to_hex(&id),
+            "recipient": address_to_hex(&stream.recipient),
+            "rate_sat_per_block": stream.rate_sat_per_block,
+            "max_total_sat": stream.max_total_sat,
+            "settled_sat": st.settled_sat,
+            "last_settled_height": st.last_settled_height,
+            "last_nonce": st.last_nonce,
+            "settlements": st.settlements,
+            "claimable_sat": sh.streams.claimable(stream, height).unwrap_or(0),
+            "height": height,
+        })))
+    })?
+}
+
+// ---------------------------------------------------------------------------
+// Wallet safety: reconciliation, audit export, risk policy
+// ---------------------------------------------------------------------------
+//
+// A network timeout must never cause a double-pay: the agent lists what is in
+// flight (`unsettled`) and what claims nothing recorded (`orphans`) before
+// retrying, and the audit ring gives developers the complete trail.
+
+/// `GET /v1/payments/unsettled` — recorded payments with no settlement tx
+/// bound and not yet expired. Retry these idempotently; do not rebuild them.
+async fn payments_unsettled(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let height = sh.chain.height();
+        let settled: std::collections::BTreeSet<Hash> =
+            sh.payment_tx.keys().copied().collect();
+        let mut out = Vec::new();
+        for (id, payment) in &sh.payment_store {
+            if settled.contains(id) || height >= payment.expires_at_height {
+                continue;
+            }
+            out.push(json!({
+                "payment_id": hash_to_hex(id),
+                "amount_sat": payment.amount_sat,
+                "recipient": address_to_hex(&payment.recipient),
+                "expires_at_height": payment.expires_at_height,
+            }));
+        }
+        Ok(Json(json!({ "count": out.len(), "payments": out })))
+    })?
+}
+
+/// `GET /v1/receipts/orphans` — receipts claiming payments this node never
+/// recorded. Investigate, never auto-settle.
+async fn receipts_orphans(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |sh| {
+        let known: std::collections::BTreeSet<Hash> =
+            sh.payment_store.keys().copied().collect();
+        let mut out = Vec::new();
+        for receipt in sh.receipts.iter() {
+            if !known.contains(&receipt.payment_id) {
+                out.push(json!({
+                    "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                    "payment_id": hash_to_hex(&receipt.payment_id),
+                    "amount_sat": receipt.amount_sat,
+                }));
+            }
+        }
+        Ok(Json(json!({ "count": out.len(), "orphans": out })))
+    })?
+}
+
+/// `GET /v1/audit[?limit=]` — the tamper-evident audit ring (newest last),
+/// plus chain verification. Full history lives in the payment/receipt
+/// stores; the ring is the index over them.
+async fn audit_list(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let limit: usize = query
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(512);
+    with_shared(&state, |sh| {
+        let valid = sh.audit.verify_chain().is_ok();
+        let entries: Vec<Value> = sh
+            .audit
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|e| {
+                json!({
+                    "seq": e.seq,
+                    "kind": e.kind,
+                    "payment_id": e.payment_id.map(|h| hash_to_hex(&h)),
+                    "amount_sat": e.amount_sat,
+                    "detail": e.detail,
+                })
+            })
+            .collect();
+        Ok(Json(json!({
+            "chain_valid": valid,
+            "count": entries.len(),
+            "entries": entries,
+        })))
+    })?
+}
+
+/// `GET /v1/risk/policy` — current wallet-safety knobs (thresholds, velocity,
+/// test mode) and session-budget envelope, so developers know when approval
+/// is required before they pay.
+async fn risk_policy(State(state): State<ApiState>) -> ApiResult {
+    with_shared(&state, |_sh| {
+        let risk = srct_core::safety::RiskPolicy::from_env();
+        let (window, cap) = session_envelope();
+        Ok(Json(json!({
+            "high_value_threshold_sat": risk.high_value_threshold_sat,
+            "max_payments_per_payer": risk.max_payments_per_payer,
+            "test_mode": risk.test_mode,
+            "session_window_blocks": window,
+            "session_cap_sat": cap,
+        })))
+    })?
+}
+
+// ---------------------------------------------------------------------------
 // Always-on + exposed middleware (SPEC.md §19.2: opt-in, loopback by default)
 // ---------------------------------------------------------------------------
 // `dos_guard` always runs (timeout + in-flight cap, on every bind including
@@ -4148,7 +4746,15 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/exit/crankable", get(exit_crankable))
         .route("/v1/x402/verify", post(x402_verify))
         .route("/v1/x402/settle", post(x402_settle))
-        .route("/v1/paid/weather", get(paid_weather));
+        .route("/v1/paid/weather", get(paid_weather))
+        .route("/v1/payments/aggregate", post(payments_aggregate))
+        .route("/v1/streams/open", post(stream_open))
+        .route("/v1/streams/settle", post(stream_settle))
+        .route("/v1/streams/{stream_id}", get(stream_get))
+        .route("/v1/payments/unsettled", get(payments_unsettled))
+        .route("/v1/receipts/orphans", get(receipts_orphans))
+        .route("/v1/audit", get(audit_list))
+        .route("/v1/risk/policy", get(risk_policy));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));

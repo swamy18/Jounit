@@ -542,6 +542,12 @@ impl ReceiptBook {
             .get(request_id)
             .and_then(|id| self.by_id.get(id))
     }
+
+    /// Iterate all receipts (deterministic id order; used for reconciliation
+    /// exports, never for consensus).
+    pub fn iter(&self) -> impl Iterator<Item = &ServiceReceipt> {
+        self.by_id.values()
+    }
 }
 
 /// Largest entry count the book codec will read back, and the largest capacity
