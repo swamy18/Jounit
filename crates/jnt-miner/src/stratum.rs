@@ -145,9 +145,13 @@ impl Pool {
     /// can pin the submission to it.
     pub fn get_job(&self) -> Result<Job> {
         let block = (self.template_fn)()?;
-        if block.header.puzzle_id != self.spec.id
-            && !(self.hbm.is_some() && block.header.puzzle_id == 2)
-        {
+        // The pool serves hybrid (puzzle 1) when its spec is hybrid, and HBM
+        // (puzzle 2) only when an HBM config is present. A puzzle-2 template
+        // with no config must be refused here, not handed out to fail at
+        // share validation.
+        let serves_hybrid = self.spec.id == 1 && block.header.puzzle_id == 1;
+        let serves_hbm = self.hbm.is_some() && block.header.puzzle_id == 2;
+        if !(serves_hybrid || serves_hbm) {
             return Err(Error::BadPuzzleSpec(format!(
                 "template names puzzle {} but the pool serves {}",
                 block.header.puzzle_id, self.spec.id
@@ -158,7 +162,7 @@ impl Pool {
             .lock()
             .map_err(|_| Error::Malformed("pool lock"))?;
         let job_id = inner.next_job_id;
-        inner.next_job_id += 1;
+        inner.next_job_id = inner.next_job_id.wrapping_add(1).max(1);
         inner.jobs.insert(job_id, block.clone());
         // Jobs are single-use: a submission consumes its job, so a replayed
         // share cannot be counted twice and a stale template cannot linger.
@@ -209,24 +213,10 @@ impl Pool {
             return Err(Error::Malformed("share below pool difficulty"));
         }
         let is_block = self.proof_meets(&block.header, b.difficulty)?;
-        let coinbase_sat = template
-            .txs
-            .first()
-            .and_then(|tx| tx.outputs.first())
-            .map(|o| o.value)
-            .unwrap_or(0);
-        let block_height = b.height;
-        // Copied before `block` moves into the submit callback below.
-        let template_difficulty = b.difficulty;
-        if is_block {
-            let accepted = (self.submit_fn)(block)?;
-            if !accepted {
-                return Err(Error::Malformed("node refused the block"));
-            }
-        }
         // One proof, one share: the same solved header handed in under two
-        // job ids (or replayed twice) counts once. Checked before any
-        // accounting, so a duplicate records nothing anywhere.
+        // job ids (or replayed twice) counts once. Checked before the node
+        // submit, so a duplicate neither pays nor forwards a second copy of
+        // the block to the node.
         {
             let mut inner = self
                 .inner
@@ -240,6 +230,42 @@ impl Pool {
                 if let Some(oldest) = inner.seen_order.pop_front() {
                     inner.seen.remove(&oldest);
                 }
+            }
+        }
+        let coinbase_sat = template
+            .txs
+            .first()
+            .and_then(|tx| tx.outputs.first())
+            .map(|o| o.value)
+            .unwrap_or(0);
+        let block_height = b.height;
+        // Copied before `block` moves into the submit callback below.
+        let template_difficulty = b.difficulty;
+        if is_block {
+            let submitted = (self.submit_fn)(block);
+            let accepted = match submitted {
+                Ok(v) => v,
+                Err(e) => {
+                    // The block never reached the node: forget the proof so a
+                    // retry of the same solution is not misreported as a
+                    // duplicate.
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .map_err(|_| Error::Malformed("pool lock"))?;
+                    inner.seen.remove(&digest);
+                    inner.seen_order.retain(|d| *d != digest);
+                    return Err(e);
+                }
+            };
+            if !accepted {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| Error::Malformed("pool lock"))?;
+                inner.seen.remove(&digest);
+                inner.seen_order.retain(|d| *d != digest);
+                return Err(Error::Malformed("node refused the block"));
             }
         }
         {
@@ -730,6 +756,9 @@ mod tests {
         let stats = pool.stats_for(&miner);
         assert_eq!(stats.shares, 1);
         assert_eq!(stats.blocks_found, 1);
+        // The duplicate must not have been forwarded a second time: one
+        // proof, one submit.
+        assert_eq!(submitted.lock().unwrap().len(), 1);
         assert_eq!(pool.pending_payout(&miner), {
             let coinbase: u64 = submitted.lock().unwrap()[0].txs[0].outputs[0].value;
             coinbase

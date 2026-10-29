@@ -283,17 +283,32 @@ pub fn fold32(v: i64) -> i32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochWeights {
     pub epoch_id: u32,
-    /// `[layer * hidden * hidden + out * hidden + in_dim + in]`
+    /// All layers concatenated. Layer `l` starts at `layer_offsets[l]` and
+    /// has stride `spec.in_dim(l)`, so the layout stays correct when
+    /// `nn_input_dim != nn_hidden_dim` (layer 0 is `hidden × input`, later
+    /// layers are `hidden × hidden`).
     weights: Vec<i32>,
+    /// Start index of each layer inside `weights`.
+    layer_offsets: Vec<usize>,
     /// `[layer * hidden + out]`
     biases: Vec<i32>,
 }
 
 impl EpochWeights {
     pub fn build(spec: &PuzzleSpec, epoch_id: u32) -> Self {
-        let mut weights =
-            Vec::with_capacity(spec.nn_layers * spec.nn_hidden_dim * spec.nn_hidden_dim);
+        let mut weights = Vec::with_capacity(
+            spec.nn_hidden_dim
+                .saturating_mul(spec.in_dim(0))
+                .saturating_add(
+                    spec.nn_layers
+                        .saturating_sub(1)
+                        .saturating_mul(spec.nn_hidden_dim)
+                        .saturating_mul(spec.nn_hidden_dim),
+                ),
+        );
+        let mut layer_offsets = Vec::with_capacity(spec.nn_layers);
         for layer in 0..spec.nn_layers {
+            layer_offsets.push(weights.len());
             for out in 0..spec.nn_hidden_dim {
                 for inp in 0..spec.in_dim(layer) {
                     let b = weight_stream(weight_index(spec, layer, out, inp), epoch_id)[0] as i32;
@@ -311,14 +326,14 @@ impl EpochWeights {
         EpochWeights {
             epoch_id,
             weights,
+            layer_offsets,
             biases,
         }
     }
 
     #[inline]
     pub fn weight(&self, spec: &PuzzleSpec, layer: usize, out: usize, inp: usize) -> i32 {
-        self.weights
-            [layer * spec.nn_hidden_dim * spec.nn_hidden_dim + out * spec.nn_hidden_dim + inp]
+        self.weights[self.layer_offsets[layer] + out * spec.in_dim(layer) + inp]
     }
 
     #[inline]
@@ -649,6 +664,31 @@ mod tests {
         let w0 = weight(&s, 0, 0, 0, 0);
         let w1 = weight(&s, 0, 0, 0, 1);
         assert_ne!(w0, w1, "weights must rotate every epoch");
+    }
+
+    #[test]
+    fn epoch_weights_match_point_queries_for_nonsquare_dims() {
+        // `EpochWeights` packs layers with stride `in_dim(layer)`; the cached
+        // accessor must agree with the point query even when layer 0 is
+        // wider/narrower than the hidden layers (previously it assumed a
+        // square `hidden x hidden` layout and returned the wrong weights).
+        let mut s = spec();
+        s.nn_input_dim = 8;
+        s.nn_hidden_dim = 16;
+        for epoch in [0u32, 3] {
+            let w = EpochWeights::build(&s, epoch);
+            for layer in 0..s.nn_layers {
+                for o in 0..s.nn_hidden_dim {
+                    for i in 0..s.in_dim(layer) {
+                        assert_eq!(
+                            w.weight(&s, layer, o, i),
+                            weight(&s, layer, o, i, epoch),
+                            "layer {layer} out {o} inp {i} epoch {epoch}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

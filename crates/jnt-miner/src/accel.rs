@@ -84,8 +84,13 @@ impl ComputeBackend for PortableBackend {
 /// after [`ACTIVATION_SHIFT`], every layer's pre-activation values committed
 /// little-endian under [`DOM_S2`] — the same commit layout as consensus.
 fn portable_digest(spec: &PuzzleSpec, seed: &Hash, weights: &EpochWeights) -> Hash {
-    // Seed bytes as signed inputs, layer 0 width.
-    let mut x: Vec<i32> = seed.iter().map(|b| *b as i32 - 128).collect();
+    // Seed bytes as signed inputs, layer 0 width: exactly `nn_input_dim`
+    // bytes like the consensus `forward`, never the full 32-byte seed.
+    // Reading the whole seed is harmless while input == hidden == 16 but
+    // diverges the moment a spec changes either width.
+    let mut x: Vec<i32> = (0..spec.nn_input_dim)
+        .map(|j| seed[j] as i32 - 128)
+        .collect();
     let mut committed: Vec<u8> =
         Vec::with_capacity(DOM_S2.len() + spec.nn_layers * spec.nn_hidden_dim * 4);
     committed.extend_from_slice(DOM_S2);

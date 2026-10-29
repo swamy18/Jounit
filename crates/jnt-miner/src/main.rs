@@ -224,7 +224,7 @@ fn mine_once(args: &Args) -> Result<(), String> {
             &template.header,
             mode,
             args.threads,
-            args.batch.max(2),
+            args.batch,
             u64::MAX,
             jnt_miner::accel::PortableBackend,
         ),

@@ -150,10 +150,13 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # No `merge-multiple`: the linux and macOS jobs both produce a file
+      # named `jnt-node` (and each its own SHA256SUMS), so a flat merge
+      # would let one platform silently overwrite the other. Keeping the
+      # per-artifact directories preserves every platform's files.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-          merge-multiple: true
 
       - name: Assets
         shell: bash
@@ -166,14 +169,19 @@ jobs:
             echo 'Verification:'
             echo
             echo '  1. Fetch the binary and its .sig bundle for your platform from the'
-            echo '     GitHub Release assets.'
-            echo '  2. Verify the SHA-256 checksum:'
-            echo '       sha256sum -c SHA256SUMS'
+            echo '     GitHub Release assets (each platform lives in its own'
+            echo '     jnt-node-<target>/ directory).'
+            echo '  2. Verify the SHA-256 checksum inside that directory:'
+            echo '       cd jnt-node-<target> && sha256sum -c SHA256SUMS'
             echo '  3. Verify the sigstore bundle (cosign 2.x):'
             echo '       cosign verify-blob --bundle <binary>.sig <binary>'
             echo
-            echo 'Checksums:'
-            cat dist/SHA256SUMS
+            echo 'Checksums per platform:'
+            for f in dist/*/SHA256SUMS; do
+              echo
+              echo "## $f"
+              cat "$f"
+            done
           } > dist/VERIFICATION.txt
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
