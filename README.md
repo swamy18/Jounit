@@ -4,12 +4,10 @@
 
 AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
 
-**Author and copyright:** Community-owned. The code is open source — no single
-person holds it, like Bitcoin. The *Solar Cyber Unit* name, `SRCT` ticker and logos are
-community marks — see [License and trademark](#license-and-trademark).
+**Author and copyright:** The project is open source — see [License](#license).
 
-**Built by:** Swamy Gadila. The project is open for anyone to use,
-and redistribute — no single person owns it.
+**Built by:** Swamy Gadila. The project is open for anyone to use
+and redistribute.
 
 ---
 
@@ -33,7 +31,7 @@ and redistribute — no single person owns it.
 - [Network profiles](#network-profiles)
 - [Commands](#commands)
 - [Testing](#testing)
-- [License and trademark](#license-and-trademark)
+- [License](#license)
 
 ---
 
@@ -1296,28 +1294,14 @@ record of defects found and fixed is in [docs/status.md](docs/status.md).
 
 ---
 
-## License and trademark
+## License
 
-**Copyright © 2026 The Solar Cyber Unit developers.** The code is open — no single
-person holds it, like Bitcoin.
+**Copyright © 2026 The Solar Cyber Unit developers.**
 
 **Code: MIT** — the same permissive licence Bitcoin Core uses. The full text
 ships at the repo root (`LICENSE-MIT`). You may use, copy, modify, merge,
 publish, distribute, sublicense, and/or sell copies of the software, and permit
 persons to whom it is furnished to do so, including commercially.
-
-**Name and marks: community-owned.** The *Solar Cyber Unit* name, the `SRCT` ticker and
-the project's logos are community marks — not part of the code licence and not
-held by any single person.
-
-This follows the same arrangement Bitcoin uses: **the code is open so anyone
-can run it, and the name belongs to the community.** Nothing in an open-source
-licence can stop someone from using the code — that is deliberate, and it is
-how the ecosystem works. You are free to fork the code and ship it under your
-own name; the only thing we ask is that you do not call your fork "Solar Cyber Unit" or
-use the `SRCT` ticker, so that users holding real value are never confused
-about what chain they are on. That is a community norm, not a gate requiring
-permission — there is no trademark file to read and no application to file.
 
 ---
 
