@@ -272,6 +272,43 @@ fn a_repayment_pays_interest_first_and_then_principal() {
 }
 
 #[test]
+fn a_dust_repayment_against_a_large_position_never_increases_the_debt() {
+    // Regression test for the l2_credit_apply fuzz crash: a 1-sat repayment
+    // against a 10M position legitimately leaves ~10M outstanding. The debt
+    // only goes one way — it must not increase, and conservation must hold.
+    let mut w = world();
+    let id = open_a_position(&mut w, PRINCIPAL);
+    let before = w
+        .state
+        .credit_position(&id)
+        .expect("the position is in the state")
+        .outstanding_sat;
+
+    let payload = CreditRepayPayload::build(&w.borrower, id, 1).unwrap();
+    let tx = L2Transaction::new(L2Payload::CreditRepay(payload));
+    w.state
+        .apply(&tx, 20, &w.validators, &MockBls)
+        .expect("a dust repayment applies");
+    let after = w
+        .state
+        .credit_position(&id)
+        .expect("the position is still in the state")
+        .outstanding_sat;
+    assert!(
+        after <= before,
+        "a repayment increased the outstanding debt: {before} -> {after}"
+    );
+    // Opened at height 10, repaid at 20, window 100: no complete window has
+    // passed, so no interest is due and the sat pays principal.
+    assert_eq!(
+        after,
+        PRINCIPAL - 1,
+        "the sat paid principal; no interest due yet"
+    );
+    assert!(w.state.check_conservation());
+}
+
+#[test]
 fn a_fully_repaid_position_returns_the_collateral_to_the_borrower() {
     let mut w = world();
     let id = open_a_position(&mut w, PRINCIPAL);

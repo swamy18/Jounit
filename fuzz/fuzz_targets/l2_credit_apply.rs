@@ -136,16 +136,24 @@ fuzz_target!(|data: &[u8]| {
                 };
                 let tx = L2Transaction::new(L2Payload::CreditRepay(payload));
                 let before = state.committed_root();
+                // Debt only goes one way: capture the balance first, because a
+                // repayment must never increase what is owed. (A bound against
+                // the instalment size would be wrong here: a 1-sat repayment
+                // against a 25M position legitimately leaves ~25M outstanding.)
+                let before_outstanding =
+                    state.credit_position(&id).map(|p| p.outstanding_sat);
                 match state.apply(&tx, height, &validators, &verifier) {
                     Ok(_) => {
                         last_repay = Some(tx.clone());
                         let p = state
                             .credit_position(&id)
                             .expect("the position is in the state");
-                        assert!(
-                            p.outstanding_sat <= amount.max(1) * 1000,
-                            "the outstanding debt is implausibly large"
-                        );
+                        if let Some(prev) = before_outstanding {
+                            assert!(
+                                p.outstanding_sat <= prev,
+                                "a repayment increased the outstanding debt"
+                            );
+                        }
                         assert_ne!(
                             before,
                             state.committed_root(),
