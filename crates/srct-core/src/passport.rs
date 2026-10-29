@@ -287,9 +287,13 @@ mod tests {
             sig: crate::bls_checkpoint::BlsSignature([0u8; 96]),
         };
         // 100 farmed payments, one counterparty: sqrt(100)=10, not 100.
-        let farmed: Vec<_> = (0..100u8).map(|i| evt(PassportEventKind::PaymentCompleted, 9, i)).collect();
+        let farmed: Vec<_> = (0..100u8)
+            .map(|i| evt(PassportEventKind::PaymentCompleted, 9, i))
+            .collect();
         // 4 genuine payments, four counterparties.
-        let genuine: Vec<_> = (0..4u8).map(|i| evt(PassportEventKind::PaymentCompleted, i, i)).collect();
+        let genuine: Vec<_> = (0..4u8)
+            .map(|i| evt(PassportEventKind::PaymentCompleted, i, i))
+            .collect();
         assert!(score_batch(&mk(farmed)) < score_batch(&mk(genuine)) * 3);
     }
 

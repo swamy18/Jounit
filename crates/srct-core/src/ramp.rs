@@ -162,13 +162,14 @@ pub fn sign_quote(
     quote: &RampQuote,
 ) -> Result<(crate::sig::Bundle, crate::sig::Bundle), RampError> {
     quote.validate()?;
-    let addr = provider.address().map_err(|_| RampError::Malformed("provider address"))?;
+    let addr = provider
+        .address()
+        .map_err(|_| RampError::Malformed("provider address"))?;
     if addr != quote.provider {
         return Err(RampError::SignerMismatch);
     }
     let keys = Auth::keys_for(provider).map_err(|_| RampError::Malformed("provider keys"))?;
-    let sigs =
-        Auth::sigs_for(provider, &quote.id()).map_err(|_| RampError::SignatureInvalid)?;
+    let sigs = Auth::sigs_for(provider, &quote.id()).map_err(|_| RampError::SignatureInvalid)?;
     Ok((sigs, keys))
 }
 
@@ -183,7 +184,9 @@ pub fn verify_quote(
     if height > quote.expires_height {
         return Err(RampError::Malformed("quote expired"));
     }
-    let signer = keys.address().map_err(|_| RampError::Malformed("provider keys"))?;
+    let signer = keys
+        .address()
+        .map_err(|_| RampError::Malformed("provider keys"))?;
     if signer != quote.provider {
         return Err(RampError::SignerMismatch);
     }

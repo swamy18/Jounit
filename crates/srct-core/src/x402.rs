@@ -378,8 +378,10 @@ pub fn base64_decode(raw: &str) -> Result<Vec<u8>, X402Error> {
                 sextets[i] = b64_value(b).ok_or(X402Error::Malformed("base64 alphabet"))?;
             }
         }
-        let triple =
-            ((sextets[0] as u32) << 18) | ((sextets[1] as u32) << 12) | ((sextets[2] as u32) << 6) | (sextets[3] as u32);
+        let triple = ((sextets[0] as u32) << 18)
+            | ((sextets[1] as u32) << 12)
+            | ((sextets[2] as u32) << 6)
+            | (sextets[3] as u32);
         out.push(((triple >> 16) & 0xff) as u8);
         if pad < 2 {
             out.push(((triple >> 8) & 0xff) as u8);
@@ -393,8 +395,7 @@ pub fn base64_decode(raw: &str) -> Result<Vec<u8>, X402Error> {
 
 /// Encode a challenge for the `PAYMENT-REQUIRED` header.
 pub fn encode_required(required: &X402Required) -> Result<String, X402Error> {
-    let json =
-        serde_json::to_vec(required).map_err(|_| X402Error::Malformed("required json"))?;
+    let json = serde_json::to_vec(required).map_err(|_| X402Error::Malformed("required json"))?;
     Ok(base64_encode(&json))
 }
 

@@ -143,9 +143,13 @@ impl OfferBook {
             return Err(LendingError::Malformed("offer expired"));
         }
         if self.offers.len() >= MAX_LOAN_OFFERS && !self.offers.contains_key(&offer.id()) {
-            return Err(LendingError::BookFull { cap: MAX_LOAN_OFFERS });
+            return Err(LendingError::BookFull {
+                cap: MAX_LOAN_OFFERS,
+            });
         }
-        let signer = keys.address().map_err(|_| LendingError::Malformed("lender keys"))?;
+        let signer = keys
+            .address()
+            .map_err(|_| LendingError::Malformed("lender keys"))?;
         if signer != offer.lender {
             return Err(LendingError::SignerMismatch);
         }
@@ -199,14 +203,19 @@ impl RepaymentHistory {
         positions: impl Iterator<Item = &'a CreditPosition>,
         now_height: u64,
     ) -> Self {
-        let mut h = RepaymentHistory { borrower: *borrower, ..Default::default() };
+        let mut h = RepaymentHistory {
+            borrower: *borrower,
+            ..Default::default()
+        };
         for p in positions {
             if p.borrower != *borrower {
                 continue;
             }
             h.total_borrowed_sat = h.total_borrowed_sat.saturating_add(p.amount_sat);
             match p.state {
-                PositionState::Repaid { interest_paid_sat, .. } => {
+                PositionState::Repaid {
+                    interest_paid_sat, ..
+                } => {
                     h.repaid_positions += 1;
                     h.total_repaid_sat = h
                         .total_repaid_sat
@@ -307,7 +316,9 @@ pub fn sign_standing_repay(
     expires_height: u64,
     nonce: u64,
 ) -> Result<(StandingRepay, crate::sig::Bundle, crate::sig::Bundle), LendingError> {
-    let addr = borrower.address().map_err(|_| LendingError::Malformed("borrower address"))?;
+    let addr = borrower
+        .address()
+        .map_err(|_| LendingError::Malformed("borrower address"))?;
     let instruction = StandingRepay {
         network_id: network_id.to_string(),
         borrower: addr,
@@ -340,7 +351,9 @@ pub fn verify_standing_repay(
     if !instruction.live_at(height) {
         return Err(LendingError::Malformed("instruction spent or expired"));
     }
-    let signer = keys.address().map_err(|_| LendingError::Malformed("borrower keys"))?;
+    let signer = keys
+        .address()
+        .map_err(|_| LendingError::Malformed("borrower keys"))?;
     if signer != instruction.borrower {
         return Err(LendingError::SignerMismatch);
     }
@@ -358,7 +371,10 @@ pub fn apply_standing_repay(
 ) -> (u64, u64) {
     let share = (deposit_sat as u128 * instruction.pct_bps as u128 / 10_000) as u64;
     let remaining_cap = instruction.cap_sat.saturating_sub(instruction.applied_sat);
-    let to_position = share.min(remaining_cap).min(position_debt_sat).min(deposit_sat);
+    let to_position = share
+        .min(remaining_cap)
+        .min(position_debt_sat)
+        .min(deposit_sat);
     (to_position, deposit_sat - to_position)
 }
 

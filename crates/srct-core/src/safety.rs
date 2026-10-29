@@ -58,7 +58,10 @@ impl std::fmt::Display for SafetyError {
                 "amount {amount} needs human approval (threshold {threshold})"
             ),
             SafetyError::VelocityLimited { recent, limit } => {
-                write!(f, "velocity limited: {recent} recent payments, limit {limit}")
+                write!(
+                    f,
+                    "velocity limited: {recent} recent payments, limit {limit}"
+                )
             }
             SafetyError::MainnetBlockedInTestMode => {
                 write!(f, "test mode refuses srct/mainnet spends")
@@ -110,7 +113,9 @@ impl SessionBook {
             return Err(SafetyError::Malformed("duplicate session"));
         }
         if self.states.len() >= self.max_sessions {
-            return Err(SafetyError::SessionBookFull { cap: self.max_sessions });
+            return Err(SafetyError::SessionBookFull {
+                cap: self.max_sessions,
+            });
         }
         self.states.insert(agent, state);
         Ok(())
@@ -145,7 +150,12 @@ impl SessionBook {
         }
         let st = match self.states.get(agent) {
             Some(st) => {
-                if height >= st.window_start_height.checked_add(window_blocks).ok_or(SafetyError::Malformed("window overflow"))? {
+                if height
+                    >= st
+                        .window_start_height
+                        .checked_add(window_blocks)
+                        .ok_or(SafetyError::Malformed("window overflow"))?
+                {
                     SessionState {
                         window_start_height: height,
                         spent_in_window_sat: 0,
@@ -157,7 +167,9 @@ impl SessionBook {
             }
             None => {
                 if self.states.len() >= self.max_sessions {
-                    return Err(SafetyError::SessionBookFull { cap: self.max_sessions });
+                    return Err(SafetyError::SessionBookFull {
+                        cap: self.max_sessions,
+                    });
                 }
                 SessionState {
                     window_start_height: height,
@@ -166,14 +178,20 @@ impl SessionBook {
                 }
             }
         };
-        let spent = st.spent_in_window_sat.checked_add(amount_sat).ok_or(SafetyError::Malformed("spent overflow"))?;
+        let spent = st
+            .spent_in_window_sat
+            .checked_add(amount_sat)
+            .ok_or(SafetyError::Malformed("spent overflow"))?;
         if spent > cap_sat {
             return Err(SafetyError::SessionLimitExceeded {
                 spent,
                 cap: cap_sat,
             });
         }
-        let total = st.total_spent_sat.checked_add(amount_sat).ok_or(SafetyError::Malformed("total overflow"))?;
+        let total = st
+            .total_spent_sat
+            .checked_add(amount_sat)
+            .ok_or(SafetyError::Malformed("total overflow"))?;
         self.states.insert(
             *agent,
             SessionState {
@@ -207,7 +225,9 @@ pub enum RiskVerdict {
 impl RiskPolicy {
     /// Whether `test_mode` is on (`SRCT_TEST_MODE=1`).
     pub fn test_mode_from_env() -> bool {
-        std::env::var(TEST_MODE_ENV).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+        std::env::var(TEST_MODE_ENV)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     }
 
     pub fn from_env() -> Self {
@@ -237,7 +257,9 @@ impl RiskPolicy {
         if self.test_mode && network_id == "srct/mainnet" {
             return Err(SafetyError::MainnetBlockedInTestMode);
         }
-        if self.max_payments_per_payer > 0 && recent_payments_by_payer >= self.max_payments_per_payer {
+        if self.max_payments_per_payer > 0
+            && recent_payments_by_payer >= self.max_payments_per_payer
+        {
             return Err(SafetyError::VelocityLimited {
                 recent: recent_payments_by_payer,
                 limit: self.max_payments_per_payer,
@@ -263,7 +285,14 @@ pub struct AuditEntry {
 }
 
 impl AuditEntry {
-    fn compute_hash(seq: u64, kind: &str, payment_id: &Option<Hash>, amount: &Option<u64>, detail: &str, prev: &Hash) -> Hash {
+    fn compute_hash(
+        seq: u64,
+        kind: &str,
+        payment_id: &Option<Hash>,
+        amount: &Option<u64>,
+        detail: &str,
+        prev: &Hash,
+    ) -> Hash {
         let mut amt = [0u8; 8];
         if let Some(a) = amount {
             amt = a.to_le_bytes();
@@ -332,10 +361,13 @@ impl AuditLog {
             return Err(SafetyError::Malformed("audit detail too long"));
         }
         if self.entries.len() >= self.max_entries {
-            return Err(SafetyError::AuditFull { cap: self.max_entries });
+            return Err(SafetyError::AuditFull {
+                cap: self.max_entries,
+            });
         }
         let seq = self.next_seq;
-        let hash = AuditEntry::compute_hash(seq, kind, &payment_id, &amount_sat, &detail, &self.tip);
+        let hash =
+            AuditEntry::compute_hash(seq, kind, &payment_id, &amount_sat, &detail, &self.tip);
         let entry = AuditEntry {
             seq,
             kind,
@@ -362,8 +394,14 @@ impl AuditLog {
             if e.prev_hash != prev {
                 return Err(SafetyError::Malformed("audit chain link"));
             }
-            let recomputed =
-                AuditEntry::compute_hash(e.seq, e.kind, &e.payment_id, &e.amount_sat, &e.detail, &prev);
+            let recomputed = AuditEntry::compute_hash(
+                e.seq,
+                e.kind,
+                &e.payment_id,
+                &e.amount_sat,
+                &e.detail,
+                &prev,
+            );
             if recomputed != e.hash {
                 return Err(SafetyError::Malformed("audit entry hash"));
             }
@@ -419,7 +457,10 @@ mod tests {
         book.record(&agent, 101, 400, 10, 1_000).unwrap();
         assert_eq!(
             book.record(&agent, 102, 300, 10, 1_000),
-            Err(SafetyError::SessionLimitExceeded { spent: 1_100, cap: 1_000 })
+            Err(SafetyError::SessionLimitExceeded {
+                spent: 1_100,
+                cap: 1_000
+            })
         );
         // Window rolls forward.
         book.record(&agent, 200, 300, 10, 1_000).unwrap();
@@ -440,7 +481,10 @@ mod tests {
         );
         assert_eq!(
             policy.check("srct/mini", 100, 2),
-            Err(SafetyError::VelocityLimited { recent: 2, limit: 2 })
+            Err(SafetyError::VelocityLimited {
+                recent: 2,
+                limit: 2
+            })
         );
         assert_eq!(
             policy.check("srct/mainnet", 100, 0),
@@ -451,8 +495,10 @@ mod tests {
     #[test]
     fn audit_log_chains_and_verifies() {
         let mut log = AuditLog::with_capacity(4);
-        log.push("authorize", None, Some(500), "grant".to_string()).unwrap();
-        log.push("payment", Some([1u8; 32]), Some(500), "submit".to_string()).unwrap();
+        log.push("authorize", None, Some(500), "grant".to_string())
+            .unwrap();
+        log.push("payment", Some([1u8; 32]), Some(500), "submit".to_string())
+            .unwrap();
         log.verify_chain().unwrap();
         assert_eq!(log.len(), 2);
     }

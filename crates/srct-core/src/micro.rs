@@ -60,10 +60,9 @@ impl std::fmt::Display for MicroError {
             MicroError::WrongNetwork { expected, got } => {
                 write!(f, "wrong network: expected {expected}, got {got}")
             }
-            MicroError::SignerNotSponsor { signer, sponsor } => write!(
-                f,
-                "sponsor signature from {signer:?}, expected {sponsor:?}"
-            ),
+            MicroError::SignerNotSponsor { signer, sponsor } => {
+                write!(f, "sponsor signature from {signer:?}, expected {sponsor:?}")
+            }
             MicroError::SignatureInvalid(w) => write!(f, "sponsor signature invalid: {w}"),
         }
     }
@@ -93,7 +92,11 @@ pub struct BatchQuote {
 impl BatchQuote {
     /// Price `batch` at `base_fee_sat_per_gas` assuming `input_count` funding
     /// inputs. Pure arithmetic; refuses overflow rather than wrapping.
-    pub fn price(batch: &PaymentBatch, base_fee_sat_per_gas: u64, input_count: usize) -> Result<Self, MicroError> {
+    pub fn price(
+        batch: &PaymentBatch,
+        base_fee_sat_per_gas: u64,
+        input_count: usize,
+    ) -> Result<Self, MicroError> {
         if batch.payment_ids.is_empty() {
             return Err(MicroError::EmptyBatch);
         }
@@ -163,7 +166,9 @@ pub fn voucher_spec(
             cap: stream.max_total_sat,
         });
     }
-    let amount = accrued.checked_sub(settled_sat).ok_or(MicroError::Overflow)?;
+    let amount = accrued
+        .checked_sub(settled_sat)
+        .ok_or(MicroError::Overflow)?;
     if amount == 0 {
         return Err(MicroError::NothingNew);
     }
@@ -246,7 +251,9 @@ pub fn sign_sponsor_intent(
     fee_sat: u64,
     expires_at_height: u64,
 ) -> Result<(SponsoredIntent, crate::sig::Bundle, crate::sig::Bundle), MicroError> {
-    let sponsor = wallet.address().map_err(|_| MicroError::Malformed("sponsor address"))?;
+    let sponsor = wallet
+        .address()
+        .map_err(|_| MicroError::Malformed("sponsor address"))?;
     let intent = SponsoredIntent {
         network_id: network_id.to_string(),
         sponsor,
@@ -289,7 +296,9 @@ pub fn verify_sponsor_intent(
         // mislabeled intent, not coverage.
         return Err(MicroError::Malformed("intent fee below declared fees"));
     }
-    let signer = keys.address().map_err(|_| MicroError::Malformed("sponsor keys"))?;
+    let signer = keys
+        .address()
+        .map_err(|_| MicroError::Malformed("sponsor keys"))?;
     if signer != intent.sponsor {
         return Err(MicroError::SignerNotSponsor {
             signer,
@@ -304,7 +313,7 @@ pub fn verify_sponsor_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{derive_agent_id, AgentRole, POLICY_VERSION, SpendPolicy};
+    use crate::agent::{derive_agent_id, AgentRole, SpendPolicy, POLICY_VERSION};
     use crate::service::{build_signed_request, RequestSpec};
     use crate::stream::build_stream;
     use crate::stream::StreamOpenSpec;
@@ -320,7 +329,11 @@ mod tests {
         )
     }
 
-    fn policy_for(payer: &Wallet, provider: &crate::hash::Address, service: [u8; 32]) -> SpendPolicy {
+    fn policy_for(
+        payer: &Wallet,
+        provider: &crate::hash::Address,
+        service: [u8; 32],
+    ) -> SpendPolicy {
         let owner = payer.address().unwrap();
         SpendPolicy {
             version: POLICY_VERSION,
@@ -362,9 +375,24 @@ mod tests {
                 &[],
             )
             .unwrap();
-            let auth = crate::service::authorize_request(&mut book, &policy, NET, &req, HEIGHT, (i + 1) as u64).unwrap();
+            let auth = crate::service::authorize_request(
+                &mut book,
+                &policy,
+                NET,
+                &req,
+                HEIGHT,
+                (i + 1) as u64,
+            )
+            .unwrap();
             let pay = crate::payment::build_signed_payment(
-                &payer, &auth, NET, AgentRole::Machine, 0, EXPIRES, req.request_id(), &[],
+                &payer,
+                &auth,
+                NET,
+                AgentRole::Machine,
+                0,
+                EXPIRES,
+                req.request_id(),
+                &[],
             )
             .unwrap();
             out.push(pay);
@@ -380,7 +408,12 @@ mod tests {
         assert_eq!(quote.payments, 10);
         // One shared base fee vs ten separate ones.
         assert!(quote.savings_sat > 0);
-        assert!(quote.fee_per_payment_sat < 10 * (crate::tx::GAS_TX_BASE + crate::tx::GAS_PER_INPUT + crate::tx::GAS_PER_OUTPUT));
+        assert!(
+            quote.fee_per_payment_sat
+                < 10 * (crate::tx::GAS_TX_BASE
+                    + crate::tx::GAS_PER_INPUT
+                    + crate::tx::GAS_PER_OUTPUT)
+        );
         assert!(quote_batch(&[], NET, HEIGHT, 10, 1).is_err());
     }
 
@@ -409,7 +442,10 @@ mod tests {
         assert_eq!(spec.amount_sat, 50);
         assert_eq!(spec.nonce, 1);
         // Same height again settles nothing new.
-        assert_eq!(voucher_spec(&stream, 50, 1, 104, [9u8; 32]), Err(MicroError::NothingNew));
+        assert_eq!(
+            voucher_spec(&stream, 50, 1, 104, [9u8; 32]),
+            Err(MicroError::NothingNew)
+        );
         // Next window accrues the delta only.
         let spec2 = voucher_spec(&stream, 50, 1, 109, [9u8; 32]).unwrap();
         assert_eq!(spec2.amount_sat, 50);
@@ -421,11 +457,19 @@ mod tests {
         let (payments, _) = test_payments(3, 500);
         let (batch, quote) = quote_batch(&payments, NET, HEIGHT, 10, 1).unwrap();
         let sponsor = Wallet::from_private_key_bytes(&[9u8; 32], "sponsor").unwrap();
-        let (intent, sigs, keys) =
-            sign_sponsor_intent(&sponsor, NET, &batch, quote.required_fee_sat.max(batch.declared_fee_sat).max(1), 500).unwrap();
+        let (intent, sigs, keys) = sign_sponsor_intent(
+            &sponsor,
+            NET,
+            &batch,
+            quote.required_fee_sat.max(batch.declared_fee_sat).max(1),
+            500,
+        )
+        .unwrap();
         verify_sponsor_intent(&intent, &sigs, &keys, &batch, NET, HEIGHT).unwrap();
         // Wrong network, expired, or wrong batch all refuse.
-        assert!(verify_sponsor_intent(&intent, &sigs, &keys, &batch, "srct/other", HEIGHT).is_err());
+        assert!(
+            verify_sponsor_intent(&intent, &sigs, &keys, &batch, "srct/other", HEIGHT).is_err()
+        );
         assert!(verify_sponsor_intent(&intent, &sigs, &keys, &batch, NET, 600).is_err());
     }
 }

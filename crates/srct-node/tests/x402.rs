@@ -60,7 +60,9 @@ fn wallet(seed: u8, label: &str) -> Wallet {
 
 fn exchange_raw(addr: SocketAddr, request: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     let _ = stream.write_all(request);
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
@@ -68,11 +70,16 @@ fn exchange_raw(addr: SocketAddr, request: &[u8]) -> String {
 }
 
 fn body_of(raw: &str) -> String {
-    raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+    raw.split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default()
 }
 
 fn status_of(raw: &str) -> u16 {
-    raw.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    raw.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -93,7 +100,10 @@ fn paid_weather_challenge_verify_settle_and_retry() {
     let body: Value = serde_json::from_str(&body_of(&raw)).unwrap();
     assert_eq!(body["accepts"][0]["scheme"], "exact");
     assert_eq!(body["accepts"][0]["amount"], DEMO_AMOUNT.to_string());
-    assert!(body["accepts"][0]["network"].as_str().unwrap().starts_with("srct:"));
+    assert!(body["accepts"][0]["network"]
+        .as_str()
+        .unwrap()
+        .starts_with("srct:"));
 
     // 2. Agent builds a bounded policy + payment for the demo offer.
     let payer = wallet(11, "x402-payer");
@@ -116,7 +126,12 @@ fn paid_weather_challenge_verify_settle_and_retry() {
         parent_agent_id: None,
     };
     // Fund the payer's node-local credit line so admission can reserve.
-    node.shared.lock().unwrap().credit.deposit(payer_addr, 10_000).unwrap();
+    node.shared
+        .lock()
+        .unwrap()
+        .credit
+        .deposit(payer_addr, 10_000)
+        .unwrap();
     // Register the policy by issuing one authorization on the node.
     let mut book = PolicyBook::default();
     let request = build_signed_request(
@@ -137,8 +152,11 @@ fn paid_weather_challenge_verify_settle_and_retry() {
     let auth = {
         let mut node_book = node.shared.lock().unwrap();
         // Seed node-local policy book + registry the same way /v1/authorize does.
-        let auth = authorize_request(&mut node_book.policies, &policy, NET, &request, 0, 1).unwrap();
-        node_book.policy_registry.insert(policy.hash(), policy.clone());
+        let auth =
+            authorize_request(&mut node_book.policies, &policy, NET, &request, 0, 1).unwrap();
+        node_book
+            .policy_registry
+            .insert(policy.hash(), policy.clone());
         // Mirror the grant in the local book for the settle path.
         let _ = authorize_request(&mut book, &policy, NET, &request, 0, 1).unwrap();
         auth
@@ -236,8 +254,16 @@ fn base64_encode(bytes: &[u8]) -> String {
         let t = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((t >> 18) & 63) as usize] as char);
         out.push(T[((t >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 { out.push(T[((t >> 6) & 63) as usize] as char); } else { out.push('='); }
-        if chunk.len() > 2 { out.push(T[(t & 63) as usize] as char); } else { out.push('='); }
+        if chunk.len() > 1 {
+            out.push(T[((t >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(T[(t & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
     }
     out
 }

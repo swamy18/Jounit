@@ -113,7 +113,10 @@ impl JobRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobError {
     Malformed(&'static str),
-    BadTransition { from: JobState, action: &'static str },
+    BadTransition {
+        from: JobState,
+        action: &'static str,
+    },
     ResultMismatch,
 }
 
@@ -135,7 +138,10 @@ impl std::error::Error for JobError {}
 pub fn accept(job: &mut JobRecord, escrow_id: Hash) -> Result<(), JobError> {
     job.validate()?;
     if job.state != JobState::Offered {
-        return Err(JobError::BadTransition { from: job.state, action: "accept" });
+        return Err(JobError::BadTransition {
+            from: job.state,
+            action: "accept",
+        });
     }
     job.escrow_id = Some(escrow_id);
     job.state = JobState::Accepted;
@@ -145,11 +151,17 @@ pub fn accept(job: &mut JobRecord, escrow_id: Hash) -> Result<(), JobError> {
 /// Record delivery of the result (worker posts hash + receipt off-chain).
 pub fn deliver(job: &mut JobRecord, result_hash: Hash, height: u64) -> Result<(), JobError> {
     if job.state != JobState::Accepted {
-        return Err(JobError::BadTransition { from: job.state, action: "deliver" });
+        return Err(JobError::BadTransition {
+            from: job.state,
+            action: "deliver",
+        });
     }
     if height > job.deadline_height {
         job.state = JobState::Expired;
-        return Err(JobError::BadTransition { from: JobState::Expired, action: "deliver late" });
+        return Err(JobError::BadTransition {
+            from: JobState::Expired,
+            action: "deliver late",
+        });
     }
     job.result_hash = Some(result_hash);
     job.state = JobState::Delivered;
@@ -160,7 +172,10 @@ pub fn deliver(job: &mut JobRecord, result_hash: Hash, height: u64) -> Result<()
 /// release pays for *this* dataset, not any dataset.
 pub fn release(job: &mut JobRecord, result_hash: Hash) -> Result<(), JobError> {
     if job.state != JobState::Delivered {
-        return Err(JobError::BadTransition { from: job.state, action: "release" });
+        return Err(JobError::BadTransition {
+            from: job.state,
+            action: "release",
+        });
     }
     if job.result_hash != Some(result_hash) {
         return Err(JobError::ResultMismatch);
@@ -176,7 +191,10 @@ pub fn dispute(job: &mut JobRecord) -> Result<(), JobError> {
             job.state = JobState::Disputed;
             Ok(())
         }
-        other => Err(JobError::BadTransition { from: other, action: "dispute" }),
+        other => Err(JobError::BadTransition {
+            from: other,
+            action: "dispute",
+        }),
     }
 }
 
@@ -184,7 +202,10 @@ pub fn dispute(job: &mut JobRecord) -> Result<(), JobError> {
 /// refund the hirer. Terminal: no further transition.
 pub fn resolve(job: &mut JobRecord, pay_worker: bool) -> Result<(), JobError> {
     if job.state != JobState::Disputed {
-        return Err(JobError::BadTransition { from: job.state, action: "resolve" });
+        return Err(JobError::BadTransition {
+            from: job.state,
+            action: "resolve",
+        });
     }
     job.state = if pay_worker {
         JobState::ResolvedRelease
@@ -215,10 +236,7 @@ pub const DOM_JOB_RESOLVE: &[u8] = b"srct/job-resolve/v1";
 /// (pay worker or refund hirer) and the result hash the decision is about
 /// (zero when the decision does not hinge on a result).
 pub fn resolve_hash(job_id: &Hash, pay_worker: bool, result_hash: &Hash) -> Hash {
-    sha256_dom(
-        DOM_JOB_RESOLVE,
-        &[job_id, &[pay_worker as u8], result_hash],
-    )
+    sha256_dom(DOM_JOB_RESOLVE, &[job_id, &[pay_worker as u8], result_hash])
 }
 
 #[cfg(test)]

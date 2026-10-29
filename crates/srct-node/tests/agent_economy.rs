@@ -18,9 +18,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use srct_core::agent::{
-    derive_agent_id, AgentRole, Authorization, SpendPolicy, POLICY_VERSION,
-};
+use srct_core::agent::{derive_agent_id, AgentRole, Authorization, SpendPolicy, POLICY_VERSION};
 use srct_core::bls::SecretKey as BlsSecretKey;
 use srct_core::chain::Chain;
 use srct_core::hash::address_to_hex;
@@ -28,9 +26,7 @@ use srct_core::l2::Auth;
 use srct_core::params::NetworkParams;
 use srct_core::payment::{build_signed_payment, MachinePayment};
 use srct_core::receipt::{sign_receipt, ReceiptAnchor, ServiceReceipt, RECEIPT_VERSION};
-use srct_core::service::{
-    build_signed_request, derive_service_id, result_hash_of, RequestSpec,
-};
+use srct_core::service::{build_signed_request, derive_service_id, result_hash_of, RequestSpec};
 use srct_core::sig::Bundle;
 use srct_core::wallet::Wallet;
 use srct_node::api::{spawn_with_options, SharedNode};
@@ -71,14 +67,26 @@ fn wallet(seed: u8, label: &str) -> Wallet {
 
 fn exchange(addr: SocketAddr, request: &[u8]) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     let _ = stream.write_all(request);
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf).into_owned();
-    let status: u16 = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
-    (status, serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}")))
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}")),
+    )
 }
 
 fn post(node: &Node, path: &str, body: &Value) -> (u16, Value) {
@@ -91,12 +99,19 @@ fn post(node: &Node, path: &str, body: &Value) -> (u16, Value) {
 }
 
 fn get(node: &Node, path: &str) -> (u16, Value) {
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", node.addr);
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        node.addr
+    );
     exchange(node.addr, req.as_bytes())
 }
 
 fn policy_sigs_hex(owner: &Wallet, policy: &SpendPolicy) -> String {
-    hex::encode(Auth::sigs_for(owner, &policy.signing_hash()).unwrap().to_bytes())
+    hex::encode(
+        Auth::sigs_for(owner, &policy.signing_hash())
+            .unwrap()
+            .to_bytes(),
+    )
 }
 
 fn policy_keys_hex(owner: &Wallet) -> String {
@@ -132,7 +147,14 @@ fn bridge(
     service: [u8; 32],
     amount: u64,
     nonce: u64,
-) -> (String, MachinePayment, Authorization, Bundle, Bundle, srct_core::service::PaymentRequest) {
+) -> (
+    String,
+    MachinePayment,
+    Authorization,
+    Bundle,
+    Bundle,
+    srct_core::service::PaymentRequest,
+) {
     let request = build_signed_request(
         payer,
         RequestSpec {
@@ -164,7 +186,14 @@ fn bridge(
     )
     .unwrap();
     let payment = build_signed_payment(
-        payer, &auth, NET, AgentRole::Machine, 0, EXPIRES, request.request_id(), &[],
+        payer,
+        &auth,
+        NET,
+        AgentRole::Machine,
+        0,
+        EXPIRES,
+        request.request_id(),
+        &[],
     )
     .unwrap();
     let sigs = Auth::sigs_for(payer, &auth.signing_hash()).unwrap();
@@ -180,7 +209,14 @@ fn bridge(
         }),
     );
     assert_eq!(s, 200, "submit refused: {submitted}");
-    (submitted["payment_id"].as_str().unwrap().to_string(), payment, auth, sigs, keys, request)
+    (
+        submitted["payment_id"].as_str().unwrap().to_string(),
+        payment,
+        auth,
+        sigs,
+        keys,
+        request,
+    )
 }
 
 #[test]
@@ -337,7 +373,10 @@ fn job_hire_deliver_dispute_and_resolve() {
     assert_eq!(s, 200, "deliver refused: {b}");
 
     // Hirer disputes: funds lock.
-    let dispute_sig = payer_sk.sign(&srct_core::jobs::dispute_hash(&job_hash, "dataset incomplete"));
+    let dispute_sig = payer_sk.sign(&srct_core::jobs::dispute_hash(
+        &job_hash,
+        "dataset incomplete",
+    ));
     let (s, b) = post(
         &node,
         &format!("/v1/jobs/{job_id}/dispute"),
@@ -403,12 +442,19 @@ fn passport_scores_a_recorded_payment() {
         payment_id: payment.signing_hash(),
         request_id: signed_request.request_id(),
         result_hash: Some(result_hash_of(b"rep-output")),
-        anchor: Some(ReceiptAnchor { height: 120, block_hash: [7u8; 64] }),
+        anchor: Some(ReceiptAnchor {
+            height: 120,
+            block_hash: [7u8; 64],
+        }),
         keys: Default::default(),
         sigs: Default::default(),
     };
     sign_receipt(&mut receipt, &provider).unwrap();
-    let (s, b) = post(&node, "/v1/receipt", &json!({ "receipt_hex": hex::encode(receipt.serialize()) }));
+    let (s, b) = post(
+        &node,
+        "/v1/receipt",
+        &json!({ "receipt_hex": hex::encode(receipt.serialize()) }),
+    );
     assert_eq!(s, 200, "receipt refused: {b}");
 
     // Assemble the subject's events from node books.
@@ -429,7 +475,11 @@ fn passport_scores_a_recorded_payment() {
         events: vec![srct_core::passport::PassportEvent {
             kind: srct_core::passport::PassportEventKind::PaymentCompleted,
             height: 0,
-            source: hex::decode(&payment_id).unwrap().try_into().map(|b: [u8; 32]| b).unwrap(),
+            source: hex::decode(&payment_id)
+                .unwrap()
+                .try_into()
+                .map(|b: [u8; 32]| b)
+                .unwrap(),
             counterparty: provider_addr,
             amount_sat: 400,
         }],
@@ -484,7 +534,13 @@ fn passport_scores_a_recorded_payment() {
     );
     assert_ne!(s, 200);
 
-    let (s, score) = get(&node, &format!("/v1/reputation/score/{}?role=machine", address_to_hex(&payer_addr)));
+    let (s, score) = get(
+        &node,
+        &format!(
+            "/v1/reputation/score/{}?role=machine",
+            address_to_hex(&payer_addr)
+        ),
+    );
     assert_eq!(s, 200);
     assert!(score["score"].as_i64().unwrap() > 0);
 }
@@ -679,8 +735,14 @@ fn productive_lending_from_offer_to_autorepay() {
     let borrower = wallet(62, "borrower");
     let borrower_addr = borrower.address().unwrap();
     for (path, body) in [
-        ("/v1/credit/deposit", json!({ "address_hex": address_to_hex(&borrower_addr), "amount_sat": 5_000 })),
-        ("/v1/credit/bond", json!({ "address_hex": address_to_hex(&borrower_addr), "action": "post", "amount_sat": 200 })),
+        (
+            "/v1/credit/deposit",
+            json!({ "address_hex": address_to_hex(&borrower_addr), "amount_sat": 5_000 }),
+        ),
+        (
+            "/v1/credit/bond",
+            json!({ "address_hex": address_to_hex(&borrower_addr), "action": "post", "amount_sat": 200 }),
+        ),
     ] {
         let (s, b) = post(&node, path, &body);
         assert_eq!(s, 200, "{path} refused: {b}");
@@ -709,13 +771,23 @@ fn productive_lending_from_offer_to_autorepay() {
     assert_eq!(col["debt_sat"], 1_000);
 
     // Repay in full: history records it, the limit becomes nonzero.
-    let (s, b) = post(&node, "/v1/credit/repay", &json!({ "position_id": position_id, "amount_sat": 1000 }));
+    let (s, b) = post(
+        &node,
+        "/v1/credit/repay",
+        &json!({ "position_id": position_id, "amount_sat": 1000 }),
+    );
     assert_eq!(s, 200, "repay refused: {b}");
-    let (s, history) = get(&node, &format!("/v1/lending/borrower/{}", address_to_hex(&borrower_addr)));
+    let (s, history) = get(
+        &node,
+        &format!("/v1/lending/borrower/{}", address_to_hex(&borrower_addr)),
+    );
     assert_eq!(s, 200);
     assert_eq!(history["repaid_positions"], 1);
     assert!(history["suggested_max_principal_sat"].as_u64().unwrap() > 0);
-    let (s, limit) = get(&node, &format!("/v1/lending/limit/{}", address_to_hex(&borrower_addr)));
+    let (s, limit) = get(
+        &node,
+        &format!("/v1/lending/limit/{}", address_to_hex(&borrower_addr)),
+    );
     assert_eq!(s, 200);
     assert!(limit["suggested_max_principal_sat"].as_u64().unwrap() > 0);
 
@@ -734,9 +806,17 @@ fn productive_lending_from_offer_to_autorepay() {
     assert_eq!(s, 200, "second accept refused: {accepted2}");
     let position2 = accepted2["position_id"].as_str().unwrap().to_string();
     let (instr, isigs, ikeys) = srct_core::lending::sign_standing_repay(
-        &borrower, NET,
-        hex::decode(&position2).unwrap().try_into().map(|b: [u8; 32]| b).unwrap(),
-        5_000, 10_000, 9_000, 1,
+        &borrower,
+        NET,
+        hex::decode(&position2)
+            .unwrap()
+            .try_into()
+            .map(|b: [u8; 32]| b)
+            .unwrap(),
+        5_000,
+        10_000,
+        9_000,
+        1,
     )
     .unwrap();
     let (s, b) = post(
@@ -768,9 +848,14 @@ fn productive_lending_from_offer_to_autorepay() {
     let provider_addr = wallet(64, "status-provider").address().unwrap();
     let service = derive_service_id(NET, &provider_addr, b"status-svc");
     let policy = machine_policy(&payer, &provider_addr, service);
-    let (s, deposited) = post(&node, "/v1/credit/deposit", &json!({ "address_hex": address_to_hex(&payer_addr), "amount_sat": 100_000 }));
+    let (s, deposited) = post(
+        &node,
+        "/v1/credit/deposit",
+        &json!({ "address_hex": address_to_hex(&payer_addr), "amount_sat": 100_000 }),
+    );
     assert_eq!(s, 200, "deposit refused: {deposited}");
-    let (payment_id, payment, _, _, _, signed_request) = bridge(&node, &payer, &policy, &provider_addr, service, 400, 1);
+    let (payment_id, payment, _, _, _, signed_request) =
+        bridge(&node, &payer, &policy, &provider_addr, service, 400, 1);
     let (s, status) = get(&node, &format!("/v1/payments/{payment_id}/receipt_status"));
     assert_eq!(s, 200);
     assert_eq!(status["recorded"], true);
@@ -787,12 +872,19 @@ fn productive_lending_from_offer_to_autorepay() {
         payment_id: payment.signing_hash(),
         request_id: signed_request.request_id(),
         result_hash: Some(result_hash_of(b"status-output")),
-        anchor: Some(ReceiptAnchor { height: 120, block_hash: [7u8; 64] }),
+        anchor: Some(ReceiptAnchor {
+            height: 120,
+            block_hash: [7u8; 64],
+        }),
         keys: Default::default(),
         sigs: Default::default(),
     };
     sign_receipt(&mut receipt, &wallet(64, "status-provider")).unwrap();
-    let (s, b) = post(&node, "/v1/receipt", &json!({ "receipt_hex": hex::encode(receipt.serialize()) }));
+    let (s, b) = post(
+        &node,
+        "/v1/receipt",
+        &json!({ "receipt_hex": hex::encode(receipt.serialize()) }),
+    );
     assert_eq!(s, 200, "receipt refused: {b}");
     let (s, status) = get(&node, &format!("/v1/payments/{payment_id}/receipt_status"));
     assert_eq!(s, 200);

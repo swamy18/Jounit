@@ -70,14 +70,26 @@ fn wallet(seed: u8, label: &str) -> Wallet {
 
 fn exchange(addr: SocketAddr, request: &[u8]) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     let _ = stream.write_all(request);
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf).into_owned();
-    let status: u16 = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
-    (status, serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}")))
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}")),
+    )
 }
 
 fn post(node: &Node, path: &str, body: &Value) -> (u16, Value) {
@@ -98,7 +110,11 @@ fn get(node: &Node, path: &str) -> (u16, Value) {
 }
 
 fn policy_sigs_hex(owner: &Wallet, policy: &SpendPolicy) -> String {
-    hex::encode(Auth::sigs_for(owner, &policy.signing_hash()).unwrap().to_bytes())
+    hex::encode(
+        Auth::sigs_for(owner, &policy.signing_hash())
+            .unwrap()
+            .to_bytes(),
+    )
 }
 
 fn policy_keys_hex(owner: &Wallet) -> String {
@@ -147,7 +163,14 @@ fn authorize_and_submit(
     )
     .unwrap();
     let payment = build_signed_payment(
-        payer, &auth, NET, AgentRole::Machine, 0, EXPIRES, request.request_id(), &[],
+        payer,
+        &auth,
+        NET,
+        AgentRole::Machine,
+        0,
+        EXPIRES,
+        request.request_id(),
+        &[],
     )
     .unwrap();
     let sigs = Auth::sigs_for(payer, &auth.signing_hash()).unwrap();
@@ -164,7 +187,13 @@ fn authorize_and_submit(
     );
     assert_eq!(s, 200, "payment submit refused: {submitted}");
     assert_eq!(submitted["duplicate"], false);
-    (submitted["payment_id"].as_str().unwrap().to_string(), payment, auth, sigs, keys)
+    (
+        submitted["payment_id"].as_str().unwrap().to_string(),
+        payment,
+        auth,
+        sigs,
+        keys,
+    )
 }
 
 #[test]
@@ -357,12 +386,19 @@ fn reconciliation_and_audit_make_retries_safe() {
         payment_id: [77u8; 32],
         request_id: [78u8; 32],
         result_hash: Some(result_hash_of(b"orphan")),
-        anchor: Some(ReceiptAnchor { height: 120, block_hash: [7u8; 64] }),
+        anchor: Some(ReceiptAnchor {
+            height: 120,
+            block_hash: [7u8; 64],
+        }),
         keys: Default::default(),
         sigs: Default::default(),
     };
     sign_receipt(&mut orphan, &provider).unwrap();
-    let (s, _) = post(&node, "/v1/receipt", &json!({ "receipt_hex": hex::encode(orphan.serialize()) }));
+    let (s, _) = post(
+        &node,
+        "/v1/receipt",
+        &json!({ "receipt_hex": hex::encode(orphan.serialize()) }),
+    );
     assert_eq!(s, 200);
     let (s, orphans) = get(&node, "/v1/receipts/orphans");
     assert_eq!(s, 200, "orphans refused: {orphans}");

@@ -174,14 +174,19 @@ mod tests {
     #[test]
     fn max_and_min_tiers_nest_and_narrow() {
         let p = parent();
-        let (max, min) = build_tier_pair(&p, &spec("max-spend", 20, 5_000), &spec("min-spend", 1, 500)).unwrap();
+        let (max, min) = build_tier_pair(
+            &p,
+            &spec("max-spend", 20, 5_000),
+            &spec("min-spend", 1, 500),
+        )
+        .unwrap();
         assert!(is_valid_tier(&p, &max));
         // The min tier hangs under max (one child identity per parent), so it
         // must validate against max, not the root.
         assert!(is_valid_tier(&max, &min));
         assert!(!is_valid_tier(&p, &min));
         assert_eq!(min.expires_at_height, 500); // temporary key by construction
-        // A tier that widens the parent is refused.
+                                                // A tier that widens the parent is refused.
         let mut wide = spec("wide", 1, 500);
         wide.allowed_recipients = vec![[9u8; 20]];
         assert!(build_tier(&p, &wide).is_err());

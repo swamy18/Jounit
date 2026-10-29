@@ -198,7 +198,10 @@ pub fn quote_usd(
         .checked_mul(slippage_bps as u128)
         .ok_or(FxError::Overflow)?
         / BPS as u128;
-    let total = gross.checked_add(fee).and_then(|t| t.checked_add(slip)).ok_or(FxError::Overflow)?;
+    let total = gross
+        .checked_add(fee)
+        .and_then(|t| t.checked_add(slip))
+        .ok_or(FxError::Overflow)?;
     let sat_due: u64 = total.try_into().map_err(|_| FxError::Overflow)?;
     let fee_sat: u64 = fee.try_into().map_err(|_| FxError::Overflow)?;
     Ok(Quote {
@@ -240,7 +243,10 @@ mod tests {
 
     #[test]
     fn stale_rate_and_overflow_refuse() {
-        assert_eq!(quote_usd(&rate(), 100, 0, 0, 20_000, 60), Err(FxError::StaleRate));
+        assert_eq!(
+            quote_usd(&rate(), 100, 0, 0, 20_000, 60),
+            Err(FxError::StaleRate)
+        );
         assert!(quote_usd(&rate(), u64::MAX, 0, 0, 500, 60).is_err());
     }
 }

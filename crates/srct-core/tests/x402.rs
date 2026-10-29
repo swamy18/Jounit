@@ -98,7 +98,9 @@ fn agent_paid_api_roundtrip() {
     let accept = select_accept(&required, &budget, &provider_addr, &Some(service)).unwrap();
     let amount = parse_sat_amount(&accept.amount).unwrap();
     assert_eq!(amount, 500);
-    budget.check(amount, &provider_addr, &Some(service)).unwrap();
+    budget
+        .check(amount, &provider_addr, &Some(service))
+        .unwrap();
 
     // ---- Agent authorizes + pays (existing SRCT primitives) ----
     let mut book = PolicyBook::default();
@@ -119,9 +121,17 @@ fn agent_paid_api_roundtrip() {
     let auth = authorize_request(&mut book, &policy, NET, &request, HEIGHT, 1).unwrap();
     let sigs = Auth::sigs_for(&payer(), &auth.signing_hash()).unwrap();
     let keys = Auth::keys_for(&payer()).unwrap();
-    let payment =
-        build_signed_payment(&payer(), &auth, NET, AgentRole::Machine, 0, EXPIRES, request.request_id(), &[])
-            .unwrap();
+    let payment = build_signed_payment(
+        &payer(),
+        &auth,
+        NET,
+        AgentRole::Machine,
+        0,
+        EXPIRES,
+        request.request_id(),
+        &[],
+    )
+    .unwrap();
     payment.verify(NET, HEIGHT).unwrap();
     payment.linked_to(&auth).unwrap();
 
