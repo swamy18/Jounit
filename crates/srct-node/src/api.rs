@@ -105,7 +105,7 @@
 //!   *every* binding, loopback included, because they bound the hold time on
 //!   the shared-state `Mutex` rather than defending against a remote attacker.
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -3643,6 +3643,453 @@ impl RateLimiter {
 }
 
 // ---------------------------------------------------------------------------
+// x402-compatible adapter (internet-native agent payments, facilitator mode)
+// ---------------------------------------------------------------------------
+// The node speaks the x402 challenge/response shape without a second payment
+// system: `GET /v1/paid/weather` answers 402 + `PAYMENT-REQUIRED` (base64
+// `srct_core::x402::X402Required`), the agent retries with `PAYMENT-SIGNATURE`
+// (base64 `X402Signature` carrying the exact `payment_submit` envelope), and
+// the node verifies/settles through the same `admit_payment` + credit path
+// `POST /v1/payment/submit` uses. `POST /v1/x402/verify` and
+// `POST /v1/x402/settle` expose the facilitator verbs directly.
+
+/// Fixed demo price for the paid weather resource (satoshis).
+const X402_DEMO_AMOUNT_SAT: u64 = 500;
+/// Fixed demo recipient the 402 challenge advertises (operator wallet in prod).
+const X402_DEMO_RECIPIENT: Address = [0x42; 20];
+/// Service tag for the demo resource.
+const X402_DEMO_SERVICE_NAME: &[u8] = b"x402-weather-v1";
+
+fn x402_err(e: srct_core::x402::X402Error) -> (StatusCode, Json<ErrorBody>) {
+    use srct_core::x402::X402Error as E;
+    match &e {
+        E::UnsupportedVersion(_) | E::UnsupportedScheme(_) => fail(
+            StatusCode::BAD_REQUEST,
+            "x402_unsupported",
+            e.to_string(),
+        ),
+        E::UnknownNetwork(_) | E::RecipientNotAllowed | E::ServiceNotAllowed => fail(
+            StatusCode::CONFLICT,
+            "x402_refused",
+            e.to_string(),
+        ),
+        _ => bad(e.to_string()),
+    }
+}
+
+fn x402_demo_service_id(network_id: &str) -> [u8; 32] {
+    srct_core::service::derive_service_id(network_id, &X402_DEMO_RECIPIENT, X402_DEMO_SERVICE_NAME)
+}
+
+fn x402_challenge(
+    network_id: &str,
+    resource: &str,
+    description: &str,
+) -> Result<(srct_core::x402::X402Required, String), (StatusCode, Json<ErrorBody>)> {
+    let required = srct_core::x402::build_required(
+        network_id,
+        X402_DEMO_AMOUNT_SAT,
+        address_to_hex(&X402_DEMO_RECIPIENT),
+        resource.to_string(),
+        description.to_string(),
+    )
+    .map_err(x402_err)?;
+    let header = srct_core::x402::encode_required(&required).map_err(x402_err)?;
+    Ok((required, header))
+}
+
+/// Shared admission: identical checks to `payment_submit` so the x402 path
+/// cannot admit anything the native path would refuse.
+fn admit_machine_payment_inner(
+    sh: &mut SharedNode,
+    payment: MachinePayment,
+    authorization: srct_core::agent::Authorization,
+    auth_sigs: srct_core::sig::Bundle,
+    auth_keys: srct_core::sig::Bundle,
+) -> Result<Hash, (StatusCode, Json<ErrorBody>)> {
+    let network = sh.chain.params().network_id.clone();
+    let height = sh.chain.height();
+    let id = payment.signing_hash();
+    let mut revoked_in_chain = sh.revoked_policies.contains(&payment.policy_hash);
+    for ancestor in &payment.chain {
+        if sh.revoked_policies.contains(&ancestor.hash()) {
+            revoked_in_chain = true;
+        }
+    }
+    if revoked_in_chain {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "policy_revoked",
+            "the policy this payment names, or an ancestor of it, has been revoked by its owner",
+        ));
+    }
+    if !payment.chain.is_empty() {
+        let recorded = sh.delegations.chain_of(payment.chain.last().unwrap());
+        let provable = recorded.as_ref().map(|chain| {
+            chain.len() == payment.chain.len()
+                && chain
+                    .iter()
+                    .zip(payment.chain.iter())
+                    .all(|(a, b)| a.hash() == b.hash())
+        });
+        if provable != Some(true) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "payment_refused",
+                "the delegation chain this payment names is not a lineage this node recorded",
+            ));
+        }
+    }
+    if sh.payment_tracker.contains(&id) {
+        return Ok(id);
+    }
+    let policy = match sh.policy_registry.get(&payment.policy_hash).cloned() {
+        Some(policy) => policy,
+        None => {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "payment_refused",
+                "the policy this payment names was never authorized under on this node",
+            ));
+        }
+    };
+    payment
+        .verify(&network, height)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, "payment_refused", e.to_string()))?;
+    let presented = srct_core::service::AuthPresentation {
+        auth: &authorization,
+        sigs: &auth_sigs,
+        keys: &auth_keys,
+    };
+    let reservation = srct_core::service::admit_payment(
+        &sh.policies,
+        &policy,
+        &payment,
+        presented,
+        &network,
+        height,
+        &mut sh.credit,
+    )
+    .map_err(session_err)?;
+    if !reservation.position_draws.is_empty() {
+        let _ = sh.credit.release(&reservation);
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "payment_refused",
+            "the payer's free balance cannot cover this payment and the remainder would draw on position headroom, which never settles through a receipt: fund the free balance or repay the position first",
+        ));
+    }
+    match sh.payment_tracker.accept(&payment, &network, height) {
+        Ok(id) => {
+            sh.payment_store.insert(id, payment);
+            sh.reservations.insert(id, reservation);
+            Ok(id)
+        }
+        Err(srct_core::payment::PaymentError::AlreadySeen) => {
+            let _ = sh.credit.release(&reservation);
+            Ok(id)
+        }
+        Err(e) => {
+            let _ = sh.credit.release(&reservation);
+            Err(fail(
+                StatusCode::BAD_REQUEST,
+                "payment_refused",
+                e.to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct X402VerifyReq {
+    payment_hex: String,
+    authorization_hex: String,
+    auth_sigs_hex: String,
+    auth_keys_hex: String,
+}
+
+/// Facilitator `verify`: offline checks only, no state change.
+async fn x402_verify(
+    State(state): State<ApiState>,
+    Json(req): Json<X402VerifyReq>,
+) -> ApiResult {
+    let payment_bytes = decode_hex_bytes(&req.payment_hex, "payment")?;
+    let payment = MachinePayment::deserialize(&payment_bytes)
+        .map_err(|e| bad(format!("payment: {e}")))?;
+    let auth_bytes = decode_hex_bytes(&req.authorization_hex, "authorization")?;
+    let authorization = srct_core::agent::Authorization::deserialize(&auth_bytes)
+        .map_err(|e| bad(format!("authorization: {e}")))?;
+    let auth_sigs = decode_bundle(&req.auth_sigs_hex, "auth_sigs")?;
+    let auth_keys = decode_bundle(&req.auth_keys_hex, "auth_keys")?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        if let Err(e) = payment.verify(&network, height) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "x402_invalid",
+                format!("payment verify: {e}"),
+            ));
+        }
+        if let Err(e) =
+            srct_core::agent::verify_authorization(&auth_sigs, &auth_keys, &authorization)
+        {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "x402_invalid",
+                format!("authorization verify: {e}"),
+            ));
+        }
+        if let Err(e) = payment.linked_to(&authorization) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "x402_invalid",
+                format!("payment/authorization binding: {e}"),
+            ));
+        }
+        Ok(Json(json!({
+            "valid": true,
+            "payment_id": hash_to_hex(&payment.signing_hash()),
+            "amount_sat": payment.amount_sat,
+            "recipient": address_to_hex(&payment.recipient),
+        })))
+    })?
+}
+
+#[derive(Deserialize)]
+struct X402SettleReq {
+    payment_hex: String,
+    authorization_hex: String,
+    auth_sigs_hex: String,
+    auth_keys_hex: String,
+}
+
+/// Facilitator `settle`: verify + record through the shared admission path.
+async fn x402_settle(
+    State(state): State<ApiState>,
+    Json(req): Json<X402SettleReq>,
+) -> ApiResult {
+    let payment_bytes = decode_hex_bytes(&req.payment_hex, "payment")?;
+    let payment = MachinePayment::deserialize(&payment_bytes)
+        .map_err(|e| bad(format!("payment: {e}")))?;
+    let auth_bytes = decode_hex_bytes(&req.authorization_hex, "authorization")?;
+    let authorization = srct_core::agent::Authorization::deserialize(&auth_bytes)
+        .map_err(|e| bad(format!("authorization: {e}")))?;
+    let auth_sigs = decode_bundle(&req.auth_sigs_hex, "auth_sigs")?;
+    let auth_keys = decode_bundle(&req.auth_keys_hex, "auth_keys")?;
+    with_shared(&state, |sh| {
+        match admit_machine_payment_inner(sh, payment, authorization, auth_sigs, auth_keys) {
+            Ok(id) => {
+                let resp = srct_core::x402::X402Response {
+                    success: true,
+                    payment_id: hash_to_hex(&id),
+                    error: String::new(),
+                };
+                Ok(Json(json!({
+                    "success": true,
+                    "payment_id": hash_to_hex(&id),
+                    "payment_response": srct_core::x402::encode_response(&resp),
+                })))
+            }
+            Err(e) => Err(e),
+        }
+    })?
+}
+
+/// Paid demo resource: `GET /v1/paid/weather`.
+///
+/// Without `PAYMENT-SIGNATURE` this answers `402` + `PAYMENT-REQUIRED` (the
+/// x402 challenge). With a valid signature for the demo price it admits the
+/// payment and answers `200` + `PAYMENT-RESPONSE` + the weather body.
+async fn paid_weather(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let (network_id, height) = match with_shared(&state, |sh| {
+        (sh.chain.params().network_id.clone(), sh.chain.height())
+    }) {
+        Ok(v) => v,
+        Err((status, body)) => return (status, HeaderMap::new(), body).into_response(),
+    };
+    let resource = "/v1/paid/weather".to_string();
+    let description = "Demo paid weather (x402 exact, 500 sat)".to_string();
+    let (_required, challenge) = match x402_challenge(&network_id, &resource, &description) {
+        Ok(v) => v,
+        Err((status, body)) => return (status, HeaderMap::new(), body).into_response(),
+    };
+    let sig_header = headers
+        .get(srct_core::x402::X402_HEADER_SIGNATURE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if sig_header.is_empty() {
+        let mut out_headers = HeaderMap::new();
+        if let Ok(v) = HeaderValue::from_str(&challenge) {
+            out_headers.insert(srct_core::x402::X402_HEADER_REQUIRED, v);
+        }
+        let body = Json(json!({
+            "error": "payment required",
+            "x402Version": srct_core::x402::X402_VERSION,
+            "accepts": [{
+                "scheme": srct_core::x402::SRCT_SCHEME,
+                "network": srct_core::x402::srct_network_caip2(&network_id).unwrap_or(network_id.clone()),
+                "amount": X402_DEMO_AMOUNT_SAT.to_string(),
+                "payTo": address_to_hex(&X402_DEMO_RECIPIENT),
+                "description": description,
+                "mimeType": "application/json",
+                "resource": resource,
+                "maxTimeoutSecs": 60,
+            }],
+            "resource": resource,
+        }));
+        return (StatusCode::PAYMENT_REQUIRED, out_headers, body).into_response();
+    }
+    let sig = match srct_core::x402::decode_signature(&sig_header) {
+        Ok(sig) => sig,
+        Err(e) => {
+            let (status, body) = x402_err(e);
+            return (status, HeaderMap::new(), body).into_response();
+        }
+    };
+    let network_expected = match srct_core::x402::parse_srct_network(&sig.network) {
+        Ok(n) => n,
+        Err(e) => {
+            let (status, body) = x402_err(e);
+            return (status, HeaderMap::new(), body).into_response();
+        }
+    };
+    if network_expected != network_id {
+        let (status, body) = x402_err(srct_core::x402::X402Error::UnknownNetwork(sig.network));
+        return (status, HeaderMap::new(), body).into_response();
+    }
+    let payment_bytes = match hex::decode(sig.payload.payment_hex.trim().trim_start_matches("0x")) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(json!({"error": "bad_request", "detail": "payment hex"})),
+            )
+                .into_response()
+        }
+    };
+    let payment = match MachinePayment::deserialize(&payment_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(json!({"error": "bad_request", "detail": format!("payment: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let auth_bytes = match hex::decode(
+        sig.payload
+            .authorization_hex
+            .trim()
+            .trim_start_matches("0x"),
+    ) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(json!({"error": "bad_request", "detail": "authorization hex"})),
+            )
+                .into_response()
+        }
+    };
+    let authorization = match srct_core::agent::Authorization::deserialize(&auth_bytes) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(json!({"error": "bad_request", "detail": format!("authorization: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let decode_bundle_hex = |raw: &str| -> Result<srct_core::sig::Bundle, String> {
+        let bytes = hex::decode(raw.trim().trim_start_matches("0x")).map_err(|e| e.to_string())?;
+        let mut r = srct_core::ser::Reader::new(&bytes);
+        srct_core::sig::Bundle::from_reader(&mut r).map_err(|e| e.to_string())
+    };
+    let auth_sigs = match decode_bundle_hex(&sig.payload.auth_sigs_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(json!({"error": "bad_request", "detail": format!("auth_sigs: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let auth_keys = match decode_bundle_hex(&sig.payload.auth_keys_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(json!({"error": "bad_request", "detail": format!("auth_keys: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    // Demo price/service/recipient gate before admission.
+    let demo_service = x402_demo_service_id(&network_id);
+    if payment.amount_sat < X402_DEMO_AMOUNT_SAT {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            HeaderMap::new(),
+            Json(json!({"error": "payment required", "detail": format!("demo price is {X402_DEMO_AMOUNT_SAT} sat") })),
+        )
+            .into_response();
+    }
+    if payment.recipient != X402_DEMO_RECIPIENT || payment.service != Some(demo_service) {
+        return (
+            StatusCode::CONFLICT,
+            HeaderMap::new(),
+            Json(json!({"error": "x402_refused", "detail": "payment recipient/service does not match the demo offer"})),
+        )
+            .into_response();
+    }
+    if payment.verify(&network_id, height).is_err() || payment.linked_to(&authorization).is_err() {
+        return (
+            StatusCode::CONFLICT,
+            HeaderMap::new(),
+            Json(json!({"error": "x402_invalid", "detail": "payment/authorization verify failed"})),
+        )
+            .into_response();
+    }
+    let payment_id = match with_shared(&state, |sh| {
+        admit_machine_payment_inner(sh, payment, authorization, auth_sigs, auth_keys)
+    }) {
+        Ok(Ok(id)) => id,
+        Ok(Err((status, body))) => return (status, HeaderMap::new(), body).into_response(),
+        Err((status, body)) => return (status, HeaderMap::new(), body).into_response(),
+    };
+    let resp = srct_core::x402::X402Response {
+        success: true,
+        payment_id: hash_to_hex(&payment_id),
+        error: String::new(),
+    };
+    let mut out_headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&srct_core::x402::encode_response(&resp)) {
+        out_headers.insert(srct_core::x402::X402_HEADER_RESPONSE, v);
+    }
+    (
+        StatusCode::OK,
+        out_headers,
+        Json(json!({
+            "report": { "weather": "sunny", "temperature": 70 },
+            "payment_id": hash_to_hex(&payment_id),
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Always-on + exposed middleware (SPEC.md §19.2: opt-in, loopback by default)
 // ---------------------------------------------------------------------------
 // `dos_guard` always runs (timeout + in-flight cap, on every bind including
@@ -3698,7 +4145,10 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/escrow/{id}/release", post(escrow_release))
         .route("/v1/escrow/{id}/settle", post(escrow_settle))
         .route("/v1/escrow/{id}", get(escrow_get))
-        .route("/v1/exit/crankable", get(exit_crankable));
+        .route("/v1/exit/crankable", get(exit_crankable))
+        .route("/v1/x402/verify", post(x402_verify))
+        .route("/v1/x402/settle", post(x402_settle))
+        .route("/v1/paid/weather", get(paid_weather));
     // The stack stays `Router<ApiState>` (no state yet) until the end, where a
     // single `with_state` resolves it to the servable `Router<()>`.
     let mut app: Router<ApiState> = app.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));

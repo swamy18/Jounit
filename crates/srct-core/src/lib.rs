@@ -63,6 +63,7 @@ pub mod tx;
 pub mod u256;
 pub mod validators;
 pub mod wallet;
+pub mod x402;
 
 pub use error::{Error, Result};
 pub use hash::{Address, Hash};
