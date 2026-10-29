@@ -15,6 +15,9 @@ curl -X POST $NODE/v1/loans/accept -d '{"offer_id":"...","borrower_hex":"...",
 
 Accepting opens a position on exactly the signed terms — amount and deadline
 are the borrower's only choices. Bond and collateral must already be funded.
+The accept carries the borrower's own signature over (offer, borrower,
+amount, bond, deadline): the debt lands in the named borrower's book, so
+only that borrower can authorize it.
 
 ## History, limits, dashboards
 
@@ -49,3 +52,6 @@ curl $NODE/v1/lending/autorepay/<borrower>               # live instruction, if 
 While live, each credit deposit routes the authorized share to the position
 first (`credit/deposit` answers `autorepay: {position_id, repaid_sat, ...}`).
 Only explicit borrower authorization, only while unexpired and under cap.
+Replacing the instruction needs a strictly greater nonce (a stale signature
+never unedits the live one), and the routed total carries over — editing the
+cap or rate cannot silently reset what was already repaid through it.

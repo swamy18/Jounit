@@ -168,9 +168,11 @@ impl FinalityManager {
     /// finality is *not* touched here: it is only ever advanced by `accept`,
     /// never rolled back (P2-15).
     pub fn rewind_observation(&mut self, tip_height: u64) {
-        if self.accepted_height > tip_height {
-            self.accepted_height = 0;
-        }
+        // Clamp, never wipe: heights at or below the new tip are still
+        // canonical, so observation of them stays valid. Resetting to zero
+        // made every retained certificate "unobserved" and re-acceptable —
+        // a replay of old certificates through a short reorg.
+        self.accepted_height = self.accepted_height.min(tip_height);
         self.recent.retain(|c| c.payload.height <= tip_height);
     }
 
@@ -299,24 +301,9 @@ impl FinalityManager {
         //     exist (bonded == true) -> reject, fail closed;
         //   * NoCandidates with no bond-backed committee ever installed
         //     (bonded == false) -> genuine genesis fallback, allowed.
-        let keys = &self.keys;
-        let sets = &self.sets;
-        let bonded = self.bonded;
         validate_checkpoint_against_set(
             checkpoint,
-            move |epoch| match sets.get(epoch) {
-                Ok(set) => Ok(set.clone()),
-                Err(ValidatorError::SetExpired { .. }) => Err(ValidatorError::SetExpired { epoch }),
-                Err(ValidatorError::NoCandidates { .. }) if bonded => {
-                    Err(ValidatorError::NoCandidates { epoch })
-                }
-                Err(ValidatorError::NoCandidates { .. }) => {
-                    // Genuine no-bond state: the declared genesis committee is
-                    // the only authority, and it is allowed as the fallback.
-                    genesis_epoch_set_at(epoch, keys)
-                }
-                Err(other) => Err(other),
-            },
+            |epoch| self.set_for_epoch(epoch),
             0,
             self.epoch_blocks,
             verify,
@@ -332,8 +319,18 @@ impl FinalityManager {
         // equivocation shape Decision 14 requires be detected.
         if let Some(prior) = self.prior_at(height).cloned() {
             if prior.payload.block_hash != checkpoint.payload.block_hash {
-                if let Some(ev) = conflict_evidence(&self.keys, &prior, checkpoint) {
-                    self.record_evidence(ev);
+                // Offenders are intersected over the committee that *validated*
+                // the checkpoint (the epoch set), not the declared genesis
+                // keys: after the bond-backed rotation, genesis keys name
+                // nobody in the signing set, so evidence was missed or
+                // mis-attributed. Unresolvable here only when validation
+                // itself refused — and then we never reach this line.
+                if let Ok(set) = self.set_for_epoch(checkpoint.payload.epoch) {
+                    let members: Vec<BlsPublicKey> =
+                        set.validators.iter().map(|r| r.bls_pk).collect();
+                    if let Some(ev) = conflict_evidence(&members, &prior, checkpoint) {
+                        self.record_evidence(ev);
+                    }
                 }
                 return Err(FinalityError::ConflictingFinality {
                     height,
@@ -415,6 +412,26 @@ impl FinalityManager {
                 self.evidence.remove(0);
             }
             self.evidence.push(ev);
+        }
+    }
+
+    /// The epoch set for `epoch`, shared by validation and conflict
+    /// detection: a cached set, `SetExpired`/missing-while-bonded refused
+    /// fail-closed, and the declared genesis committee only when no
+    /// bond-backed committee was ever installed.
+    fn set_for_epoch(&self, epoch: u64) -> std::result::Result<EpochSet, ValidatorError> {
+        match self.sets.get(epoch) {
+            Ok(set) => Ok(set.clone()),
+            Err(ValidatorError::SetExpired { .. }) => Err(ValidatorError::SetExpired { epoch }),
+            Err(ValidatorError::NoCandidates { .. }) if self.bonded => {
+                Err(ValidatorError::NoCandidates { epoch })
+            }
+            Err(ValidatorError::NoCandidates { .. }) => {
+                // Genuine no-bond state: the declared genesis committee is
+                // the only authority, and it is allowed as the fallback.
+                genesis_epoch_set_at(epoch, &self.keys)
+            }
+            Err(other) => Err(other),
         }
     }
 

@@ -64,6 +64,15 @@ pub fn queue_exit_plan(
             "an exit must move a non-zero amount",
         )));
     }
+    // The SDK promised this check in its own docstring but never performed
+    // it: an exit to the sink moves value *in*, not out, and the protocol
+    // would queue it into an unspendable address. Refused locally, before
+    // any fee is considered.
+    if destination == state.deposit_sink() {
+        return Err(WorkerError::Protocol(srct_l2::L2Error::BadExitDestination(
+            "the destination is the deposit sink",
+        )));
+    }
     if !state.exit_queue_is_active(height) {
         return Err(WorkerError::TaskNotAvailable(
             "exits are not active at this height on this profile",

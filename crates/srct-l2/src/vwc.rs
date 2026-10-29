@@ -414,7 +414,13 @@ impl VerifiedWorkCertificate {
                     srct_core::validators::check_sidecar(
                         pq_sidecar,
                         n,
-                        |idx| idx < n && (signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1,
+                        // Bounds-checked: same truncated-bitmap panic as the
+                        // settle path (see `state.rs::apply_settle`).
+                        |idx| {
+                            idx < n
+                                && idx / 8 < signer_bitmap.len()
+                                && (signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1
+                        },
                         |idx| validators.mldsa_key(idx).copied(),
                         &msg,
                         &mut seen,
@@ -485,18 +491,6 @@ impl VerifiedWorkCertificate {
             VwcVerification::Quorum { pq_sidecar, .. } => pq_sidecar.len(),
             VwcVerification::WindowElapsed => 0,
         }
-    }
-
-    /// Drop the lattice sidecar and re-derive the id. Test-only: it exists so
-    /// the downgrade attack (a valid BLS aggregate with the quantum half
-    /// stripped in transit) can be staged against an *honestly issued*
-    /// certificate — the registry copy keeps the real evidence.
-    #[doc(hidden)]
-    pub fn strip_pq_sidecar_for_test(&mut self) {
-        if let VwcVerification::Quorum { pq_sidecar, .. } = &mut self.verification {
-            pq_sidecar.clear();
-        }
-        self.id = self.id();
     }
 }
 

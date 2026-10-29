@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 
 use srct_core::hash::{hash512_from_hex, hash512_to_hex, sha256, Hash512};
 
-use crate::log::LOG_MAGIC;
 use crate::StoreError;
 
 /// Metadata format version, independent of the log's.
@@ -313,15 +312,22 @@ impl MetaFile {
             // the new name pointing at content that never landed.
             f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
-        fs::rename(&tmp, &self.path).map_err(|e| StoreError::io(&self.path, e))
+        fs::rename(&tmp, &self.path).map_err(|e| StoreError::io(&self.path, e))?;
+        // The directory entry is data too: without an fsync of the parent,
+        // a crash can lose the rename itself on filesystems that order
+        // directory updates behind file data.
+        fsync_parent(&self.path);
+        Ok(())
     }
+}
 
-    /// Whether the file starts with this store's magic, so a foreign file is
-    /// recognised rather than parsed.
-    pub fn looks_like_store(&self) -> bool {
-        match fs::read(&self.path) {
-            Ok(bytes) => bytes.len() >= 4 && bytes[..4] == LOG_MAGIC,
-            Err(_) => false,
+/// Best-effort durability for a rename's directory entry. Ignored on
+/// platforms without directory fsync rather than failing the write the
+/// rename already committed.
+fn fsync_parent(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
 }

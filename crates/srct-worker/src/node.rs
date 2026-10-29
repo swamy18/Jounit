@@ -39,6 +39,18 @@ pub trait L2NodeView {
     fn l2_state(&self) -> WorkerResult<L2State>;
     /// The height the state reflects, or the reason it could not be read.
     fn chain_height(&self) -> WorkerResult<u64>;
+    /// The state and the height it reflects, read atomically. The default
+    /// reads the two legs in sequence, which is exact for an in-process view
+    /// and for transports that cache one observation per fetch (`HttpNode`
+    /// does, so its override is identical behaviour, not a new rule).
+    /// Transports whose height can move between the two reads should
+    /// override this so expiry and deadline checks cannot straddle a tip
+    /// advance.
+    fn observe(&self) -> WorkerResult<(L2State, u64)> {
+        let state = self.l2_state()?;
+        let height = self.chain_height()?;
+        Ok((state, height))
+    }
 }
 
 /// A failure the write side reported. `Retryable` marks transport trouble
@@ -72,12 +84,18 @@ pub trait L2Broadcaster {
 }
 
 impl From<BroadcastError> for WorkerError {
-    fn from(_: BroadcastError) -> Self {
-        // Both transport shapes reconcile the same way (§18.9): the
-        // protocol's real answer arrives through the authoritative state, so
-        // any broadcast failure is "unknown, go look", never "build a
-        // different payload".
-        WorkerError::BroadcastUnavailable("transport")
+    fn from(e: BroadcastError) -> Self {
+        // The *variant* survives the conversion: a definitive protocol
+        // refusal (`Refused`, e.g. replay or bad signature surfaced as 4xx)
+        // is NOT retryable, while a transport failure is. Collapsing both
+        // into `BroadcastUnavailable` turned every definitive refusal into
+        // an infinite retry loop.
+        match e {
+            // Transport failures reconcile through the authoritative state
+            // (§18.9): "unknown, go look", never "build a different payload".
+            BroadcastError::Retryable(_) => WorkerError::BroadcastUnavailable("transport"),
+            BroadcastError::Refused(detail) => WorkerError::BroadcastRefused(detail),
+        }
     }
 }
 

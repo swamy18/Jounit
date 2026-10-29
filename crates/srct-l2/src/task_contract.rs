@@ -65,6 +65,19 @@ pub struct L2Config {
 }
 
 impl L2Config {
+    /// Check the documented ranges: the bounty is a whole percent
+    /// (`0..=100`, see the field doc), and a zero dispute window is not a
+    /// window — nothing could ever be challenged inside it.
+    pub fn validate(&self) -> L2Result<()> {
+        if self.whistleblower_bounty_percent > 100 {
+            return Err(L2Error::BadConfig("whistleblower bounty over 100 percent"));
+        }
+        if self.dispute_window == 0 {
+            return Err(L2Error::BadConfig("dispute window must be nonzero"));
+        }
+        Ok(())
+    }
+
     /// Production values: a ~100-block (~17 hour) challenge window and the
     /// one-year M2 vesting period.
     pub fn mainnet() -> Self {
@@ -358,6 +371,17 @@ impl TaskContract {
         if post.payment_sat == 0 {
             return Err(L2Error::ZeroAmount("payment_sat"));
         }
+        // No dust escrows: an explicit `Correct`/`Expired` settlement
+        // refuses when the escrow cannot cover the settle fee floor, so a
+        // task posted below it could never settle explicitly and would rely
+        // on implicit paths. Refuse the post instead.
+        let fee_floor = srct_core::l2::settle_fee_sat(post.payment_sat);
+        if post.payment_sat < fee_floor {
+            return Err(L2Error::AmountTooSmallForFee {
+                available: post.payment_sat,
+                fee: fee_floor,
+            });
+        }
         if post.deadline_height != post.compute_task.expiry_height {
             return Err(L2Error::DeadlineMismatch);
         }
@@ -524,6 +548,15 @@ where
         if challenge_deposit_sat == 0 {
             return Err(L2Error::ZeroAmount("challenge_deposit_sat"));
         }
+        // The counter-attestation belongs to the challenger: without this
+        // binding anyone could file a dispute quoting someone else's
+        // attestation, and the bounty would accrue to the filer rather than
+        // the attester who did the work.
+        if counter_attestation.worker_address() != actor {
+            return Err(L2Error::BadAttestation(
+                "counter attestation worker_address",
+            ));
+        }
         if !counter_attestation.is_signed() {
             return Err(L2Error::BadAttestation("counter attestation is unsigned"));
         }
@@ -687,10 +720,18 @@ where
                 // Expiry is normally implicit and free (`try_expire`). An explicit
                 // Expired verdict exists so the arbitrator set can close a task a
                 // vanished worker never delivered, and it pays the settle fee like
-                // any other explicit settlement.
+                // any other explicit settlement. The deadline guard matches
+                // `try_expire`: a quorum cannot kill a live task early,
+                // refunding the submitter and burning the worker's deposit
+                // while the worker still had time to deliver.
                 match &self.state {
                     ContractState::Open | ContractState::InProgress { .. } => {}
                     _ => return Err(self.illegal("settle as Expired")),
+                }
+                if current_height <= self.deadline_height {
+                    // Same variant `try_expire`-adjacent paths use for "not
+                    // yet open": the window for expiry has not opened.
+                    return Err(L2Error::DisputeWindowClosed);
                 }
                 if vwc_hash != VWC_HASH_EXPIRED {
                     return Err(L2Error::BadVwcHash);

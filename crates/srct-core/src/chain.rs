@@ -1098,8 +1098,14 @@ impl Chain {
             .get(&seed)
             .ok_or(ValidatorError::NoCandidates { epoch })?;
         let records = self.records_from_ledger(snapshot);
+        // Empty seed ledger means the bootstrap committee was authoritative
+        // at that height — the same fallback `committee_keys_at` and
+        // `settlement_committee_at` apply. Returning `NoCandidates` here
+        // made genesis-era slash evidence unverifiable exactly when no
+        // bonds existed, while every other committee accessor agreed on
+        // the bootstrap keys.
         if records.is_empty() {
-            return Err(ValidatorError::NoCandidates { epoch });
+            return crate::validators::genesis_epoch_set_at(epoch, &self.params.genesis_validators);
         }
         crate::validators::derive_set(
             epoch,
@@ -1342,14 +1348,6 @@ impl Chain {
         if claim.amount_sat == 0 {
             return Err(Error::Malformed("exit claim amount must be nonzero"));
         }
-        // Overwrite guard (see `UtxoSet::apply_tx`): release outputs are
-        // keyed by claim id, and a blind insert would destroy live coins.
-        if utxo.contains(&OutPoint {
-            txid: claim.claim_id(),
-            index: 0,
-        }) {
-            return Err(Error::Malformed("exit release output already exists"));
-        }
         // The anchor: the queue block's committed root must exist and the
         // record proof must verify against it. A queue in a block that
         // committed no root cannot be proven — which is why post-activation
@@ -1393,6 +1391,17 @@ impl Chain {
             return Err(Error::Malformed(
                 "exit claim inputs must total exactly amount + fee + l1 fee",
             ));
+        }
+        // Overwrite guard, after the input checks (see `UtxoSet::apply_tx`):
+        // release outputs are keyed by claim id, and a blind insert would
+        // destroy live coins. Ordered last so a double-spend reports the
+        // missing inputs (`UnknownOutPoint`), while a genuine id collision
+        // with live inputs reports the collision.
+        if utxo.contains(&OutPoint {
+            txid: claim.claim_id(),
+            index: 0,
+        }) {
+            return Err(Error::Malformed("exit release output already exists"));
         }
         Ok((gas, l1_fee))
     }

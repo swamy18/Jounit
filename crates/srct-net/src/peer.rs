@@ -158,9 +158,27 @@ impl PeerHandle {
     }
 
     /// Add to the peer's ban score. If threshold is reached, disconnects.
+    ///
+    /// Saturating: at the boundary the score clamps at `u32::MAX` instead of
+    /// wrapping to a small number that would un-ban a hostile peer.
     pub fn add_ban_score(&self, score: u32) {
-        let prev = self.ban_score.fetch_add(score, Ordering::SeqCst);
-        if prev + score >= BAN_SCORE_THRESHOLD {
+        // CAS loop (no `fetch_update`: MSRV 1.75 predates it). The score
+        // only moves up by at most `score` per call, so the loop
+        // terminates; contention is one thread per peer.
+        let prev = loop {
+            let prev = self.ban_score.load(Ordering::SeqCst);
+            let next = prev.saturating_add(score);
+            match self.ban_score.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break prev,
+                Err(_) => continue,
+            }
+        };
+        if prev.saturating_add(score) >= BAN_SCORE_THRESHOLD {
             self.stop();
         }
     }
@@ -230,7 +248,7 @@ pub fn perform_handshake(
             }
         };
 
-        validate_peer_version(&ver, &config.params, &genesis_hash)?;
+        validate_peer_version(&ver, &config.params, &genesis_hash, local_nonce)?;
 
         // Send VERACK with peer's nonce
         let verack_payload = Message::Verack { nonce: ver.nonce }.encode();
@@ -285,7 +303,7 @@ pub fn perform_handshake(
             }
         };
 
-        validate_peer_version(&ver, &config.params, &genesis_hash)?;
+        validate_peer_version(&ver, &config.params, &genesis_hash, local_nonce)?;
 
         // Send our VERSION
         let ver_payload = Message::Version(local_version).encode();
@@ -341,6 +359,7 @@ fn validate_peer_version(
     ver: &Version,
     params: &NetworkParams,
     genesis_hash: &Hash512,
+    local_nonce: u64,
 ) -> NetResult<()> {
     check_network(params, ver.network_magic, &ver.network_id)?;
     if ver.protocol_version > PROTOCOL_VERSION {
@@ -352,6 +371,15 @@ fn validate_peer_version(
     if ver.height == 0 && ver.tip_hash != *genesis_hash {
         return Err(NetError::Protocol(
             "peer claiming height 0 has non-genesis tip hash".into(),
+        ));
+    }
+    // Self-connection guard: a peer that echoes our own handshake nonce is
+    // (almost certainly) us, reached through our own listen address or a
+    // NAT reflection. Connecting to ourselves splits the peer table in two
+    // halves of one node and can amplify relay loops.
+    if ver.nonce == local_nonce {
+        return Err(NetError::Protocol(
+            "self-connection: peer echoed our handshake nonce".into(),
         ));
     }
     Ok(())

@@ -100,7 +100,7 @@ impl BatchQuote {
         if batch.payment_ids.is_empty() {
             return Err(MicroError::EmptyBatch);
         }
-        let gas = batch.gas_used(input_count);
+        let gas = batch.gas_used(input_count).ok_or(MicroError::Overflow)?;
         let required = base_fee_sat_per_gas
             .checked_mul(gas)
             .ok_or(MicroError::Overflow)?;

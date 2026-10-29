@@ -45,9 +45,15 @@ pub fn next_difficulty(
     prev_difficulty: u128,
     history_newest_first: &[u64],
 ) -> u128 {
-    let max_window = params.difficulty_window as usize;
+    // Clamp the genesis shortcuts into the profile bounds: `validate()`
+    // pins sane profiles, but an out-of-range genesis must not persist
+    // forever on a chain that short-circuits here.
+    let max_window = params.difficulty_window.max(1) as usize;
     if history_newest_first.len() < 2 {
-        return params.genesis_difficulty;
+        return params.genesis_difficulty.clamp(
+            params.min_difficulty,
+            params.max_difficulty.max(params.min_difficulty),
+        );
     }
     let window = (history_newest_first.len() - 1).min(max_window);
     let t = params.target_block_time_ms as u128;
@@ -80,9 +86,14 @@ pub fn next_difficulty(
     // `avg_solve` is at least T/4 (every solve time is clamped, and the
     // clamp floor is at least 1 ms), so the division below is safe and
     // the result is at most 4 * d_prev, well inside u128.
-    let avg_solve = s / w_sum;
+    // `w_sum` is nonzero: `window >= 1` (guaranteed above), and
+    // `weight_sum` is a sum of positive squares.
+    let avg_solve = s / w_sum.max(1);
     let raw = if avg_solve == 0 {
-        prev_difficulty
+        prev_difficulty.clamp(
+            params.min_difficulty,
+            params.max_difficulty.max(params.min_difficulty),
+        )
     } else {
         prev_difficulty.saturating_mul(t).saturating_div(avg_solve)
     };
@@ -91,7 +102,7 @@ pub fn next_difficulty(
     // Per-block change limit: +/- change_limit_bps. The upper bound always
     // admits at least +1, otherwise a chain starting at difficulty 1 could
     // never bootstrap upwards.
-    let bps = params.change_limit_bps as u128;
+    let bps = params.change_limit_bps.min(10_000) as u128;
     let lo = prev_difficulty
         .saturating_mul(10_000 - bps)
         .saturating_div(10_000)

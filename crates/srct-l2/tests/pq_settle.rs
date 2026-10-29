@@ -325,7 +325,12 @@ fn a_vwc_stripped_of_its_sidecar_does_not_validate() {
         )
         .unwrap();
     let mut cert = w.state.vwc(&w.task_id).expect("issued").clone();
-    cert.strip_pq_sidecar_for_test();
+    // Stage the downgrade attack inline (valid BLS aggregate, quantum half
+    // stripped in transit) against the honestly issued certificate.
+    if let srct_l2::VwcVerification::Quorum { pq_sidecar, .. } = &mut cert.verification {
+        pq_sidecar.clear();
+    }
+    cert.id = cert.id();
     let err = cert.validate(&set, &MockBls).unwrap_err();
     assert!(
         matches!(err, L2Error::VwcInvalid(_)),

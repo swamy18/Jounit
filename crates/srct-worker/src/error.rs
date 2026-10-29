@@ -36,6 +36,12 @@ pub enum WorkerError {
     },
     /// A transport/broadcast failure: retryable, timeout-safe per §18.9.
     BroadcastUnavailable(&'static str),
+    /// A definitive protocol refusal of a broadcast (replay, bad signature,
+    /// insufficient balance surfaced as 4xx): the node's answer, carried
+    /// verbatim, and NOT retryable — retrying the same bytes can never
+    /// succeed. Kept separate from `BroadcastUnavailable` precisely so the
+    /// retry table cannot collapse the two.
+    BroadcastRefused(String),
     /// The node could not be reached, or answered with a status that carries
     /// no observation (5xx, timeout, refused connect). The *reading* seam's
     /// counterpart to `BroadcastUnavailable`: nothing was observed, so the
@@ -66,6 +72,7 @@ impl fmt::Display for WorkerError {
                 write!(f, "execution failed on {backend}: {reason}")
             }
             WorkerError::BroadcastUnavailable(why) => write!(f, "broadcast unavailable: {why}"),
+            WorkerError::BroadcastRefused(detail) => write!(f, "broadcast refused: {detail}"),
             WorkerError::ObservationUnavailable(why) => write!(f, "observation unavailable: {why}"),
             WorkerError::ObservationMalformed(why) => write!(f, "malformed observation: {why}"),
             WorkerError::EmptyResult => write!(f, "executor produced no result bytes"),
@@ -104,6 +111,7 @@ impl From<srct_core::Error> for WorkerError {
 /// configuration error never succeeds by being attempted twice.
 pub fn is_retryable(err: &WorkerError) -> bool {
     match err {
+        WorkerError::BroadcastRefused(_) => false,
         WorkerError::BroadcastUnavailable(_) | WorkerError::ObservationMalformed(_) => true,
         WorkerError::ObservationUnavailable(_) => true,
         // A timeout can leave a protocol error *behind* a broadcast that landed;

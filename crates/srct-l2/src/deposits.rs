@@ -72,8 +72,19 @@ pub struct DetectedDeposit {
 impl DetectedDeposit {
     /// The height at which this deposit becomes spendable: detected at
     /// `height`, credited once `tip >= matures_at`.
+    ///
+    /// Saturating on purpose, and documented: maturity is a *delay*, and a
+    /// near-`u64::MAX` detection height collapsing the wait is unreachable in
+    /// practice (heights advance one per block). Callers that need a refusal
+    /// at the boundary use `checked_matures_at`.
     pub fn matures_at(&self, maturity_depth: u64) -> u64 {
         self.height.saturating_add(maturity_depth)
+    }
+
+    /// Fallible form of [`Self::matures_at`]: a wrapped sum is `Overflow`,
+    /// never a collapsed maturity wait.
+    pub fn checked_matures_at(&self, maturity_depth: u64) -> Option<u64> {
+        self.height.checked_add(maturity_depth)
     }
 
     /// Replay identity: `(txid, output_index)` (Decision 10 item 5).

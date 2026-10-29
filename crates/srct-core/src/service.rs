@@ -862,15 +862,20 @@ impl PaymentBatch {
 
     /// Gas this settlement's transaction would consume, given how many
     /// inputs fund it. Uses the existing `GAS_TX_*` constants unchanged.
-    pub fn gas_used(&self, input_count: usize) -> u64 {
+    /// `None` on overflow: the caller prices, never the saturating figure,
+    /// so a clamped gas total cannot masquerade as a cheap settlement.
+    pub fn gas_used(&self, input_count: usize) -> Option<u64> {
         crate::tx::GAS_TX_BASE
-            .saturating_add(crate::tx::GAS_PER_INPUT.saturating_mul(input_count as u64))
-            .saturating_add(crate::tx::GAS_PER_OUTPUT.saturating_mul(self.output_count() as u64))
+            .checked_add(crate::tx::GAS_PER_INPUT.checked_mul(input_count as u64)?)
+            .and_then(|g| {
+                g.checked_add(crate::tx::GAS_PER_OUTPUT.checked_mul(self.output_count() as u64)?)
+            })
     }
 
     /// The base-fee obligation for this settlement at `base_fee` sat/gas.
-    pub fn required_fee(&self, base_fee: u64, input_count: usize) -> u64 {
-        crate::fees::required_fee(base_fee, self.gas_used(input_count))
+    /// `None` when the gas total or the fee product overflows.
+    pub fn required_fee(&self, base_fee: u64, input_count: usize) -> Option<u64> {
+        crate::fees::checked_required_fee(base_fee, self.gas_used(input_count)?).ok()
     }
 }
 
@@ -1167,10 +1172,13 @@ mod tests {
         assert_eq!(batch.outputs[0].1 + batch.outputs[1].1, 1_100);
         assert_eq!(batch.payment_ids.len(), 4);
         // One settlement costs one base: 2 outputs, 1 input at 100 sat/gas.
-        assert_eq!(batch.gas_used(1), crate::tx::GAS_TX_BASE + 1_000 + 500);
+        assert_eq!(
+            batch.gas_used(1),
+            Some(crate::tx::GAS_TX_BASE + 1_000 + 500)
+        );
         assert_eq!(
             batch.required_fee(100, 1),
-            100 * (crate::tx::GAS_TX_BASE + 1_000 + 500)
+            Some(100 * (crate::tx::GAS_TX_BASE + 1_000 + 500))
         );
 
         // Mixed payers cannot share one signed transaction: a *second*,

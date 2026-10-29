@@ -1730,6 +1730,61 @@ existing behavior — no new transaction types, endpoints or issuance:
   (522), `srct-miner` (47), redteam suites, `srct-node --test api`
   (47) + `agent_economy`/`micro_safety`/`x402`, L2 `credit_flow` — all green.
 
+### 2026-10-29 hardening round 2 (no new features)
+
+Second review pass (L2, P2P/net, store, node service layer, worker, MCP,
+params), same rule: fix existing behavior only. Highlights:
+
+- L2 consensus: bitmap OOB panic on truncated settle/VWC bitmaps (bounds
+  guard); explicit `Expired` verdicts now respect the deadline like
+  `try_expire`; dust escrows refused at post instead of created-then-stuck;
+  mutate-before-fail ordering in `note_release`/`queue_exit`;
+  counter-attestation bound to the challenger; bounty percent validated
+  0..=100 with checked math; deposits keep-pending on failed apply;
+  `L2Transaction` version actually checked; `strip_pq_sidecar_for_test`
+  removed from release builds; double revoke is an idempotent no-op.
+- L1 consensus: `lock_time` enforced (SPEC §9.2 updated from "advisory");
+  overwrite guards on every UTXO insert; checked PSCB/burn math;
+  `historical_epoch_set` falls back to genesis (matches `committee_keys_at`);
+  conflict evidence now intersects the validating epoch set, not genesis
+  keys; `rewind_observation` clamps instead of wiping (replay via reorg
+  closed); params validate retarget bounds; difficulty clamps into profile;
+  reserve/burn undo checked.
+- Worker: definitive broadcast refusals are `BroadcastRefused`
+  (non-retryable) instead of collapsing into infinite retry; atomic `observe`
+  + re-observe after execution; exit-to-sink refused; over-long HTTP bodies
+  capped in MCP/miner readers with strict status parsing; VWC batch listing
+  validated; `certificates_for_worker` takes the validator context.
+- Pool/miner: share check no longer mutates the header difficulty (it
+  evaluated a different puzzle instance); solver errors propagate; thread and
+  batch counts clamped; per-connection HTTP caps.
+- Node API auth: job `open` needs the hirer's signature, `deliver` the
+  worker's (over job+result, and a receipt naming another result is refused),
+  `loans/accept` the borrower's; resolve binds the signed result;
+  reputation batches must match the subject/counterparty/amounts of their
+  sources; ramp settle digest covers the fill ref; FX swap recomputes
+  `sat_due` server-side; autorepay replacements need a greater nonce and keep
+  the routed total; job identity includes the funding nonce (`state.bin`
+  envelope v6 → v7); expired tiers refused; demo weather demands the exact
+  amount; list endpoints take `?limit=` (max 1000, `total`/`truncated`).
+- Net/store: handshake failures scored per-IP (no more free handshake
+  spam); self-connection refused by nonce; trailing-bytes refused on
+  reader-decoded messages (Unknown exempt per §13.5); INV batch deduped;
+  lowest-score ban eviction; `Version` UTF-8 slicing panic fixed;
+  unbounded writer/queue paths capped (`MAX_ORPHANS`, orphan index no longer
+  O(n²)); ancestry walks cycle-guarded; empty records rejected at scan;
+  dir fsync after renames; address-book writes batched (30s).
+- Residuals deliberately left: sighash has no network binding (replayable
+  across networks — needs a protocol bump, Decision + vectors); bundle order
+  is order-independent (pinned by tests); maturity applies to all outputs;
+  `fx/swap` and `ramp/intent` record unauthenticated user claims (inert
+  without the provider/quote signature; settlement is enforced elsewhere).
+- Verification: clippy clean; core lib 522, L2 all suites, node
+  api/agent_economy/micro_safety/x402, miner 47, worker, net (incl.
+  arbitration propagation), store, mcp, committee/rotation, redteam — green.
+  Two tests were updated to the new fail-closed rules (dust-at-post,
+  FX fee binding), not weakened.
+
 ### 2026-10-29 service-layer additions (no consensus change)
 
 Three feature commits landed on top of the consensus described above. All are

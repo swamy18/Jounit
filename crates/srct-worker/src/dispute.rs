@@ -32,12 +32,12 @@ pub struct DisputeView {
 }
 
 impl DisputeView {
-    /// Read the dispute out of a `Disputed` contract. `worker_is_subject`
-    /// checks whether this dispute is over the given wallet's submission.
-    pub fn from_contract(
-        contract: &srct_l2::TaskContract,
-        worker: &Address,
-    ) -> WorkerResult<DisputeView> {
+    /// Read the dispute out of a `Disputed` contract. Observation is public:
+    /// any wallet may read any dispute — whether the caller's own submission
+    /// is the one contested is answered by the `involves` flag in
+    /// `dispute_of_task`, not by refusing the read (refusing would blind
+    /// challengers and watchers to disputes they are entitled to see).
+    pub fn from_contract(contract: &srct_l2::TaskContract) -> WorkerResult<DisputeView> {
         let c = match &contract.state {
             ContractState::Disputed(c) => c,
             _ => {
@@ -46,7 +46,6 @@ impl DisputeView {
                 ))
             }
         };
-        let _ = worker;
         Ok(DisputeView {
             task_id: contract.task_id,
             challenger: c.challenger,
@@ -69,7 +68,7 @@ pub fn dispute_of_task(
         None => Err(WorkerError::UnknownTask),
         Some(c) => match &c.state {
             ContractState::Disputed(challenge) => {
-                let view = DisputeView::from_contract(c, worker)?;
+                let view = DisputeView::from_contract(c)?;
                 let involves = c.worker.as_ref() == Some(worker)
                     && challenge.against_attestation.worker_address == *worker;
                 Ok(Some((view, involves)))

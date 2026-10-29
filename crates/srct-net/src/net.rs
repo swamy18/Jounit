@@ -103,8 +103,16 @@ fn score_violation(bans: &Arc<Mutex<HashMap<IpAddr, BanState>>>, ip: IpAddr) {
     }
     state.score = state.score.saturating_add(INBOUND_VIOLATION_SCORE);
     if map.len() > MAX_BAN_TRACKED {
-        let threshold = BAN_SCORE_THRESHOLD;
-        map.retain(|_, s| s.score >= threshold);
+        // Evict the lowest scores first, keeping banned addresses: the old
+        // retain dropped every sub-threshold entry at once, which wiped the
+        // 1-per-hour decay ledger for addresses that were merely old, and
+        // cost O(n) on every violation past the cap.
+        let excess = map.len() - MAX_BAN_TRACKED;
+        let mut scores: Vec<(IpAddr, u32)> = map.iter().map(|(ip, s)| (*ip, s.score)).collect();
+        scores.sort_unstable_by_key(|(_, s)| *s);
+        for (ip, _) in scores.into_iter().take(excess) {
+            map.remove(&ip);
+        }
     }
 }
 
@@ -289,6 +297,11 @@ impl P2pNode {
                             let p_params = l_config.params.clone();
                             let h_count = Arc::clone(&l_handshakes);
                             h_count.fetch_add(1, Ordering::Relaxed);
+                            // Cloned outside the handshake thread: the inner
+                            // `move` closure would otherwise capture `l_bans`
+                            // (and `peer_addr`) out of the accept loop.
+                            let p_bans = Arc::clone(&l_bans);
+                            let p_addr = peer_addr;
 
                             thread::spawn(move || {
                                 match perform_handshake(&mut stream, &hs_config, false) {
@@ -303,7 +316,21 @@ impl P2pNode {
                                         );
                                     }
                                     Err(_) => {
-                                        // Handshake failed or rejected
+                                        // Handshake failed or rejected: score
+                                        // it. A wrong-magic or replayed
+                                        // handshake is a misbehaving peer,
+                                        // not weather — without scoring,
+                                        // only connection *volume* was
+                                        // gated while handshake spam that
+                                        // passes the volume check was free.
+                                        // The score is per-IP, so a test or
+                                        // NAT peer that fails once is not
+                                        // banned: five strikes make a ban.
+                                        let ip = stream
+                                            .peer_addr()
+                                            .map(|a| a.ip())
+                                            .unwrap_or(p_addr.ip());
+                                        score_violation(&p_bans, ip);
                                         drop(stream);
                                     }
                                 }

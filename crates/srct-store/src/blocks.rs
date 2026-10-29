@@ -43,10 +43,15 @@ pub struct BlockStore {
     /// `set_tip`.
     by_height: HashMap<u64, Hash512>,
     /// Blocks whose parent is not in the store, waiting for it. Bounded by the
-    /// caller (the sync layer already bounds unconnected-block queues); the
-    /// store itself never evicts a block it accepted.
+    /// store itself: the log bytes stay (append-only), but list membership is
+    /// capped — a peer feeding unconnectable side branches must not grow RAM
+    /// without bound.
     orphans: Vec<Hash512>,
 }
+
+/// List-only cap for [`BlockStore::orphans`]. The block bytes stay in the log;
+/// only the waiting-list entry is evicted, oldest first.
+pub const MAX_ORPHANS: usize = 1024;
 
 /// What appending a block did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,11 +163,21 @@ impl BlockStore {
         let by_height = rebuild_height_index(&mut log, &log_path, &by_hash, &meta)?;
         // A side branch that forked at genesis has no parent in common with the
         // canonical walk; anything whose parent is unknown is an orphan.
-        let orphans: Vec<Hash512> = by_hash
+        // The canonical set is built once: scanning it per candidate is
+        // O(n^2) in the size of the log.
+        let canonical: std::collections::HashSet<&Hash512> = by_height.values().collect();
+        let mut orphans: Vec<Hash512> = by_hash
             .keys()
-            .filter(|h| !by_height.values().any(|v| v == *h) && **h != meta.genesis)
+            .filter(|h| !canonical.contains(*h) && **h != meta.genesis)
             .copied()
             .collect();
+        // The same bound `append_block` enforces live. Order here is hash
+        // order, not append order — bounded is the property; the live path
+        // keeps newest-first from here on.
+        orphans.sort();
+        if orphans.len() > MAX_ORPHANS {
+            orphans.drain(..orphans.len() - MAX_ORPHANS);
+        }
 
         let store = BlockStore {
             log,
@@ -292,6 +307,12 @@ impl BlockStore {
         if parent_known {
             Ok(AppendOutcome::Stored)
         } else {
+            // Cap list membership, not storage: the bytes are already in the
+            // log, and dropping the oldest waiter cannot lose a block the
+            // node can still connect by hash.
+            if self.orphans.len() >= MAX_ORPHANS {
+                self.orphans.remove(0);
+            }
             self.orphans.push(h);
             Ok(AppendOutcome::Orphaned)
         }
@@ -315,10 +336,21 @@ impl BlockStore {
         }
 
         // Walk the candidate's ancestry to genesis, collecting the heights.
+        // Cycle-guarded: two stored blocks can point at each other (a
+        // corrupt or hostile log), and an unguarded walk would loop forever
+        // instead of refusing the tip. A genuine chain visits every hash at
+        // most once and cannot be longer than the store itself.
         let mut chain: Vec<(u64, Hash512)> = Vec::new();
+        let mut seen: std::collections::HashSet<Hash512> = std::collections::HashSet::new();
         let mut cur = *new_tip;
         let mut at_tip = true;
         loop {
+            if !seen.insert(cur) {
+                return Err(StoreError::MissingParent { hash: cur });
+            }
+            if chain.len() > self.by_hash.len() {
+                return Err(StoreError::MissingParent { hash: cur });
+            }
             let &r = self.by_hash.get(&cur).ok_or({
                 if at_tip {
                     StoreError::MissingBlock { hash: cur }
@@ -399,6 +431,12 @@ impl BlockStore {
         for r in refs.iter().rev() {
             let bytes = self.log.read(*r)?;
             if payload_is_utxo(&bytes) {
+                // `payload_is_utxo` is true only for a non-empty record, but
+                // slice by length rather than trust that: an empty record
+                // must skip, never panic the open path.
+                if bytes.len() < 2 {
+                    continue;
+                }
                 return Ok(Some(bytes[1..].to_vec()));
             }
         }
@@ -449,8 +487,19 @@ fn rebuild_height_index(
     if meta.height == 0 {
         return Ok(by_height);
     }
+    // Same cycle guard as `set_tip`: a corrupt log must fail the open,
+    // never hang it.
+    let mut seen: std::collections::HashSet<Hash512> = std::collections::HashSet::new();
+    let mut walked = 0usize;
     let mut cur = meta.tip;
     loop {
+        if !seen.insert(cur) {
+            return Err(StoreError::MissingParent { hash: cur });
+        }
+        walked += 1;
+        if walked > by_hash.len() + 1 {
+            return Err(StoreError::MissingParent { hash: cur });
+        }
         let &r = by_hash
             .get(&cur)
             .ok_or(StoreError::MissingBlock { hash: cur })?;

@@ -491,38 +491,13 @@ fn a_payment_equal_to_the_settle_fee_settles_with_a_zero_payout() {
 }
 
 #[test]
-fn a_payment_below_the_settle_fee_is_refused_and_not_settled() {
+fn a_payment_below_the_settle_fee_is_refused_at_post_time() {
+    // Dust escrows are refused at post: an escrow that cannot cover the
+    // settle fee floor could never settle explicitly, so the task is never
+    // created and no claim/submit/settle path is reachable for it.
     let mut w = world();
-    let id = w.post(999, 1);
-    w.apply(
-        &L2Transaction::new(L2Payload::Claim(
-            ClaimTaskPayload::build(&w.worker, id, ComputeBackend::Cpu, 100_000).unwrap(),
-        )),
-        2,
-    )
-    .unwrap();
-    w.apply(
-        &L2Transaction::new(L2Payload::Submit(
-            SubmitResultPayload::build(&w.worker, id, attestation(&w.worker, id, SUBMITTED))
-                .unwrap(),
-        )),
-        3,
-    )
-    .unwrap();
-    let err = w.apply(
-        &L2Transaction::new(L2Payload::Settle(srct_core::l2::SettlePayload {
-            task_id: id,
-            verdict: Verdict::Correct,
-            vwc_hash: SUBMITTED,
-            network_id: "srct/mini".to_string(),
-            height: 9,
-            bls_sig: [0xAAu8; 96],
-            signer_bitmap: quorum_bitmap(4, 3),
-            signer_count: 3,
-            pq_sidecar: Vec::new(),
-        })),
-        9,
-    );
+    let post = PostTaskPayload::build(&w.submitter, 1, 999, DEADLINE, task(DEADLINE)).unwrap();
+    let err = w.apply(&L2Transaction::new(L2Payload::Post(post)), 1);
     assert_eq!(
         err,
         Err(L2Error::AmountTooSmallForFee {
@@ -530,10 +505,6 @@ fn a_payment_below_the_settle_fee_is_refused_and_not_settled() {
             fee: 1_000
         })
     );
-    assert!(matches!(
-        w.state.task(&id).unwrap().state,
-        ContractState::ResultSubmitted { .. }
-    ));
     assert_eq!(w.state.conservation_total(), CREDITED);
 }
 

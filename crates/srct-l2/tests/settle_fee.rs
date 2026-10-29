@@ -147,49 +147,18 @@ impl World {
 #[test]
 fn fee_boundary_exact_from_dust_to_whale() {
     let mut w = world(100_000_000, 10_000_000);
-    // Below the floor the fee exceeds the value: refused, task untouched.
-    let id = {
+    // Below the floor the fee exceeds the value: refused at post, so no
+    // task exists to claim, submit or settle.
+    {
         let post = PostTaskPayload::build(&w.submitter, 1, 999, EXPIRY, task()).unwrap();
-        let id = post.task_id;
-        w.apply(&L2Transaction::new(L2Payload::Post(post)), 1)
-            .unwrap();
-        w.apply(
-            &L2Transaction::new(L2Payload::Claim(
-                ClaimTaskPayload::build(&w.worker, id, ComputeBackend::Cpu, 50_000).unwrap(),
-            )),
-            2,
-        )
-        .unwrap();
-        w.apply(
-            &L2Transaction::new(L2Payload::Submit(
-                SubmitResultPayload::build(&w.worker, id, attestation(&w.worker, id, RESULT))
-                    .unwrap(),
-            )),
-            3,
-        )
-        .unwrap();
-        id
-    };
-    assert_eq!(
-        w.apply(
-            &L2Transaction::new(L2Payload::Settle(SettlePayload {
-                task_id: id,
-                verdict: Verdict::Correct,
-                vwc_hash: RESULT,
-                network_id: "srct/mini".to_string(),
-                height: 9,
-                bls_sig: [0xAAu8; 96],
-                signer_bitmap: quorum_bitmap(),
-                signer_count: 3,
-                pq_sidecar: Vec::new(),
-            })),
-            9,
-        ),
-        Err(L2Error::AmountTooSmallForFee {
-            available: 999,
-            fee: 1_000
-        })
-    );
+        assert_eq!(
+            w.apply(&L2Transaction::new(L2Payload::Post(post)), 1),
+            Err(L2Error::AmountTooSmallForFee {
+                available: 999,
+                fee: 1_000
+            })
+        );
+    }
 
     // At and above the floor: escrow minus exactly the rule's fee.
     assert_eq!(w.run_to_settle(10, 1_000, 10), 0);

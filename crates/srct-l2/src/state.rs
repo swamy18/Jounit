@@ -489,6 +489,22 @@ impl L2State {
         self.genesis_applied
     }
 
+    /// The L1 deposit sink for this state's network: an ordinary address
+    /// nobody can spend from (same derivation as
+    /// `NetworkParams::l2_deposit_sink`, bound to this state's network id).
+    /// An exit naming it as destination would lock value in an unspendable
+    /// address — value in, never out — so callers refuse it before building
+    /// the payload.
+    pub fn deposit_sink(&self) -> Address {
+        let digest = srct_core::hash::sha256_dom(
+            srct_core::params::DOM_L2_DEPOSIT_SINK,
+            &[self.config.network_id.as_bytes()],
+        );
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&digest[..20]);
+        out
+    }
+
     /// Credit a detected L1 deposit: exactly the sink output's satoshis to the
     /// common input owner, 1:1, no rate, no fee on the credit itself (Decision
     /// 10 item 6).
@@ -762,6 +778,8 @@ impl L2State {
         if p.exit_fee_sat < MIN_EXIT_FEE_SAT {
             return Err(L2Error::ExitFeeBelowMinimum);
         }
+        // Nonces start at 1 (see the spend path): a first queue with
+        // nonce 0 is refused by name.
         let last = self.exit_nonce.get(&p.owner).copied().unwrap_or(0);
         if p.nonce <= last {
             return Err(L2Error::BadExitNonce);
@@ -775,12 +793,17 @@ impl L2State {
         if self.exits.contains_key(&(p.owner, p.nonce)) {
             return Err(L2Error::BadExitNonce);
         }
+        // Compute-then-mutate: the locked-total add is checked *before*
+        // the debit lands, so an overflow refuses with balances untouched
+        // instead of leaving a half-applied queue behind.
+        let new_locked = p
+            .amount_sat
+            .checked_add(p.exit_fee_sat)
+            .and_then(|v| self.exits_locked.checked_add(v))
+            .ok_or(L2Error::Overflow)?;
         self.charge(&p.owner, need)?;
         self.collect_fee(fee);
-        self.exits_locked = self
-            .exits_locked
-            .checked_add(p.amount_sat + p.exit_fee_sat)
-            .ok_or(L2Error::Overflow)?;
+        self.exits_locked = new_locked;
         self.exits.insert(
             (p.owner, p.nonce),
             ExitRecord {
@@ -810,26 +833,35 @@ impl L2State {
     /// (never queued, or already released and therefore removed) is refused by
     /// name rather than debited twice.
     pub fn note_release(&mut self, owner: &Address, nonce: u64) -> L2Result<ExitRecord> {
+        // Peek-then-commit: all three counter updates are proven first, and
+        // the record is removed only after every one succeeds. A failure used
+        // to land after the removal, leaving the exit neither queued nor
+        // accounted while replay recorded it as unbacked.
         let record = self
             .exits
-            .remove(&(*owner, nonce))
-            .ok_or(L2Error::UnknownExit)?;
+            .get(&(*owner, nonce))
+            .ok_or(L2Error::UnknownExit)?
+            .clone();
         let value = record
             .amount_sat
             .checked_add(record.exit_fee_sat)
             .ok_or(L2Error::Overflow)?;
-        self.exits_locked = self
+        let new_locked = self
             .exits_locked
             .checked_sub(value)
             .ok_or(L2Error::Overflow)?;
-        self.exited_total = self
+        let new_exited = self
             .exited_total
             .checked_add(value)
             .ok_or(L2Error::Overflow)?;
-        self.funded_total = self
+        let new_funded = self
             .funded_total
             .checked_sub(value)
             .ok_or(L2Error::Overflow)?;
+        self.exits.remove(&(*owner, nonce));
+        self.exits_locked = new_locked;
+        self.exited_total = new_exited;
+        self.funded_total = new_funded;
         Ok(record)
     }
 
@@ -1101,6 +1133,14 @@ impl L2State {
         if entry.policy.owner != p.owner {
             return Err(L2Error::PolicyBinding("the grant names another owner"));
         }
+        // Idempotent kill switch: revoking twice charges once. A second
+        // revoke is a no-op success — charging again would bill the owner
+        // for flipping an already-dead switch.
+        if entry.revoked {
+            return Ok(L2Effect::PolicyRevoked {
+                agent_id: p.agent_id,
+            });
+        }
         self.ensure_balance(&p.owner, fee)?;
         self.charge(&p.owner, fee)?;
         self.collect_fee(fee);
@@ -1173,6 +1213,8 @@ impl L2State {
                 }
             }
         }
+        // Nonces start at 1: `last_nonce` defaults to 0 and must strictly
+        // increase, so a first spend/queue with nonce 0 is refused by name.
         if p.nonce <= entry.last_nonce {
             return Err(L2Error::PolicyNonce);
         }
@@ -1649,7 +1691,15 @@ impl L2State {
             srct_core::validators::check_sidecar(
                 &p.pq_sidecar,
                 n,
-                |idx| idx < n && (p.signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1,
+                // Bounds-checked: `signers_from_bitmap` tolerates a short
+                // bitmap (missing bytes read as zero), but this closure runs
+                // for every member index — an unchecked index here panics on
+                // a truncated bitmap instead of refusing it.
+                |idx| {
+                    idx < n
+                        && idx / 8 < p.signer_bitmap.len()
+                        && (p.signer_bitmap[idx / 8] >> (idx % 8)) & 1 == 1
+                },
                 |idx| validators.mldsa_key(idx).copied(),
                 &msg,
                 &mut seen,
@@ -1760,9 +1810,14 @@ impl L2State {
         if let Some(c) = challenger {
             self.pay(&c, o.challenger_refunded)?;
             if o.worker_deposit_slashed > 0 {
+                // Checked: a saturated product would silently shrink the
+                // challenger's bounty at the boundary instead of refusing.
+                // (`validate` caps the percent at 100, but the deposit half
+                // of the product is still attacker-chosen.)
                 let wanted = o
                     .worker_deposit_slashed
-                    .saturating_mul(self.config.whistleblower_bounty_percent)
+                    .checked_mul(self.config.whistleblower_bounty_percent)
+                    .ok_or(L2Error::Overflow)?
                     / 100;
                 bonus = wanted.min(self.pscb);
                 if bonus > 0 {
@@ -1771,12 +1826,15 @@ impl L2State {
                 }
             }
         }
+        // Checked like every adjacent `pay`/`charge` path: a clamped total
+        // would make `check_conservation` meaningless at the boundary.
         self.burned = self
             .burned
-            .saturating_add(o.challenger_deposit_burned)
-            .saturating_add(o.worker_deposit_burned)
-            .saturating_add(o.fee_burned);
-        self.pscb = self.pscb.saturating_add(o.fee_pscb);
+            .checked_add(o.challenger_deposit_burned)
+            .and_then(|v| v.checked_add(o.worker_deposit_burned))
+            .and_then(|v| v.checked_add(o.fee_burned))
+            .ok_or(L2Error::Overflow)?;
+        self.pscb = self.pscb.checked_add(o.fee_pscb).ok_or(L2Error::Overflow)?;
         Ok(bonus)
     }
 
@@ -2224,6 +2282,13 @@ impl L2State {
             whistleblower_bounty_percent: r.u64le().map_err(|_| codec_err("bounty percent"))?,
             exit_activation_height: r.u64le().map_err(|_| codec_err("exit activation height"))?,
         };
+        // A blob carrying a config the constructors would never build (a
+        // 200% bounty, a zero window) decodes into what `apply` could never
+        // produce — validate it here rather than running under it.
+        config.validate().map_err(|e| match e {
+            L2Error::BadConfig(why) => codec_err(why),
+            other => other,
+        })?;
         let genesis_applied = match r.u8().map_err(|_| codec_err("genesis flag"))? {
             0 => false,
             1 => true,

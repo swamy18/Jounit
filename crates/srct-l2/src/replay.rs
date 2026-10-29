@@ -347,16 +347,24 @@ impl ChainL2 {
             // minimum, and L1 rejects zero outputs) — but fail closed rather
             // than unwrap, because this is value creation and an error must
             // never become a silent credit.
-            // Remove any stale pending entry for the same deposit first: it was
-            // detected immature and is now credited, and `pending` must
-            // describe exactly the uncredited set.
-            self.pending.retain(|p| p.deposit.id() != id);
+            // Credit first, unpend on success only: if `apply_deposit`
+            // fails the deposit stays visible in `pending` rather than
+            // becoming invisible — in neither `applied` nor `pending` nor
+            // `ignored` — which is where a dropped deposit used to go.
             if self
                 .state
                 .apply_deposit(d.recipient, d.amount_sat, id)
                 .is_ok()
             {
+                // It was detected immature and is now credited, and `pending`
+                // must describe exactly the uncredited set.
+                self.pending.retain(|p| p.deposit.id() != id);
                 self.deposits_applied += 1;
+            } else if !self.pending.iter().any(|p| p.deposit.id() == id) {
+                self.pending.push(PendingDeposit {
+                    deposit: d,
+                    matures_at: d.matures_at(self.deposits.maturity_depth),
+                });
             }
         } else {
             // Detected but not yet safe: visible, not spendable. Recorded

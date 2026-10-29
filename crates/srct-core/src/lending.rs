@@ -28,7 +28,32 @@ use crate::wallet::Wallet;
 use std::collections::BTreeMap;
 
 pub const DOM_LOAN_OFFER: &[u8] = b"srct/loan-offer/v1";
+pub const DOM_LOAN_ACCEPT: &[u8] = b"srct/loan-accept/v1";
 pub const DOM_STANDING_REPAY: &[u8] = b"srct/standing-repay/v1";
+
+/// The message a borrower signs to accept an offer: the offer id plus the
+/// exact draw (borrower, amount, bond, deadline). Binding all of them
+/// matters: without a borrower signature anyone could open debt in anyone
+/// else's name (the debit lands in the named borrower's book), and without
+/// the amounts bound a signed accept could be replayed for a different draw.
+pub fn accept_hash(
+    offer_id: &Hash,
+    borrower: &Address,
+    amount_sat: u64,
+    bond_sat: u64,
+    deadline_height: u64,
+) -> Hash {
+    sha256_dom(
+        DOM_LOAN_ACCEPT,
+        &[
+            offer_id.as_slice(),
+            borrower.as_slice(),
+            &amount_sat.to_le_bytes(),
+            &bond_sat.to_le_bytes(),
+            &deadline_height.to_le_bytes(),
+        ],
+    )
+}
 pub const MAX_LOAN_OFFERS: usize = 512;
 
 /// A lender's standard, signed offer. Accepting it opens a position on

@@ -347,7 +347,11 @@ fn scan(
         // Checked before allocating, and before trusting anything else in the
         // record: a length that cannot be real makes the rest of the file
         // meaningless, so it is a tail regardless of how much follows it.
-        if len > MAX_RECORD_BYTES {
+        // Zero-length records are rejected the same way: every record the
+        // store writes carries at least its one-byte kind tag, so an empty
+        // record is damage, and accepting it would hand `block_payload` an
+        // empty slice it must index into.
+        if len == 0 || len > MAX_RECORD_BYTES {
             recovery.discarded_tail_bytes = file_len - pos;
             recovery.truncated = true;
             break;

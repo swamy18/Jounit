@@ -23,8 +23,12 @@ curl -X POST $NODE/v1/fx/swap -d '{"payer_hex":"...","stable_asset":"USDC",
 
 Every number is stated up front: amount, exact satoshis due, fee, slippage
 headroom, rate, expiry. A quote whose rate is not the live rate is refused;
-an expired quote is refused. Custody of the stablecoin never touches the
-node — the swap intent is the audit trail, not a custody receipt.
+an expired quote is refused. The swap re-verifies the arithmetic server-side:
+`sat_due` must equal gross-at-live-rate plus the declared `fee_sat` (the
+quote's slippage headroom rides inside that declared fee), so a swap cannot
+understate what the payer owes while pointing at the live rate. Custody of
+the stablecoin never touches the node — the swap intent is the audit trail,
+not a custody receipt.
 
 ## Pegged-asset policy
 

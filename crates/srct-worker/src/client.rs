@@ -213,14 +213,18 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
         observe_certificate(&self.l2_state()?, task_id, &self.validators, self.verifier)
     }
 
-    /// §18.13: every certificate naming this worker, sorted by task id.
+    /// §18.13: every certificate naming this worker, sorted by task id,
+    /// validated against the client's configured validator context (§17.6).
     pub fn certificates(&self) -> WorkerResult<Vec<srct_l2::vwc::VerifiedWorkCertificate>> {
-        Ok(
-            certificates_for_worker(&self.l2_state()?, &self.config.address)
-                .into_iter()
-                .cloned()
-                .collect(),
+        Ok(certificates_for_worker(
+            &self.l2_state()?,
+            &self.config.address,
+            &self.validators,
+            self.verifier,
         )
+        .into_iter()
+        .cloned()
+        .collect())
     }
 
     fn l2_state(&self) -> WorkerResult<L2State> {

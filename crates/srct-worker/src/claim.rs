@@ -91,13 +91,8 @@ pub fn claim_task<V: L2NodeView, B: L2Broadcaster>(
     config: &WorkerConfig,
     task_id: Hash,
 ) -> WorkerResult<ClaimPlan> {
-    let plan = claim_plan(
-        wallet,
-        config,
-        task_id,
-        &host.l2_state()?,
-        host.chain_height()?,
-    )?;
+    let (state, height) = host.observe()?;
+    let plan = claim_plan(wallet, config, task_id, &state, height)?;
     host.broadcast(&plan.tx).map_err(WorkerError::from)?;
     Ok(plan)
 }

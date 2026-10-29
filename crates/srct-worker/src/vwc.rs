@@ -83,18 +83,23 @@ pub fn observe_verified_certificate(
 }
 
 /// Every certificate naming `worker`, sorted by task id — the worker's
-/// certified-history view (§18.13). Unlike `observe_certificate` these are
-/// read straight from the registry without re-validation: the protocol
-/// already refused anything else at issuance, and §18.1 forbids a second
-/// validation implementation. The worker binding is what this function adds.
+/// certified-history view (§18.13). Read from the registry *and validated*
+/// against the caller's set: an embedded or hostile view can hand over
+/// anything, and an unvalidated batch let a lying node inflate this
+/// history. Validation reuses the certificate's own `validate` (the same
+/// rule `observe_certificate` applies through `L2State::validate_vwc`),
+/// so §18.1 gains no second implementation.
 pub fn certificates_for_worker<'a>(
     state: &'a L2State,
     worker: &Address,
+    validators: &ValidatorSet,
+    verifier: &dyn BlsVerifier,
 ) -> Vec<&'a VerifiedWorkCertificate> {
     state
         .vwcs()
         .into_iter()
         .filter(|c| &c.worker == worker)
+        .filter(|c| c.validate(validators, verifier).is_ok())
         .collect()
 }
 

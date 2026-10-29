@@ -70,6 +70,11 @@ pub struct JobRecord {
     pub deadline_height: u64,
     pub escrow_id: Option<Hash>,
     pub state: JobState,
+    /// The escrow funding nonce, part of the identity: two opens with
+    /// identical terms but different funding nonces are different jobs. The
+    /// id used to omit it, so a second open with a fresh nonce collided
+    /// with the first and could never be registered.
+    pub nonce: u64,
 }
 
 impl JobRecord {
@@ -89,6 +94,7 @@ impl JobRecord {
                 &self.amount_sat.to_le_bytes(),
                 &result,
                 &self.deadline_height.to_le_bytes(),
+                &self.nonce.to_le_bytes(),
             ],
         )
     }
@@ -198,14 +204,23 @@ pub fn dispute(job: &mut JobRecord) -> Result<(), JobError> {
     }
 }
 
-/// Arbitrator resolves to pay the worker (optionally against a result) or
-/// refund the hirer. Terminal: no further transition.
-pub fn resolve(job: &mut JobRecord, pay_worker: bool) -> Result<(), JobError> {
+/// Arbitrator resolves to pay the worker (against a result) or refund the
+/// hirer. Terminal: no further transition.
+///
+/// `result_hash` is the result the signed decision is *about* (zero when
+/// the decision does not hinge on a result): when paying the worker for
+/// delivered work, it must equal the delivered result — otherwise an
+/// arbitrator could sign "pay for result A" while the record holds result
+/// B, and the payment would settle for the wrong dataset.
+pub fn resolve(job: &mut JobRecord, pay_worker: bool, result_hash: &Hash) -> Result<(), JobError> {
     if job.state != JobState::Disputed {
         return Err(JobError::BadTransition {
             from: job.state,
             action: "resolve",
         });
+    }
+    if pay_worker && job.result_hash != Some(*result_hash) {
+        return Err(JobError::ResultMismatch);
     }
     job.state = if pay_worker {
         JobState::ResolvedRelease
@@ -227,6 +242,47 @@ pub const DOM_JOB_DISPUTE: &[u8] = b"srct/job-dispute/v1";
 /// The message a party signs to freeze a job's funds: job id + reason.
 pub fn dispute_hash(job_id: &Hash, reason: &str) -> Hash {
     sha256_dom(DOM_JOB_DISPUTE, &[job_id, reason.as_bytes()])
+}
+
+/// Domain tag for a worker's delivery commitment.
+pub const DOM_JOB_DELIVER: &[u8] = b"srct/job-deliver/v1";
+
+/// The message a worker signs to deliver a result: job id plus the result
+/// hash being delivered. Binding both matters: a signature over the job id
+/// alone (the `accept` message) would replay as delivery authorization for
+/// an attacker's result, finalizing the job to `Delivered` with the wrong
+/// hash and blocking the real worker.
+pub fn deliver_hash(job_id: &Hash, result_hash: &Hash) -> Hash {
+    sha256_dom(DOM_JOB_DELIVER, &[job_id, result_hash])
+}
+
+/// Domain tag for a hirer's open authorization.
+pub const DOM_JOB_OPEN: &[u8] = b"srct/job-open/v1";
+
+/// The message a hirer signs to open a job: every term that commits funds.
+/// Without this anyone could open escrow-backed jobs naming any hirer and
+/// worker, griefing both with holds they never agreed to.
+pub fn open_hash(
+    hirer: &[u8; 20],
+    worker: &[u8; 20],
+    arbitrator: &crate::bls_checkpoint::BlsPublicKey,
+    service_id: &[u8; 32],
+    amount_sat: u64,
+    deadline_height: u64,
+    nonce: u64,
+) -> Hash {
+    sha256_dom(
+        DOM_JOB_OPEN,
+        &[
+            hirer.as_slice(),
+            worker.as_slice(),
+            &arbitrator.0,
+            service_id.as_slice(),
+            &amount_sat.to_le_bytes(),
+            &deadline_height.to_le_bytes(),
+            &nonce.to_le_bytes(),
+        ],
+    )
 }
 
 /// Domain tag for an arbitrator's resolve decision.
@@ -255,6 +311,7 @@ mod tests {
             deadline_height: 1_000,
             escrow_id: None,
             state: JobState::Offered,
+            nonce: 7,
         }
     }
 
@@ -276,7 +333,7 @@ mod tests {
         dispute(&mut j).unwrap();
         assert!(funds_locked(j.state));
         assert!(release(&mut j, [7u8; 32]).is_err());
-        resolve(&mut j, false).unwrap();
+        resolve(&mut j, false, &[0u8; 32]).unwrap();
         assert_eq!(j.state, JobState::ResolvedRefund);
         assert!(!funds_locked(j.state));
     }

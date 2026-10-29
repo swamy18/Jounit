@@ -479,11 +479,16 @@ fn bundle_from_bytes(bytes: &[u8]) -> Result<srct_core::sig::Bundle, McpError> {
     Ok(bundle)
 }
 
+/// Cap for a single node response body (same 16 MiB as the miner reader).
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// A minimal `host:port` HTTP/1.1 client, so this crate stays dependency-free
 /// and never reaches an address the caller did not name. Loopback is the
 /// expected endpoint (the node API is loopback by default). When the operator
 /// has set `SRCT_API_TOKEN`, it is sent as a bearer header — an exposed bind
-/// requires it (SPEC.md §19.2); a loopback node ignores it.
+/// requires it (SPEC.md §19.2); a loopback node ignores it. The token goes
+/// out over whatever transport the operator configured: point this client at
+/// a loopback node, or accept that the bearer is visible on the wire.
 fn http_json(
     endpoint: &str,
     method: &str,
@@ -517,21 +522,35 @@ fn http_json(
     stream
         .write_all(request.as_bytes())
         .map_err(|e| McpError::transport(format!("send: {e}")))?;
+    // Cap the response: a compromised or hostile node must not be able to
+    // OOM this client with an unbounded body (same 16 MiB cap as the miner
+    // and node readers).
     let mut buf = Vec::new();
     stream
+        .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut buf)
         .map_err(|e| McpError::transport(format!("receive: {e}")))?;
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(McpError::transport("node response over the 16 MiB cap"));
+    }
 
     let text = String::from_utf8_lossy(&buf);
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| McpError::transport("node returned no HTTP status"))?;
+    // Strict status line: the version token must be present and the code a
+    // real 3-digit status. The old split-whitespace parse accepted any
+    // second token, so garbage before the headers read as success.
+    let mut words = text.split_whitespace();
+    let version = words.next().unwrap_or_default();
+    let status = words.next().unwrap_or_default();
+    if !version.starts_with("HTTP/") || status.len() != 3 {
+        return Err(McpError::transport("node returned no HTTP status"));
+    }
+    let status: u16 = status
+        .parse()
+        .map_err(|_| McpError::transport("node returned no HTTP status"))?;
     let payload = text
         .split_once("\r\n\r\n")
         .map(|(_, b)| b)
-        .unwrap_or_default();
+        .ok_or_else(|| McpError::transport("node response has no header terminator"))?;
     let value: Value = serde_json::from_str(payload)
         .map_err(|e| McpError::transport(format!("node reply was not JSON: {e}")))?;
 

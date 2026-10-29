@@ -47,13 +47,12 @@ pub fn discover_tasks<V: L2NodeView>(
     view: &V,
     config: &crate::config::WorkerConfig,
 ) -> WorkerResult<Vec<TaskRef>> {
-    let state = view.l2_state()?;
+    let (state, height) = view.observe()?;
     if state.task_count() > config.filter.max_scan {
         return Err(WorkerError::ObservationMalformed(
             "state exposes more tasks than the scan bound",
         ));
     }
-    let height = view.chain_height()?;
     let mut out = Vec::new();
     for contract in state.tasks() {
         if !available(contract, height, &state, config) {

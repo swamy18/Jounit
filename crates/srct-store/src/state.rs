@@ -75,6 +75,19 @@ impl StateFile {
     /// unreadable" demand opposite responses, and collapsing them would load an
     /// empty book over a corrupt one.
     pub fn load(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        // Length before content: a huge or corrupt file must be refused by
+        // its metadata, never read whole into memory first.
+        let declared = match fs::metadata(&self.path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::io(&self.path, e)),
+        };
+        if declared > (STATE_HEADER_LEN as u64) + (MAX_STATE_BYTES as u64) {
+            return Err(StoreError::BadState {
+                path: self.path.clone(),
+                detail: format!("file of {declared} bytes is over the maximum"),
+            });
+        }
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -183,7 +196,14 @@ impl StateFile {
             // leave the new name pointing at content that never landed.
             f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
-        fs::rename(&tmp, &self.path).map_err(|e| StoreError::io(&self.path, e))
+        fs::rename(&tmp, &self.path).map_err(|e| StoreError::io(&self.path, e))?;
+        // The directory entry is data too (see `meta.rs::save`).
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 

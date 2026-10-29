@@ -281,6 +281,23 @@ impl Message {
                 }
             }
         };
+        // Trailing garbage is a protocol violation, not padding: a message
+        // that decodes with bytes left over is either a version mismatch or
+        // a smuggling attempt, and both must be refused by name. Unknown
+        // types are exempt by the §13.5 freeze rule: a future version's
+        // fields are opaque to this build, and refusing them would partition
+        // the network on upgrade. Block, Tx, Checkpoint and Vote arms
+        // decode straight from `payload` (their own codecs `expect_end`
+        // internally), so the reader is untouched for them — the check
+        // applies only to arms that actually read through it.
+        let consumed_via_reader = payload.len() - r.remaining();
+        if consumed_via_reader > 0 && r.remaining() != 0 && !matches!(msg, Message::Unknown { .. })
+        {
+            return Err(NetError::Decode(format!(
+                "trailing {} bytes after message type {ty}",
+                r.remaining()
+            )));
+        }
         Ok(msg)
     }
 }

@@ -679,6 +679,19 @@ impl NetworkParams {
         if self.max_difficulty > crate::u256::MAX_DIFFICULTY {
             return Err(Error::Malformed("max_difficulty above MAX_DIFFICULTY"));
         }
+        // Retarget arithmetic divides by the window and subtracts the change
+        // limit from 10 000: a zero window is a divide-by-zero in
+        // `difficulty.rs`, and a limit above 10 000 underflows the `u128`
+        // subtraction. Both are profile bugs, refused at construction.
+        if self.difficulty_window == 0 {
+            return Err(Error::Malformed("difficulty_window must be > 0"));
+        }
+        if self.change_limit_bps > 10_000 {
+            return Err(Error::Malformed("change_limit_bps must be <= 10000"));
+        }
+        if self.genesis_difficulty > self.max_difficulty {
+            return Err(Error::Malformed("genesis_difficulty above max_difficulty"));
+        }
         if self.coinbase_maturity == 0 {
             return Err(Error::Malformed("coinbase_maturity must be > 0"));
         }

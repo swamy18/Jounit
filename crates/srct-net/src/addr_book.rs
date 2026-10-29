@@ -33,7 +33,15 @@ struct AddrEntry {
 pub struct AddressBook {
     path: PathBuf,
     entries: Vec<AddrEntry>,
+    /// Last wall-clock save, for write batching (`SAVE_INTERVAL_MS`).
+    last_save_ms: u64,
 }
+
+/// Writes are batched: with per-connection `save` the disk paid one atomic
+/// rename per handshake, which is a disk-IOPS amplifier under connection
+/// churn. The book is a reconnect cache, not consensus data — losing seconds
+/// of recency on a crash is acceptable, stalling the handshake loop is not.
+const SAVE_INTERVAL_MS: u64 = 30_000;
 
 impl AddressBook {
     /// Open (or create) the address book at `path`.
@@ -45,7 +53,18 @@ impl AddressBook {
     pub fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         let entries = Self::load(&path).unwrap_or_default();
-        AddressBook { path, entries }
+        AddressBook {
+            path,
+            entries,
+            last_save_ms: 0,
+        }
+    }
+
+    /// Flush pending entries to disk. Called on clean shutdown paths and by
+    /// tests that assert persistence; the hot path batches instead.
+    pub fn flush(&mut self) {
+        self.last_save_ms = now_ms();
+        let _ = self.save();
     }
 
     /// The path this book persists to.
@@ -80,7 +99,14 @@ impl AddressBook {
             f.sync_all().map_err(|e| e.to_string())?;
         }
         set_private_perms(&tmp);
-        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
+        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
+        // The directory entry is data too (see `srct-store` saves).
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
 
     /// Record an address as recently contacted.
@@ -107,7 +133,7 @@ impl AddressBook {
             self.entries.truncate(MAX_ADDR_BOOK_ENTRIES);
         }
 
-        let _ = self.save();
+        self.save_batched();
     }
 
     /// Record a batch of addresses. Equivalent to calling `add` for each, but
@@ -127,7 +153,17 @@ impl AddressBook {
                 .sort_by_key(|a| std::cmp::Reverse(a.last_seen_ms));
             self.entries.truncate(MAX_ADDR_BOOK_ENTRIES);
         }
-        let _ = self.save();
+        self.save_batched();
+    }
+
+    /// Save at most once per `SAVE_INTERVAL_MS`: the in-memory book is
+    /// always current, the file lags by seconds.
+    fn save_batched(&mut self) {
+        let now = now_ms();
+        if now.saturating_sub(self.last_save_ms) >= SAVE_INTERVAL_MS {
+            self.last_save_ms = now;
+            let _ = self.save();
+        }
     }
 
     /// All known addresses, in descending last-seen order.
@@ -206,7 +242,9 @@ mod tests {
         ab.add(addr);
         assert!(ab.contains(&addr));
 
-        // Reopen from disk; the entry must survive.
+        // Reopen from disk; the entry must survive. The hot path batches
+        // writes, so flush explicitly like a clean shutdown would.
+        ab.flush();
         let ab2 = AddressBook::new(&path);
         assert!(ab2.contains(&addr));
         assert_eq!(ab2.len(), 1);

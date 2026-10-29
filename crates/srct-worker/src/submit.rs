@@ -97,12 +97,24 @@ pub fn submit_result<V: L2NodeView, B: L2Broadcaster, E: Executor>(
     task_id: Hash,
     executor: &E,
 ) -> WorkerResult<SubmitPlan> {
-    let state = host.l2_state()?;
-    let height = host.chain_height()?;
+    let (state, height) = host.observe()?;
     let contract = state.task(&task_id).ok_or(WorkerError::UnknownTask)?;
     let work = crate::executor::ExecutionWork::from_contract(contract, height)?;
     let out = crate::executor::execute_task(executor, &work)?;
-    let plan = submit_plan(wallet, task_id, &out.output, out.backend, &state, height)?;
+    // Re-observe after execution: it can take arbitrarily long, and the
+    // height and task used above may be stale by now (expiry, a re-claim,
+    // or a dispute in the meantime would make this submission refuse — or
+    // worse, attest at a height that no longer holds). Never auto-retry;
+    // the caller reconciles and decides.
+    let (fresh_state, fresh_height) = host.observe()?;
+    let plan = submit_plan(
+        wallet,
+        task_id,
+        &out.output,
+        out.backend,
+        &fresh_state,
+        fresh_height,
+    )?;
     host.broadcast(&plan.tx).map_err(WorkerError::from)?;
     Ok(plan)
 }

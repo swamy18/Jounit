@@ -157,7 +157,16 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.sync_all().map_err(|e| e.to_string())?;
     }
 
-    fs::rename(tmp, path).map_err(|e| format!("wallet file replace: {e}"))
+    fs::rename(tmp, path).map_err(|e| format!("wallet file replace: {e}"))?;
+    // The directory entry is data too: without an fsync of the parent, a
+    // crash can lose the rename itself. Best-effort — a platform without
+    // directory fsync must not fail a write the rename already committed.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

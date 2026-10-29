@@ -232,7 +232,13 @@ impl RelayManager {
         // live: a caller that forgot it would silently restore the stall, and the
         // failure would look like a slow network rather than a bug.
         self.expire(now_ms);
+        // Dedupe the wire batch itself first: a message carrying the same hash
+        // 500 times must cost one queue scan, not 500.
+        let mut seen_batch: std::collections::HashSet<&Hash512> = std::collections::HashSet::new();
         for e in entries {
+            if !seen_batch.insert(&e.hash) {
+                continue;
+            }
             if e.kind != INV_TYPE_TX {
                 continue;
             }

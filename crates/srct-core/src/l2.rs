@@ -1800,6 +1800,12 @@ impl L2Transaction {
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let version = r.u32le()?;
+        // The envelope is versioned for a reason: a future version may
+        // reframe the bytes that follow, so decoding them as v1 would
+        // misinterpret rather than merely accept.
+        if version != Self::VERSION {
+            return Err(Error::Malformed("unsupported L2 transaction version"));
+        }
         let t = L2TxType::from_wire(r.u8()?)?;
         let payload = L2Payload::from_reader(t, &mut r)?;
         r.expect_end()?;

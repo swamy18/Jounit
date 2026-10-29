@@ -100,6 +100,12 @@ pub enum L2Error {
     /// released (release removes the record, so a spent exit has no leaf and
     /// no second release).
     UnknownExit,
+    /// The exit names an unspendable destination (for example the deposit
+    /// sink): value in, never out. The reason is stated.
+    BadExitDestination(&'static str),
+    /// A configuration value is outside its documented range (for example a
+    /// whistleblower bounty over 100 percent, or a zero dispute window).
+    BadConfig(&'static str),
     /// A codec failure raised by `srct-core`.
     Codec(srct_core::Error),
     /// A reputation derivation refused a canonical artifact (roadmap item 9).
@@ -227,6 +233,8 @@ impl fmt::Display for L2Error {
             }
             L2Error::BadExitNonce => write!(f, "exit nonce repeats or rewinds"),
             L2Error::UnknownExit => write!(f, "no such queued exit"),
+            L2Error::BadExitDestination(why) => write!(f, "bad exit destination: {why}"),
+            L2Error::BadConfig(why) => write!(f, "bad l2 config: {why}"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),
             L2Error::Reputation(w) => write!(f, "reputation: {w}"),
             L2Error::Policy(w) => write!(f, "policy refused: {w}"),

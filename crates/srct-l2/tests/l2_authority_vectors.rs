@@ -89,6 +89,8 @@ fn error_name(e: &L2Error) -> &'static str {
         L2Error::ExitFeeBelowMinimum => "ExitFeeBelowMinimum",
         L2Error::BadExitNonce => "BadExitNonce",
         L2Error::UnknownExit => "UnknownExit",
+        L2Error::BadExitDestination(_) => "BadExitDestination",
+        L2Error::BadConfig(_) => "BadConfig",
         L2Error::Codec(_) => "Codec",
         L2Error::Reputation(_) => "Reputation",
         L2Error::Policy(_) => "Policy",

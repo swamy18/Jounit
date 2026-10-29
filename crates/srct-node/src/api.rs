@@ -197,7 +197,7 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 ///
 /// Version 5 added the stream opens/settlement accounting and the session
 /// budgets (micro-payment channels + wallet safety).
-const STATE_ENVELOPE_VERSION: u8 = 6;
+const STATE_ENVELOPE_VERSION: u8 = 7;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -671,6 +671,9 @@ impl SharedNode {
                     }
                 }
                 jw.u8(j.state.as_u8());
+                // v7: the funding nonce joins the identity (distinct funding
+                // runs are distinct jobs).
+                jw.u64le(j.nonce);
                 jw.into_vec()
             }),
         );
@@ -1006,6 +1009,8 @@ impl SharedNode {
                 let state =
                     srct_core::jobs::JobState::from_u8(jr.u8().map_err(|e| format!("jobs: {e}"))?)
                         .ok_or("jobs: unknown state")?;
+                // v7: the funding nonce.
+                let nonce = jr.u64le().map_err(|e| format!("jobs: {e}"))?;
                 jr.expect_end().map_err(|e| format!("jobs: {e}"))?;
                 Ok(srct_core::jobs::JobRecord {
                     network_id,
@@ -1018,6 +1023,7 @@ impl SharedNode {
                     deadline_height,
                     escrow_id,
                     state,
+                    nonce,
                 })
             })
         })?;
@@ -4811,8 +4817,13 @@ async fn x402_verify(State(state): State<ApiState>, Json(req): Json<X402VerifyRe
                 format!("payment/authorization binding: {e}"),
             ));
         }
+        // Advisory only: `valid` means "this node would admit this
+        // payment right now" — it records nothing and settles nothing.
+        // A facilitator that treats verify as settlement will credit work
+        // that never lands; settle through `/v1/x402/settle` instead.
         Ok(Json(json!({
             "valid": true,
+            "advisory": true,
             "payment_id": hash_to_hex(&payment.signing_hash()),
             "amount_sat": payment.amount_sat,
             "recipient": address_to_hex(&payment.recipient),
@@ -4972,8 +4983,15 @@ async fn paid_weather(State(state): State<ApiState>, headers: HeaderMap) -> impl
     };
     let decode_bundle_hex = |raw: &str| -> Result<srct_core::sig::Bundle, String> {
         let bytes = hex::decode(raw.trim().trim_start_matches("0x")).map_err(|e| e.to_string())?;
+        // Same 8 KiB cap as every other bundle input: an uncapped hex blob
+        // here decoded straight into the bundle reader.
+        if bytes.len() > 8 * 1024 {
+            return Err("bundle over the 8 KiB cap".to_string());
+        }
         let mut r = srct_core::ser::Reader::new(&bytes);
-        srct_core::sig::Bundle::from_reader(&mut r).map_err(|e| e.to_string())
+        let bundle = srct_core::sig::Bundle::from_reader(&mut r).map_err(|e| e.to_string())?;
+        r.expect_end().map_err(|e| e.to_string())?;
+        Ok(bundle)
     };
     let auth_sigs = match decode_bundle_hex(&sig.payload.auth_sigs_hex) {
         Ok(b) => b,
@@ -4997,13 +5015,15 @@ async fn paid_weather(State(state): State<ApiState>, headers: HeaderMap) -> impl
                 .into_response()
         }
     };
-    // Demo price/service/recipient gate before admission.
+    // Demo price/service/recipient gate before admission. Exact amount:
+    // an overpay is not a valid exact-scheme payment, and admitting it
+    // would leave the excess unaccounted.
     let demo_service = x402_demo_service_id(&network_id);
-    if payment.amount_sat < X402_DEMO_AMOUNT_SAT {
+    if payment.amount_sat != X402_DEMO_AMOUNT_SAT {
         return (
             StatusCode::PAYMENT_REQUIRED,
             HeaderMap::new(),
-            Json(json!({"error": "payment required", "detail": format!("demo price is {X402_DEMO_AMOUNT_SAT} sat") })),
+            Json(json!({"error": "payment required", "detail": format!("demo price is exactly {X402_DEMO_AMOUNT_SAT} sat") })),
         )
             .into_response();
     }
@@ -5255,42 +5275,81 @@ async fn stream_get(State(state): State<ApiState>, Path(raw): Path<String>) -> A
 
 /// `GET /v1/payments/unsettled` — recorded payments with no settlement tx
 /// bound and not yet expired. Retry these idempotently; do not rebuild them.
-async fn payments_unsettled(State(state): State<ApiState>) -> ApiResult {
+async fn payments_unsettled(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let limit = page_limit(&query);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let settled: std::collections::BTreeSet<Hash> = sh.payment_tx.keys().copied().collect();
         let mut out = Vec::new();
+        let mut total = 0usize;
         for (id, payment) in &sh.payment_store {
             if settled.contains(id) || height >= payment.expires_at_height {
                 continue;
             }
-            out.push(json!({
-                "payment_id": hash_to_hex(id),
-                "amount_sat": payment.amount_sat,
-                "recipient": address_to_hex(&payment.recipient),
-                "expires_at_height": payment.expires_at_height,
-            }));
+            total += 1;
+            if out.len() < limit {
+                out.push(json!({
+                    "payment_id": hash_to_hex(id),
+                    "amount_sat": payment.amount_sat,
+                    "recipient": address_to_hex(&payment.recipient),
+                    "expires_at_height": payment.expires_at_height,
+                }));
+            }
         }
-        Ok(Json(json!({ "count": out.len(), "payments": out })))
+        let truncated = total > out.len();
+        Ok(Json(
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "payments": out }),
+        ))
     })?
+}
+
+/// Page size for unbounded list endpoints: `?limit=N` honored up to
+/// `MAX_PAGE`, default `MAX_PAGE`. A node that has served for years holds
+/// millions of records; an uncapped serialization is a memory spike on both
+/// sides. `total` + `truncated` let the client re-ask with a larger window.
+const MAX_PAGE: usize = 1_000;
+
+/// Resolve `?limit=` for a list endpoint: parse failure and zero mean the
+/// default; anything over the cap clamps to the cap.
+fn page_limit(query: &HashMap<String, String>) -> usize {
+    query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_PAGE)
+        .min(MAX_PAGE)
 }
 
 /// `GET /v1/receipts/orphans` — receipts claiming payments this node never
 /// recorded. Investigate, never auto-settle.
-async fn receipts_orphans(State(state): State<ApiState>) -> ApiResult {
+async fn receipts_orphans(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let limit = page_limit(&query);
     with_shared(&state, |sh| {
         let known: std::collections::BTreeSet<Hash> = sh.payment_store.keys().copied().collect();
         let mut out = Vec::new();
+        let mut total = 0usize;
         for receipt in sh.receipts.iter() {
             if !known.contains(&receipt.payment_id) {
-                out.push(json!({
-                    "receipt_id": hash_to_hex(&receipt.receipt_id()),
-                    "payment_id": hash_to_hex(&receipt.payment_id),
-                    "amount_sat": receipt.amount_sat,
-                }));
+                total += 1;
+                if out.len() < limit {
+                    out.push(json!({
+                        "receipt_id": hash_to_hex(&receipt.receipt_id()),
+                        "payment_id": hash_to_hex(&receipt.payment_id),
+                        "amount_sat": receipt.amount_sat,
+                    }));
+                }
             }
         }
-        Ok(Json(json!({ "count": out.len(), "orphans": out })))
+        let truncated = total > out.len();
+        Ok(Json(
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "orphans": out }),
+        ))
     })?
 }
 
@@ -5574,26 +5633,49 @@ async fn passport_batch_register(
             ));
         }
         use srct_core::passport::PassportEventKind as K;
+        // Every event is bound to its source, not just present alongside it:
+        // existence alone let an issuer inflate any subject's score with
+        // real-but-unrelated payments and loans. The subject must be a party
+        // to the source, the counterparty the other party, and the amounts
+        // must agree.
         for e in &batch.events {
             match e.kind {
                 K::PaymentCompleted => {
-                    if !sh.payment_store.contains_key(&e.source) {
-                        return Err(fail(
+                    let p = sh.payment_store.get(&e.source).ok_or_else(|| {
+                        fail(
                             StatusCode::CONFLICT,
                             "passport_refused",
                             format!("payment source {} not recorded", hash_to_hex(&e.source)),
+                        )
+                    })?;
+                    // The subject is an agent identity, not a raw address:
+                    // it must equal the payment's derived `agent_id`
+                    // (`derive_agent_id(network, payer_type, payer)`), and
+                    // the counterparty must be the other side — the
+                    // recipient of the subject's payment.
+                    let sides = p.agent_id == batch.subject && p.recipient == e.counterparty;
+                    if !sides || p.amount_sat != e.amount_sat {
+                        return Err(fail(
+                            StatusCode::CONFLICT,
+                            "passport_refused",
+                            format!(
+                                "passport event does not match payment {}",
+                                hash_to_hex(&e.source)
+                            ),
                         ));
                     }
                 }
                 K::LoanRepaid => match sh.credit.position(&e.source) {
                     Some(p)
-                        if matches!(p.state, srct_core::credit::PositionState::Repaid { .. }) => {}
+                        if matches!(p.state, srct_core::credit::PositionState::Repaid { .. })
+                            && p.borrower == batch.subject
+                            && p.amount_sat == e.amount_sat => {}
                     _ => {
                         return Err(fail(
                             StatusCode::CONFLICT,
                             "passport_refused",
                             format!(
-                                "loan source {} is not a repaid position",
+                                "loan source {} is not this subject's repaid position",
                                 hash_to_hex(&e.source)
                             ),
                         ))
@@ -5604,13 +5686,14 @@ async fn passport_batch_register(
                         if matches!(
                             p.state,
                             srct_core::credit::PositionState::Defaulted { .. }
-                        ) => {}
+                        ) && p.borrower == batch.subject
+                            && p.amount_sat == e.amount_sat => {}
                     _ => {
                         return Err(fail(
                             StatusCode::CONFLICT,
                             "passport_refused",
                             format!(
-                                "loan source {} is not a defaulted position",
+                                "loan source {} is not this subject's defaulted position",
                                 hash_to_hex(&e.source)
                             ),
                         ))
@@ -5724,6 +5807,17 @@ async fn wallet_tier(State(state): State<ApiState>, Json(req): Json<WalletTierRe
                 "tier must be scoped to this node's network",
             ));
         }
+        // An already-expired tier is a dead record: `link` would store it
+        // and only the spend check would refuse it. Refuse the registration
+        // instead, so the book holds no tier that can never authorize.
+        let height = sh.chain.height();
+        if tier.expires_at_height <= height {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "tier_refused",
+                "tier is already expired",
+            ));
+        }
         match sh.delegations.link(&parent, &tier) {
             Ok(()) => {
                 sh.policy_registry.insert(tier.hash(), tier.clone());
@@ -5750,22 +5844,35 @@ async fn wallet_tier(State(state): State<ApiState>, Json(req): Json<WalletTierRe
     })?
 }
 
-/// `GET /v1/wallet/tiers/{agent_hex}` — tiers registered under an agent id.
-async fn wallet_tiers(State(state): State<ApiState>, Path(raw): Path<String>) -> ApiResult {
+/// `GET /v1/wallet/tiers/{agent_hex}[?limit=]` — tiers registered under an
+/// agent id.
+async fn wallet_tiers(
+    State(state): State<ApiState>,
+    Path(raw): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
     let agent = decode_agent(&raw)?;
+    let limit = page_limit(&query);
     with_shared(&state, |sh| {
         let mut out = Vec::new();
+        let mut total = 0usize;
         for policy in sh.policy_registry.values() {
             if policy.parent_agent_id == Some(agent) {
-                out.push(json!({
-                    "tier_policy_hash": hash_to_hex(&policy.hash()),
-                    "per_tx_max_sat": policy.per_tx_max_sat,
-                    "cumulative_max_sat": policy.cumulative_max_sat,
-                    "expires_at_height": policy.expires_at_height,
-                }));
+                total += 1;
+                if out.len() < limit {
+                    out.push(json!({
+                        "tier_policy_hash": hash_to_hex(&policy.hash()),
+                        "per_tx_max_sat": policy.per_tx_max_sat,
+                        "cumulative_max_sat": policy.cumulative_max_sat,
+                        "expires_at_height": policy.expires_at_height,
+                    }));
+                }
             }
         }
-        Ok(Json(json!({ "count": out.len(), "tiers": out })))
+        let truncated = total > out.len();
+        Ok(Json(
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "tiers": out }),
+        ))
     })?
 }
 
@@ -5782,6 +5889,9 @@ struct JobOpenReq {
     amount_sat: u64,
     deadline_height: u64,
     nonce: u64,
+    /// Hirer's BLS signature over `open_hash(...)`: opening commits the
+    /// hirer's funds, so the open must be the hirer's own authorization.
+    hirer_sig_hex: String,
 }
 
 /// `POST /v1/jobs/open` — hirer locks payment in an escrow and posts the job.
@@ -5799,6 +5909,25 @@ async fn job_open(State(state): State<ApiState>, Json(req): Json<JobOpenReq>) ->
     }
     let mut service = [0u8; 32];
     service.copy_from_slice(&service_bytes);
+    let hirer_sig = decode_bls_sig(&req.hirer_sig_hex)?;
+    // The open commits the hirer's funds: verify the hirer's own
+    // authorization over every term before any escrow or job exists.
+    let open_msg = srct_core::jobs::open_hash(
+        &hirer,
+        &worker,
+        &arbitrator,
+        &service,
+        req.amount_sat,
+        req.deadline_height,
+        req.nonce,
+    );
+    if !srct_core::bls::RealBls::verify(&payer_key, &open_msg, &hirer_sig) {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "job_refused",
+            "open is not signed by the hirer",
+        ));
+    }
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -5813,6 +5942,7 @@ async fn job_open(State(state): State<ApiState>, Json(req): Json<JobOpenReq>) ->
             deadline_height: req.deadline_height,
             escrow_id: None,
             state: srct_core::jobs::JobState::Offered,
+            nonce: req.nonce,
         };
         job.validate().map_err(|e| bad(e.to_string()))?;
         let escrow = srct_core::escrow::ConditionalEscrow::open(
@@ -5927,6 +6057,10 @@ async fn job_accept(
 struct JobDeliverReq {
     result_hash_hex: String,
     receipt_hex: Option<String>,
+    /// Worker's bundle signature over `deliver_hash(job_id, result)`: only
+    /// the worker names in the job may finalize it to `Delivered`.
+    worker_sigs_hex: String,
+    worker_keys_hex: String,
 }
 
 /// `POST /v1/jobs/{id}/deliver` — worker posts the result (+ optional signed
@@ -5943,6 +6077,8 @@ async fn job_deliver(
         .as_deref()
         .map(|h| decode_hex_bytes(h, "receipt"))
         .transpose()?;
+    let sigs = decode_bundle(&req.worker_sigs_hex, "worker_sigs")?;
+    let keys = decode_bundle(&req.worker_keys_hex, "worker_keys")?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -5952,12 +6088,43 @@ async fn job_deliver(
             receipt
                 .verify(&network)
                 .map_err(|e| fail(StatusCode::BAD_REQUEST, "receipt_refused", e.to_string()))?;
+            // A receipt naming a different result is not evidence for this
+            // delivery: refuse the mismatch rather than file it alongside.
+            if let Some(named) = receipt.result_hash {
+                if named != result {
+                    return Err(fail(
+                        StatusCode::CONFLICT,
+                        "job_refused",
+                        "receipt names a different result",
+                    ));
+                }
+            }
         }
         let mut job = sh
             .jobs
             .get(&job_id)
             .cloned()
             .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "no such job"))?;
+        let signer = keys
+            .address()
+            .map_err(|e| bad(format!("worker_keys: {e}")))?;
+        if signer != job.worker {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "job_refused",
+                "delivery is not signed by the worker",
+            ));
+        }
+        // The message binds the result: an `accept`-shaped signature over
+        // the bare job id does not authorize delivery.
+        let msg = srct_core::jobs::deliver_hash(&job_id, &result);
+        srct_core::sig::verify_bundle(&sigs, &keys, &msg).map_err(|_| {
+            fail(
+                StatusCode::CONFLICT,
+                "job_refused",
+                "worker delivery signature invalid",
+            )
+        })?;
         srct_core::jobs::deliver(&mut job, result, height)
             .map_err(|e| fail(StatusCode::CONFLICT, "job_refused", e.to_string()))?;
         sh.jobs.insert(job_id, job);
@@ -6078,7 +6245,10 @@ async fn job_resolve(
                 "resolve signature is not the arbitrator",
             ));
         }
-        srct_core::jobs::resolve(&mut job, req.pay_worker)
+        // The verified `result` is the same one the state machine checks:
+        // a resolve that pays for result B while the record holds result A
+        // is refused here, not settled.
+        srct_core::jobs::resolve(&mut job, req.pay_worker, &result)
             .map_err(|e| fail(StatusCode::CONFLICT, "job_refused", e.to_string()))?;
         if let Some(escrow_id) = job.escrow_id {
             sh.held_escrows.remove(&escrow_id);
@@ -6235,14 +6405,19 @@ async fn fx_rate_register(State(state): State<ApiState>, Json(req): Json<Value>)
     })?
 }
 
-/// `GET /v1/fx/rates` — live rates at this height.
-async fn fx_rates(State(state): State<ApiState>) -> ApiResult {
+/// `GET /v1/fx/rates[?limit=]` — live rates at this height.
+async fn fx_rates(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let limit = page_limit(&query);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let rates: Vec<Value> = sh
             .fx_rates
             .values()
             .filter(|r| r.live_at(height))
+            .take(limit)
             .map(|r| {
                 json!({
                     "base": r.base,
@@ -6253,8 +6428,12 @@ async fn fx_rates(State(state): State<ApiState>) -> ApiResult {
                 })
             })
             .collect();
+        // The rate book is trustee-curated and tiny (bounded by
+        // `MAX_FX_RATES`); the cap here is uniformity, not load.
+        let total = sh.fx_rates.values().filter(|r| r.live_at(height)).count();
+        let truncated = total > rates.len();
         Ok(Json(
-            json!({ "height": height, "count": rates.len(), "rates": rates }),
+            json!({ "height": height, "count": rates.len(), "total": total, "truncated": truncated, "rates": rates }),
         ))
     })?
 }
@@ -6342,6 +6521,24 @@ async fn fx_swap(State(state): State<ApiState>, Json(req): Json<FxSwapReq>) -> A
                 StatusCode::CONFLICT,
                 "fx_refused",
                 "quote rate is not the live rate",
+            ));
+        }
+        // Recompute the due amount server-side: the request's `sat_due`
+        // must equal gross-at-live-rate plus the declared fee. Trusting the
+        // client's figure let a swap understate what the payer owes while
+        // the audit trail pointed at the live rate.
+        let gross = (req.stable_minor as u128)
+            .checked_mul(req.rate_sat_per_minor as u128)
+            .ok_or_else(|| fail(StatusCode::CONFLICT, "fx_refused", "amount overflows"))?;
+        let expected = gross
+            .checked_add(req.fee_sat as u128)
+            .and_then(|t| u64::try_from(t).ok())
+            .ok_or_else(|| fail(StatusCode::CONFLICT, "fx_refused", "amount overflows"))?;
+        if req.sat_due != expected {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "fx_refused",
+                "sat_due does not match the live rate plus fee",
             ));
         }
         let intent = srct_core::fx::SwapIntent {
@@ -6463,14 +6660,16 @@ async fn ramp_quote(State(state): State<ApiState>, Json(req): Json<RampQuoteReq>
     })?
 }
 
-/// `GET /v1/ramp/quotes[?direction=]` — live quotes for entry and exit.
+/// `GET /v1/ramp/quotes[?direction=&limit=]` — live quotes for entry and exit.
 async fn ramp_quotes(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
+    let limit = page_limit(&query);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let mut out = Vec::new();
+        let mut total = 0usize;
         for (id, (q, _, _)) in &sh.ramp_quotes {
             if q.expires_height < height {
                 continue;
@@ -6487,17 +6686,23 @@ async fn ramp_quotes(
                     continue;
                 }
             }
-            out.push(json!({
-                "quote_id": hash_to_hex(id),
-                "provider": address_to_hex(&q.provider),
-                "asset": q.asset,
-                "asset_minor": q.asset_minor,
-                "sat_amount": q.sat_amount,
-                "fee_sat": q.fee_sat,
-                "expires_height": q.expires_height,
-            }));
+            total += 1;
+            if out.len() < limit {
+                out.push(json!({
+                    "quote_id": hash_to_hex(id),
+                    "provider": address_to_hex(&q.provider),
+                    "asset": q.asset,
+                    "asset_minor": q.asset_minor,
+                    "sat_amount": q.sat_amount,
+                    "fee_sat": q.fee_sat,
+                    "expires_height": q.expires_height,
+                }));
+            }
         }
-        Ok(Json(json!({ "count": out.len(), "quotes": out })))
+        let truncated = total > out.len();
+        Ok(Json(
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "quotes": out }),
+        ))
     })?
 }
 
@@ -6589,9 +6794,17 @@ async fn ramp_intent_settle(
                 "settle signature is not the provider",
             ));
         }
-        let mut msg = Vec::with_capacity(64);
+        if req.fill_ref.len() > 128 {
+            return Err(bad("fill ref over cap"));
+        }
+        let mut msg = Vec::with_capacity(64 + req.fill_ref.len());
         msg.extend_from_slice(&id);
         msg.extend_from_slice(req.outcome.as_bytes());
+        // The fill reference rides inside the signed digest: without it, one
+        // provider signature authorized *any* fill_ref, so a tampered receipt
+        // reference carried a valid receipt signature.
+        msg.extend_from_slice(&(req.fill_ref.len() as u64).to_le_bytes());
+        msg.extend_from_slice(req.fill_ref.as_bytes());
         let digest = srct_core::hash::sha256_dom(b"srct/ramp-settle/v1", &[&msg]);
         srct_core::sig::verify_bundle(&sigs, &keys, &digest).map_err(|_| {
             fail(
@@ -6624,9 +6837,6 @@ async fn ramp_intent_settle(
             }
             _ => return Err(bad("outcome must be filled or refunded")),
         }
-        if req.fill_ref.len() > 128 {
-            return Err(bad("fill ref over cap"));
-        }
         intent.fill_ref = req.fill_ref.clone();
         sh.ramp_intents.insert(id, intent);
         audit_push(
@@ -6642,11 +6852,16 @@ async fn ramp_intent_settle(
     })?
 }
 
-/// `GET /v1/ramp/intents` — the registry trail for entry and exit.
-async fn ramp_intents(State(state): State<ApiState>) -> ApiResult {
+/// `GET /v1/ramp/intents[?limit=]` — the registry trail for entry and exit.
+async fn ramp_intents(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let limit = page_limit(&query);
     with_shared(&state, |sh| {
+        let total = sh.ramp_intents.len();
         let mut out = Vec::new();
-        for (id, intent) in &sh.ramp_intents {
+        for (id, intent) in sh.ramp_intents.iter().take(limit) {
             out.push(json!({
                 "intent_id": hash_to_hex(id),
                 "quote_id": hash_to_hex(&intent.quote_id),
@@ -6657,7 +6872,10 @@ async fn ramp_intents(State(state): State<ApiState>) -> ApiResult {
                 "refunded": intent.refunded,
             }));
         }
-        Ok(Json(json!({ "count": out.len(), "intents": out })))
+        let truncated = total > out.len();
+        Ok(Json(
+            json!({ "count": out.len(), "total": total, "truncated": truncated, "intents": out }),
+        ))
     })?
 }
 
@@ -6760,12 +6978,13 @@ async fn loan_offer_post(
     })?
 }
 
-/// `GET /v1/loans/offers?principal=` — discover live offers, cheapest rate
-/// first. Loan discovery without bespoke negotiation.
+/// `GET /v1/loans/offers?principal=&limit=` — discover live offers, cheapest
+/// rate first. Loan discovery without bespoke negotiation.
 async fn loan_offers(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
+    let limit = page_limit(&query);
     with_shared(&state, |sh| {
         let height = sh.chain.height();
         let principal: u64 = query
@@ -6780,7 +6999,10 @@ async fn loan_offers(
             })
             .map(|(id, (o, _, _))| (id, o))
             .collect();
+        let total = out.len();
         out.sort_by_key(|(_, o)| (o.rate_bps_per_window, o.id()));
+        out.truncate(limit);
+        let truncated = total > out.len();
         let offers: Vec<Value> = out
             .iter()
             .map(|(id, o)| {
@@ -6799,7 +7021,9 @@ async fn loan_offers(
                 })
             })
             .collect();
-        Ok(Json(json!({ "count": offers.len(), "offers": offers })))
+        Ok(Json(
+            json!({ "count": offers.len(), "total": total, "truncated": truncated, "offers": offers }),
+        ))
     })?
 }
 
@@ -6810,6 +7034,10 @@ struct LoanAcceptReq {
     bond_sat: u64,
     amount_sat: u64,
     deadline_height: u64,
+    /// Borrower's bundle signature over `accept_hash(...)`: the debit lands
+    /// in the named borrower's book, so the named borrower must authorize it.
+    borrower_sigs_hex: String,
+    borrower_keys_hex: String,
 }
 
 /// `POST /v1/loans/accept` — borrower takes a standard offer: terms come from
@@ -6818,6 +7046,32 @@ struct LoanAcceptReq {
 async fn loan_accept(State(state): State<ApiState>, Json(req): Json<LoanAcceptReq>) -> ApiResult {
     let offer_id = decode_hash(&req.offer_id)?;
     let borrower = decode_address(&req.borrower_hex)?;
+    let sigs = decode_bundle(&req.borrower_sigs_hex, "borrower_sigs")?;
+    let keys = decode_bundle(&req.borrower_keys_hex, "borrower_keys")?;
+    let signer = keys
+        .address()
+        .map_err(|e| bad(format!("borrower_keys: {e}")))?;
+    if signer != borrower {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "loan_refused",
+            "accept is not signed by the borrower",
+        ));
+    }
+    let msg = srct_core::lending::accept_hash(
+        &offer_id,
+        &borrower,
+        req.amount_sat,
+        req.bond_sat,
+        req.deadline_height,
+    );
+    srct_core::sig::verify_bundle(&sigs, &keys, &msg).map_err(|_| {
+        fail(
+            StatusCode::CONFLICT,
+            "loan_refused",
+            "borrower signature invalid",
+        )
+    })?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -7104,13 +7358,30 @@ async fn lending_autorepay(
                 "instruction is not signed by the borrower",
             ));
         }
+        // Replay guard + lifetime accounting: a replacement must carry a
+        // strictly greater nonce than the live instruction, and the routed
+        // total survives the swap — resetting it to zero on every edit
+        // would silently lift the borrower's own cap.
+        let carried_applied = match sh.standing_repay.get(&borrower) {
+            Some((existing, _, _)) => {
+                if req.nonce <= existing.nonce {
+                    return Err(fail(
+                        StatusCode::CONFLICT,
+                        "loan_refused",
+                        "instruction nonce must exceed the live instruction",
+                    ));
+                }
+                existing.applied_sat
+            }
+            None => 0,
+        };
         let instr = srct_core::lending::StandingRepay {
             network_id: network.clone(),
             borrower,
             position_id,
             pct_bps: req.pct_bps,
             cap_sat: req.cap_sat,
-            applied_sat: 0,
+            applied_sat: carried_applied,
             expires_height: req.expires_height,
             nonce: req.nonce,
         };

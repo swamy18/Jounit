@@ -328,6 +328,16 @@ fn job_hire_deliver_dispute_and_resolve() {
     let payer_sk = BlsSecretKey::derive(&[23u8; 32]).unwrap();
     let payee_sk = BlsSecretKey::derive(&[24u8; 32]).unwrap();
     let arb_sk = BlsSecretKey::derive(&[25u8; 32]).unwrap();
+    // The open commits the hirer's funds: the hirer authorizes every term.
+    let open_msg = srct_core::jobs::open_hash(
+        &hirer_addr,
+        &worker_addr,
+        &arb_sk.public_key(),
+        &[9u8; 32],
+        500,
+        9_000,
+        1,
+    );
     let (s, opened) = post(
         &node,
         "/v1/jobs/open",
@@ -341,6 +351,7 @@ fn job_hire_deliver_dispute_and_resolve() {
             "amount_sat": 500,
             "deadline_height": 9_000,
             "nonce": 1,
+            "hirer_sig_hex": hex::encode(payer_sk.sign(&open_msg).0),
         }),
     );
     assert_eq!(s, 200, "job open refused: {opened}");
@@ -363,12 +374,20 @@ fn job_hire_deliver_dispute_and_resolve() {
     );
     assert_eq!(s, 200, "accept refused: {b}");
 
-    // Deliver the dataset hash.
+    // Deliver the dataset hash, authorized by the worker's signature over
+    // the (job, result) pair.
     let result = [7u8; 32];
+    let deliver_msg = srct_core::jobs::deliver_hash(&job_hash, &result);
+    let dsigs = Auth::sigs_for(&worker, &deliver_msg).unwrap();
+    let dkeys = Auth::keys_for(&worker).unwrap();
     let (s, b) = post(
         &node,
         &format!("/v1/jobs/{job_id}/deliver"),
-        &json!({ "result_hash_hex": hex::encode(result) }),
+        &json!({
+            "result_hash_hex": hex::encode(result),
+            "worker_sigs_hex": hex::encode(dsigs.to_bytes()),
+            "worker_keys_hex": hex::encode(dkeys.to_bytes()),
+        }),
     );
     assert_eq!(s, 200, "deliver refused: {b}");
 
@@ -587,6 +606,9 @@ fn usd_quote_settles_in_srct_with_transparent_fees() {
     assert_eq!(quote["fee_sat"], 1_000);
 
     // Stablecoin-in: the agent holds USDC off-protocol, settles SRCT on market.
+    // `fee_sat` is the all-in surcharge the node binds: sat_due must equal
+    // gross-at-live-rate plus fee (100*1000 + 1500), so the quote's slippage
+    // headroom rides inside the declared fee rather than beside it.
     let payer_addr = wallet(42, "fx-payer").address().unwrap();
     let (s, swap) = post(
         &node,
@@ -597,7 +619,7 @@ fn usd_quote_settles_in_srct_with_transparent_fees() {
             "stable_asset": "USDC",
             "stable_minor": 100,
             "sat_due": 101_500,
-            "fee_sat": 1_000,
+            "fee_sat": 1_500,
             "rate_sat_per_minor": 1_000,
             "expires_height": 60,
             "stable_ref": "usdc-tx-abc",
@@ -659,11 +681,14 @@ fn ramp_quote_intent_and_provider_settle() {
     assert_eq!(s, 200, "intent refused: {intent}");
     let intent_id = intent["intent_id"].as_str().unwrap().to_string();
 
-    // Provider closes as filled, signed over (intent id + outcome).
+    // Provider closes as filled, signed over
+    // (intent id + outcome + fill ref): the receipt reference is covered.
     let id_bytes = hex::decode(&intent_id).unwrap();
     let mut msg = Vec::new();
     msg.extend_from_slice(&id_bytes);
     msg.extend_from_slice(b"filled");
+    msg.extend_from_slice(&("bank-ref-1-done".len() as u64).to_le_bytes());
+    msg.extend_from_slice(b"bank-ref-1-done");
     let digest = srct_core::hash::sha256_dom(b"srct/ramp-settle/v1", &[&msg]);
     let fsigs = Auth::sigs_for(&provider, &digest).unwrap();
     let fkeys = Auth::keys_for(&provider).unwrap();
@@ -747,6 +772,21 @@ fn productive_lending_from_offer_to_autorepay() {
         let (s, b) = post(&node, path, &body);
         assert_eq!(s, 200, "{path} refused: {b}");
     }
+    let accept_msg = |amount: u64| {
+        srct_core::lending::accept_hash(
+            &hex::decode(&offer_id)
+                .unwrap()
+                .try_into()
+                .map(|b: [u8; 32]| b)
+                .unwrap(),
+            &borrower_addr,
+            amount,
+            200,
+            9000,
+        )
+    };
+    let asigs = Auth::sigs_for(&borrower, &accept_msg(1000)).unwrap();
+    let akeys = Auth::keys_for(&borrower).unwrap();
     let (s, accepted) = post(
         &node,
         "/v1/loans/accept",
@@ -756,6 +796,8 @@ fn productive_lending_from_offer_to_autorepay() {
             "bond_sat": 200,
             "amount_sat": 1000,
             "deadline_height": 9000,
+            "borrower_sigs_hex": hex::encode(asigs.to_bytes()),
+            "borrower_keys_hex": hex::encode(akeys.to_bytes()),
         }),
     );
     assert_eq!(s, 200, "accept refused: {accepted}");
@@ -792,6 +834,8 @@ fn productive_lending_from_offer_to_autorepay() {
     assert!(limit["suggested_max_principal_sat"].as_u64().unwrap() > 0);
 
     // Second loan + standing auto-repay: revenue pays the loan down by itself.
+    let asigs2 = Auth::sigs_for(&borrower, &accept_msg(1500)).unwrap();
+    let akeys2 = Auth::keys_for(&borrower).unwrap();
     let (s, accepted2) = post(
         &node,
         "/v1/loans/accept",
@@ -801,6 +845,8 @@ fn productive_lending_from_offer_to_autorepay() {
             "bond_sat": 200,
             "amount_sat": 1500,
             "deadline_height": 9000,
+            "borrower_sigs_hex": hex::encode(asigs2.to_bytes()),
+            "borrower_keys_hex": hex::encode(akeys2.to_bytes()),
         }),
     );
     assert_eq!(s, 200, "second accept refused: {accepted2}");

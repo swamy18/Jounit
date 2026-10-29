@@ -8,8 +8,10 @@ stay locked until the arbitrator decides.
 
 ```
 POST /v1/jobs/open                 hirer locks payment + posts the job
+                                   (hirer BLS-signs every term: open_hash)
 POST /v1/jobs/{id}/accept          worker commits (signature over the job id)
-POST /v1/jobs/{id}/deliver         worker posts result hash (+ signed receipt)
+POST /v1/jobs/{id}/deliver         worker posts result hash, worker-signed
+                                   over (job id, result) + optional receipt
 POST /v1/jobs/{id}/resolve|release hirer/arbitrator releases against the result
 — or —
 POST /v1/jobs/{id}/dispute         hirer, worker or arbitrator freezes funds
@@ -23,13 +25,21 @@ GET  /v1/jobs/{id}                 record + escrow state + held flag
 Result binding is the point: `release` against a delivered job refuses a
 mismatched hash — the release pays for *this* dataset, not any dataset. The
 resolve signature binds (job id, direction, result hash) to the arbitrator
-key the escrow named at open, so no other key can decide.
+key the escrow named at open, so no other key can decide. The same binding
+runs at every step: `open` needs the hirer's signature over all terms (no
+one can open escrow-backed jobs in someone else's name), `deliver` needs the
+worker's signature over (job id, result) — the `accept` signature over the
+bare job id is not accepted as delivery authorization — and a receipt naming
+a different result is refused rather than filed alongside.
 
-Dispute locks are node-enforced (`held_escrows`, persisted in `state.bin`
-v6): release, settlement binding and the timeout auto-refund all refuse while
+Dispute locks are node-enforced (`held_escrows`, persisted in `state.bin` —
+currently envelope v7): release, settlement binding and the timeout
+auto-refund all refuse while
 a job is disputed. An unresponsive arbitrator cannot be distinguished from a
 slow one by the machine — expiry policy says the hirer should pick
-arbitrators with live tooling, and jobs carry deadlines regardless.
+arbitrators with live tooling, and jobs carry deadlines regardless. Job
+identity includes the funding nonce, so two opens with identical terms but
+different funding are different jobs.
 
 ## Receipts on every payment
 
