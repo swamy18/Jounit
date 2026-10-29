@@ -111,3 +111,19 @@ total-over-mutation tests derived from earlier fuzz-discovered panics. **No
 product bug was surfaced by the 2026-10-09 campaign** — 0 crashes across all
 seventeen targets — which is a statement about this run's coverage, not a proof
 that none exists.
+
+## 2026-10-29 incident: `l2_credit_apply` false bound (target bug, not product)
+
+The CI smoke run crashed `l2_credit_apply` with *"the outstanding debt is
+implausibly large"*. Root cause was in the target, not the protocol: it
+asserted `outstanding <= repay_amount * 1000`, comparing the **remaining
+debt** against the **current instalment**. A large open followed by a dust
+repayment legitimately leaves a large outstanding balance, so the assertion
+was false by construction and seed-dependent. The library was verified
+correct (repayment capped at debt, interest-first, conservation holds).
+
+Fix: the target now asserts the documented invariant instead — the
+outstanding balance never increases across a repayment. Regression test:
+`a_dust_repayment_against_a_large_position_never_increases_the_debt` in
+`crates/srct-l2/tests/credit_flow.rs`. No consensus, crypto or accounting
+code changed.
