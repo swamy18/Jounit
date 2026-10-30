@@ -462,3 +462,276 @@ fn a_malformed_grant_is_refused_by_name() {
         .expect_err("garbage is refused");
     assert_eq!(err.code, "bad_request");
 }
+
+// ---------------------------------------------------------------------------
+// Wallet guard + portable policy surface
+// ---------------------------------------------------------------------------
+
+fn guard_json(f: &Fixture, amount: u64, height: u64, expires: u64) -> serde_json::Value {
+    json!({
+        "op": "wallet.guard",
+        "max_amount_sat": 600,
+        "allowed_recipients_hex": [hex::encode(f.policy.allowed_recipients[0])],
+        "allowed_services_hex": [hex::encode(f.policy.allowed_services[0])],
+        "amount_sat": amount,
+        "recipient_hex": hex::encode(f.policy.allowed_recipients[0]),
+        "service_hex": hex::encode(f.policy.allowed_services[0]),
+        "height": height,
+        "expires_at_height": expires,
+    })
+}
+
+#[test]
+fn the_guard_ops_are_advertised() {
+    let mcp = SolarCyberUnitMcp::new();
+    for expected in [
+        "wallet.guard",
+        "policy.decide",
+        "policy.export",
+        "policy.verify",
+        "delegation.prove",
+        "delegation.verify",
+        "auth.bind",
+        "auth.verify_bound",
+        "audit.verify",
+    ] {
+        assert!(mcp.capabilities().contains(&expected), "{expected} must be advertised");
+    }
+}
+
+#[test]
+fn the_guard_allows_denies_and_gates_approval() {
+    let mut mcp = SolarCyberUnitMcp::new();
+    let f = fixture();
+    // Inside the budget and the window: allow.
+    let out = mcp
+        .handle(&guard_json(&f, 400, HEIGHT, HEIGHT + 10))
+        .expect("fits the budget");
+    assert_eq!(out["decision"], "allow");
+    // Over budget: refused by name, nothing signed.
+    let mut over = guard_json(&f, 700, HEIGHT, HEIGHT + 10);
+    over["approval_threshold_sat"] = json!(10_000);
+    let err = mcp.handle(&over).expect_err("over budget");
+    assert_eq!(err.code, "guard_refused");
+    // Inside the budget but above the approval threshold: gated, not refused.
+    let mut gated = guard_json(&f, 400, HEIGHT, HEIGHT + 10);
+    gated["approval_threshold_sat"] = json!(100);
+    let out = mcp.handle(&gated).expect("gated, not refused");
+    assert_eq!(out["decision"], "needs_approval");
+    // A stale window refuses even when the budget fits.
+    let err = mcp
+        .handle(&guard_json(&f, 400, HEIGHT + 10, HEIGHT + 10))
+        .expect_err("past expiry");
+    assert_eq!(err.code, "guard_refused");
+}
+
+#[test]
+fn policy_decide_matches_the_engine_without_committing() {
+    let mut mcp = SolarCyberUnitMcp::new();
+    let f = fixture();
+    let base = json!({
+        "op": "policy.decide",
+        "network_id": NET,
+        "height": HEIGHT,
+        "policy_hex": hex::encode(f.policy.serialize()),
+        "agent_id_hex": hex::encode(f.policy.agent_id),
+        "recipient_hex": hex::encode(f.policy.allowed_recipients[0]),
+        "service_hex": hex::encode(f.policy.allowed_services[0]),
+    });
+    let mut allow = base.clone();
+    allow["amount_sat"] = json!(400);
+    assert_eq!(mcp.handle(&allow).unwrap()["decision"], "allow");
+    // A spend the policy forbids is denied by name.
+    let mut deny = base.clone();
+    deny["amount_sat"] = json!(50_000);
+    let err = mcp.handle(&deny).expect_err("over per-tx");
+    assert_eq!(err.code, "policy_refused");
+    // The decide path commits nothing: the same authorization still works.
+    mcp.handle(&authorize_request_json(&f, 1))
+        .expect("decide must not consume the nonce");
+    mcp.handle(&authorize_request_json(&f, 1))
+        .expect_err("the nonce is still fresh, so a replay refuses");
+}
+
+#[test]
+fn policy_export_verify_and_delegation_prove_round_trip() {
+    use srct_core::agent::{derive_sub_agent_id, AgentRole};
+    use srct_core::l2::Auth;
+
+    let mut mcp = SolarCyberUnitMcp::new();
+    let f = fixture();
+    let owner = wallet(1);
+    let keys_hex = hex::encode(Auth::keys_for(&owner).unwrap().to_bytes());
+    let sigs_hex = hex::encode(
+        Auth::sigs_for(&owner, &f.policy.signing_hash())
+            .unwrap()
+            .to_bytes(),
+    );
+    let exported = mcp
+        .handle(&json!({
+            "op": "policy.export",
+            "policy_hex": hex::encode(f.policy.serialize()),
+            "sigs_hex": sigs_hex,
+            "keys_hex": keys_hex,
+        }))
+        .expect("a signed grant exports");
+    assert_eq!(
+        exported["owner"],
+        srct_core::hash::address_to_hex(&owner.address().unwrap())
+    );
+
+    let verified = mcp
+        .handle(&json!({
+            "op": "policy.verify",
+            "portable_json": exported.to_string(),
+        }))
+        .expect("the export verifies anywhere");
+    assert_eq!(verified["valid"], true);
+
+    // A narrowed child under the same owner proves as one ancestry.
+    let child = SpendPolicy {
+        agent_id: derive_sub_agent_id(NET, &f.policy.agent_id, AgentRole::Machine),
+        parent_agent_id: Some(f.policy.agent_id),
+        per_tx_max_sat: 300,
+        window_blocks: 5,
+        cumulative_max_sat: 500,
+        not_before_height: 0,
+        expires_at_height: 5_000,
+        ..f.policy.clone()
+    };
+    let child_sigs = hex::encode(
+        Auth::sigs_for(&owner, &child.signing_hash())
+            .unwrap()
+            .to_bytes(),
+    );
+    let proof = mcp
+        .handle(&json!({
+            "op": "delegation.prove",
+            "policies_hex": [hex::encode(f.policy.serialize()), hex::encode(child.serialize())],
+            "sigs_hex": [sigs_hex, child_sigs],
+            "keys_hex": [keys_hex.clone(), keys_hex],
+        }))
+        .expect("the ancestry proves");
+    let checked = mcp
+        .handle(&json!({
+            "op": "delegation.verify",
+            "proof_json": proof.to_string(),
+        }))
+        .expect("the proof verifies");
+    assert_eq!(checked["valid"], true);
+    assert_eq!(checked["depth"], 2);
+}
+
+#[test]
+fn auth_bind_and_verify_bound_enforce_expiry_and_tx() {
+    use srct_core::agent::PolicyBook;
+    use srct_core::l2::Auth;
+    use srct_core::service::authorize_request;
+
+    let mut mcp = SolarCyberUnitMcp::new();
+    let f = fixture();
+    let payer = wallet(1);
+    let mut book = PolicyBook::default();
+    let auth =
+        authorize_request(&mut book, &f.policy, NET, &f.request, HEIGHT, 1).expect("grant");
+    let payment = build_signed_payment(
+        &payer,
+        &auth,
+        NET,
+        AgentRole::Machine,
+        0,
+        EXPIRES,
+        f.request.request_id(),
+        &[],
+    )
+    .unwrap();
+    let auth_sigs = Auth::sigs_for(&payer, &auth.signing_hash()).unwrap();
+    let auth_keys = Auth::keys_for(&payer).unwrap();
+    let bound = srct_core::portable::BoundAuthorization::issue(
+        &payer,
+        &auth,
+        &auth_sigs,
+        &auth_keys,
+        HEIGHT + 10,
+        payment.signing_hash(),
+    )
+    .unwrap();
+
+    // The keyless bind step names the exact hash the owner must sign.
+    let bind_out = mcp
+        .handle(&json!({
+            "op": "auth.bind",
+            "authorization_hex": hex::encode(auth.serialize()),
+            "expires_at_height": HEIGHT + 10,
+            "tx_hash_hex": hash_to_hex(&payment.signing_hash()),
+        }))
+        .expect("bind names the hash");
+    assert_eq!(
+        bind_out["binding_hash"],
+        hash_to_hex(&bound.signing_hash())
+    );
+
+    // The bound grant verifies against the exact payment inside its window.
+    let ok = mcp
+        .handle(&json!({
+            "op": "auth.verify_bound",
+            "bound_json": bound.to_json(),
+            "policy_hex": hex::encode(f.policy.serialize()),
+            "payment_hex": hex::encode(payment.serialize()),
+            "height": HEIGHT,
+        }))
+        .expect("live binding verifies");
+    assert_eq!(ok["valid"], true);
+
+    // Past expiry, or against another transaction, it refuses by name.
+    for height in [HEIGHT + 10, HEIGHT + 11] {
+        let err = mcp
+            .handle(&json!({
+                "op": "auth.verify_bound",
+                "bound_json": bound.to_json(),
+                "policy_hex": hex::encode(f.policy.serialize()),
+                "payment_hex": hex::encode(payment.serialize()),
+                "height": height,
+            }))
+            .expect_err("expired bindings refuse");
+        assert_eq!(err.code, "bound_invalid");
+    }
+    let mut other = payment.clone();
+    other.amount_sat = 399;
+    let err = mcp
+        .handle(&json!({
+            "op": "auth.verify_bound",
+            "bound_json": bound.to_json(),
+            "policy_hex": hex::encode(f.policy.serialize()),
+            "payment_hex": hex::encode(other.serialize()),
+            "height": HEIGHT,
+        }))
+        .expect_err("another transaction refuses");
+    assert_eq!(err.code, "bound_invalid");
+}
+
+#[test]
+fn audit_verify_checks_the_exported_chain() {
+    use srct_core::safety::AuditLog;
+
+    let mut mcp = SolarCyberUnitMcp::new();
+    let mut log = AuditLog::default();
+    log.push("authorize", None, Some(500), "grant".to_string())
+        .unwrap();
+    log.push("payment", Some([1u8; 32]), Some(500), "submit".to_string())
+        .unwrap();
+    let out = mcp
+        .handle(&json!({ "op": "audit.verify", "audit_json": log.export_json() }))
+        .expect("the chain verifies");
+    assert_eq!(out, json!({ "valid": true, "entries": 2 }));
+
+    let mut tampered = log.export();
+    tampered.entries[0].detail = "forged".to_string();
+    let err = mcp
+        .handle(&json!({
+            "op": "audit.verify",
+            "audit_json": serde_json::to_string(&tampered).unwrap(),
+        }))
+        .expect_err("rewritten history refuses");
+    assert_eq!(err.code, "audit_invalid");
+}

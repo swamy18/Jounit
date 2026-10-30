@@ -1,5 +1,5 @@
-//! A **keyless** MCP surface over the Solar Cyber Unit payment/service layer
-//! (roadmap §10, roadmap §21–§22).
+//! A **keyless** MCP surface over the Solar Cyber Unit payment/policy layer
+//! (roadmap §10, SPEC.md §21–§22).
 //!
 //! # What this is
 //!
@@ -10,6 +10,10 @@
 //! - **build** an authorization from a payer-signed request (delegates every
 //!   budget rule to the existing `PolicyBook` — no rules are re-implemented
 //!   here);
+//! - **guard** a payment against a budget before signing (the agent wallet
+//!   guard: short-lived, exact, keyless — allow, deny or approval-needed);
+//! - **prove/verify** portable policy and delegation objects any rail can
+//!   check (`SignedPolicy`, `DelegationProof`, `BoundAuthorization`);
 //! - **inspect/verify** a request, authorization, payment or receipt offline,
 //!   against a network and height the caller supplies;
 //! - **submit** an already-signed payment or receipt to a node's opt-in REST
@@ -18,9 +22,9 @@
 //! # What this is not
 //!
 //! - **Not a trust authority.** It verifies using the same public functions
-//!   every other verifier uses; it cannot mint an authorization, a payment or
-//!   a receipt, and a "valid: true" answer is just the shared verification
-//!   result.
+//!   every other verifier uses; it cannot mint an authorization, a payment, a
+//!   bound grant or a receipt, and a "valid: true" answer is just the shared
+//!   verification result.
 //! - **Not a key holder.** No operation accepts, returns or stores a private
 //!   key. Signing is the client's job: this layer hands back the bytes and the
 //!   signing hash, and the client signs them (exactly as `POST /v1/authorize`
@@ -38,7 +42,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use srct_core::agent::{verify_authorization, PolicyBook, SpendPolicy};
-use srct_core::hash::hash_to_hex;
+use srct_core::hash::{address_from_hex, hash_from_hex, hash_to_hex};
 use srct_core::payment::MachinePayment;
 use srct_core::receipt::{ReceiptBook, ServiceReceipt};
 use srct_core::service::{authorize_request, PaymentRequest, SessionError};
@@ -108,6 +112,15 @@ impl SolarCyberUnitMcp {
     pub fn capabilities(&self) -> Vec<&'static str> {
         vec![
             "authorize",
+            "wallet.guard",
+            "policy.decide",
+            "policy.export",
+            "policy.verify",
+            "delegation.prove",
+            "delegation.verify",
+            "auth.bind",
+            "auth.verify_bound",
+            "audit.verify",
             "inspect.authorization",
             "inspect.request",
             "inspect.payment",
@@ -130,6 +143,15 @@ impl SolarCyberUnitMcp {
             .ok_or_else(|| McpError::bad("missing `op`"))?;
         match op {
             "authorize" => self.authorize(request),
+            "wallet.guard" => self.wallet_guard(request),
+            "policy.decide" => self.policy_decide(request),
+            "policy.export" => self.policy_export(request),
+            "policy.verify" => self.policy_verify(request),
+            "delegation.prove" => self.delegation_prove(request),
+            "delegation.verify" => self.delegation_verify(request),
+            "auth.bind" => self.auth_bind(request),
+            "auth.verify_bound" => self.auth_verify_bound(request),
+            "audit.verify" => self.audit_verify(request),
             "inspect.authorization" => self.inspect_authorization(request),
             "inspect.request" => self.inspect_request(request),
             "inspect.payment" => self.inspect_payment(request),
@@ -184,6 +206,254 @@ impl SolarCyberUnitMcp {
             "height": auth.height,
             "note": "the policy owner signs `signing_hash`; this layer holds no key",
         }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent wallet guard: budget + short-lived checks before any key is used
+    // -----------------------------------------------------------------------
+
+    /// `wallet.guard` — the keyless pre-sign check. Runs the budget
+    /// (`X402Budget::check_guarded`: amount, allow-lists, short expiry) and an
+    /// optional high-value approval threshold, and answers allow, deny, or
+    /// approval-needed. Nothing is signed and no key is touched: the agent
+    /// signs only what this approves.
+    fn wallet_guard(&self, request: &Value) -> Result<Value, McpError> {
+        let budget = budget_from(request)?;
+        let amount_sat = u64_field(request, "amount_sat")?;
+        let recipient = address_from_hex(str_field(request, "recipient_hex")?.trim())
+            .map_err(|e| McpError::bad(format!("recipient: {e}")))?;
+        let service = opt_service(request)?;
+        let height = u64_field(request, "height")?;
+        let expires_at_height = u64_field(request, "expires_at_height")?;
+
+        match budget.check_guarded(amount_sat, &recipient, &service, height, expires_at_height)
+        {
+            Ok(grant) => {
+                if let Some(threshold) = request
+                    .get("approval_threshold_sat")
+                    .and_then(Value::as_u64)
+                {
+                    if threshold > 0 && amount_sat >= threshold {
+                        return Ok(json!({
+                            "decision": "needs_approval",
+                            "reason": format!("amount {amount_sat} needs human approval (threshold {threshold})"),
+                        }));
+                    }
+                }
+                Ok(json!({
+                    "decision": "allow",
+                    "amount_sat": grant.amount_sat,
+                    "recipient": hex::encode(grant.recipient),
+                    "expires_at_height": grant.expires_at_height,
+                    "note": "sign only this exact payment inside this window",
+                }))
+            }
+            Err(e) => Err(McpError::refused("guard_refused", e.to_string())),
+        }
+    }
+
+    /// `policy.decide` — the stateless engine seam over MCP: evaluate a policy
+    /// against a payment intent and answer allow, deny, or approval-needed.
+    /// No state is committed; the nonce/window accounting still runs in
+    /// `authorize` (or the node).
+    fn policy_decide(&self, request: &Value) -> Result<Value, McpError> {
+        let network_id = str_field(request, "network_id")?;
+        let height = u64_field(request, "height")?;
+        let policy_bytes = hex_field(request, "policy_hex")?;
+        let policy = SpendPolicy::deserialize(&policy_bytes)
+            .map_err(|e| McpError::bad(format!("policy: {e}")))?;
+        if policy.network_id != network_id {
+            return Err(McpError::refused(
+                "policy_refused",
+                format!(
+                    "policy is for network {}, request for {network_id}",
+                    policy.network_id
+                ),
+            ));
+        }
+        let intent = srct_core::portable::PaymentIntent {
+            agent_id: str_field(request, "agent_id_hex")?.to_string(),
+            recipient: str_field(request, "recipient_hex")?.to_string(),
+            amount_sat: u64_field(request, "amount_sat")?,
+            service: request
+                .get("service_hex")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            height,
+            nonce: request.get("nonce").and_then(Value::as_u64).unwrap_or(0),
+            network_id: network_id.to_string(),
+        };
+        let decoded = intent
+            .decoded()
+            .map_err(|e| McpError::bad(format!("intent: {e}")))?;
+        let threshold = request
+            .get("approval_threshold_sat")
+            .and_then(Value::as_u64);
+        match srct_core::portable::evaluate_policy(&policy, &decoded, height, threshold) {
+            srct_core::portable::PolicyDecision::Allow => Ok(json!({"decision": "allow"})),
+            srct_core::portable::PolicyDecision::Deny { reason } => Err(McpError::refused(
+                "policy_refused",
+                reason,
+            )),
+            srct_core::portable::PolicyDecision::NeedsApproval { reason } => Ok(json!({
+                "decision": "needs_approval",
+                "reason": reason,
+            })),
+        }
+    }
+
+    /// `policy.export` — wrap a signed policy as portable JSON (verified on
+    /// the way out, so an unverified grant never leaves as "portable").
+    fn policy_export(&self, request: &Value) -> Result<Value, McpError> {
+        let signed = signed_policy_from(request)?;
+        serde_json::from_str(&signed.to_json())
+            .map_err(|e| McpError::bad(format!("portable json: {e}")))
+    }
+
+    /// `policy.verify` — verify portable policy JSON from any rail.
+    fn policy_verify(&self, request: &Value) -> Result<Value, McpError> {
+        let raw = str_field(request, "portable_json")?;
+        let signed = srct_core::portable::SignedPolicy::from_json(raw)
+            .map_err(|e| McpError::refused("policy_invalid", e.to_string()))?;
+        Ok(json!({
+            "valid": true,
+            "policy_hash": hash_to_hex(&signed.policy.hash()),
+            "owner": hex::encode(signed.policy.owner),
+            "agent_id": hex::encode(signed.policy.agent_id),
+            "network_id": signed.policy.network_id,
+        }))
+    }
+
+    /// `delegation.prove` — assemble parallel `policies_hex`/`sigs_hex`/
+    /// `keys_hex` arrays (root first) into a verified [`DelegationProof`]
+    /// and return its portable JSON: the clean proof a service checks.
+    fn delegation_prove(&self, request: &Value) -> Result<Value, McpError> {
+        let policies = hex_array(request, "policies_hex")?;
+        let sigs = hex_array(request, "sigs_hex")?;
+        let keys = hex_array(request, "keys_hex")?;
+        if policies.len() != sigs.len()
+            || policies.len() != keys.len()
+            || policies.is_empty()
+            || policies.len() > srct_core::delegation::MAX_DELEGATION_DEPTH
+        {
+            return Err(McpError::bad("parallel link arrays must be non-empty and equal"));
+        }
+        let mut links = Vec::with_capacity(policies.len());
+        for (((policy_bytes, sigs_bytes), keys_bytes), i) in policies
+            .iter()
+            .zip(sigs.iter())
+            .zip(keys.iter())
+            .zip(0..)
+        {
+            let policy = SpendPolicy::deserialize(policy_bytes)
+                .map_err(|e| McpError::bad(format!("policy[{i}]: {e}")))?;
+            let mut r = srct_core::ser::Reader::new(sigs_bytes);
+            let sig_bundle = srct_core::sig::Bundle::from_reader(&mut r)
+                .map_err(|e| McpError::bad(format!("sigs[{i}]: {e}")))?;
+            let mut r = srct_core::ser::Reader::new(keys_bytes);
+            let key_bundle = srct_core::sig::Bundle::from_reader(&mut r)
+                .map_err(|e| McpError::bad(format!("keys[{i}]: {e}")))?;
+            links.push(srct_core::portable::SignedPolicy {
+                policy,
+                sigs: sig_bundle,
+                keys: key_bundle,
+            });
+        }
+        let proof = srct_core::portable::DelegationProof::new(links)
+            .map_err(|e| McpError::refused("delegation_invalid", e.to_string()))?;
+        proof
+            .verify()
+            .map_err(|e| McpError::refused("delegation_invalid", e.to_string()))?;
+        serde_json::from_str(&proof.to_json())
+            .map_err(|e| McpError::bad(format!("proof json: {e}")))
+    }
+
+    /// `delegation.verify` — verify a delegation proof from any rail.
+    fn delegation_verify(&self, request: &Value) -> Result<Value, McpError> {
+        let raw = str_field(request, "proof_json")?;
+        let proof = srct_core::portable::DelegationProof::from_json(raw)
+            .map_err(|e| McpError::refused("delegation_invalid", e.to_string()))?;
+        Ok(json!({
+            "valid": true,
+            "depth": proof.links.len(),
+            "root_owner": hex::encode(proof.root_owner()),
+            "leaf_agent": hex::encode(proof.leaf().agent_id),
+            "leaf_policy_hash": hash_to_hex(&proof.leaf().hash()),
+        }))
+    }
+
+    /// `auth.bind` — keyless step of the enforced approval: given an
+    /// authorization, an expiry and the exact transaction hash, return the
+    /// binding hash the *owner* signs. This layer never signs.
+    fn auth_bind(&self, request: &Value) -> Result<Value, McpError> {
+        let auth_bytes = hex_field(request, "authorization_hex")?;
+        let auth = srct_core::agent::Authorization::deserialize(&auth_bytes)
+            .map_err(|e| McpError::bad(format!("authorization: {e}")))?;
+        let expires_at_height = u64_field(request, "expires_at_height")?;
+        let bound_tx = hash_from_hex(str_field(request, "tx_hash_hex")?.trim())
+            .map_err(|e| McpError::bad(format!("tx hash: {e}")))?;
+        if expires_at_height <= auth.height {
+            return Err(McpError::bad("bound expiry must be after the grant height"));
+        }
+        let lifetime = expires_at_height.saturating_sub(auth.height);
+        if lifetime > srct_core::portable::MAX_BOUND_LIFETIME_BLOCKS {
+            return Err(McpError::refused(
+                "bound_invalid",
+                format!(
+                    "bound lifetime {lifetime} exceeds cap {}",
+                    srct_core::portable::MAX_BOUND_LIFETIME_BLOCKS
+                ),
+            ));
+        }
+        let draft = srct_core::portable::BoundAuthorization {
+            version: srct_core::portable::PORTABLE_POLICY_VERSION,
+            auth: auth.clone(),
+            expires_at_height,
+            bound_tx,
+            sigs: srct_core::sig::Bundle::default(),
+            keys: srct_core::sig::Bundle::default(),
+            auth_sigs: srct_core::sig::Bundle::default(),
+            auth_keys: srct_core::sig::Bundle::default(),
+        };
+        Ok(json!({
+            "binding_hash": hash_to_hex(&draft.signing_hash()),
+            "auth_hash": hash_to_hex(&auth.signing_hash()),
+            "expires_at_height": expires_at_height,
+            "note": "the policy owner signs `binding_hash`; this layer holds no key",
+        }))
+    }
+
+    /// `auth.verify_bound` — verify a bound authorization against its grant,
+    /// the exact payment, and the height: the enforced check.
+    fn auth_verify_bound(&self, request: &Value) -> Result<Value, McpError> {
+        let bound_raw = str_field(request, "bound_json")?;
+        let bound = srct_core::portable::BoundAuthorization::from_json_parsed(bound_raw)
+            .map_err(|e| McpError::bad(format!("bound: {e}")))?;
+        let policy_bytes = hex_field(request, "policy_hex")?;
+        let policy = SpendPolicy::deserialize(&policy_bytes)
+            .map_err(|e| McpError::bad(format!("policy: {e}")))?;
+        let payment_bytes = hex_field(request, "payment_hex")?;
+        let payment = srct_core::payment::MachinePayment::deserialize(&payment_bytes)
+            .map_err(|e| McpError::bad(format!("payment: {e}")))?;
+        let height = u64_field(request, "height")?;
+        bound
+            .verify(&policy, &payment, height)
+            .map_err(|e| McpError::refused("bound_invalid", e.to_string()))?;
+        Ok(json!({
+            "valid": true,
+            "owner": hex::encode(bound.auth.owner),
+            "bound_tx": hash_to_hex(&bound.bound_tx),
+            "expires_at_height": bound.expires_at_height,
+        }))
+    }
+
+    /// `audit.verify` — verify an exported audit chain (auditor/insurer
+    /// readable): links, entry hashes, order and tip.
+    fn audit_verify(&self, request: &Value) -> Result<Value, McpError> {
+        let raw = str_field(request, "audit_json")?;
+        let count = srct_core::safety::AuditLog::verify_export_json(raw)
+            .map_err(|e| McpError::refused("audit_invalid", e.to_string()))?;
+        Ok(json!({ "valid": true, "entries": count }))
     }
 
     // -----------------------------------------------------------------------
@@ -459,6 +729,115 @@ fn session_error(e: SessionError) -> McpError {
         SessionError::Binding(_) => McpError::refused("session_binding", e.to_string()),
         _ => McpError::bad(e.to_string()),
     }
+}
+
+/// Parse an `X402Budget` from `max_amount_sat` + optional hex allow-lists.
+/// An absent list means unbounded on that axis (same as `X402Budget::check`).
+fn budget_from(v: &Value) -> Result<srct_core::x402::X402Budget, McpError> {
+    let max_amount_sat = v
+        .get("max_amount_sat")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| McpError::bad("missing integer field `max_amount_sat`"))?;
+    let mut allowed_recipients = Vec::new();
+    if let Some(list) = v.get("allowed_recipients_hex") {
+        let arr = list
+            .as_array()
+            .ok_or_else(|| McpError::bad("`allowed_recipients_hex` must be an array"))?;
+        for item in arr {
+            let s = item
+                .as_str()
+                .ok_or_else(|| McpError::bad("recipient entry must be a string"))?;
+            allowed_recipients.push(
+                address_from_hex(s.trim())
+                    .map_err(|e| McpError::bad(format!("recipient: {e}")))?,
+            );
+        }
+    }
+    let mut allowed_services = Vec::new();
+    if let Some(list) = v.get("allowed_services_hex") {
+        let arr = list
+            .as_array()
+            .ok_or_else(|| McpError::bad("`allowed_services_hex` must be an array"))?;
+        for item in arr {
+            let s = item
+                .as_str()
+                .ok_or_else(|| McpError::bad("service entry must be a string"))?;
+            let raw = s
+                .trim()
+                .trim_start_matches("0x")
+                .to_string();
+            let bytes = hex::decode(&raw)
+                .map_err(|e| McpError::bad(format!("service: {e}")))?;
+            let tag: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| McpError::bad("service tag must be 32 bytes"))?;
+            allowed_services.push(tag);
+        }
+    }
+    Ok(srct_core::x402::X402Budget {
+        max_amount_sat,
+        allowed_recipients,
+        allowed_services,
+    })
+}
+
+/// Optional `service_hex` field: absent means untagged.
+fn opt_service(v: &Value) -> Result<Option<[u8; 32]>, McpError> {
+    match v.get("service_hex").and_then(Value::as_str) {
+        None => Ok(None),
+        Some(s) => {
+            let bytes = hex::decode(s.trim().trim_start_matches("0x"))
+                .map_err(|e| McpError::bad(format!("service: {e}")))?;
+            let tag: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| McpError::bad("service tag must be 32 bytes"))?;
+            Ok(Some(tag))
+        }
+    }
+}
+
+/// A JSON array of hex strings, each under the hex cap.
+fn hex_array(v: &Value, name: &str) -> Result<Vec<Vec<u8>>, McpError> {
+    let arr = v
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::bad(format!("missing array field `{name}`")))?;
+    if arr.len() > srct_core::delegation::MAX_DELEGATION_DEPTH {
+        return Err(McpError::bad(format!("{name} over the delegation cap")));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item
+            .as_str()
+            .ok_or_else(|| McpError::bad(format!("{name} entries must be strings")))?;
+        let s = s.trim().trim_start_matches("0x");
+        if s.len() > MAX_HEX_FIELD_CHARS {
+            return Err(McpError::bad(format!("{name} entry over the hex cap")));
+        }
+        out.push(hex::decode(s).map_err(|e| McpError::bad(format!("{name}: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// A signed policy from `policy_hex` + `sigs_hex` + `keys_hex`, verified on
+/// the way in — an unverified grant never becomes a proof.
+fn signed_policy_from(v: &Value) -> Result<srct_core::portable::SignedPolicy, McpError> {
+    let policy_bytes = hex_field(v, "policy_hex")?;
+    let policy = SpendPolicy::deserialize(&policy_bytes)
+        .map_err(|e| McpError::bad(format!("policy: {e}")))?;
+    let sigs_bytes = hex_field(v, "sigs_hex")?;
+    let keys_bytes = hex_field(v, "keys_hex")?;
+    let sigs = bundle_from_bytes(&sigs_bytes)?;
+    let keys = bundle_from_bytes(&keys_bytes)?;
+    let signed = srct_core::portable::SignedPolicy {
+        policy,
+        sigs,
+        keys,
+    };
+    signed
+        .verify()
+        .map_err(|e| McpError::refused("policy_invalid", e.to_string()))?;
+    Ok(signed)
 }
 
 fn str_field<'a>(v: &'a Value, name: &str) -> Result<&'a str, McpError> {

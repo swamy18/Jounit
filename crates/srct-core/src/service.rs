@@ -710,6 +710,50 @@ pub fn admit_payment(
     Ok(reservation)
 }
 
+/// Map a portable-layer refusal onto the session error: policy clauses keep
+/// their names, everything else (expiry, lifetime, transaction mismatch,
+/// delegation) is a binding refusal with the message intact.
+fn portable_refused(e: crate::portable::PortableError) -> SessionError {
+    match e {
+        crate::portable::PortableError::Policy(p) => SessionError::Policy(p),
+        crate::portable::PortableError::Payment(p) => SessionError::Payment(p),
+        other => SessionError::Payment(PaymentError::ChainRefused(other.to_string())),
+    }
+}
+
+/// The **enforced** admission: a machine payment plus the short-lived,
+/// exact-transaction binding that authorizes it.
+///
+/// This is what turns the advisory approval into a rule. `admit_payment`
+/// trusts the authorization the caller presents; this gate additionally
+/// requires a [`crate::portable::BoundAuthorization`] for the exact payment
+/// hash with a live short expiry, verified here before anything else runs. A
+/// stolen authorization re-aimed at another transaction, or replayed past its
+/// window, is refused by name and nothing is reserved.
+///
+/// The node wires this into `payment_submit` (and both x402 money paths) for
+/// policy-governed payments; human payments keep the existing path.
+pub fn admit_bound_payment(
+    book: &PolicyBook,
+    policy: &SpendPolicy,
+    payment: &MachinePayment,
+    bound: &crate::portable::BoundAuthorization,
+    network_id: &str,
+    height: u64,
+    gate: &mut dyn CreditGate,
+) -> Result<crate::credit::Reservation, SessionError> {
+    // 0. the binding proves the grant, the expiry and the exact transaction.
+    bound
+        .verify(policy, payment, height)
+        .map_err(portable_refused)?;
+    // 1..5. the standard admission under the same grant.
+    let presented = AuthPresentation {
+        auth: &bound.auth,
+        sigs: &bound.auth_sigs,
+        keys: &bound.auth_keys,
+    };
+    admit_payment(book, policy, payment, presented, network_id, height, gate)
+}
 /// A granted authorization plus the signature material that proves the owner
 /// issued it, as presented by a session verifier.
 #[derive(Debug, Clone, Copy)]

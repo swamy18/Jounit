@@ -20,7 +20,8 @@
 //! evicts security state.
 
 use crate::agent::AgentId;
-use crate::hash::{sha256_dom, Hash};
+use crate::hash::{hash_from_hex, hash_to_hex, sha256_dom, Hash};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
 /// Domain tag for audit-chain entries.
@@ -411,6 +412,111 @@ impl AuditLog {
     }
 }
 
+/// One audit entry in exportable form: hex strings and owned data, so an
+/// auditor or insurer can read and re-verify the chain without the node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditExportEntry {
+    pub seq: u64,
+    pub kind: String,
+    pub payment_id: Option<String>,
+    pub amount_sat: Option<u64>,
+    pub detail: String,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
+/// The whole export: the entries in order plus the tip, so the reader knows
+/// what "complete" means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditExport {
+    pub entries: Vec<AuditExportEntry>,
+    pub tip: String,
+}
+
+impl AuditLog {
+    /// Export the in-memory ring as auditor-readable JSON. The entries carry
+    /// their hashes, so the reader re-verifies rather than trusts.
+    pub fn export(&self) -> AuditExport {
+        AuditExport {
+            entries: self
+                .entries
+                .iter()
+                .map(|e| AuditExportEntry {
+                    seq: e.seq,
+                    kind: e.kind.to_string(),
+                    payment_id: e.payment_id.map(|h| hash_to_hex(&h)),
+                    amount_sat: e.amount_sat,
+                    detail: e.detail.clone(),
+                    prev_hash: hash_to_hex(&e.prev_hash),
+                    hash: hash_to_hex(&e.hash),
+                })
+                .collect(),
+            tip: hash_to_hex(&self.tip),
+        }
+    }
+
+    /// Serialize what [`AuditLog::export`] produced.
+    pub fn export_json(&self) -> String {
+        serde_json::to_string(&self.export()).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Verify an export: chain links, entry hashes, ordering from genesis, and
+    /// the tip. Returns the entry count. Refuses the first broken link by name
+    /// — an auditor must never have to guess which entry failed.
+    pub fn verify_export(export: &AuditExport) -> Result<usize, SafetyError> {
+        let genesis = [0u8; 32];
+        let mut prev = genesis;
+        for (i, e) in export.entries.iter().enumerate() {
+            if e.seq != i as u64 {
+                return Err(SafetyError::Malformed("audit export out of order"));
+            }
+            if e.detail.len() > 512 {
+                return Err(SafetyError::Malformed("audit detail too long"));
+            }
+            let prev_hash =
+                hash_from_hex(e.prev_hash.trim()).map_err(|_| SafetyError::Malformed("prev hash"))?;
+            let hash =
+                hash_from_hex(e.hash.trim()).map_err(|_| SafetyError::Malformed("entry hash"))?;
+            if prev_hash != prev {
+                return Err(SafetyError::Malformed("audit chain link"));
+            }
+            let payment_id = match &e.payment_id {
+                None => None,
+                Some(s) => Some(
+                    hash_from_hex(s.trim()).map_err(|_| SafetyError::Malformed("payment id"))?,
+                ),
+            };
+            let recomputed = AuditEntry::compute_hash(
+                e.seq,
+                &e.kind,
+                &payment_id,
+                &e.amount_sat,
+                &e.detail,
+                &prev,
+            );
+            if recomputed != hash {
+                return Err(SafetyError::Malformed("audit entry hash"));
+            }
+            prev = hash;
+        }
+        let tip = hash_from_hex(export.tip.trim()).map_err(|_| SafetyError::Malformed("tip"))?;
+        if tip != prev {
+            return Err(SafetyError::Malformed("audit tip mismatch"));
+        }
+        Ok(export.entries.len())
+    }
+
+    /// Parse and verify export JSON in one step.
+    pub fn verify_export_json(raw: &str) -> Result<usize, SafetyError> {
+        if raw.len() > 256 * 1024 {
+            return Err(SafetyError::Malformed("audit export over cap"));
+        }
+        let export: AuditExport =
+            serde_json::from_str(raw).map_err(|_| SafetyError::Malformed("audit export json"))?;
+        Self::verify_export(&export)
+    }
+}
+
 /// Reconciliation views over node-local books.
 pub mod reconcile {
     use super::Hash;
@@ -501,6 +607,25 @@ mod tests {
             .unwrap();
         log.verify_chain().unwrap();
         assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn audit_export_round_trips_and_tampering_is_refused() {
+        let mut log = AuditLog::with_capacity(4);
+        log.push("authorize", None, Some(500), "grant".to_string())
+            .unwrap();
+        log.push("payment", Some([1u8; 32]), Some(500), "submit".to_string())
+            .unwrap();
+        let json = log.export_json();
+        assert_eq!(AuditLog::verify_export_json(&json).unwrap(), 2);
+        let mut export = log.export();
+        // Rewriting history breaks the entry hash, not just the link.
+        export.entries[0].detail = "forged".to_string();
+        assert!(AuditLog::verify_export(&export).is_err());
+        // Truncating the tip is a different refusal, not silent acceptance.
+        let mut short = log.export();
+        short.tip = hash_to_hex(&[0u8; 32]);
+        assert!(AuditLog::verify_export(&short).is_err());
     }
 
     #[test]

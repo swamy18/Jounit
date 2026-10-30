@@ -53,6 +53,7 @@ pub mod micro;
 pub mod params;
 pub mod passport;
 pub mod payment;
+pub mod portable;
 pub mod puzzle;
 pub mod ramp;
 pub mod receipt;

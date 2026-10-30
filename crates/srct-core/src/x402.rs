@@ -51,6 +51,16 @@ pub const X402_HEADER_RESPONSE: &str = "PAYMENT-RESPONSE";
 pub const SRCT_SCHEME: &str = "exact";
 /// CAIP-2 namespace for SRCT.
 pub const SRCT_NAMESPACE: &str = "srct";
+/// CAIP-2 namespace for EVM chains (Base settles here; the node settles SRCT).
+pub const EVM_NAMESPACE: &str = "eip155";
+/// Base mainnet chain id: the EVM rail this adapter speaks beside SRCT.
+pub const BASE_CHAIN_ID: u64 = 8453;
+/// Base Sepolia chain id (test rail).
+pub const BASE_SEPOLIA_CHAIN_ID: u64 = 84532;
+/// Longest a guarded payment may live, in blocks, measured from the challenge
+/// height. The wallet guard is short-lived by construction: a grant that
+/// outlives this is refused before any key is touched.
+pub const MAX_GUARD_LIFETIME_BLOCKS: u64 = 30;
 /// Longest accepted resource/description string (bounds the 402 body).
 pub const MAX_X402_STRING_LEN: usize = 512;
 /// Most payment options one challenge may carry.
@@ -68,6 +78,13 @@ pub enum X402Error {
     RecipientNotAllowed,
     ServiceNotAllowed,
     BudgetExceeded(String),
+    /// The guarded payment is spent at or past its expiry.
+    Expired {
+        expires_at_height: u64,
+        height: u64,
+    },
+    /// The guarded window outlives [`MAX_GUARD_LIFETIME_BLOCKS`].
+    LifetimeTooLong { lifetime: u64, max: u64 },
 }
 
 impl std::fmt::Display for X402Error {
@@ -84,6 +101,16 @@ impl std::fmt::Display for X402Error {
             X402Error::RecipientNotAllowed => write!(f, "x402 recipient outside budget allow-list"),
             X402Error::ServiceNotAllowed => write!(f, "x402 service outside budget allow-list"),
             X402Error::BudgetExceeded(w) => write!(f, "x402 budget exceeded: {w}"),
+            X402Error::Expired {
+                expires_at_height,
+                height,
+            } => write!(
+                f,
+                "x402 guard expired at {expires_at_height}, spent at {height}"
+            ),
+            X402Error::LifetimeTooLong { lifetime, max } => {
+                write!(f, "x402 guard lifetime {lifetime} exceeds cap {max}")
+            }
         }
     }
 }
@@ -307,6 +334,140 @@ pub fn select_accept<'a>(
     best.ok_or_else(|| X402Error::BudgetExceeded("no compatible accept inside budget".to_string()))
 }
 
+/// Parse an EVM CAIP-2 id (`eip155:<chain>`) for the rails this adapter speaks
+/// beside SRCT: Base mainnet and Base Sepolia. Returns the chain id. Anything
+/// else — including SRCT — is refused by name, so an EVM route can never be
+/// mistaken for an SRCT settlement the node would admit.
+pub fn parse_evm_caip2(caip2: &str) -> Result<u64, X402Error> {
+    let (ns, reference) = caip2
+        .split_once(':')
+        .ok_or_else(|| X402Error::UnknownNetwork(caip2.to_string()))?;
+    if ns != EVM_NAMESPACE {
+        return Err(X402Error::UnknownNetwork(caip2.to_string()));
+    }
+    let chain: u64 = reference
+        .parse()
+        .map_err(|_| X402Error::UnknownNetwork(caip2.to_string()))?;
+    if chain == BASE_CHAIN_ID || chain == BASE_SEPOLIA_CHAIN_ID {
+        Ok(chain)
+    } else {
+        Err(X402Error::UnknownNetwork(caip2.to_string()))
+    }
+}
+
+impl X402Accept {
+    /// An EVM payment option (e.g. USDC on Base) advertised beside the SRCT
+    /// option. `amount` is in the route's own atomic units and `pay_to` is the
+    /// route's address encoding — the guard checks the SRCT-equivalent budget
+    /// before signing, but settlement on the EVM rail is the external
+    /// facilitator's job, never this node's.
+    pub fn evm(
+        chain_id: u64,
+        amount_atomic: String,
+        pay_to: String,
+        resource: String,
+        description: String,
+    ) -> Result<Self, X402Error> {
+        if chain_id != BASE_CHAIN_ID && chain_id != BASE_SEPOLIA_CHAIN_ID {
+            return Err(X402Error::UnknownNetwork(format!(
+                "{EVM_NAMESPACE}:{chain_id}"
+            )));
+        }
+        if amount_atomic.is_empty() || amount_atomic.len() > 64 {
+            return Err(X402Error::Malformed("evm amount length"));
+        }
+        if !amount_atomic.chars().all(|c| c.is_ascii_digit()) {
+            return Err(X402Error::Malformed("evm amount digits"));
+        }
+        if pay_to.len() > MAX_X402_STRING_LEN
+            || resource.len() > MAX_X402_STRING_LEN
+            || description.len() > MAX_X402_STRING_LEN
+        {
+            return Err(X402Error::Malformed("evm option too long"));
+        }
+        Ok(X402Accept {
+            scheme: SRCT_SCHEME.to_string(),
+            network: format!("{EVM_NAMESPACE}:{chain_id}"),
+            amount: amount_atomic,
+            pay_to,
+            description,
+            mime_type: "application/json".to_string(),
+            resource,
+            max_timeout_secs: 60,
+        })
+    }
+}
+
+/// Build a challenge that advertises SRCT first and one EVM rail (Base)
+/// second. A server that only settles SRCT uses [`build_required`]; a server
+/// reachable from Base wallets uses this, and the agent picks the SRCT option
+/// whenever the budget covers it (`select_accept` skips non-SRCT networks, so
+/// EVM options never enter the SRCT signing path by accident).
+pub fn build_required_with_evm(
+    network_id: &str,
+    amount_sat: u64,
+    pay_to_hex: String,
+    resource: String,
+    description: String,
+    evm: X402Accept,
+) -> Result<X402Required, X402Error> {
+    parse_evm_caip2(&evm.network)?;
+    let mut required = build_required(network_id, amount_sat, pay_to_hex, resource, description)?;
+    if required.accepts.len() + 1 > MAX_X402_ACCEPTS {
+        return Err(X402Error::Malformed("accepts length"));
+    }
+    required.accepts.push(evm);
+    Ok(required)
+}
+
+/// A granted wallet check: the exact payment the guard approved. The agent
+/// signs only what matches this — amount, recipient, service and a short
+/// expiry — so the budget is enforced *before* any key is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardGrant {
+    pub amount_sat: u64,
+    pub recipient: Address,
+    pub service: Option<[u8; 32]>,
+    /// Exclusive: the payment must land at a height below this.
+    pub expires_at_height: u64,
+}
+
+impl X402Budget {
+    /// Budget check plus short-lived expiry: the amount/recipient/service must
+    /// fit the budget, the challenge height must precede the expiry, and the
+    /// window must fit inside [`MAX_GUARD_LIFETIME_BLOCKS`]. Returns the grant
+    /// the agent may sign — nothing else.
+    pub fn check_guarded(
+        &self,
+        amount_sat: u64,
+        recipient: &Address,
+        service: &Option<[u8; 32]>,
+        height: u64,
+        expires_at_height: u64,
+    ) -> Result<GuardGrant, X402Error> {
+        self.check(amount_sat, recipient, service)?;
+        if height >= expires_at_height {
+            return Err(X402Error::Expired {
+                expires_at_height,
+                height,
+            });
+        }
+        let lifetime = expires_at_height.saturating_sub(height);
+        if lifetime > MAX_GUARD_LIFETIME_BLOCKS {
+            return Err(X402Error::LifetimeTooLong {
+                lifetime,
+                max: MAX_GUARD_LIFETIME_BLOCKS,
+            });
+        }
+        Ok(GuardGrant {
+            amount_sat,
+            recipient: *recipient,
+            service: *service,
+            expires_at_height,
+        })
+    }
+}
+
 // --- minimal base64 (RFC 4648, standard alphabet) so no new dependency ---
 
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -502,8 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_refuses_overrun_and_allowlist() {
-        let budget = X402Budget {
+    fn budget_refuses_overrun_and_allowlist() {        let budget = X402Budget {
             max_amount_sat: 600,
             allowed_recipients: vec![[1u8; 20]],
             allowed_services: vec![[2u8; 32]],
@@ -521,5 +681,65 @@ mod tests {
             budget.check(500, &[1u8; 20], &Some([9u8; 32])),
             Err(X402Error::ServiceNotAllowed)
         );
+    }
+
+    #[test]
+    fn guard_is_short_lived_and_evm_routes_parse() {
+        let budget = X402Budget {
+            max_amount_sat: 600,
+            allowed_recipients: vec![[1u8; 20]],
+            allowed_services: vec![],
+        };
+        let grant = budget
+            .check_guarded(500, &[1u8; 20], &None, 100, 110)
+            .unwrap();
+        assert_eq!(grant.expires_at_height, 110);
+        // Past expiry refuses by name.
+        assert!(matches!(
+            budget.check_guarded(500, &[1u8; 20], &None, 110, 110),
+            Err(X402Error::Expired { .. })
+        ));
+        // A window longer than the cap refuses at guard time, not at signing.
+        assert!(matches!(
+            budget.check_guarded(500, &[1u8; 20], &None, 100, 100 + MAX_GUARD_LIFETIME_BLOCKS + 1),
+            Err(X402Error::LifetimeTooLong { .. })
+        ));
+        // Over-budget still refuses first.
+        assert!(matches!(
+            budget.check_guarded(700, &[1u8; 20], &None, 100, 110),
+            Err(X402Error::AmountTooLarge { .. })
+        ));
+        // Base rails parse; anything else (including SRCT) is not an EVM route.
+        assert_eq!(parse_evm_caip2("eip155:8453").unwrap(), BASE_CHAIN_ID);
+        assert_eq!(
+            parse_evm_caip2("eip155:84532").unwrap(),
+            BASE_SEPOLIA_CHAIN_ID
+        );
+        assert!(parse_evm_caip2("srct:testnet").is_err());
+        assert!(parse_evm_caip2("eip155:1").is_err());
+        // A dual-rail challenge advertises SRCT first, Base second, and the
+        // SRCT signing path still picks the SRCT option.
+        let evm = X402Accept::evm(
+            BASE_CHAIN_ID,
+            "1000000".to_string(),
+            "0xbasepayee".to_string(),
+            "/v1/paid/weather".to_string(),
+            "weather".to_string(),
+        )
+        .unwrap();
+        let required = build_required_with_evm(
+            "srct/testnet",
+            500,
+            "42".to_string(),
+            "/v1/paid/weather".to_string(),
+            "weather".to_string(),
+            evm,
+        )
+        .unwrap();
+        assert_eq!(required.accepts.len(), 2);
+        assert_eq!(required.accepts[0].network, "srct:testnet");
+        assert_eq!(required.accepts[1].network, "eip155:8453");
+        let picked = select_accept(&required, &budget, &[1u8; 20], &None).unwrap();
+        assert_eq!(picked.network, "srct:testnet");
     }
 }

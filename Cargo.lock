@@ -1190,6 +1190,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "srct-policy"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "srct-core",
+]
+
+[[package]]
 name = "srct-store"
 version = "0.1.0"
 dependencies = [
