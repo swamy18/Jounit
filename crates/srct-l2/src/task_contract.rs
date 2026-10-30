@@ -62,6 +62,20 @@ pub struct L2Config {
     /// `NetworkParams::exit_activation_height` by the node; the constructors
     /// below carry `0` and the node overrides per profile.
     pub exit_activation_height: u64,
+    /// Maximum total exit principal per `exit_window_blocks` window. Wired
+    /// from `NetworkParams::max_exit_window_sat`; `0` disables. A refused
+    /// queue keeps its funds — the owner retries in the next window.
+    pub max_exit_window_sat: u64,
+    /// Length of the exit window in blocks. Wired from
+    /// `NetworkParams::exit_window_blocks`.
+    pub exit_window_blocks: u64,
+    /// Exits at or above this principal wait an additional
+    /// `large_exit_extra_delay_blocks`. Wired from
+    /// `NetworkParams::large_exit_threshold_sat`; `0` disables.
+    pub large_exit_threshold_sat: u64,
+    /// Extra maturity blocks for large exits. Wired from
+    /// `NetworkParams::large_exit_extra_delay_blocks`.
+    pub large_exit_extra_delay_blocks: u64,
 }
 
 impl L2Config {
@@ -75,6 +89,18 @@ impl L2Config {
         if self.dispute_window == 0 {
             return Err(L2Error::BadConfig("dispute window must be nonzero"));
         }
+        // Exit throttle pairing mirrors `NetworkParams::validate`: a cap
+        // without a window (or a threshold without its delay) is a half-rule.
+        if (self.max_exit_window_sat == 0) != (self.exit_window_blocks == 0) {
+            return Err(L2Error::BadConfig(
+                "exit window cap and length must be set together",
+            ));
+        }
+        if (self.large_exit_threshold_sat == 0) != (self.large_exit_extra_delay_blocks == 0) {
+            return Err(L2Error::BadConfig(
+                "large exit threshold and delay must be set together",
+            ));
+        }
         Ok(())
     }
 
@@ -87,6 +113,10 @@ impl L2Config {
             vesting_period: VESTING_BLOCKS_MAINNET,
             whistleblower_bounty_percent: 25,
             exit_activation_height: 0,
+            max_exit_window_sat: 0,
+            exit_window_blocks: 0,
+            large_exit_threshold_sat: 0,
+            large_exit_extra_delay_blocks: 0,
         }
     }
 
@@ -101,6 +131,10 @@ impl L2Config {
             vesting_period: srct_core::slash::VESTING_BLOCKS_MINI,
             whistleblower_bounty_percent: 25,
             exit_activation_height: 0,
+            max_exit_window_sat: 0,
+            exit_window_blocks: 0,
+            large_exit_threshold_sat: 0,
+            large_exit_extra_delay_blocks: 0,
         }
     }
 }

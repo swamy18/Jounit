@@ -214,6 +214,16 @@ pub struct L2State {
     /// Value ever released to L1, append-only. `funded_total` equals genesis
     /// plus deposits minus this — anything else is invented or vanished money.
     exited_total: u64,
+    /// Start height of the current exit-principal window. `0` means no window
+    /// is open yet; the first queue at or above `height` opens one. Derived
+    /// by replay like everything else in this struct — a reorg replays the
+    /// winning chain, so windows always describe the chain they were built
+    /// on, with no undo bookkeeping.
+    exit_window_start: u64,
+    /// Exit principal queued inside the current window. Refusals keep funds
+    /// in place (only the window delays the queue), so this is a throttle,
+    /// never a taking.
+    exit_window_total: u64,
     /// Published spending policies, keyed by the grant's hash (SPEC.md §21.1).
     /// A revoked grant stays in the map for the record; revocation is a flag on
     /// the entry, and a descendant of a revoked grant is dead by ancestry
@@ -453,6 +463,8 @@ impl L2State {
             exit_nonce: HashMap::new(),
             exits_locked: 0,
             exited_total: 0,
+            exit_window_start: 0,
+            exit_window_total: 0,
             policies: BTreeMap::new(),
             policy_by_agent: BTreeMap::new(),
             positions: BTreeMap::new(),
@@ -706,6 +718,16 @@ impl L2State {
         self.exited_total
     }
 
+    /// Start height of the current exit-principal window (`0` = none open).
+    pub fn exit_window_start(&self) -> u64 {
+        self.exit_window_start
+    }
+
+    /// Exit principal queued inside the current window.
+    pub fn exit_window_total(&self) -> u64 {
+        self.exit_window_total
+    }
+
     /// Prove a queued exit record against [`L2State::committed_root`].
     ///
     /// `None` for an unknown or already-released record — there is no leaf, so
@@ -738,6 +760,25 @@ impl L2State {
         let depth_ok = tip >= queued_height.saturating_add(maturity_depth);
         let binding_ok = binding_finalized == 0 || queued_height <= binding_finalized;
         depth_ok && binding_ok
+    }
+
+    /// Maturity depth for an exit of `amount_sat`: the base depth plus the
+    /// large-exit extra delay when the principal crosses the profile
+    /// threshold. Both halves of an exit (L2 queue accounting here, L1
+    /// release in `check_claim`) compute the same number from the same
+    /// inputs, so neither half can release early. Zero thresholds mean zero
+    /// extra — the bare depth the tests pin.
+    pub fn exit_maturity_depth_for(
+        amount_sat: u64,
+        base_depth: u64,
+        threshold_sat: u64,
+        extra_delay: u64,
+    ) -> u64 {
+        if threshold_sat > 0 && amount_sat >= threshold_sat {
+            base_depth.saturating_add(extra_delay)
+        } else {
+            base_depth
+        }
     }
 
     /// Whether this profile accepts an exit queue at `height`.
@@ -801,9 +842,40 @@ impl L2State {
             .checked_add(p.exit_fee_sat)
             .and_then(|v| self.exits_locked.checked_add(v))
             .ok_or(L2Error::Overflow)?;
+        // Exit window throttle: the sink is a honeypot, and one window must
+        // not drain it. A refused queue keeps its funds — the owner retries
+        // in the next window — so this is a delay, never a taking. Windows
+        // are replay-derived (first queue opens one), so reorgs rebuild them
+        // from the winning chain with no undo bookkeeping.
+        let (window_start, window_total) =
+            if self.config.max_exit_window_sat > 0 && self.config.exit_window_blocks > 0 {
+                let (start, total) = if self.exit_window_start == 0
+                    || height
+                        >= self
+                            .exit_window_start
+                            .saturating_add(self.config.exit_window_blocks)
+                {
+                    (height, 0)
+                } else {
+                    (self.exit_window_start, self.exit_window_total)
+                };
+                let total = total.checked_add(p.amount_sat).ok_or(L2Error::Overflow)?;
+                if total > self.config.max_exit_window_sat {
+                    return Err(L2Error::ExitWindowFull {
+                        window_total: total,
+                        window_cap: self.config.max_exit_window_sat,
+                        window_ends_at: start.saturating_add(self.config.exit_window_blocks),
+                    });
+                }
+                (start, total)
+            } else {
+                (self.exit_window_start, self.exit_window_total)
+            };
         self.charge(&p.owner, need)?;
         self.collect_fee(fee);
         self.exits_locked = new_locked;
+        self.exit_window_start = window_start;
+        self.exit_window_total = window_total;
         self.exits.insert(
             (p.owner, p.nonce),
             ExitRecord {
@@ -2110,7 +2182,7 @@ impl L2State {
 /// state (Decision 26). Pre-bump blobs are refused rather than guessed at,
 /// because a state that cannot describe a committed policy or credit position
 /// would silently diverge from the chain.
-pub const L2_STATE_WIRE_VERSION: u8 = 5;
+pub const L2_STATE_WIRE_VERSION: u8 = 6;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
@@ -2169,6 +2241,11 @@ impl L2State {
             .u64le(self.config.vesting_period)
             .u64le(self.config.whistleblower_bounty_percent)
             .u64le(self.config.exit_activation_height)
+            // v6: exit throttle (window cap + large-exit delay).
+            .u64le(self.config.max_exit_window_sat)
+            .u64le(self.config.exit_window_blocks)
+            .u64le(self.config.large_exit_threshold_sat)
+            .u64le(self.config.large_exit_extra_delay_blocks)
             .u8(u8::from(self.genesis_applied))
             .u64le(self.funded_total)
             .u64le(self.deposited_total)
@@ -2221,6 +2298,10 @@ impl L2State {
             w.fixed(owner).u64le(*nonce);
         }
         w.u64le(self.exits_locked);
+        // v6: exit window accounting (replay-derived, but encoded so a
+        // transported state keeps the throttle it was built under).
+        w.u64le(self.exit_window_start)
+            .u64le(self.exit_window_total);
 
         let mut vwcs: Vec<(&Hash, &VerifiedWorkCertificate)> = self.vwcs.iter().collect();
         vwcs.sort_by_key(|(id, _)| **id);
@@ -2281,6 +2362,10 @@ impl L2State {
             vesting_period: r.u64le().map_err(|_| codec_err("vesting period"))?,
             whistleblower_bounty_percent: r.u64le().map_err(|_| codec_err("bounty percent"))?,
             exit_activation_height: r.u64le().map_err(|_| codec_err("exit activation height"))?,
+            max_exit_window_sat: r.u64le().map_err(|_| codec_err("exit window cap"))?,
+            exit_window_blocks: r.u64le().map_err(|_| codec_err("exit window length"))?,
+            large_exit_threshold_sat: r.u64le().map_err(|_| codec_err("large exit threshold"))?,
+            large_exit_extra_delay_blocks: r.u64le().map_err(|_| codec_err("large exit delay"))?,
         };
         // A blob carrying a config the constructors would never build (a
         // 200% bounty, a zero window) decodes into what `apply` could never
@@ -2420,6 +2505,9 @@ impl L2State {
         if decoded_exits_locked != exits_locked {
             return Err(codec_err("locked exits disagree with the records"));
         }
+        // v6: exit window accounting.
+        let exit_window_start = r.u64le().map_err(|_| codec_err("exit window start"))?;
+        let exit_window_total = r.u64le().map_err(|_| codec_err("exit window total"))?;
 
         let declared_vwcs = r.u64le().map_err(|_| codec_err("certificate count"))?;
         let n_vwcs = bounded_count(
@@ -2536,6 +2624,8 @@ impl L2State {
             exit_nonce,
             exits_locked,
             exited_total,
+            exit_window_start,
+            exit_window_total,
             policies,
             policy_by_agent,
             positions,
@@ -2543,6 +2633,13 @@ impl L2State {
         };
         // The protocol's own invariant. A state that does not conserve is not
         // a valid observation of the chain, whatever its structure said.
+        // A disabled throttle never accumulates window accounting, so a blob
+        // carrying it under a zero cap is tampered with, not merely odd.
+        if state.config.max_exit_window_sat == 0
+            && (state.exit_window_start != 0 || state.exit_window_total != 0)
+        {
+            return Err(codec_err("exit window accounting under a disabled cap"));
+        }
         // Exit nonces must also cover their records: a record beyond its
         // owner's last nonce was never queueable.
         for (owner, nonce) in state.exits.keys() {

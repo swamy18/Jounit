@@ -229,6 +229,9 @@ pub enum PolicyError {
     NonceNotIncreasing { nonce: u64, last_nonce: u64 },
     /// An arithmetic bound would overflow.
     Overflow,
+    /// The authorization does not belong to this grant (wrong owner, wrong
+    /// grant hash). The reason is stated.
+    PolicyBinding(&'static str),
     /// The policy book is at capacity and refuses a new policy rather than grow.
     PolicyBookFull { cap: usize },
 }
@@ -303,6 +306,7 @@ impl fmt::Display for PolicyError {
                 )
             }
             PolicyError::Overflow => write!(f, "arithmetic overflow in policy accounting"),
+            PolicyError::PolicyBinding(why) => write!(f, "policy binding: {why}"),
             PolicyError::PolicyBookFull { cap } => {
                 write!(f, "policy book is full ({cap} policies)")
             }
@@ -861,6 +865,48 @@ pub fn verify_authorization(
     crate::sig::verify_bundle(sigs, keys, &msg)
 }
 
+/// Verify an authorization against the policy it names, at `height`.
+///
+/// `verify_authorization` proves the owner signed — but the signed object
+/// carries no expiry, so a bare check accepts a stale grant forever. Services
+/// that verify offline (a receipt, a delivery, an x402 retry) must call this
+/// with the grant the `policy_hash` names: a revoked grant, a wrong owner,
+/// or a height outside `[not_before, expires_at)` refuses here, not later.
+pub fn verify_authorization_for_policy(
+    sigs: &crate::sig::Bundle,
+    keys: &crate::sig::Bundle,
+    auth: &Authorization,
+    policy: &SpendPolicy,
+    height: u64,
+) -> Result<(), PolicyError> {
+    if policy.owner != auth.owner {
+        return Err(PolicyError::PolicyBinding("the grant names another owner"));
+    }
+    verify_authorization(sigs, keys, auth)
+        .map_err(|_| PolicyError::PolicyBinding("authorization signature invalid"))?;
+    if policy.revoked {
+        return Err(PolicyError::PolicyRevoked);
+    }
+    if height < policy.not_before_height {
+        return Err(PolicyError::NotYetValid {
+            not_before: policy.not_before_height,
+            height,
+        });
+    }
+    if height >= policy.expires_at_height {
+        return Err(PolicyError::PolicyExpired {
+            expires_at: policy.expires_at_height,
+            height,
+        });
+    }
+    if auth.policy_hash != policy.hash() {
+        return Err(PolicyError::PolicyBinding(
+            "the authorization names another grant",
+        ));
+    }
+    Ok(())
+}
+
 /// Bounded set of policies the engine tracks, keyed by policy hash.
 ///
 /// Keying by hash is what makes **rotation** safe: a rotated-in policy has a
@@ -1180,6 +1226,62 @@ mod tests {
         p.validate().expect("policy must validate");
         let bytes = p.serialize();
         assert_eq!(SpendPolicy::deserialize(&bytes).unwrap(), p);
+    }
+
+    /// `verify_authorization_for_policy` binds the signature to a *live*
+    /// grant: it passes inside the window, and refuses expired, premature,
+    /// revoked, and wrong-owner grants at the same height.
+    #[test]
+    fn for_policy_checks_liveness_not_just_signature() {
+        use crate::l2::Auth;
+        use crate::wallet::Wallet;
+        let network = "srct/testnet";
+        let wallet = Wallet::new_random("owner");
+        let owner = wallet.address().unwrap();
+        let mut p = policy(network);
+        p.owner = owner;
+        p.agent_id = derive_agent_id(network, AgentRole::Machine, &owner);
+        let auth = Authorization {
+            version: POLICY_VERSION,
+            policy_hash: p.hash(),
+            agent_id: p.agent_id,
+            owner,
+            recipient: [1u8; 20],
+            amount_sat: 100,
+            service: None,
+            height: 5,
+            nonce: 1,
+        };
+        let keys = Auth::keys_for(&wallet).unwrap();
+        let sigs = Auth::sigs_for(&wallet, &auth.signing_hash()).unwrap();
+        // Live grant: passes.
+        verify_authorization_for_policy(&sigs, &keys, &auth, &p, 5).unwrap();
+        // Expired grant: same bytes, later height — refused by name.
+        assert!(matches!(
+            verify_authorization_for_policy(&sigs, &keys, &auth, &p, 1_000),
+            Err(PolicyError::PolicyExpired { .. })
+        ));
+        // Premature grant.
+        let mut early = p.clone();
+        early.not_before_height = 10;
+        assert!(matches!(
+            verify_authorization_for_policy(&sigs, &keys, &auth, &early, 5),
+            Err(PolicyError::NotYetValid { .. })
+        ));
+        // Revoked grant.
+        let mut revoked = p.clone();
+        revoked.revoked = true;
+        assert!(matches!(
+            verify_authorization_for_policy(&sigs, &keys, &auth, &revoked, 5),
+            Err(PolicyError::PolicyRevoked)
+        ));
+        // Wrong owner.
+        let mut other = p.clone();
+        other.owner = [9u8; 20];
+        assert!(matches!(
+            verify_authorization_for_policy(&sigs, &keys, &auth, &other, 5),
+            Err(PolicyError::PolicyBinding(_))
+        ));
     }
 
     #[test]

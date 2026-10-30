@@ -366,6 +366,23 @@ pub struct NetworkParams {
     /// funds can never be encumbered with no release. All shipped profiles
     /// carry `1` (active from the first block).
     pub exit_activation_height: u64,
+    /// Maximum total exit principal per `exit_window_blocks` window, in
+    /// satoshis. The L2 deposit sink is a honeypot: without a window cap a
+    /// single compromised key set drains it in one window. A refused queue
+    /// keeps its funds (nothing is lost, only delayed) and retries in the
+    /// next window. `0` disables the cap (`mini`/`testnet`).
+    pub max_exit_window_sat: u64,
+    /// Length of the exit window in blocks. Must be nonzero when
+    /// `max_exit_window_sat` is nonzero (`validate` enforces the pairing).
+    pub exit_window_blocks: u64,
+    /// Exits at or above this principal wait an additional
+    /// `large_exit_extra_delay_blocks` on top of maturity: large outflows
+    /// give monitors and operators time to react. `0` disables the delay
+    /// (`mini`/`testnet`).
+    pub large_exit_threshold_sat: u64,
+    /// Extra maturity blocks for large exits. Meaningless without a
+    /// threshold and refused by `validate` in that shape.
+    pub large_exit_extra_delay_blocks: u64,
     /// Height at which the network begins enforcing post-quantum (ML-DSA-65,
     /// scheme 3) spends. `0` means never: the rule is inert and every profile
     /// is byte-identical to the current consensus, so flipping it is the single
@@ -528,8 +545,17 @@ impl NetworkParams {
             // launch decision sets a height.
             pq_activation_height: 0,
             // Anti-dust bond floor on mainnet (see the field doc): 1-sat
-            // bonds cost every node permanent ledger entries for no stake.
+            // bonds cost every node permanent ledger entries at no stake.
             min_bond_sat: 1_000_000,
+            // Exit throttle on mainnet: at most 1,000 SRCT of exit principal
+            // per 144-block (~24h) window; exits of 100 SRCT or more wait an
+            // extra 144 blocks. Refusals delay, never destroy: funds stay
+            // put and the owner retries in the next window. `mini`/testnet
+            // leave all four at 0 (disabled) so tests exercise bare rules.
+            max_exit_window_sat: 1_000 * SAT_PER_SRCT,
+            exit_window_blocks: 144,
+            large_exit_threshold_sat: 100 * SAT_PER_SRCT,
+            large_exit_extra_delay_blocks: 144,
         }
     }
 
@@ -610,6 +636,11 @@ impl NetworkParams {
             pq_activation_height: 0,
             // No bond floor on mini: tests exercise dust behavior deliberately.
             min_bond_sat: 0,
+            // Exit throttle disabled on mini (all four zero): bare rules.
+            max_exit_window_sat: 0,
+            exit_window_blocks: 0,
+            large_exit_threshold_sat: 0,
+            large_exit_extra_delay_blocks: 0,
         }
     }
 
@@ -674,6 +705,11 @@ impl NetworkParams {
             pq_activation_height: 0,
             // No bond floor on testnet either: play money, dust is test data.
             min_bond_sat: 0,
+            // Exit throttle disabled on testnet too.
+            max_exit_window_sat: 0,
+            exit_window_blocks: 0,
+            large_exit_threshold_sat: 0,
+            large_exit_extra_delay_blocks: 0,
         }
     }
 
@@ -709,6 +745,19 @@ impl NetworkParams {
         }
         if self.coinbase_maturity == 0 {
             return Err(Error::Malformed("coinbase_maturity must be > 0"));
+        }
+        // Exit throttle pairing: a cap without a window (or a threshold
+        // without its delay) is a half-rule the state machine cannot apply,
+        // so the profile is refused instead of running half-throttled.
+        if (self.max_exit_window_sat == 0) != (self.exit_window_blocks == 0) {
+            return Err(Error::Malformed(
+                "max_exit_window_sat and exit_window_blocks must be set together",
+            ));
+        }
+        if (self.large_exit_threshold_sat == 0) != (self.large_exit_extra_delay_blocks == 0) {
+            return Err(Error::Malformed(
+                "large_exit_threshold_sat and large_exit_extra_delay_blocks must be set together",
+            ));
         }
         if self.gas_cap == 0 {
             return Err(Error::Malformed("gas_cap must be > 0"));

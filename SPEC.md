@@ -592,7 +592,10 @@ A transaction must pay `fee ≥ base_fee × gas_used(tx)`.
 10. Bond (`2`): inputs share exactly one signer (the bonder); BLS key valid
      and not already bonded; exactly one output pays the derived bond identity
      `SHA256("srct/bond-identity/v1" ‖ network_id ‖ bonder ‖ bls_pk)[..20]`
-     with a positive value (no minimum stake threshold — Solar Cyber Unit is permissionless);
+     with value at or above `min_bond_sat` (0.01 SRCT mainnet; 0 on
+     `mini`/`testnet` — an anti-dust floor, not a wealth gate: Solar Cyber Unit
+     stays permissionless while 1-sat bonds cannot permanently occupy ledger
+     entries on every node);
      that output is consumed into the bond ledger by
     the applying block (it never rests in the UTXO set, so a later release
     cannot double-count it)
@@ -653,6 +656,11 @@ The mini version is **not** a second codebase. It is the same `srct-core` with a
 | `exit_activation_height` | `1` | `1` | `1` |
 | `l2_genesis_escrow_sat` | `100 000 SRCT` | `10 SRCT` | `10 SRCT` |
 | `escrow_ceiling_sat` | `100 000 SRCT` | `10 SRCT` | `10 SRCT` |
+| `min_bond_sat` | `0.01 SRCT` | `0` | `0` |
+| `max_exit_window_sat` | `1 000 SRCT` | `0` (disabled) | `0` (disabled) |
+| `exit_window_blocks` | `144` | `0` | `0` |
+| `large_exit_threshold_sat` | `100 SRCT` | `0` (disabled) | `0` (disabled) |
+| `large_exit_extra_delay_blocks` | `144` | `0` | `0` |
 
 `testnet` shares the mini ladder and block schedule but has its own magic/id,
 its own deterministic committee (distinct derivation), and the §14.8
@@ -668,6 +676,17 @@ profile carries a stock supply cap (Decision 18).
 carry no root. All three shipped profiles activate at height `1`, so deposits
 and exits are open from genesis on every profile: the rule is compiled,
 tested and live, and a profile that wants it closed sets `0`.
+
+**Exit throttle (mainnet only).** The deposit sink is a honeypot: at most
+`max_exit_window_sat` of exit principal may queue per `exit_window_blocks`
+(1 000 SRCT per 144 blocks), and exits at or above
+`large_exit_threshold_sat` wait `large_exit_extra_delay_blocks` on top of
+base maturity (100 SRCT → +144 blocks). Over-cap queues are refused with the
+retry height named; funds stay put and the owner retries in the next window —
+a delay, never a taking. Both L2 queue accounting and the L1 release check
+compute the same window and the same delay, so neither half can release
+early. `mini`/`testnet` carry `0` for all four (disabled) so tests exercise
+the bare rules.
 
 ---
 
@@ -2953,6 +2972,17 @@ balance — the record is written only after every check passes, so a refused
 queue leaves no partial state. No cancellation:
 a cancel/claim race needs its own ordering rule for no benefit, and the value is
 encumbered for exactly one finality window.
+
+*Exit throttle.* The deposit sink is a honeypot: at most
+`max_exit_window_sat` of exit principal may queue per `exit_window_blocks`
+(1 000 SRCT per 144 blocks on mainnet; `0` disables on `mini`/`testnet`).
+Over-cap queues are refused with the retry height (`ExitWindowFull`) — funds
+stay put and the owner retries in the next window. Exits at or above
+`large_exit_threshold_sat` wait `large_exit_extra_delay_blocks` on top of
+base maturity (100 SRCT → +144 blocks on mainnet). Both halves compute the
+same delay from the same inputs, so neither the L2 queue accounting nor the
+L1 release check can release early. Windows are replay-derived, so reorgs
+rebuild them from the winning chain with no undo bookkeeping.
 
 *L1 side.* A block carries `exit_claims: Vec<ExitClaim>` beside its L2 trailer.
 A claim takes **sink outputs** as inputs and is authorised by an *inclusion

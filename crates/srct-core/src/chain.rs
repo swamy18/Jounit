@@ -1331,10 +1331,19 @@ impl Chain {
         // Maturity: depth *and* the binding checkpoint once binding finality
         // is active (Decision 15) — exits are never less safe than deposits,
         // and `binding == 0` keeps depth-only finality where it never
-        // activated. `height - 1` is the tip this block extends.
-        let mature_at = claim
-            .queued_height
-            .saturating_add(self.params.finality_depth);
+        // activated. `height - 1` is the tip this block extends. Large exits
+        // wait the profile's extra delay on top — the same number the L2
+        // queue side enforces, so neither half releases early.
+        let depth = if self.params.large_exit_threshold_sat > 0
+            && claim.amount_sat >= self.params.large_exit_threshold_sat
+        {
+            self.params
+                .finality_depth
+                .saturating_add(self.params.large_exit_extra_delay_blocks)
+        } else {
+            self.params.finality_depth
+        };
+        let mature_at = claim.queued_height.saturating_add(depth);
         if height.saturating_sub(1) < mature_at {
             return Err(Error::Malformed("exit not yet mature"));
         }

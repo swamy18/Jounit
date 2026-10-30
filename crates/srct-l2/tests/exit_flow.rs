@@ -791,6 +791,55 @@ fn exit_proof_fails_against_a_root_built_without_policies() {
     );
 }
 
+/// A throttled config refuses the queue that would overflow the window, keeps
+/// funds untouched, and admits it again once the window rolls over.
+#[test]
+fn exit_window_cap_refuses_then_reopens() {
+    let mut cfg = exits_on();
+    cfg.max_exit_window_sat = 1_500_000;
+    cfg.exit_window_blocks = 10;
+    let mut w = world_with(cfg);
+    // First queue (1M) fits; second (1M) would total 2M over a 1.5M cap.
+    w.apply(&queue_tx(&w, 1, 1_000_000, 1_000), 5);
+    let before = w.state.balance(&addr(&w.submitter));
+    let over = L2Transaction::new(L2Payload::ExitQueue(
+        ExitQueuePayload::build(&w.submitter, 2, 1_000_000, addr(&w.worker), 1_000).unwrap(),
+    ));
+    let err = w
+        .state
+        .apply(&over, 5, &w.validators, &w.verifier)
+        .expect_err("window overflow must be refused");
+    assert!(
+        matches!(err, L2Error::ExitWindowFull { .. }),
+        "the refusal names the window: {err:?}"
+    );
+    // Nothing moved: balance, locked total and nonce are exactly as before.
+    assert_eq!(w.state.balance(&addr(&w.submitter)), before);
+    assert_eq!(w.state.exits_locked_total(), 1_001_000);
+    // Next window: the same queue is admitted.
+    w.apply(&queue_tx(&w, 2, 1_000_000, 1_000), 15);
+    assert_eq!(w.state.exits_locked_total(), 2_002_000);
+    w.assert_conserved("window rollover");
+}
+
+/// A large exit waits the extra delay on top of base maturity — same rule on
+/// the L2 queue side and (via chain params) on the L1 release side.
+#[test]
+fn large_exit_waits_extra_maturity() {
+    assert_eq!(
+        L2State::exit_maturity_depth_for(99, 20, 100, 144),
+        20,
+        "below the threshold the bare depth governs"
+    );
+    assert_eq!(
+        L2State::exit_maturity_depth_for(100, 20, 100, 144),
+        164,
+        "at the threshold the extra delay applies (inclusive)"
+    );
+    // Disabled profiles add nothing regardless of size.
+    assert_eq!(L2State::exit_maturity_depth_for(u64::MAX, 20, 0, 0), 20);
+}
+
 /// After release, the exit leaf is gone and adding a policy does not resurrect
 /// it — proves against the *current* tree even when the tree shrinks.
 #[test]

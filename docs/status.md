@@ -1730,6 +1730,45 @@ existing behavior — no new transaction types, endpoints or issuance:
   (522), `srct-miner` (47), redteam suites, `srct-node --test api`
   (47) + `agent_economy`/`micro_safety`/`x402`, L2 `credit_flow` — all green.
 
+### 2026-10-30 security lessons (exit throttle, enforced approval, auth liveness)
+
+A second external input — incident-style lessons (hot-wallet drain playbook).
+Verified claim-by-claim, then implemented:
+
+- Exit rate limit (was absent, now consensus): `max_exit_window_sat` /
+  `exit_window_blocks` cap exit principal per window (mainnet: 1,000 SRCT per
+  144 blocks); over-cap queues refuse with `ExitWindowFull` naming the retry
+  height, funds untouched. Large exits (≥100 SRCT mainnet) wait 144 extra
+  blocks, enforced identically in L2 queue accounting and the L1 release
+  check. All four knobs are `NetworkParams` (mini/testnet 0 = disabled) with
+  pair-validation, mirrored into `L2Config`; L2 wire v5 → v6. Reorg-safe by
+  construction (windows replay from the winning chain, no undo bookkeeping).
+- Human approval enforced (was advisory): at/above
+  `SRCT_HIGH_VALUE_THRESHOLD_SAT` the payment is **refused** (403
+  `human_approval_required`) until a key listed in
+  `SRCT_HIGH_VALUE_APPROVERS` co-signs the payment hash — payer's own key
+  does not count, `payment_approved` is audited, and both submit and x402
+  settle enforce it. Threshold 0 keeps everything off, as before.
+- Offline-auth liveness (was owner+sig only): new
+  `verify_authorization_for_policy` checks owner, signature, revocation and
+  the `[not_before, expires_at)` window; `Session::verify` uses it when the
+  policy is attached (`with_policy`), and x402 `verify` loads the named
+  grant and refuses stale ones. `PolicyBinding` variant added for the two
+  new mismatch shapes.
+- Monitoring signal: `/v1/conservation` now reports `exit_window_*`,
+  `pending_exit_sat` and the cap — theft conserves, so the outflow signal is
+  what trips, not the invariant. Docs gain Monitoring alerts, hot-wallet cap
+  recipes, and key-separation rules (approvers ≠ issuers ≠ providers ≠ seed
+  keys; provider keys deserve hardware/threshold custody).
+- Found while verifying: a `git stash` round-trip confirmed `mine_block`
+  behavior the template filter had changed (dust bond tests caught it in
+  the previous commit's scoping fix).
+- Verification: clippy clean; L2 incl. new window/large-exit tests, the
+  `verify_authorization_for_policy` liveness unit test, 3 node-lib approval
+  tests, core bond/exit suites, node
+  api/agent_economy/micro_safety/x402/state_persist — green. README count
+  1368 → 1374; `state_wire` version pin 5 → 6.
+
 ### 2026-10-30 external critique response (docs honesty + 2 code gates)
 
 An outside reviewer's critique verified claim-by-claim against the code; all

@@ -1274,7 +1274,7 @@ the mechanism follows as a new L1 rule. Decision 2's economics stand (TopN 21,
 no rewards, no fee share); this decision supplies what Decision 8 deliberately
 left unbuilt.
 
-1. **No minimum stake; anti-dust floor instead (AMENDED 2026-10-30).** Any
+1. **No minimum stake; anti-dust floor instead (AMENDED 2026-10-30, exit throttle added 2026-10-30).** Any
    positive bond amount is accepted into the bond ledger. The 5,000 SRCT
    minimum stake from the original Decision 2 design has been **removed**:
    Solar Cyber Unit is permissionless. The committee is stake-weighted

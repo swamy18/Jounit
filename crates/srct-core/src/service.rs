@@ -729,6 +729,11 @@ pub struct Session<'a> {
     pub authorization: Option<AuthPresentation<'a>>,
     pub payment: Option<&'a MachinePayment>,
     pub receipt: Option<&'a ServiceReceipt>,
+    /// The grant the authorization names. Without it the authorization stage
+    /// can check the owner's signature but not whether the grant is live —
+    /// and a stale grant would verify. Pass the policy the node issued
+    /// under; verification refuses revoked and out-of-window grants.
+    pub policy: Option<&'a crate::agent::SpendPolicy>,
 }
 
 impl<'a> Session<'a> {
@@ -738,7 +743,13 @@ impl<'a> Session<'a> {
             authorization: None,
             payment: None,
             receipt: None,
+            policy: None,
         }
+    }
+
+    pub fn with_policy(mut self, policy: &'a crate::agent::SpendPolicy) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     pub fn with_authorization(
@@ -768,8 +779,21 @@ impl<'a> Session<'a> {
         self.request.verify(network_id, height)?;
 
         // Authorization stage: offline-verifiable and bound to the request.
+        // With the grant attached, liveness is checked too — a stale grant
+        // verifies a signature but must not verify a session.
         if let Some(presented) = self.authorization {
-            verify_authorization(presented.sigs, presented.keys, presented.auth)?;
+            if let Some(policy) = self.policy {
+                crate::agent::verify_authorization_for_policy(
+                    presented.sigs,
+                    presented.keys,
+                    presented.auth,
+                    policy,
+                    height,
+                )
+                .map_err(SessionError::Policy)?;
+            } else {
+                verify_authorization(presented.sigs, presented.keys, presented.auth)?;
+            }
             let auth = presented.auth;
             if auth.owner != self.request.payer {
                 return Err(SessionError::Binding("authorization owner"));

@@ -100,6 +100,14 @@ pub enum L2Error {
     /// released (release removes the record, so a spent exit has no leaf and
     /// no second release).
     UnknownExit,
+    /// The exit window is full: this queue would push the window's total
+    /// principal over `max_exit_window_sat`. Funds are untouched — the owner
+    /// retries once `window_ends_at` passes.
+    ExitWindowFull {
+        window_total: u64,
+        window_cap: u64,
+        window_ends_at: u64,
+    },
     /// The exit names an unspendable destination (for example the deposit
     /// sink): value in, never out. The reason is stated.
     BadExitDestination(&'static str),
@@ -233,6 +241,14 @@ impl fmt::Display for L2Error {
             }
             L2Error::BadExitNonce => write!(f, "exit nonce repeats or rewinds"),
             L2Error::UnknownExit => write!(f, "no such queued exit"),
+            L2Error::ExitWindowFull {
+                window_total,
+                window_cap,
+                window_ends_at,
+            } => write!(
+                f,
+                "exit window full: {window_total} of {window_cap} sat used, retry after height {window_ends_at}"
+            ),
             L2Error::BadExitDestination(why) => write!(f, "bad exit destination: {why}"),
             L2Error::BadConfig(why) => write!(f, "bad l2 config: {why}"),
             L2Error::Codec(e) => write!(f, "codec: {e}"),

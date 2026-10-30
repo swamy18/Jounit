@@ -370,7 +370,11 @@ consequence, not a bug — the analysis and sensitivity tables are in
 [docs/monetary-policy.md](docs/monetary-policy.md).
 
 Gross issuance, removal and net supply are reported by `status`,
-`GET /v1/conservation` and the `/metrics` gauges.
+`GET /v1/conservation` and the `/metrics` gauges. Conservation passing does
+not mean nothing was stolen — a thief's exit conserves perfectly — so
+`/v1/conservation` also reports the exit-outflow watch (`exit_window_total`
+vs cap, `pending_exit_sat`): alert on a window filling fast, not on the
+invariant staying green.
 
 ---
 
@@ -586,11 +590,14 @@ The wallet around them is safer than a normal crypto wallet by construction
 2. **Session budget** (`safety::SessionBook`) — per-agent aggregate across
    rotated policies, so spend cannot be split across N policies.
    `SRCT_SESSION_WINDOW_BLOCKS` + `SRCT_SESSION_CAP_SAT` (both zero = gate off).
-3. **Risk checks** (`safety::RiskPolicy`) — high-value human-approval advisory
-   (`SRCT_HIGH_VALUE_THRESHOLD_SAT`; `payment_submit` answers
-   `requires_human_approval: true` — the agent pauses, the chain never
-   decides), per-payer velocity cap (`SRCT_MAX_PAYMENTS_PER_PAYER`), mainnet
-   guard in test mode (`SRCT_TEST_MODE=1` refuses `srct/mainnet` spends).
+3. **Risk checks** (`safety::RiskPolicy`) — high-value approval is *enforced*,
+   not advisory: at or above `SRCT_HIGH_VALUE_THRESHOLD_SAT` the node answers
+   `403 human_approval_required` until a key listed in
+   `SRCT_HIGH_VALUE_APPROVERS` co-signs the payment (the payer's own key does
+   not count). Threshold `0` disables the gate. Plus per-payer velocity cap
+   (`SRCT_MAX_PAYMENTS_PER_PAYER`) and a mainnet guard in test mode
+   (`SRCT_TEST_MODE=1` refuses `srct/mainnet` spends). Full operator recipe:
+   [`docs/wallet-safety.md`](docs/wallet-safety.md).
 4. **Idempotency** — `PaymentTracker` (exact replay → `duplicate: true`
    before admission), `ReceiptBook` (same receipt → `duplicate`; conflicting
    receipt → `receipt_conflict` 409), strictly increasing policy nonces.
@@ -1319,7 +1326,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1368 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1374 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors

@@ -1713,6 +1713,25 @@ async fn conservation(State(state): State<ApiState>) -> ApiResult {
             "l1_live_sat": report.supply.l1_live_sat,
             "l2_held_sat": report.supply.l2_held_sat,
             "sink_held_sat": report.supply.sink_held_sat,
+            // Exit-outflow watch (lesson: the sink is a honeypot). An operator
+            // alerts when the window fills faster than legitimate use: the
+            // window total and its reset height say how much can still leave
+            // this window, and `pending_exit_sat` says how much is already
+            // queued. Conservation cannot see theft — a stolen exit still
+            // conserves — so this is the signal theft trips.
+            "exit_window_start": sh.l2.state().exit_window_start(),
+            "exit_window_total_sat": sh.l2.state().exit_window_total(),
+            "exit_window_cap_sat": sh.chain.params().max_exit_window_sat,
+            "exit_window_ends_at": sh
+                .l2
+                .state()
+                .exit_window_start()
+                .saturating_add(sh.chain.params().exit_window_blocks),
+            "pending_exit_sat": sh
+                .l2
+                .pending_exits()
+                .iter()
+                .fold(0u64, |a, w| a.saturating_add(w.record.amount_sat)),
             "network_id": sh.chain.params().network_id,
             "height": sh.chain.height(),
         }))
@@ -3184,6 +3203,70 @@ fn audit_push(
     let _ = sh.audit.push(kind, payment_id, amount_sat, detail);
 }
 
+/// Addresses allowed to approve high-value payments, from
+/// `SRCT_HIGH_VALUE_APPROVERS` (comma-separated hex, `0x` optional). Empty —
+/// the default — means nobody can approve, so any payment at or above the
+/// high-value threshold is refused outright rather than admitted on a flag.
+fn high_value_approvers() -> Vec<srct_core::hash::Address> {
+    std::env::var("SRCT_HIGH_VALUE_APPROVERS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim().trim_start_matches("0x");
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        })
+        .collect()
+}
+
+/// Enforce the human-approval gate: a payment that tripped the threshold is
+/// refused unless it carries a signature over its signing hash from a
+/// configured approver. The advisory flag alone used to admit the payment —
+/// now the signature is the admission.
+fn require_high_value_approval(
+    payment: &MachinePayment,
+    id: Hash,
+    approval: Option<(&srct_core::sig::Bundle, &srct_core::sig::Bundle)>,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let approvers = high_value_approvers();
+    let (sigs, keys) = approval.ok_or_else(|| {
+        fail(
+            StatusCode::FORBIDDEN,
+            "human_approval_required",
+            format!(
+                "this payment is at or above the high-value threshold and no approval was supplied: \
+                 have a key listed in SRCT_HIGH_VALUE_APPROVERS ({} configured) sign the payment id {}",
+                approvers.len(),
+                hash_to_hex(&id),
+            ),
+        )
+    })?;
+    let signer = keys
+        .address()
+        .map_err(|e| bad(format!("approval_keys: {e}")))?;
+    if !approvers.contains(&signer) {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "human_approval_required",
+            "the approval is signed by a key this node does not list as an approver",
+        ));
+    }
+    srct_core::sig::verify_bundle(sigs, keys, &id).map_err(|_| {
+        fail(
+            StatusCode::FORBIDDEN,
+            "human_approval_required",
+            "the human-approval signature does not verify against this payment",
+        )
+    })?;
+    if signer == payment.payer {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "human_approval_required",
+            "the approver must be a second key, not the payer itself",
+        ));
+    }
+    Ok(())
+}
+
 /// Wallet-safety pre-admission gates shared by `payment_submit` and the x402
 /// settle path: test-mode mainnet refusal + per-payer velocity cap. Returns
 /// the human-approval advisory. No state change on any path.
@@ -3278,6 +3361,12 @@ struct PaymentSubmitReq {
     /// public key bundle it verifies against.
     auth_sigs_hex: String,
     auth_keys_hex: String,
+    /// Human approval over the payment's signing hash, by a key listed in
+    /// `SRCT_HIGH_VALUE_APPROVERS`. Required only when the payment trips the
+    /// high-value threshold (`SRCT_HIGH_VALUE_THRESHOLD_SAT`); absent
+    /// otherwise.
+    approval_sigs_hex: Option<String>,
+    approval_keys_hex: Option<String>,
 }
 
 /// Decode a signature/key bundle from its canonical bytes.
@@ -3370,6 +3459,19 @@ async fn payment_submit(
         .map_err(|e| bad(format!("authorization: {e}")))?;
     let auth_sigs = decode_bundle(&req.auth_sigs_hex, "auth_sigs")?;
     let auth_keys = decode_bundle(&req.auth_keys_hex, "auth_keys")?;
+    // Decoded only when present: most payments are below the threshold and
+    // must not pay a parse cost — or a parse failure — for a field they do
+    // not need.
+    let approval_sigs = req
+        .approval_sigs_hex
+        .as_deref()
+        .map(|s| decode_bundle(s, "approval_sigs"))
+        .transpose()?;
+    let approval_keys = req
+        .approval_keys_hex
+        .as_deref()
+        .map(|s| decode_bundle(s, "approval_keys"))
+        .transpose()?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -3449,6 +3551,26 @@ async fn payment_submit(
         // velocity caps bursts per payer. Both are operator-configured and
         // off by default, so existing flows are unaffected.
         let requires_human_approval = risk_gate(sh, &payment, &network, id)?;
+        // The advisory used to be the end of it: the payment was admitted
+        // and the response merely noted a human should have looked. Now the
+        // threshold is a refusal until a configured approver co-signs — the
+        // signature is checked before admission, the payer's own key does
+        // not count, and nothing about this path changes while the
+        // threshold is 0 (disabled).
+        if requires_human_approval {
+            require_high_value_approval(
+                &payment,
+                id,
+                approval_sigs.as_ref().zip(approval_keys.as_ref()),
+            )?;
+            audit_push(
+                sh,
+                "payment_approved",
+                Some(id),
+                Some(payment.amount_sat),
+                format!("human-approved {}", hash_to_hex(&id)),
+            );
+        }
         // Admission first: the payment must be what an authentic, live policy
         // granted. A payment that names a policy this node never authorized
         // under — or one that has since expired, or one whose authorization is
@@ -4852,13 +4974,15 @@ fn x402_challenge(
 }
 
 /// Shared admission: identical checks to `payment_submit` so the x402 path
-/// cannot admit anything the native path would refuse.
+/// cannot admit anything the native path would refuse — including the
+/// human-approval gate, which `payment_submit` enforces separately.
 fn admit_machine_payment_inner(
     sh: &mut SharedNode,
     payment: MachinePayment,
     authorization: srct_core::agent::Authorization,
     auth_sigs: srct_core::sig::Bundle,
     auth_keys: srct_core::sig::Bundle,
+    approval: Option<(srct_core::sig::Bundle, srct_core::sig::Bundle)>,
 ) -> Result<Hash, (StatusCode, Json<ErrorBody>)> {
     let network = sh.chain.params().network_id.clone();
     let height = sh.chain.height();
@@ -4896,8 +5020,18 @@ fn admit_machine_payment_inner(
     if sh.payment_tracker.contains(&id) {
         return Ok(id);
     }
-    // Same wallet-safety gates as `payment_submit`.
-    let _approval = risk_gate(sh, &payment, &network, id)?;
+    // Same wallet-safety gates as `payment_submit`, including the enforced
+    // human-approval refusal above the threshold.
+    if risk_gate(sh, &payment, &network, id)? {
+        require_high_value_approval(&payment, id, approval.as_ref().map(|(s, k)| (s, k)))?;
+        audit_push(
+            sh,
+            "payment_approved",
+            Some(id),
+            Some(payment.amount_sat),
+            format!("human-approved {}", hash_to_hex(&id)),
+        );
+    }
     let policy = match sh.policy_registry.get(&payment.policy_hash).cloned() {
         Some(policy) => policy,
         None => {
@@ -4991,9 +5125,28 @@ async fn x402_verify(State(state): State<ApiState>, Json(req): Json<X402VerifyRe
                 format!("payment verify: {e}"),
             ));
         }
-        if let Err(e) =
-            srct_core::agent::verify_authorization(&auth_sigs, &auth_keys, &authorization)
-        {
+        // The grant itself is checked, not just the signature: an offline
+        // `verify` that skipped the policy window would bless a payment
+        // whose grant expired, and a facilitator serving from that answer
+        // would credit work the settle path refuses.
+        let policy = sh.policy_registry.get(&authorization.policy_hash).cloned();
+        let policy = match policy {
+            Some(p) => p,
+            None => {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "x402_invalid",
+                    "the policy this authorization names was never issued on this node",
+                ))
+            }
+        };
+        if let Err(e) = srct_core::agent::verify_authorization_for_policy(
+            &auth_sigs,
+            &auth_keys,
+            &authorization,
+            &policy,
+            height,
+        ) {
             return Err(fail(
                 StatusCode::CONFLICT,
                 "x402_invalid",
@@ -5027,6 +5180,10 @@ struct X402SettleReq {
     authorization_hex: String,
     auth_sigs_hex: String,
     auth_keys_hex: String,
+    /// Same human-approval flow as `POST /v1/payment/submit`: required when
+    /// the payment trips the high-value threshold.
+    approval_sigs_hex: Option<String>,
+    approval_keys_hex: Option<String>,
 }
 
 /// Facilitator `settle`: verify + record through the shared admission path.
@@ -5039,8 +5196,26 @@ async fn x402_settle(State(state): State<ApiState>, Json(req): Json<X402SettleRe
         .map_err(|e| bad(format!("authorization: {e}")))?;
     let auth_sigs = decode_bundle(&req.auth_sigs_hex, "auth_sigs")?;
     let auth_keys = decode_bundle(&req.auth_keys_hex, "auth_keys")?;
+    let approval_sigs = req
+        .approval_sigs_hex
+        .as_deref()
+        .map(|s| decode_bundle(s, "approval_sigs"))
+        .transpose()?;
+    let approval_keys = req
+        .approval_keys_hex
+        .as_deref()
+        .map(|s| decode_bundle(s, "approval_keys"))
+        .transpose()?;
+    let approval = approval_sigs.zip(approval_keys);
     with_shared(&state, |sh| {
-        match admit_machine_payment_inner(sh, payment, authorization, auth_sigs, auth_keys) {
+        match admit_machine_payment_inner(
+            sh,
+            payment,
+            authorization,
+            auth_sigs,
+            auth_keys,
+            approval,
+        ) {
             Ok(id) => {
                 let resp = srct_core::x402::X402Response {
                     success: true,
@@ -5234,7 +5409,11 @@ async fn paid_weather(State(state): State<ApiState>, headers: HeaderMap) -> impl
             .into_response();
     }
     let payment_id = match with_shared(&state, |sh| {
-        admit_machine_payment_inner(sh, payment, authorization, auth_sigs, auth_keys)
+        // The demo price sits far below any sane high-value threshold; the
+        // demo carries no approver flow, so `None` is correct here rather
+        // than a gap. An operator who sets a threshold at or below 500 sat
+        // refuses the demo by configuration, loudly.
+        admit_machine_payment_inner(sh, payment, authorization, auth_sigs, auth_keys, None)
     }) {
         Ok(Ok(id)) => id,
         Ok(Err((status, body))) => return (status, HeaderMap::new(), body).into_response(),
@@ -8039,4 +8218,140 @@ pub fn spawn_with_options(
         })
         .map_err(|e| format!("api thread: {e}"))?;
     Ok(addr)
+}
+
+#[cfg(test)]
+mod high_value_tests {
+    use super::*;
+    use srct_core::l2::Auth;
+    use srct_core::sig::Bundle;
+    use srct_core::wallet::Wallet;
+
+    /// Env vars are process-global, so these tests own their keys outright:
+    /// no other test in this binary reads `SRCT_HIGH_VALUE_*`, and each case
+    /// removes what it sets even on panic paths (the guard drops on unwind).
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // `set_var` is process-global by nature; this module is the only
+            // reader/writer of these two keys in the test binary.
+            unsafe { std::env::set_var(key, value) };
+            EnvGuard { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Serializes the env-touching tests below: env vars are process-global
+    /// and Rust runs tests on threads, so two of these tests racing on
+    /// `SRCT_HIGH_VALUE_APPROVERS` would read each other's values.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn payer_and_payment(amount: u64) -> (Wallet, MachinePayment) {
+        let wallet = Wallet::new_random("payer");
+        let owner = wallet.address().unwrap();
+        let auth = srct_core::agent::Authorization {
+            version: srct_core::agent::POLICY_VERSION,
+            policy_hash: [0xABu8; 32],
+            agent_id: srct_core::agent::derive_agent_id(
+                "srct/testnet",
+                srct_core::agent::AgentRole::Machine,
+                &owner,
+            ),
+            owner,
+            recipient: [0xCDu8; 20],
+            amount_sat: amount,
+            service: None,
+            height: 1,
+            nonce: 1,
+        };
+        let payment = srct_core::payment::build_signed_payment(
+            &wallet,
+            &auth,
+            "srct/testnet",
+            srct_core::agent::AgentRole::Machine,
+            0,
+            100,
+            [0u8; 32],
+            &[],
+        )
+        .unwrap();
+        (wallet, payment)
+    }
+
+    fn approval_for(wallet: &Wallet, payment_id: &Hash) -> (Bundle, Bundle) {
+        (
+            Auth::sigs_for(wallet, payment_id).unwrap(),
+            Auth::keys_for(wallet).unwrap(),
+        )
+    }
+
+    fn hex_addr(a: &srct_core::hash::Address) -> String {
+        hex::encode(a)
+    }
+
+    #[test]
+    fn approver_list_parses_csv_and_skips_garbage() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::set(
+            "SRCT_HIGH_VALUE_APPROVERS",
+            " 0x0102030405060708090a0b0c0d0e0f1011121314 , not-an-address, 0x0102030405060708090a0b0c0d0e0f1011121314",
+        );
+        let list = high_value_approvers();
+        assert_eq!(list.len(), 2, "garbage entries are skipped, not fatal");
+        assert_eq!(list[0], list[1]);
+        let _h = EnvGuard::set("SRCT_HIGH_VALUE_APPROVERS", "");
+        let _ = _g;
+        assert!(high_value_approvers().is_empty());
+    }
+
+    #[test]
+    fn high_payment_without_approval_is_refused() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::set("SRCT_HIGH_VALUE_APPROVERS", &hex_addr(&[0x99u8; 20]));
+        let (_payer, payment) = payer_and_payment(1_000_000);
+        let id = payment.signing_hash();
+        let err = require_high_value_approval(&payment, id, None).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn unlisted_and_self_approvals_are_refused_but_listed_passes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let approver = Wallet::new_random("approver");
+        let approver_addr = approver.address().unwrap();
+        let _g = EnvGuard::set("SRCT_HIGH_VALUE_APPROVERS", &hex_addr(&approver_addr));
+        let (payer, payment) = payer_and_payment(1_000_000);
+        let id = payment.signing_hash();
+
+        // A stranger's co-signature is not an approval.
+        let stranger = Wallet::new_random("stranger");
+        let (ss, sk) = approval_for(&stranger, &id);
+        let err = require_high_value_approval(&payment, id, Some((&ss, &sk))).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // Neither is the payer approving its own spend: the second key must
+        // be a second human, not a second signature from the same hand.
+        let (ps, pk) = approval_for(&payer, &id);
+        let err = require_high_value_approval(&payment, id, Some((&ps, &pk))).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // The listed approver passes.
+        let (asigs, akeys) = approval_for(&approver, &id);
+        require_high_value_approval(&payment, id, Some((&asigs, &akeys))).unwrap();
+    }
 }

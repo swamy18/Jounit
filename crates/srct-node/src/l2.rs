@@ -211,6 +211,13 @@ pub fn config_for(params: &NetworkParams) -> L2Config {
     // settlements — including `testnet`, which shares `mainnet()` timings.
     config.network_id = params.network_id.clone();
     config.exit_activation_height = params.exit_activation_height;
+    // Exit throttle follows the L1 profile: the L1 release path enforces
+    // the same rule, so the two halves of an exit can never disagree about
+    // whether it may proceed.
+    config.max_exit_window_sat = params.max_exit_window_sat;
+    config.exit_window_blocks = params.exit_window_blocks;
+    config.large_exit_threshold_sat = params.large_exit_threshold_sat;
+    config.large_exit_extra_delay_blocks = params.large_exit_extra_delay_blocks;
     config
 }
 
@@ -539,7 +546,8 @@ impl NodeL2 {
     pub fn crank_pending_reasons(&self, chain: &Chain) -> Vec<(Address, u64, &'static str)> {
         let tip = chain.height();
         let binding = chain.finality().binding_finalized_height();
-        let depth = self.deposits.maturity_depth;
+        let base_depth = self.deposits.maturity_depth;
+        let params = chain.params();
         let base_fee = chain.expected_base_fee_for_next_block();
         let available: Vec<(srct_core::tx::OutPoint, u64)> = chain
             .utxo()
@@ -552,6 +560,12 @@ impl NodeL2 {
                 continue;
             }
             let record = &watch.record;
+            let depth = L2State::exit_maturity_depth_for(
+                record.amount_sat,
+                base_depth,
+                params.large_exit_threshold_sat,
+                params.large_exit_extra_delay_blocks,
+            );
             if !L2State::exit_is_mature(record.queued_height, tip, binding, depth) {
                 out.push((watch.owner, watch.nonce, "immature"));
                 continue;
@@ -595,7 +609,8 @@ impl NodeL2 {
         }
         let tip = chain.height();
         let binding = chain.finality().binding_finalized_height();
-        let depth = self.deposits.maturity_depth;
+        let base_depth = self.deposits.maturity_depth;
+        let params = chain.params();
         let base_fee = chain.expected_base_fee_for_next_block();
         let mut available: Vec<(srct_core::tx::OutPoint, u64)> = chain
             .utxo()
@@ -608,6 +623,12 @@ impl NodeL2 {
             if chain.exit_released(&watch.owner, watch.nonce) {
                 continue;
             }
+            let depth = L2State::exit_maturity_depth_for(
+                record.amount_sat,
+                base_depth,
+                params.large_exit_threshold_sat,
+                params.large_exit_extra_delay_blocks,
+            );
             if !L2State::exit_is_mature(record.queued_height, tip, binding, depth) {
                 continue;
             }
