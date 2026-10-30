@@ -1274,11 +1274,18 @@ the mechanism follows as a new L1 rule. Decision 2's economics stand (TopN 21,
 no rewards, no fee share); this decision supplies what Decision 8 deliberately
 left unbuilt.
 
-1. **No minimum stake.** Any positive bond amount is accepted into the bond
-   ledger. The 5,000 SRCT minimum stake from the original Decision 2 design has
-   been **removed**: Solar Cyber Unit is permissionless. The committee is stake-weighted
+1. **No minimum stake; anti-dust floor instead (AMENDED 2026-10-30).** Any
+   positive bond amount is accepted into the bond ledger. The 5,000 SRCT
+   minimum stake from the original Decision 2 design has been **removed**:
+   Solar Cyber Unit is permissionless. The committee is stake-weighted
    (TopN by stake), so smaller bonds simply rank lower and fail to make the top
-   21. This is fixed in the consensus rules — not a tunable.
+   21. What the amendment adds is a dust floor, not a stake threshold:
+   `NetworkParams::min_bond_sat` (0 on `mini`/`testnet`, 1_000_000 sat on
+   `mainnet`, the same anti-dust scale as `l2_deposit_minimum_sat`) — a bond
+   below the floor is refused at admission and in blocks, because 1-sat bonds
+   cost every node permanent ledger entries at only fee cost to the
+   submitter. Permissionless means no wealth gate; it never meant free
+   state bloat.
 2. **Committee: stake-weighted TopN, capped at 21.** Eligibility = a valid
    bond of any positive amount, proof of possession included. The committee
    fills from the highest bond amounts, reproducibly from chain state alone.
@@ -1633,6 +1640,14 @@ gossiped as partial shares, so a node needs quorum 15 locally to produce the
 first certificate; the command provisions the complete committee. The keys are
 public by design. After the first bond, the operator removes the bootstrap key
 files because stale non-members make signing fail closed.
+
+**Amendment 2026-10-30: bootstrap serve gate.** Serving mainnet while the
+loaded keys are exactly the 21 public bootstrap keys is refused unless
+`--allow-bootstrap-committee` is passed: anyone can sign alongside a
+bootstrap validator until the first bond rotates authority, so cold-start
+serving is an explicit operator decision, never the silent default a fresh
+`--bootstrap` becomes. Mini/testnet are ungated (play money). Node policy
+only — no consensus change.
 
 **What this does not change.** No bond economics, rewards, fee share or
 unbonding rules; no new consensus transaction type; no validator-yield change.

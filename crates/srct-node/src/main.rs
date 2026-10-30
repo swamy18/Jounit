@@ -157,6 +157,12 @@ SERVE OPTIONS:
   --peers <n>                Max total peers (default: 125)
   --interval <ms>            Serve loop period (default: 250)
   --no-mine                  Relay and validate only, never mine
+  --allow-bootstrap-committee
+                               Serve mainnet while the loaded validator keys
+                               are the 21 public bootstrap keys (default:
+                               refuse). Cold start only: replace them with
+                               bonded keys; anyone can sign alongside you
+                               until the first bond rotates authority
 ";
 
 fn main() -> ExitCode {
@@ -260,6 +266,7 @@ impl Args {
                     // operator's intent (mining when they meant not to, or
                     // vice versa). Unknown `--x` is a hard error.
                     const SWITCHES: &[&str] = &[
+                        "allow-bootstrap-committee",
                         "allow-plaintext-wallet",
                         "help",
                         "list",
@@ -1775,7 +1782,10 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
             dir.display()
         );
         println!("  quorum     15 of 21");
-        println!("  warning    public cold-start keys; remove them after the first bond");
+        println!("  warning    public cold-start keys: deterministic in source, so anyone");
+        println!("             can sign alongside you until the first bond rotates authority.");
+        println!("             `serve` on mainnet refuses these keys unless you pass");
+        println!("             --allow-bootstrap-committee; replace them with bonded keys.");
         return Ok(());
     }
 
@@ -2105,6 +2115,30 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // normal case for a non-validating node — it verifies and relays what others
     // produce and signs nothing.
     let validator_committee = load_validator_committee(&store, &store.params.clone())?;
+    // Cold-start bootstrap keys are public by construction (deterministic in
+    // source): anyone holding them can sign finality until the first bond
+    // rotates authority. Serving mainnet as a bootstrap-key validator is
+    // therefore an explicit, revocable operator decision — never the default
+    // that a fresh `validator --bootstrap` silently becomes.
+    if store.params.name == "mainnet" {
+        if let Some(committee) = &validator_committee {
+            let mut loaded = committee.public_keys();
+            loaded.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            let mut bootstrap: Vec<_> = (1u8..=21)
+                .map(srct_core::params::mainnet_validator_key)
+                .collect();
+            bootstrap.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            if loaded == bootstrap && !args.has("allow-bootstrap-committee") {
+                return Err(
+                    "refusing to serve mainnet as a bootstrap-key validator: these 21 keys \
+                     are public (deterministic in source), so anyone can sign finality alongside \
+                     you until the first bond rotates authority. Replace them with bonded keys, \
+                     or pass --allow-bootstrap-committee to accept the risk explicitly"
+                        .into(),
+                );
+            }
+        }
+    }
     let mut signed_epochs = std::collections::BTreeSet::new();
     let mut finality_keys_missing_warning =
         validator_committee.is_none() && store.params.finality_activation_height > 0;

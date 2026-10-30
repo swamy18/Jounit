@@ -2,7 +2,7 @@
 
 <img src="Solar_Cyber_unit.png" alt="Solar Cyber Unit coin logo" width="200">
 
-AI-native cryptocurrency. Mining that does useful work, and a payment layer built for AI agents. Pre-launch.
+Programmable money for machines: spend policies enforced at admission, escrow for verifiable work, micro-payments with a safety-first wallet. Pre-launch — no outside audit yet.
 
 **Author and copyright:** The project is open source — see [License](#license).
 
@@ -14,6 +14,9 @@ and redistribute.
 ## Contents
 
 - [What this is](#what-this-is)
+- [Why a new coin](#why-a-new-coin)
+- [Glossary](#glossary)
+- [Honest limits](#honest-limits)
 - [Quick start](#quick-start)
 - [Mining](#mining)
 - [Supply](#supply)
@@ -46,7 +49,13 @@ Solar Cyber Unit keeps the principle and changes the work. Mining runs three sta
 
 1. **A SHA-256 hash chain** — carries the security. This is what a quantum
    adversary has to break.
-2. **An integer-only neural network** — makes the work meaningful for AI hardware.
+2. **An integer-only neural-network-shaped stage** — matrix/vector integer ops of
+   the kind AI accelerators execute natively, so that hardware is not idle.
+   Stated plainly: the weights derive from the epoch id by SHA-256 — no
+   training and no inference happens here, and no model is produced. What it
+   buys is hardware diversity (hash throughput, matrix units and memory
+   bandwidth pull in different directions, so no single chip dominates), not
+   useful AI output.
 3. **A final hash** — binds both into the value that must fall below the target.
 
 A second puzzle, `hbm-v1` (`puzzle_id = 2`), is designed and registered in
@@ -75,6 +84,80 @@ one `ComputeBackend` contract with two in-tree implementations — the reference
 vendors port — pinned equal by differential tests. The three stages also pull
 in different directions (hash throughput, matrix-vector units, memory
 bandwidth), so no single exotic chip dominates all of them.
+
+---
+
+## Why a new coin
+
+The honest question: x402 payments, spend policies and escrow could live on an
+existing chain or on stablecoin rails. Three reasons they don't here:
+
+1. **Policies are enforced at admission, by consensus.** A spend policy on
+   another chain is a contract the base layer does not know about — it can
+   advise, not refuse. Here `check_tx` refuses a payment that violates its
+   policy the same way it refuses a double-spend: no policy-aware base layer,
+   no guarantee.
+2. **The task economy settles in the native coin.** Escrow, slashing, bonds and
+   fee burns are chain state, not contract balances — a dispute payout cannot
+   be frozen by a token issuer and does not depend on a bridge.
+3. **One fee market, one audit trail.** Batch quotes, streams, receipts and
+   reconciliation all price in the same unit the miners are paid in, so the
+   cost model in [`docs/micropayments.md`](docs/micropayments.md) is exact
+   rather than an oracle away from exact.
+
+The trade is stated openly: a new chain must earn its security and its
+liquidity from zero, and nothing here removes that cost.
+
+---
+
+## Glossary
+
+Every piece of jargon, in one line each:
+
+| Term | What it is |
+|---|---|
+| `PSCB` | Protocol-owned reserve: half of every fee accrues to it instead of the miner; it pays whistleblower bounties and vesting. |
+| `VWC` | Verified-work certificate: a credential derived from a *settled* task — proof work was paid for, never a self-claim. |
+| `TopN` | Committee rule: the N largest bonds form the validator set (N = 21). |
+| `PPLNS` | Pool payout rule: pay per last N shares — rewards recent work, resists pool-hopping. |
+| `VWB` / escrow | The locked funds behind a task or trade, released only by the rules both sides agreed to. |
+| `sats` | Smallest unit: 1 SRCT = 100,000,000 sats. Integer-only accounting, no floats. |
+| `state.bin` | One node's local books (payments, jobs, reputation…). Restarts survive; other nodes may disagree — see [Honest limits](#honest-limits). |
+| `mini` / `testnet` / `mainnet` | Network profiles: same code, different parameters (fast local testing → real deployment). |
+
+---
+
+## Honest limits
+
+What this project is not, and where trust actually lives. Read this before
+trusting any number in it:
+
+- **No outside audit.** Every test, red-team suite, simulation and the Python
+  reference implementation were written and run by the author. Counts are
+  real (`scripts/test_count.sh` reproduces them) but self-reported — treat
+  them as diligence, not certification.
+- **Verification is optimistic.** A submitted result settles as-is if nobody
+  disputes it within the window — including a wrong one
+  (`srct-l2/tests/unverified_result.rs` pins this rule). The dispute path
+  re-executes and slashes fakes, but only if a challenger shows up. Running
+  challengers is part of operating this network, not an optional extra.
+- **Mining does not train AI.** The neural stage is ML-shaped integer work
+  with epoch-derived weights — it keeps AI hardware competitive, it does not
+  produce models or inference (see [What this is](#what-this-is)).
+- **Reputation, jobs, FX and ramps are per-node views.** They live in each
+  node's `state.bin`, not in consensus — two honest nodes can disagree on a
+  score, a quote or a job state. Consensus money (UTXOs, bonds, L2 accounts)
+  cannot disagree. Never treat another node's score or quote as fact; run
+  your own node.
+- **FX issuers and ramp providers are trusted.** Rates come from a configured
+  whitelist, custody never touches the node — the chain stores the signed
+  audit trail, not the dollars. If an issuer lies, the trail proves it; it
+  does not prevent it.
+- **Mainnet cold start is public.** The 21 bootstrap keys are deterministic in
+  source — anyone can sign alongside a bootstrap validator until the first
+  bond rotates authority. Serving mainnet with them requires the explicit
+  `--allow-bootstrap-committee` flag, and replacing them with bonded keys is
+  the operator's first job.
 
 ---
 
@@ -750,10 +833,11 @@ L1 payment and the L2 debit cancel while the sink term falls by the same amount.
 ## Validators and finality
 
 **Bonded stake** (`bond.rs`, Decision 20). Three transaction types — `TX_BOND`,
-`TX_UNBOND`, `TX_SLASH` — feed a bond ledger with a bond-order index. Any
-positive bond amount is accepted — there is no minimum stake threshold. Unbonding
-locks for `UNBONDING_PERIOD_BLOCKS` = 1 008 (seven days). Provable
-equivocation burns the full bond.
+`TX_UNBOND`, `TX_SLASH` — feed a bond ledger with a bond-order index. No wealth
+gate — but an anti-dust floor (`min_bond_sat`: 0 on mini/testnet, 0.01 SRCT on
+mainnet): below it a bond is refused, so 1-sat spam cannot permanently occupy
+ledger entries on every node. Unbonding locks for `UNBONDING_PERIOD_BLOCKS` =
+1 008 (seven days). Provable equivocation burns the full bond.
 
 Bonds only admit keys whose holder proves they hold them: `TX_BOND` carries a
 96-byte proof-of-possession signature bound to network, bonder and key, and a
@@ -762,7 +846,10 @@ payload without one does not decode.
 **Finality.** Binding finality activates at `finality_activation_height = 100`
 on mainnet from genesis. Depth-based finality (100 blocks) secures the chain
 before that — the same Bitcoin-style rule. The 21-key bootstrap committee signs
-until the first bond, then the stake-weighted TopN set replaces it.
+until the first bond, then the stake-weighted TopN set replaces it. Those 21
+keys are public (deterministic in source), so serving mainnet with them loaded
+requires `--allow-bootstrap-committee` — cold start is explicit, never silent;
+replace them with bonded keys.
 
 **Fixed-epoch committees.** Each epoch's committee derives from the bond state
 at its seed height and stays fixed for the whole epoch; a bond mid-epoch takes
@@ -1232,7 +1319,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1367 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1368 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -1283,9 +1370,10 @@ is an owner step (`cargo update -p <crate>` plus `cargo audit`). Security
 
 **Vectors.** `tests/vectors/` holds the consensus byte layouts, generated only
 from the implementation. `sim/srct_reference.py` is a second PoW implementation
-written from `SPEC.md` rather than from the Rust, and it reproduces all 21 puzzle
-digests — that agreement is the evidence the spec is unambiguous rather than
-merely self-consistent.
+written from `SPEC.md` rather than from the Rust (by the same author — a second
+implementation, not a second party), and it reproduces all 21 puzzle digests —
+that agreement is evidence the spec is unambiguous rather than merely
+self-consistent.
 
 **Fuzzing.** 17 cargo-fuzz targets over L1 wire, mempool, storage and
 checkpoints; L2 codec, disputes, state and certificates; and the worker. They
@@ -1296,6 +1384,7 @@ conservation under adversarial transaction programs — not just panic-freedom.
 tests across four files (`redteam`, `redteam_credit`, `redteam_delegation`,
 `redteam_round2`), each confirmed to fail against the code it now guards. The full
 record of defects found and fixed is in [docs/status.md](docs/status.md).
+Author-run, like everything above — see [Honest limits](#honest-limits).
 
 ---
 

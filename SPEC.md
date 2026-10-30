@@ -1428,8 +1428,13 @@ byte.
 ### 14.6 M5 — Validator-set semantics (DESIGN ONLY — not consensus-active)
 
 > **Amendment (Decision 20 — consensus-active):** the economics below are now
-> decided and implemented. **No minimum stake** — any positive bond is accepted
-> (Solar Cyber Unit is permissionless); the committee
+> decided and implemented. **Anti-dust bond floor, not a stake threshold** —
+> `NetworkParams::min_bond_sat` (0 on `mini`/`testnet`, 1_000_000 sat =
+> 0.01 SRCT on `mainnet`): a bond below the floor is refused at admission and
+> in blocks. The permissionless principle stands (the floor is dust-scale,
+> ~1/500,000th of the removed 5,000 SRCT minimum); what it stops is 1-sat
+> bonds permanently occupying ledger, snapshot and committee-derivation
+> entries on every node at only fee cost to the submitter. The committee
 > is the **first 21 eligible bonds by `(bond_height, bond_index)`** (bond
 > order, not stake weight; no genesis-fixed identities, no privileged seats);
 > unbonding is **1008 blocks, fixed**; equivocation burns the **full bond**

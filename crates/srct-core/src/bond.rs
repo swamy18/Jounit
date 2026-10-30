@@ -85,9 +85,11 @@ pub struct BondRecord {
     /// the committee identity (that stays the BLS key), only the key clause 7
     /// looks up for this validator's sidecar entry.
     pub mldsa_pk: Option<[u8; 1952]>,
-    /// Locked value. No minimum threshold: any positive bond amount is
-    /// accepted. The committee is stake-weighted (TopN), so a small bond
-    /// simply ranks lower in `committee()` and is unlikely to make the top 21.
+    /// Locked value. No wealth gate — but an anti-dust floor
+    /// (`NetworkParams::min_bond_sat`, 0 on mini/testnet): the committee is
+    /// stake-weighted (TopN), so a small bond simply ranks lower in
+    /// `committee()` and is unlikely to make the top 21, and below the
+    /// floor a bond is refused outright rather than ranked.
     pub amount_sat: u64,
     /// Height of the block that bonded.
     pub bond_height: u64,
@@ -319,7 +321,12 @@ pub struct BondDraft {
 ///
 /// The proof is verified against the real BLS verifier, not a mock: a bond is
 /// admitted by consensus, so the check must be the same on every node.
-pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> Result<BondDraft> {
+pub fn check_bond_tx(
+    tx: &Transaction,
+    bonds: &BondLedger,
+    network_id: &str,
+    min_bond_sat: u64,
+) -> Result<BondDraft> {
     if tx.tx_type != TX_BOND {
         return Err(Error::StakeInvalid("not a bond transaction"));
     }
@@ -375,6 +382,13 @@ pub fn check_bond_tx(tx: &Transaction, bonds: &BondLedger, network_id: &str) -> 
     };
     if bond_out.value == 0 {
         return Err(Error::StakeInvalid("bond must lock a positive amount"));
+    }
+    // Anti-dust floor (`NetworkParams::min_bond_sat`): a bond below the
+    // floor is refused, not ranked low. Without it, 1-sat bonds cost their
+    // submitter only fees while permanently occupying ledger, snapshot and
+    // committee-derivation entries on every node.
+    if bond_out.value < min_bond_sat {
+        return Err(Error::StakeInvalid("bond below the minimum stake"));
     }
     Ok(BondDraft {
         bonder,
@@ -514,13 +528,14 @@ pub fn admit_stake_tx(
     tx: &Transaction,
     bonds: &BondLedger,
     network_id: &str,
+    min_bond_sat: u64,
     height: u64,
     epoch_blocks: u64,
     verifier: &dyn crate::bls_checkpoint::BlsVerifier,
 ) -> Result<()> {
     match tx.tx_type {
         TX_BOND => {
-            check_bond_tx(tx, bonds, network_id)?;
+            check_bond_tx(tx, bonds, network_id, min_bond_sat)?;
         }
         TX_UNBOND => {
             check_unbond_tx(tx, bonds, height)?;
@@ -573,10 +588,12 @@ fn current_epoch_set(bonds: &BondLedger, network_id: &str, epoch: u64) -> EpochS
 /// nothing permanent — the chain re-derives the real index at apply). Release
 /// outputs and vault effects are apply-time concerns the scratch ledger does
 /// not need: admission and building only decide *valid*, never *settled*.
+#[allow(clippy::too_many_arguments)]
 pub fn probe_stake_tx(
     tx: &Transaction,
     bonds: &mut BondLedger,
     network_id: &str,
+    min_bond_sat: u64,
     height: u64,
     epoch_blocks: u64,
     tx_index: u32,
@@ -584,7 +601,7 @@ pub fn probe_stake_tx(
 ) -> Result<()> {
     match tx.tx_type {
         TX_BOND => {
-            let draft = check_bond_tx(tx, bonds, network_id)?;
+            let draft = check_bond_tx(tx, bonds, network_id, min_bond_sat)?;
             bonds.insert(
                 tx.txid(),
                 BondRecord {

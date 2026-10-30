@@ -4,6 +4,11 @@ An agent's verifiable history — tasks done, payments made, disputes,
 refunds, loans repaid or defaulted — travels with the agent, and any service
 can price or gate access from it.
 
+Scope: passport batches and scores are per-node books, not consensus — two
+honest nodes can score the same agent differently (different books, different
+issuers seen). A score is that node's opinion, never a chain fact. Services
+that gate on scores should read them from a node they operate.
+
 ## How it works
 
 1. The agent works: receipts record task completions and payments, credit

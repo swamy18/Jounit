@@ -1730,6 +1730,46 @@ existing behavior — no new transaction types, endpoints or issuance:
   (522), `srct-miner` (47), redteam suites, `srct-node --test api`
   (47) + `agent_economy`/`micro_safety`/`x402`, L2 `credit_flow` — all green.
 
+### 2026-10-30 external critique response (docs honesty + 2 code gates)
+
+An outside reviewer's critique verified claim-by-claim against the code; all
+five code claims held up (one partial). Fixed as follows:
+
+- Pitch: README leads with one claim now (programmable money for machines),
+  with new "Why a new coin" (admission-enforced policies + native settlement
+  can't be a contract elsewhere), "Glossary" (PSCB, VWC, TopN, PPLNS… in one
+  line each), and "Honest limits" (no outside audit, optimistic verification,
+  no AI training in mining, per-node views can disagree, FX/ramp trusteeship,
+  public bootstrap). Neural stage described as ML-shaped integer work with
+  epoch-derived weights — explicitly not training or inference. Quality
+  claims qualified as author-run throughout; the Python reference is a second
+  implementation by the same author, not a second party.
+- Bootstrap keys (TRUE): serving mainnet with the 21 public keys loaded now
+  requires `--allow-bootstrap-committee`; without it the node refuses to
+  serve. Rotation on first bond already existed; the gate covers the custody
+  side it didn't.
+- Minimum stake (TRUE): `min_bond_sat` added (0 mini/testnet, 0.01 SRCT
+  mainnet — anti-dust scale, not a wealth gate), enforced in `check_bond_tx`
+  and therefore in mempool admission, block building and apply. Decision 20
+  amended; SPEC §14.6 amended. Boundary test pins floor-inclusive refusal.
+- Fake verification (PARTIAL): the dispute path genuinely re-executes and
+  slashes fakes *when challenged* — but unchallenged fakes settle, and the
+  reference output is self-referential deterministic mixing, not real
+  compute. No code change can fix incentives; documented instead (README
+  Honest limits + `unverified_result` test reference). Found while verifying:
+  round-3's stake filter had moved into the shared template builder and was
+  silently dropping invalid stake txs from `mine_block` (6 bond tests caught
+  it); the filter is now scoped to the external-template boundary and
+  `mine_block` fails loud at submit again.
+- Node-local disagreement (TRUE): architecture confirmed correct — nothing
+  consensus reads the books. Documented instead: per-node divergence banners
+  in `reputation.md`, `ramps.md`, `usd-settlement.md`; `state.bin` v8 refuses
+  foreign-network books.
+- FX/ramp trust (TRUE): trustee model stated up front in both docs and
+  README — trail proves lies, doesn't prevent them.
+- Verification: clippy clean; bond_stake 18/18 (incl. new floor test),
+  external_miner, node bin, full round-3 suites re-green.
+
 ### 2026-10-29 hardening round 3 (no new features)
 
 Third review pass (transfers in/out, mining end-to-end, agent/SDK workflows,

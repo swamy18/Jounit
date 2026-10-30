@@ -377,6 +377,14 @@ pub struct NetworkParams {
     /// original bundle, so history is never invalidated — a wallet can move its
     /// old funds exactly as before, and only newly created outputs demand PQ.
     pub pq_activation_height: u64,
+    /// Minimum bond per validator in satoshis. A bond below this is refused
+    /// at admission and in blocks: without a floor, 1-sat bonds cost their
+    /// submitter only L1 fees while permanently occupying ledger, snapshot
+    /// and committee-derivation entries on every node. `0` disables the floor
+    /// (`mini`/`testnet` keep `0` so tests exercise dust behavior);
+    /// `mainnet` carries 1_000_000 sat (0.01 SRCT), the same anti-dust scale
+    /// as `l2_deposit_minimum_sat`.
+    pub min_bond_sat: u64,
 }
 
 impl NetworkParams {
@@ -519,6 +527,9 @@ impl NetworkParams {
             // PQ spend enforcement is off on mainnet until the post-quantum
             // launch decision sets a height.
             pq_activation_height: 0,
+            // Anti-dust bond floor on mainnet (see the field doc): 1-sat
+            // bonds cost every node permanent ledger entries for no stake.
+            min_bond_sat: 1_000_000,
         }
     }
 
@@ -597,6 +608,8 @@ impl NetworkParams {
             // PQ enforcement off on mini; the migration tests build their own
             // profile with a nonzero activation height.
             pq_activation_height: 0,
+            // No bond floor on mini: tests exercise dust behavior deliberately.
+            min_bond_sat: 0,
         }
     }
 
@@ -659,6 +672,8 @@ impl NetworkParams {
             exit_activation_height: 1,
             // PQ enforcement off on testnet too; activated by governance.
             pq_activation_height: 0,
+            // No bond floor on testnet either: play money, dust is test data.
+            min_bond_sat: 0,
         }
     }
 

@@ -4,6 +4,12 @@ SRCT is a mined coin, not a pegged asset: its schedule never promises a
 dollar price. Services that want dollar pricing quote in USD (or a supported
 stablecoin) and settle in SRCT at a transparent, locked rate.
 
+Trust statement: rate issuers are trusted — rates come from a configured
+whitelist (`SRCT_FX_ISSUERS`), and a dishonest issuer's quotes are only as
+good as the trail they leave. Rates are per-node books: two nodes can hold
+different rate sets. Quote against your own node, and check the rate is live
+before you pay it.
+
 ## Flow
 
 ```bash

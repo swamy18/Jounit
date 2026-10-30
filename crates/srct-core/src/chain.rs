@@ -901,7 +901,12 @@ impl Chain {
     ) -> Result<()> {
         match tx.tx_type {
             TX_BOND => {
-                let draft = check_bond_tx(tx, &self.bonds, &self.params.network_id)?;
+                let draft = check_bond_tx(
+                    tx,
+                    &self.bonds,
+                    &self.params.network_id,
+                    self.params.min_bond_sat,
+                )?;
                 let id = tx.txid();
                 // Consume the bond output into the ledger: the value parks in
                 // the record, not in the UTXO set. Leaving it in place would
@@ -1911,6 +1916,13 @@ impl Chain {
         now_ms: u64,
         difficulty_override: Option<u128>,
     ) -> Result<Block> {
+        // Filter here, at the external-miner boundary — not in the shared
+        // inner: the probe must see the same body `apply_block` will, or the
+        // template's coinbase mismatches what the chain accepts. `mine_block`
+        // keeps the old loud behavior (an invalid stake tx in an explicit
+        // body fails at submit, which is what the bond tests pin), and the
+        // internal pool miner filters in `mine_from_pool_with_l2`.
+        let body = self.filter_stake_body(body);
         self.build_template_inner(
             miner_address,
             body,
@@ -1936,11 +1948,6 @@ impl Chain {
         now_ms: u64,
         difficulty_override: Option<u128>,
     ) -> Result<Block> {
-        // The probe must see the same body `apply_block` will: stake
-        // transactions shape the coinbase/fee split through the overlay, so
-        // an unfiltered body builds a template whose coinbase the chain
-        // refuses. Same filter the internal miner applies.
-        let body = self.filter_stake_body(body);
         let parent = self.tip().clone();
         let parent_hash = parent.block_hash();
         let height = parent.header.height + 1;
@@ -2373,6 +2380,7 @@ impl Chain {
                 &tx,
                 &mut scratch,
                 &self.params.network_id,
+                self.params.min_bond_sat,
                 height,
                 self.params.checkpoint_interval_blocks,
                 index,

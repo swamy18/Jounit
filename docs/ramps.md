@@ -5,6 +5,12 @@ payment technology will not be adopted. The node is the auditable registry
 for entry and exit; custody and compliance live with the ramp provider
 (exchange, on-ramp widget, OTC desk) off-protocol.
 
+Trust statement: the provider is trusted — for the quote, the fill, and the
+fiat side. The chain stores the signed trail (quote → intent → fill/refund),
+so a lying provider leaves signed evidence, but nothing here prevents the
+lie. Quotes and intents are per-node books: two nodes can hold different
+registries. Verify against your own node.
+
 ## Flow
 
 ```bash

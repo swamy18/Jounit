@@ -368,7 +368,7 @@ fn bond_refusals_name_their_rule_and_record_nothing() {
     let zero_bond = bond_tx_value(&chain, &w, &ops[..66], &sk, 0);
     assert!(
         matches!(
-            srct_core::bond::check_bond_tx(&zero_bond, chain.bonds(), &net_id),
+            srct_core::bond::check_bond_tx(&zero_bond, chain.bonds(), &net_id, 0),
             Err(Error::StakeInvalid("bond must lock a positive amount"))
         ),
         "zero-value bond must be refused"
@@ -1108,5 +1108,40 @@ fn committee_is_derived_by_stake_topn_not_bond_order() {
             .iter()
             .any(|v| v.bls_pk == low.1 && v.stake_address == low_identity),
         "low validator's stake_address must be its bond identity"
+    );
+}
+
+#[test]
+fn bond_minimum_floor_refuses_dust_and_keeps_the_floor() {
+    // Profiles: only mainnet prices dust out; mini/testnet keep 0 so tests
+    // exercise dust behavior deliberately.
+    assert_eq!(NetworkParams::mainnet().min_bond_sat, 1_000_000);
+    assert_eq!(NetworkParams::mini().min_bond_sat, 0);
+    assert_eq!(NetworkParams::testnet().min_bond_sat, 0);
+
+    let (chain, w, ops) = rich_chain();
+    let net_id = chain.params().network_id.clone();
+    let (sk, _) = bls_pair(21);
+
+    // 1 sat with no floor: accepted (mini behavior, unchanged).
+    let dust = bond_tx_value(&chain, &w, &ops[..66], &sk, 1);
+    assert!(
+        srct_core::bond::check_bond_tx(&dust, chain.bonds(), &net_id, 0).is_ok(),
+        "dust passes where the profile sets no floor"
+    );
+    // 1 sat under the mainnet floor: refused by name.
+    assert!(
+        matches!(
+            srct_core::bond::check_bond_tx(&dust, chain.bonds(), &net_id, 1_000_000),
+            Err(Error::StakeInvalid("bond below the minimum stake"))
+        ),
+        "dust must be refused under a floor"
+    );
+    // Exactly the floor: accepted (boundary is inclusive).
+    let (sk2, _) = bls_pair(22);
+    let floor = bond_tx_value(&chain, &w, &ops[..66], &sk2, 1_000_000);
+    assert!(
+        srct_core::bond::check_bond_tx(&floor, chain.bonds(), &net_id, 1_000_000).is_ok(),
+        "the floor itself must pass"
     );
 }
