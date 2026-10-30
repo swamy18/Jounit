@@ -4,13 +4,24 @@ The engine itself stays in Rust (one implementation of every rule, in
 ``crates/srct-policy``): this module is the JSON codec + client seam. It builds
 payment intents, parses decisions, and structurally reads portable documents —
 it never re-implements a budget, narrowing, or signature rule. Verification
-that matters (signatures, chains, bindings) runs in Rust behind the injected
-backend (a callable, a subprocess, or node HTTP — the caller provides it).
+that matters (signatures, chains, bindings) runs in Rust: either behind the
+injected backend (a callable, a subprocess, or node HTTP) or on any node
+speaking ``POST /v1/policy/decide``, ``/v1/delegation/verify`` and
+``/v1/audit/verify`` (see :class:`NodeHttpBackend` — no Rust toolchain needed,
+just a node URL, stdlib only).
+
+Quick start against a local node::
+
+    from srct_policy import NodeHttpBackend, PaymentIntent, PolicyClient
+
+    guard = PolicyClient.for_node("http://127.0.0.1:8080")
+    decision = guard.decide(portable_policy_json, PaymentIntent(...), 100)
 """
 
 from __future__ import annotations
 
 import json
+import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -100,6 +111,12 @@ class PolicyClient:
         self._verify_proof = verify_proof
         self._verify_audit = verify_audit
 
+    @staticmethod
+    def for_node(base_url: str) -> "PolicyClient":
+        """A client verified by any node — no Rust toolchain, just a URL."""
+        backend = NodeHttpBackend(base_url)
+        return PolicyClient(backend.decide, backend.verify_proof, backend.verify_audit)
+
     def decide(
         self,
         policy_portable_json: str,
@@ -118,3 +135,74 @@ class PolicyClient:
         if self._verify_audit is None:
             raise NotImplementedError("no audit backend wired")
         return self._verify_audit(audit_json)
+
+
+class NodeHttpBackend:
+    """A backend that speaks to any node over HTTP — stdlib only.
+
+    Verification runs on the node (the same engine that admits payments);
+    this module only codecs the JSON. Non-2xx answers raise RuntimeError
+    with the node's named refusal, so a deny is never mistaken for an
+    allow.
+    """
+
+    def __init__(self, base_url: str) -> None:
+        self._base_url = base_url.rstrip("/")
+
+    def _post(self, path: str, body: dict) -> dict:
+        data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            self._base_url + path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                doc = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                doc = json.loads(e.read().decode("utf-8"))
+            except ValueError:
+                doc = {"error": "http_error", "detail": e.reason}
+            raise RuntimeError(
+                f"node refused ({e.code} {doc.get('error', 'error')}): "
+                f"{doc.get('detail', doc.get('reason', doc))}"
+            ) from e
+        if not isinstance(doc, dict):
+            raise RuntimeError("node answered outside JSON")
+        return doc
+
+    def decide(
+        self,
+        policy_portable_json: str,
+        intent_json: str,
+        approval_threshold_sat: Optional[int] = None,
+    ) -> str:
+        intent = json.loads(intent_json)
+        doc = self._post(
+            "/v1/policy/decide",
+            {
+                "policy_portable_json": policy_portable_json,
+                "agent_id_hex": intent["agent_id"],
+                "recipient_hex": intent["recipient"],
+                "amount_sat": intent["amount_sat"],
+                "service_hex": intent.get("service"),
+                "approval_threshold_sat": approval_threshold_sat,
+            },
+        )
+        return json.dumps(
+            {"decision": doc["decision"], "reason": doc.get("reason", "")}
+        )
+
+    def verify_proof(self, proof_json: str) -> str:
+        doc = self._post("/v1/delegation/verify", {"proof_json": proof_json})
+        if doc.get("valid") is not True:
+            raise RuntimeError("node did not verify the proof")
+        return f"{doc['leaf_agent']}/{doc['leaf_policy_hash']}"
+
+    def verify_audit(self, audit_json: str) -> int:
+        doc = self._post("/v1/audit/verify", {"audit_json": audit_json})
+        if doc.get("valid") is not True or not isinstance(doc.get("entries"), int):
+            raise RuntimeError("node did not verify the audit chain")
+        return int(doc["entries"])

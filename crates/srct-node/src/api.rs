@@ -53,6 +53,9 @@
 //! GET  /v1/vwc/{task_id}       verified work certificate
 //! GET  /v1/reputation/{id}      derived reputation score for a worker address
 //! POST /v1/authorize           policy + payer-signed request -> authorization
+//! POST /v1/policy/decide      policy + payment intent -> allow/deny/approval-needed (read-only)
+//! POST /v1/delegation/verify  delegation proof -> valid/depth/leaf (read-only, any rail)
+//! POST /v1/audit/verify       exported audit chain -> valid/entries (read-only, any rail)
 //! POST /v1/payment/submit      verify + record a machine payment
 //! GET  /v1/payment/{id}        recorded payment
 //! POST /v1/payment/{id}/settle bind it to the tx that paid the recipient
@@ -3084,6 +3087,165 @@ async fn authorize(State(state): State<ApiState>, Json(req): Json<AuthorizeReq>)
     })?
 }
 
+/// `POST /v1/policy/decide` — the engine seam over HTTP: evaluate a payment
+/// intent against an owner-signed policy and answer allow, deny, or
+/// approval-needed. Read-only: nothing is committed (no nonce consumed, no
+/// window spend recorded), so calling it twice decides twice with no side
+/// effect. This is the backend the TypeScript/Python bindings speak to —
+/// verification runs here, the bindings only codec the JSON.
+///
+/// The policy arrives either as portable JSON (`policy_portable_json`,
+/// parsed *and* verified) or as raw bytes plus the owner's signature
+/// (`policy_hex` + `policy_sigs_hex` + `policy_keys_hex`, verified the same
+/// way `/v1/authorize` verifies). The frame is the node's own: its network
+/// id and its height. A policy for another network is refused by name.
+/// Node admission additionally applies `RiskPolicy` (velocity, test mode,
+/// mainnet approval default) — this route answers the policy engine only.
+#[derive(Deserialize)]
+struct PolicyDecideReq {
+    policy_portable_json: Option<String>,
+    policy_hex: Option<String>,
+    policy_sigs_hex: Option<String>,
+    policy_keys_hex: Option<String>,
+    agent_id_hex: String,
+    recipient_hex: String,
+    amount_sat: u64,
+    service_hex: Option<String>,
+    approval_threshold_sat: Option<u64>,
+}
+
+async fn policy_decide(
+    State(state): State<ApiState>,
+    Json(req): Json<PolicyDecideReq>,
+) -> ApiResult {
+    let signed = match req.policy_portable_json {
+        Some(raw) => {
+            if raw.len() > srct_core::portable::MAX_PORTABLE_JSON_LEN {
+                return Err(bad("policy_portable_json over cap"));
+            }
+            srct_core::portable::SignedPolicy::from_json(&raw)
+                .map_err(|e| bad(format!("policy: {e}")))?
+        }
+        None => {
+            let (hex_str, sigs_hex, keys_hex) =
+                match (&req.policy_hex, &req.policy_sigs_hex, &req.policy_keys_hex) {
+                    (Some(h), Some(s), Some(k)) => (h, s, k),
+                    _ => {
+                        return Err(bad(
+                            "supply policy_portable_json or policy_hex + policy_sigs_hex + policy_keys_hex",
+                        ))
+                    }
+                };
+            let policy = decode_owned_policy(
+                hex_str,
+                "policy",
+                &Some(sigs_hex.clone()),
+                &Some(keys_hex.clone()),
+            )?;
+            let sigs = decode_bundle(sigs_hex, "policy_sigs")?;
+            let keys = decode_bundle(keys_hex, "policy_keys")?;
+            srct_core::portable::SignedPolicy { policy, sigs, keys }
+        }
+    };
+    // Both input shapes verified on the way in; re-check anyway — decide
+    // must never answer from an unverified grant.
+    signed
+        .verify()
+        .map_err(|e| bad(format!("policy: {e}")))?;
+    with_shared(&state, |sh| {
+        let network = sh.chain.params().network_id.clone();
+        let height = sh.chain.height();
+        // A query answers; only malformed input is an error. A deny is a
+        // 200 with the reason, so bindings parse every answer uniformly and
+        // a "no" is never mistaken for a transport failure.
+        if signed.policy.network_id != network {
+            return Ok(Json(json!({
+                "decision": "deny",
+                "reason": format!(
+                    "policy is for network {}, this node is {network}",
+                    signed.policy.network_id
+                ),
+                "network_id": network,
+                "height": height,
+            })));
+        }
+        let intent = srct_core::portable::PaymentIntent {
+            agent_id: req.agent_id_hex,
+            recipient: req.recipient_hex,
+            amount_sat: req.amount_sat,
+            service: req.service_hex,
+            height,
+            nonce: 0,
+            network_id: network.clone(),
+        };
+        let decoded = intent
+            .decoded()
+            .map_err(|e| bad(format!("intent: {e}")))?;
+        let (decision, reason) = match srct_core::portable::evaluate_policy(
+            &signed.policy,
+            &decoded,
+            height,
+            req.approval_threshold_sat,
+        ) {
+            srct_core::portable::PolicyDecision::Allow => ("allow", None),
+            srct_core::portable::PolicyDecision::NeedsApproval { reason } => {
+                ("needs_approval", Some(reason))
+            }
+            srct_core::portable::PolicyDecision::Deny { reason } => ("deny", Some(reason)),
+        };
+        Ok(Json(json!({
+            "decision": decision,
+            "reason": reason,
+            "network_id": network,
+            "height": height,
+        })))
+    })?
+}
+
+/// `POST /v1/delegation/verify` — verify a delegation proof from any rail.
+/// Read-only: an ancestry that parses but does not verify is refused, never
+/// acted on. This is the HTTP backend for the bindings' `verifyProof`.
+#[derive(Deserialize)]
+struct DelegationVerifyReq {
+    proof_json: String,
+}
+
+async fn delegation_verify(
+    State(_state): State<ApiState>,
+    Json(req): Json<DelegationVerifyReq>,
+) -> ApiResult {
+    if req.proof_json.len() > srct_core::portable::MAX_PORTABLE_JSON_LEN {
+        return Err(bad("proof_json over cap"));
+    }
+    let proof = srct_core::portable::DelegationProof::from_json(&req.proof_json)
+        .map_err(|e| bad(format!("proof: {e}")))?;
+    Ok(Json(json!({
+        "valid": true,
+        "depth": proof.links.len(),
+        "root_owner": srct_core::hash::address_to_hex(proof.root_owner()),
+        "leaf_agent": hex::encode(proof.leaf().agent_id),
+        "leaf_policy_hash": srct_core::hash::hash_to_hex(&proof.leaf().hash()),
+    })))
+}
+
+/// `POST /v1/audit/verify` — verify an exported audit chain from any rail.
+/// Read-only: links, entry hashes, order and tip are re-checked, and the
+/// entry count is returned. This is the HTTP backend for the bindings'
+/// `verifyAudit`.
+#[derive(Deserialize)]
+struct AuditVerifyReq {
+    audit_json: String,
+}
+
+async fn audit_verify_route(
+    State(_state): State<ApiState>,
+    Json(req): Json<AuditVerifyReq>,
+) -> ApiResult {
+    let count = srct_core::safety::AuditLog::verify_export_json(&req.audit_json)
+        .map_err(|e| bad(format!("audit: {e}")))?;
+    Ok(Json(json!({ "valid": true, "entries": count })))
+}
+
 /// Decode a presented delegation chain, oldest first. An empty list is a root
 /// spend; a non-empty one must be a chain, and it is validated against the
 /// narrowing rule before the caller uses it.
@@ -3276,7 +3438,10 @@ fn risk_gate(
     network: &str,
     id: Hash,
 ) -> Result<bool, (StatusCode, Json<ErrorBody>)> {
-    let risk = srct_core::safety::RiskPolicy::from_env();
+    // Network-aware: the operator's env wins, but a missing threshold still
+    // gates mainnet (Decision 31) — the drain playbook must not depend on an
+    // env var somebody forgot.
+    let risk = srct_core::safety::RiskPolicy::from_env_for_network(network);
     let recent = sh
         .payment_store
         .values()
@@ -5763,8 +5928,11 @@ async fn audit_list(
 /// test mode) and session-budget envelope, so developers know when approval
 /// is required before they pay.
 async fn risk_policy(State(state): State<ApiState>) -> ApiResult {
-    with_shared(&state, |_sh| {
-        let risk = srct_core::safety::RiskPolicy::from_env();
+    with_shared(&state, |sh| {
+        // The node's own network decides the fallback: a mainnet node
+        // reports the mainnet default unless the operator overrode it.
+        let network = sh.chain.params().network_id.clone();
+        let risk = srct_core::safety::RiskPolicy::from_env_for_network(&network);
         let (window, cap) = session_envelope();
         Ok(Json(json!({
             "high_value_threshold_sat": risk.high_value_threshold_sat,
@@ -7839,6 +8007,9 @@ pub fn router(state: ApiState, cfg: &ApiConfig) -> Router {
         .route("/v1/credit/positions/{id}", get(credit_position_by_id))
         .route("/v1/reputation/{id}", get(reputation_get))
         .route("/v1/authorize", post(authorize))
+        .route("/v1/policy/decide", post(policy_decide))
+        .route("/v1/delegation/verify", post(delegation_verify))
+        .route("/v1/audit/verify", post(audit_verify_route))
         .route("/v1/delegation/link", post(delegation_link))
         .route("/v1/policy/revoke", post(policy_revoke))
         .route("/v1/payment/submit", post(payment_submit))

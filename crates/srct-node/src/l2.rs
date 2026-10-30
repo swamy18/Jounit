@@ -211,11 +211,14 @@ pub fn config_for(params: &NetworkParams) -> L2Config {
     // settlements — including `testnet`, which shares `mainnet()` timings.
     config.network_id = params.network_id.clone();
     config.exit_activation_height = params.exit_activation_height;
-    // Exit throttle follows the L1 profile: the L1 release path enforces
-    // the same rule, so the two halves of an exit can never disagree about
-    // whether it may proceed.
+    // Exit throttle follows the L1 profile. The throttle is enforced at the
+    // L2 queue — the only gate windows have: every L1 release must prove a
+    // queued record, so capping queues caps the drain rate with no second
+    // check needed (verified against `Chain::check_claim`, which carries no
+    // window rule). The per-owner sub-cap rides the same wiring.
     config.max_exit_window_sat = params.max_exit_window_sat;
     config.exit_window_blocks = params.exit_window_blocks;
+    config.max_exit_per_owner_window_sat = params.max_exit_per_owner_window_sat;
     config.large_exit_threshold_sat = params.large_exit_threshold_sat;
     config.large_exit_extra_delay_blocks = params.large_exit_extra_delay_blocks;
     config

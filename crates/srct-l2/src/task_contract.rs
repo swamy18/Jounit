@@ -69,6 +69,11 @@ pub struct L2Config {
     /// Length of the exit window in blocks. Wired from
     /// `NetworkParams::exit_window_blocks`.
     pub exit_window_blocks: u64,
+    /// Maximum exit principal one owner may queue per window. Wired from
+    /// `NetworkParams::max_exit_per_owner_window_sat`; `0` disables the
+    /// sub-cap, leaving the global cap as the only bound. Bounds one owner's
+    /// share of the window so a filler cannot starve every other owner.
+    pub max_exit_per_owner_window_sat: u64,
     /// Exits at or above this principal wait an additional
     /// `large_exit_extra_delay_blocks`. Wired from
     /// `NetworkParams::large_exit_threshold_sat`; `0` disables.
@@ -96,6 +101,19 @@ impl L2Config {
                 "exit window cap and length must be set together",
             ));
         }
+        // Per-owner sub-cap mirrors `NetworkParams::validate`: a share
+        // bigger than the whole is nonsense, and a share of a window that
+        // does not exist is a half-rule.
+        if self.max_exit_per_owner_window_sat > self.max_exit_window_sat {
+            return Err(L2Error::BadConfig(
+                "exit per-owner cap must not exceed the window cap",
+            ));
+        }
+        if self.max_exit_per_owner_window_sat > 0 && self.exit_window_blocks == 0 {
+            return Err(L2Error::BadConfig(
+                "exit per-owner cap needs a window length",
+            ));
+        }
         if (self.large_exit_threshold_sat == 0) != (self.large_exit_extra_delay_blocks == 0) {
             return Err(L2Error::BadConfig(
                 "large exit threshold and delay must be set together",
@@ -115,6 +133,7 @@ impl L2Config {
             exit_activation_height: 0,
             max_exit_window_sat: 0,
             exit_window_blocks: 0,
+            max_exit_per_owner_window_sat: 0,
             large_exit_threshold_sat: 0,
             large_exit_extra_delay_blocks: 0,
         }
@@ -133,6 +152,7 @@ impl L2Config {
             exit_activation_height: 0,
             max_exit_window_sat: 0,
             exit_window_blocks: 0,
+            max_exit_per_owner_window_sat: 0,
             large_exit_threshold_sat: 0,
             large_exit_extra_delay_blocks: 0,
         }
@@ -1535,6 +1555,23 @@ mod tests {
             })
         );
         c.claim(addr(2), &claim(addr(2), id, 500_000), 2).unwrap();
+    }
+
+    #[test]
+    fn exit_per_owner_subcap_pairing_is_enforced() {
+        // The constructors carry no throttle: valid by construction.
+        L2Config::mini().validate().unwrap();
+        L2Config::mainnet().validate().unwrap();
+        // A share bigger than the whole is nonsense.
+        let mut bad = L2Config::mini();
+        bad.max_exit_window_sat = 1_000;
+        bad.exit_window_blocks = 10;
+        bad.max_exit_per_owner_window_sat = 1_001;
+        assert!(bad.validate().is_err());
+        // A share of a window that does not exist is a half-rule.
+        let mut bad = L2Config::mini();
+        bad.max_exit_per_owner_window_sat = 100;
+        assert!(bad.validate().is_err());
     }
 
     #[test]

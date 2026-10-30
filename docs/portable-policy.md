@@ -100,6 +100,39 @@ SRCT (`build_required_with_evm`, `eip155:8453`/`eip155:84532`) while the node
 settles SRCT options only — EVM settlement stays the external facilitator's
 job, under the same budget.
 
+## HTTP backends (bindings without Rust)
+
+The TypeScript/Python bindings codec the JSON; verification runs in Rust.
+The Rust can be any node — no toolchain, no vendoring, just a URL:
+
+- `POST /v1/policy/decide` — policy (portable JSON, or hex + owner
+  signatures) + payment intent → `{"decision": "allow" | "deny" |
+  "needs_approval", "reason", "network_id", "height"}`. Read-only: nothing
+  is committed, so deciding twice decides twice. A deny is a 200 with the
+  reason — the query was answered, and the answer is no; only malformed
+  input is an error.
+- `POST /v1/delegation/verify` — a proof from any rail →
+  `{valid, depth, root_owner, leaf_agent, leaf_policy_hash}`.
+- `POST /v1/audit/verify` — an exported chain from any rail →
+  `{valid, entries}`.
+
+`NodeHttpBackend` (both bindings, stdlib only) speaks these three; the
+agent loop is then `PolicyClient.for_node(url)` in Python or
+`new PolicyClient(new NodeHttpBackend(url))` in TypeScript. Demo (offline
+self-test, then live against a node):
+
+```bash
+python sim/policy_decide_demo.py --self-test
+python sim/policy_decide_demo.py --node http://127.0.0.1:8080 \
+  --policy policy.json --agent-id <hex> --recipient <hex> \
+  --amount-sat 400 --threshold-sat 100
+```
+
+(The portable policy comes from the keyless MCP `policy.export`, or any
+owner-signed grant.) Vendoring the `srct-policy` Rust crate instead still
+compiles all of `srct-core` (BLS, ML-DSA and all) — see the crate docs for
+the honest weight note. For outsiders, HTTP or the bindings are the way in.
+
 ## Rules the interface keeps
 
 - One engine: `PolicyBook` commits, `dominates` narrows, `verify_*` checks.

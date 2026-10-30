@@ -108,6 +108,16 @@ pub enum L2Error {
         window_cap: u64,
         window_ends_at: u64,
     },
+    /// This owner's share of the window is full: the queue would push their
+    /// window principal over `max_exit_per_owner_window_sat`. Other owners
+    /// are unaffected — this is the fairness bound, and a filler hitting it
+    /// is exactly the attack it stops. Funds are untouched; the owner
+    /// retries once `window_ends_at` passes.
+    ExitOwnerWindowFull {
+        owner_total: u64,
+        owner_cap: u64,
+        window_ends_at: u64,
+    },
     /// The exit names an unspendable destination (for example the deposit
     /// sink): value in, never out. The reason is stated.
     BadExitDestination(&'static str),
@@ -248,6 +258,14 @@ impl fmt::Display for L2Error {
             } => write!(
                 f,
                 "exit window full: {window_total} of {window_cap} sat used, retry after height {window_ends_at}"
+            ),
+            L2Error::ExitOwnerWindowFull {
+                owner_total,
+                owner_cap,
+                window_ends_at,
+            } => write!(
+                f,
+                "owner exit share full: {owner_total} of {owner_cap} sat used, retry after height {window_ends_at}"
             ),
             L2Error::BadExitDestination(why) => write!(f, "bad exit destination: {why}"),
             L2Error::BadConfig(why) => write!(f, "bad l2 config: {why}"),

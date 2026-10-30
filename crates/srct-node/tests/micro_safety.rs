@@ -423,6 +423,10 @@ fn reconciliation_and_audit_make_retries_safe() {
     let (s, risk) = get(&node, "/v1/risk/policy");
     assert_eq!(s, 200, "risk refused: {risk}");
     assert!(risk.get("test_mode").is_some());
+    // Mini carries no approval default: the gate stays operator-opt-in here,
+    // while srct/mainnet falls back to the mainnet default (pinned in
+    // `srct-core` unit tests, not by env-twiddling a shared test server).
+    assert_eq!(risk["high_value_threshold_sat"], 0);
 
     // Idempotent retry: re-submitting payment2 is a duplicate, not a double-pay.
     let mut book = PolicyBook::default();

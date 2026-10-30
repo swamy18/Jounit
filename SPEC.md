@@ -659,6 +659,7 @@ The mini version is **not** a second codebase. It is the same `srct-core` with a
 | `min_bond_sat` | `0.01 SRCT` | `0` | `0` |
 | `max_exit_window_sat` | `1 000 SRCT` | `0` (disabled) | `0` (disabled) |
 | `exit_window_blocks` | `144` | `0` | `0` |
+| `max_exit_per_owner_window_sat` | `100 SRCT` | `0` (disabled) | `0` (disabled) |
 | `large_exit_threshold_sat` | `100 SRCT` | `0` (disabled) | `0` (disabled) |
 | `large_exit_extra_delay_blocks` | `144` | `0` | `0` |
 
@@ -679,14 +680,18 @@ tested and live, and a profile that wants it closed sets `0`.
 
 **Exit throttle (mainnet only).** The deposit sink is a honeypot: at most
 `max_exit_window_sat` of exit principal may queue per `exit_window_blocks`
-(1 000 SRCT per 144 blocks), and exits at or above
+(1 000 SRCT per 144 blocks), no more than `max_exit_per_owner_window_sat`
+of it from any one owner (100 SRCT — the fairness bound, so one filler
+cannot starve every other owner until rollover), and exits at or above
 `large_exit_threshold_sat` wait `large_exit_extra_delay_blocks` on top of
 base maturity (100 SRCT → +144 blocks). Over-cap queues are refused with the
-retry height named; funds stay put and the owner retries in the next window —
-a delay, never a taking. Both L2 queue accounting and the L1 release check
-compute the same window and the same delay, so neither half can release
-early. `mini`/`testnet` carry `0` for all four (disabled) so tests exercise
-the bare rules.
+retry height named (`ExitWindowFull`, or `ExitOwnerWindowFull` for a full
+owner share); funds stay put and the owner retries in the next window —
+a delay, never a taking. The throttle is enforced at the L2 queue, which is
+the only gate windows have: every L1 release must prove a queued record
+against a committed root, so capping queues caps the drain rate with no
+second check needed. `mini`/`testnet` carry `0` for all five (disabled) so
+tests exercise the bare rules.
 
 ---
 
@@ -2975,14 +2980,20 @@ encumbered for exactly one finality window.
 
 *Exit throttle.* The deposit sink is a honeypot: at most
 `max_exit_window_sat` of exit principal may queue per `exit_window_blocks`
-(1 000 SRCT per 144 blocks on mainnet; `0` disables on `mini`/`testnet`).
-Over-cap queues are refused with the retry height (`ExitWindowFull`) — funds
-stay put and the owner retries in the next window. Exits at or above
+(1 000 SRCT per 144 blocks on mainnet; `0` disables on `mini`/`testnet`), no
+more than `max_exit_per_owner_window_sat` of it from any one owner
+(100 SRCT on mainnet — one filler cannot starve the window). Over-cap
+queues are refused with the retry height (`ExitWindowFull`, or
+`ExitOwnerWindowFull` naming a full owner share) — funds stay put and the
+owner retries in the next window. Exits at or above
 `large_exit_threshold_sat` wait `large_exit_extra_delay_blocks` on top of
-base maturity (100 SRCT → +144 blocks on mainnet). Both halves compute the
-same delay from the same inputs, so neither the L2 queue accounting nor the
-L1 release check can release early. Windows are replay-derived, so reorgs
-rebuild them from the winning chain with no undo bookkeeping.
+base maturity (100 SRCT → +144 blocks on mainnet). The per-owner shares are
+replay-derived beside the window total (state wire v7) and re-checked at
+decode, so a transported state cannot smuggle a broken-down window. Both
+halves compute the same delay from the same inputs, so neither the L2 queue
+accounting nor the L1 release check can release early. Windows are
+replay-derived, so reorgs rebuild them from the winning chain with no undo
+bookkeeping.
 
 *L1 side.* A block carries `exit_claims: Vec<ExitClaim>` beside its L2 trailer.
 A claim takes **sink outputs** as inputs and is authorised by an *inclusion

@@ -623,7 +623,9 @@ The wallet around them is safer than a normal crypto wallet by construction
    not advisory: at or above `SRCT_HIGH_VALUE_THRESHOLD_SAT` the node answers
    `403 human_approval_required` until a key listed in
    `SRCT_HIGH_VALUE_APPROVERS` co-signs the payment (the payer's own key does
-   not count). Threshold `0` disables the gate. Plus per-payer velocity cap
+   not count). Threshold `0` disables the gate — but only if the operator
+   sets it: with no env set, mainnet gates at 10 SRCT by default, so the
+   drain playbook never depends on a forgotten variable. Plus per-payer velocity cap
    (`SRCT_MAX_PAYMENTS_PER_PAYER`) and a mainnet guard in test mode
    (`SRCT_TEST_MODE=1` refuses `srct/mainnet` spends). Full operator recipe:
    [`docs/wallet-safety.md`](docs/wallet-safety.md).
@@ -847,6 +849,13 @@ than a griefing vector.
 `amount + exit_fee + required L1 fee`, with no change and no tip. An exit whose
 funding is not sitting in a subset summing to that figure stays queued rather
 than draining a stranger's deposit. The cost is a liveness edge: it can wait.
+
+**Windowed, and fair within the window.** Mainnet caps exit principal at
+1,000 SRCT per 144-block window — and at 100 SRCT per owner inside it. The
+global cap alone is starvable (one filler holds everyone else out until
+rollover, at fee cost); the per-owner sub-cap refuses the filler by name
+(`ExitOwnerWindowFull`) while other owners still queue, and resets on
+rollover. Refusals delay, never destroy.
 
 **Anyone can crank.** Consensus has always been permissionless here, but until
 recently the only way to obtain a claim was to be the node's own miner.
@@ -1361,7 +1370,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1388 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1401 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors

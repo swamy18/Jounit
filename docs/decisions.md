@@ -1795,3 +1795,50 @@ decisions the node gets.
 proof narrowing, engine seam, bound expiry/tx-exactness), audit
 export/tamper tests, x402 guard/lifetime/Base-route tests,
 `srct-policy::decide` JSON tests, 6 MCP guard/prove/bind/audit tests.
+
+## Decision 31 — Review findings: exit fairness, approval default, binding backends, crate weight
+
+**Status: APPROVED 2026-10-30, IMPLEMENTED 2026-10-30.** Four code-reading
+findings, each verified against the code, each fixed with its test:
+
+1. **Exit sub-cap (consensus).** The window cap was global-only: one actor
+   could fill 1,000 SRCT every window and starve every other owner until
+   rollover, at fee cost. New `max_exit_per_owner_window_sat` (mainnet 100
+   SRCT; pairing rules mirror the global cap's) enforced at the L2 queue —
+   the only gate windows have — with `ExitOwnerWindowFull` naming the share
+   and the retry height. Per-owner shares are replay-derived, travel on the
+   state wire (v6 → v7, duplicate/sum/cap re-checked at decode), and reset
+   on rollover. While verifying, the "L1 release path shares the rule"
+   claim from Decision 29 did not survive contact with `check_claim`
+   (it carries no window check — the property holds because every release
+   must prove a queued record, so capping queues caps the drain): the node
+   wiring comment and SPEC now state the verified truth instead.
+2. **Approval default-on (node policy, not consensus).** `RiskPolicy`
+   defaulted the high-value threshold to 0 everywhere, so mainnet's gate
+   depended on an env var somebody might forget. New
+   `from_env_for_network`: the operator's env still wins on every axis
+   (explicit `0` is the documented opt-out), but a missing threshold falls
+   back to 10 SRCT on `srct/mainnet` and stays disabled elsewhere. Both
+   admission paths and `GET /v1/risk/policy` use the node's network.
+3. **Bindings that run.** The TS/Python bindings were codecs without a
+   backend. Three read-only routes now back them —
+   `POST /v1/policy/decide` (intent → allow/deny/approval-needed, commits
+   nothing; a deny is a 200 with the reason so a "no" is never mistaken for
+   a transport failure), `/v1/delegation/verify`, `/v1/audit/verify` — with
+   `NodeHttpBackend` in both bindings (stdlib only, no toolchain) and a
+   runnable demo (`sim/policy_decide_demo.py --self-test`, then live
+   against a node). Verified live: same node, same grant — allow, deny and
+   approval-needed all answered over real HTTP.
+4. **Crate weight, stated honestly.** `srct-policy` stays a stable API
+   facade over `srct-core`'s pure modules — vendoring it still compiles
+   BLS/ML-DSA and all; the crate docs say so, and extracting a crypto-light
+   codec crate is recorded follow-up, not done here (splitting the bundles
+   risks two implementations of one rule). Outsiders get decisions over
+   HTTP or the bindings instead. The facade earns its keep meanwhile: 5
+   tests pinning decide/proof/audit/guard agreement.
+
+**Tests.** Per-owner refusal/admission/rollover/roundtrip/tamper
+(`exit_flow`), pairing rules (`params`, `L2Config`), wire pin v7
+(`state_wire` + offsets), mainnet-default matrix (`safety`) + mini endpoint
+shape (`micro_safety`), decide/verify routes over real HTTP (`api`), 5
+`srct-policy` tests, Python demo self-test, clippy clean.

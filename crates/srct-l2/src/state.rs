@@ -224,6 +224,11 @@ pub struct L2State {
     /// in place (only the window delays the queue), so this is a throttle,
     /// never a taking.
     exit_window_total: u64,
+    /// Per-owner queued principal inside the current window. Same replay
+    /// derivation as the total (reset on rollover, rebuilt by replay): the
+    /// fairness bound that stops one actor filling the whole window and
+    /// starving every other owner until it rolls over.
+    exit_window_owner: BTreeMap<Address, u64>,
     /// Published spending policies, keyed by the grant's hash (SPEC.md §21.1).
     /// A revoked grant stays in the map for the record; revocation is a flag on
     /// the entry, and a descendant of a revoked grant is dead by ancestry
@@ -465,6 +470,7 @@ impl L2State {
             exited_total: 0,
             exit_window_start: 0,
             exit_window_total: 0,
+            exit_window_owner: BTreeMap::new(),
             policies: BTreeMap::new(),
             policy_by_agent: BTreeMap::new(),
             positions: BTreeMap::new(),
@@ -847,35 +853,72 @@ impl L2State {
         // in the next window — so this is a delay, never a taking. Windows
         // are replay-derived (first queue opens one), so reorgs rebuild them
         // from the winning chain with no undo bookkeeping.
-        let (window_start, window_total) =
-            if self.config.max_exit_window_sat > 0 && self.config.exit_window_blocks > 0 {
-                let (start, total) = if self.exit_window_start == 0
-                    || height
-                        >= self
-                            .exit_window_start
-                            .saturating_add(self.config.exit_window_blocks)
-                {
-                    (height, 0)
-                } else {
-                    (self.exit_window_start, self.exit_window_total)
-                };
-                let total = total.checked_add(p.amount_sat).ok_or(L2Error::Overflow)?;
-                if total > self.config.max_exit_window_sat {
-                    return Err(L2Error::ExitWindowFull {
-                        window_total: total,
-                        window_cap: self.config.max_exit_window_sat,
-                        window_ends_at: start.saturating_add(self.config.exit_window_blocks),
-                    });
-                }
-                (start, total)
+        //
+        // The global cap alone is starvable: one actor can fill the window
+        // and hold every other owner out until it rolls over, at fee cost
+        // (refused queues keep their funds, accepted ones release). The
+        // per-owner sub-cap bounds one owner's share of the window, so a
+        // filler is refused by name while other owners still queue.
+        let window_on =
+            self.config.max_exit_window_sat > 0 && self.config.exit_window_blocks > 0;
+        let rolled = window_on
+            && (self.exit_window_start == 0
+                || height
+                    >= self
+                        .exit_window_start
+                        .saturating_add(self.config.exit_window_blocks));
+        let (window_start, window_total) = if window_on {
+            let (start, total) = if rolled {
+                (height, 0)
             } else {
                 (self.exit_window_start, self.exit_window_total)
             };
+            let total = total.checked_add(p.amount_sat).ok_or(L2Error::Overflow)?;
+            if total > self.config.max_exit_window_sat {
+                return Err(L2Error::ExitWindowFull {
+                    window_total: total,
+                    window_cap: self.config.max_exit_window_sat,
+                    window_ends_at: start.saturating_add(self.config.exit_window_blocks),
+                });
+            }
+            (start, total)
+        } else {
+            (self.exit_window_start, self.exit_window_total)
+        };
+        // The fairness bound, checked before any state moves like the global
+        // one. A rolled window has no per-owner history, so the previous
+        // share is zero by construction, not by lookup.
+        let owner_total = if window_on {
+            let prev = if rolled {
+                0
+            } else {
+                self.exit_window_owner.get(&p.owner).copied().unwrap_or(0)
+            };
+            let total = prev.checked_add(p.amount_sat).ok_or(L2Error::Overflow)?;
+            if self.config.max_exit_per_owner_window_sat > 0
+                && total > self.config.max_exit_per_owner_window_sat
+            {
+                return Err(L2Error::ExitOwnerWindowFull {
+                    owner_total: total,
+                    owner_cap: self.config.max_exit_per_owner_window_sat,
+                    window_ends_at: window_start.saturating_add(self.config.exit_window_blocks),
+                });
+            }
+            total
+        } else {
+            0
+        };
         self.charge(&p.owner, need)?;
         self.collect_fee(fee);
         self.exits_locked = new_locked;
         self.exit_window_start = window_start;
         self.exit_window_total = window_total;
+        if rolled {
+            self.exit_window_owner.clear();
+        }
+        if window_on {
+            self.exit_window_owner.insert(p.owner, owner_total);
+        }
         self.exits.insert(
             (p.owner, p.nonce),
             ExitRecord {
@@ -2182,7 +2225,7 @@ impl L2State {
 /// state (Decision 26). Pre-bump blobs are refused rather than guessed at,
 /// because a state that cannot describe a committed policy or credit position
 /// would silently diverge from the chain.
-pub const L2_STATE_WIRE_VERSION: u8 = 6;
+    pub const L2_STATE_WIRE_VERSION: u8 = 7;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
@@ -2191,6 +2234,8 @@ const WIRE_ACCOUNT_MIN: usize = 28;
 const WIRE_EXIT_MIN: usize = 72;
 /// Smallest possible encoded exit-nonce entry: `20` owner + `8` nonce.
 const WIRE_NONCE_MIN: usize = 28;
+/// Smallest possible encoded per-owner window share: `20` owner + `8` total.
+const WIRE_OWNER_MIN: usize = 28;
 /// Smallest possible encoded applied-id entry.
 const WIRE_HASH_MIN: usize = 32;
 /// Smallest possible encoded deposit identity: `32` txid + `4` output index.
@@ -2244,6 +2289,8 @@ impl L2State {
             // v6: exit throttle (window cap + large-exit delay).
             .u64le(self.config.max_exit_window_sat)
             .u64le(self.config.exit_window_blocks)
+            // v7: per-owner window sub-cap (fairness bound on the v6 window).
+            .u64le(self.config.max_exit_per_owner_window_sat)
             .u64le(self.config.large_exit_threshold_sat)
             .u64le(self.config.large_exit_extra_delay_blocks)
             .u8(u8::from(self.genesis_applied))
@@ -2300,8 +2347,13 @@ impl L2State {
         w.u64le(self.exits_locked);
         // v6: exit window accounting (replay-derived, but encoded so a
         // transported state keeps the throttle it was built under).
+        // v7: per-owner window shares, in address order like every map.
         w.u64le(self.exit_window_start)
             .u64le(self.exit_window_total);
+        w.u64le(self.exit_window_owner.len() as u64);
+        for (owner, total) in &self.exit_window_owner {
+            w.fixed(owner).u64le(*total);
+        }
 
         let mut vwcs: Vec<(&Hash, &VerifiedWorkCertificate)> = self.vwcs.iter().collect();
         vwcs.sort_by_key(|(id, _)| **id);
@@ -2364,6 +2416,10 @@ impl L2State {
             exit_activation_height: r.u64le().map_err(|_| codec_err("exit activation height"))?,
             max_exit_window_sat: r.u64le().map_err(|_| codec_err("exit window cap"))?,
             exit_window_blocks: r.u64le().map_err(|_| codec_err("exit window length"))?,
+            // v7: the fairness bound on the window above.
+            max_exit_per_owner_window_sat: r
+                .u64le()
+                .map_err(|_| codec_err("exit per-owner window cap"))?,
             large_exit_threshold_sat: r.u64le().map_err(|_| codec_err("large exit threshold"))?,
             large_exit_extra_delay_blocks: r.u64le().map_err(|_| codec_err("large exit delay"))?,
         };
@@ -2508,6 +2564,30 @@ impl L2State {
         // v6: exit window accounting.
         let exit_window_start = r.u64le().map_err(|_| codec_err("exit window start"))?;
         let exit_window_total = r.u64le().map_err(|_| codec_err("exit window total"))?;
+        // v7: per-owner shares. The count is bounded like every map, keys
+        // must be unique, and the shares must add up to the window total
+        // they break down — a blob whose breakdown disagrees with its total
+        // is tampered with, not merely odd.
+        let declared_owners = r.u64le().map_err(|_| codec_err("exit owner count"))?;
+        let n_owners =
+            bounded_count(&r, declared_owners, WIRE_OWNER_MIN, "exit owner count exceeds buffer")?;
+        let mut exit_window_owner = BTreeMap::new();
+        let mut owner_sum = 0u64;
+        for _ in 0..n_owners {
+            let owner: Address = r.fixed().map_err(|_| codec_err("exit owner address"))?;
+            let total = r.u64le().map_err(|_| codec_err("exit owner total"))?;
+            owner_sum = owner_sum
+                .checked_add(total)
+                .ok_or(codec_err("exit owner shares overflow"))?;
+            if exit_window_owner.insert(owner, total).is_some() {
+                return Err(codec_err("duplicate exit owner in state"));
+            }
+        }
+        if owner_sum != exit_window_total {
+            return Err(codec_err(
+                "exit owner shares disagree with the window total",
+            ));
+        }
 
         let declared_vwcs = r.u64le().map_err(|_| codec_err("certificate count"))?;
         let n_vwcs = bounded_count(
@@ -2626,6 +2706,7 @@ impl L2State {
             exited_total,
             exit_window_start,
             exit_window_total,
+            exit_window_owner,
             policies,
             policy_by_agent,
             positions,
@@ -2636,9 +2717,20 @@ impl L2State {
         // A disabled throttle never accumulates window accounting, so a blob
         // carrying it under a zero cap is tampered with, not merely odd.
         if state.config.max_exit_window_sat == 0
-            && (state.exit_window_start != 0 || state.exit_window_total != 0)
+            && (state.exit_window_start != 0
+                || state.exit_window_total != 0
+                || !state.exit_window_owner.is_empty())
         {
             return Err(codec_err("exit window accounting under a disabled cap"));
+        }
+        // Shares obey the sub-cap they were built under: a blob carrying a
+        // share above its own cap was never queueable.
+        if state.config.max_exit_per_owner_window_sat > 0 {
+            for total in state.exit_window_owner.values() {
+                if *total > state.config.max_exit_per_owner_window_sat {
+                    return Err(codec_err("exit owner share exceeds its cap"));
+                }
+            }
         }
         // Exit nonces must also cover their records: a record beyond its
         // owner's last nonce was never queueable.

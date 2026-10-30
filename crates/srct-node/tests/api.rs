@@ -808,6 +808,185 @@ fn authorize_grants_then_refuses_a_replayed_nonce() {
     assert_eq!(body["error"], "session_binding");
 }
 
+/// `POST /v1/policy/decide` answers the engine without committing: allow for
+/// a fitting intent, a named refusal for a forbidden one, approval-needed
+/// above the threshold. Deciding twice decides twice identically — the route
+/// is pure, so no nonce is consumed and no window spend is recorded.
+#[test]
+fn policy_decide_answers_without_committing() {
+    let node = start();
+    let payer = wallet(1, "payer");
+    let provider = [7u8; 20];
+    let service = [9u8; 32];
+    let policy = machine_policy(&payer, &provider, service);
+    let base = || {
+        serde_json::json!({
+            "policy_hex": hex::encode(policy.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&payer, &policy),
+            "policy_keys_hex": policy_keys_hex(&payer),
+            "agent_id_hex": hex::encode(policy.agent_id),
+            "recipient_hex": hex::encode(provider),
+            "service_hex": hex::encode(service),
+        })
+    };
+    // A fitting intent is allowed, against the node's own network/height.
+    let mut allow = base();
+    allow["amount_sat"] = serde_json::json!(400);
+    let (s, out) = post(&node, "/v1/policy/decide", &allow);
+    assert_eq!(s, 200, "a fitting intent must be allowed: {out}");
+    assert_eq!(out["decision"], "allow");
+    assert_eq!(out["network_id"], NET);
+    // Deciding again decides the same: nothing was committed.
+    let (s, again) = post(&node, "/v1/policy/decide", &allow);
+    assert_eq!(s, 200, "{again}");
+    assert_eq!(again, out);
+    // Over the per-tx cap is a deny with the reason, not a transport
+    // failure: the query was answered, and the answer is no.
+    let mut over = base();
+    over["amount_sat"] = serde_json::json!(50_000);
+    let (s, body) = post(&node, "/v1/policy/decide", &over);
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["decision"], "deny");
+    // Above the threshold the spend is gated, not refused.
+    let mut gated = base();
+    gated["amount_sat"] = serde_json::json!(400);
+    gated["approval_threshold_sat"] = serde_json::json!(100);
+    let (s, out) = post(&node, "/v1/policy/decide", &gated);
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["decision"], "needs_approval");
+    // The portable shape decides the same grant, verified on parse.
+    let signed =
+        srct_core::portable::SignedPolicy::issue(&payer, &policy).expect("owner signs");
+    let (s, out) = post(
+        &node,
+        "/v1/policy/decide",
+        &serde_json::json!({
+            "policy_portable_json": signed.to_json(),
+            "agent_id_hex": hex::encode(policy.agent_id),
+            "recipient_hex": hex::encode(provider),
+            "service_hex": hex::encode(service),
+            "amount_sat": 400,
+        }),
+    );
+    assert_eq!(s, 200, "portable shape must decide identically: {out}");
+    assert_eq!(out["decision"], "allow");
+    // A policy retargeted at another network breaks its own agent-id
+    // binding: structurally invalid, refused at parse.
+    let mut foreign = policy.clone();
+    foreign.network_id = "srct/elsewhere".to_string();
+    let (s, body) = post(
+        &node,
+        "/v1/policy/decide",
+        &serde_json::json!({
+            "policy_hex": hex::encode(foreign.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&payer, &foreign),
+            "policy_keys_hex": policy_keys_hex(&payer),
+            "agent_id_hex": hex::encode(foreign.agent_id),
+            "recipient_hex": hex::encode(provider),
+            "service_hex": hex::encode(service),
+            "amount_sat": 400,
+        }),
+    );
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(body["error"], "bad_request");
+    // A structurally valid policy for another network reaches the node and
+    // is refused there by name: this node is not its network.
+    let owner_addr = payer.address().unwrap();
+    let mut testnet_policy = machine_policy(&payer, &provider, service);
+    testnet_policy.network_id = "srct/testnet".to_string();
+    testnet_policy.agent_id =
+        derive_agent_id("srct/testnet", AgentRole::Machine, &owner_addr);
+    let (s, body) = post(
+        &node,
+        "/v1/policy/decide",
+        &serde_json::json!({
+            "policy_hex": hex::encode(testnet_policy.serialize()),
+            "policy_sigs_hex": policy_sigs_hex(&payer, &testnet_policy),
+            "policy_keys_hex": policy_keys_hex(&payer),
+            "agent_id_hex": hex::encode(testnet_policy.agent_id),
+            "recipient_hex": hex::encode(provider),
+            "service_hex": hex::encode(service),
+            "amount_sat": 400,
+        }),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["decision"], "deny");
+}
+
+/// `POST /v1/delegation/verify` and `/v1/audit/verify` check foreign
+/// documents the same way every other verifier does: a proof that parses
+/// but does not verify, and an audit chain with rewritten history, are
+/// refused by name.
+#[test]
+fn delegation_verify_and_audit_verify_answer_from_any_rail() {
+    use srct_core::portable::{DelegationProof, SignedPolicy};
+    use srct_core::safety::AuditLog;
+
+    let node = start();
+    let owner = wallet(60, "proof-owner");
+    let root = machine_policy(&owner, &[1u8; 20], [2u8; 32]);
+    let child = SpendPolicy {
+        agent_id: derive_sub_agent_id(NET, &root.agent_id, AgentRole::Machine),
+        parent_agent_id: Some(root.agent_id),
+        per_tx_max_sat: 300,
+        window_blocks: 5,
+        cumulative_max_sat: 500,
+        not_before_height: 0,
+        expires_at_height: 5_000,
+        ..root.clone()
+    };
+    let proof = DelegationProof::new(vec![
+        SignedPolicy::issue(&owner, &root).expect("owner signs"),
+        SignedPolicy::issue(&owner, &child).expect("owner signs"),
+    ])
+    .expect("narrowed ancestry proves");
+    let (s, out) = post(
+        &node,
+        "/v1/delegation/verify",
+        &serde_json::json!({ "proof_json": proof.to_json() }),
+    );
+    assert_eq!(s, 200, "a valid ancestry verifies: {out}");
+    assert_eq!(out["valid"], true);
+    assert_eq!(out["depth"], 2);
+    // A widened leaf keeps signatures but breaks the narrowing rule.
+    let mut wide = child.clone();
+    wide.cumulative_max_sat = 9_999;
+    let bad_proof = DelegationProof::new(vec![
+        SignedPolicy::issue(&owner, &root).expect("owner signs"),
+        SignedPolicy::issue(&owner, &wide).expect("owner signs"),
+    ])
+    .expect("assembly does not verify");
+    let (s, body) = post(
+        &node,
+        "/v1/delegation/verify",
+        &serde_json::json!({ "proof_json": bad_proof.to_json() }),
+    );
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(body["error"], "bad_request");
+
+    let mut log = AuditLog::default();
+    log.push("authorize", None, Some(500), "grant".to_string())
+        .unwrap();
+    log.push("payment", Some([1u8; 32]), Some(500), "submit".to_string())
+        .unwrap();
+    let (s, out) = post(
+        &node,
+        "/v1/audit/verify",
+        &serde_json::json!({ "audit_json": log.export_json() }),
+    );
+    assert_eq!(s, 200, "a chained export verifies: {out}");
+    assert_eq!(out, serde_json::json!({ "valid": true, "entries": 2 }));
+    let mut tampered = log.export();
+    tampered.entries[0].detail = "forged".to_string();
+    let (s, body) = post(
+        &node,
+        "/v1/audit/verify",
+        &serde_json::json!({ "audit_json": serde_json::to_string(&tampered).unwrap() }),
+    );
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(body["error"], "bad_request");
+}
+
 #[test]
 fn a_malformed_policy_is_a_client_error() {
     let node = start();

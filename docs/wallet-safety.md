@@ -108,6 +108,9 @@ nothing.
 1. Set `SRCT_HIGH_VALUE_THRESHOLD_SAT` to the amount that needs a human, and
    list approver keys in `SRCT_HIGH_VALUE_APPROVERS` (comma-separated hex
    owner addresses — hardware or second-channel keys, never the hot key).
+   With no env set, mainnet still gates at 10 SRCT
+   (`MAINNET_DEFAULT_HIGH_VALUE_THRESHOLD_SAT`): the gate is on unless the
+   operator turns it off on purpose (`0` is the documented opt-out).
 2. The agent submits up to the threshold freely; at or above it the node
    answers `403 human_approval_required` — the advisory flag is gone as a
    bypass, and the payment is not recorded, reserved or settled.

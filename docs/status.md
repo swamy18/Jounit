@@ -1847,6 +1847,34 @@ that answer travels. All service layer, no consensus change:
   L2 policy_flow, miner, committee_rotation — green. README count
   1374 → 1388. Interface specified in `docs/portable-policy.md`.
 
+### 2026-10-30 review findings (exit fairness, approval default, binding backends)
+
+Four code-reading findings, each verified against the code and fixed with
+its test (Decision 31):
+
+- **Per-owner exit sub-cap (consensus).** The window was global-only — one
+  filler could starve every owner until rollover. Mainnet now bounds one
+  owner to 100 SRCT of the 1,000 SRCT window at the L2 queue (the only gate
+  windows have), refused as `ExitOwnerWindowFull`; shares are
+  replay-derived, ride the state wire (v6 → v7, re-checked at decode), reset
+  on rollover. While verifying, Decision 29's "L1 release path shares the
+  rule" did not survive contact with `check_claim` (no window check there —
+  the property holds because every release proves a queued record); the
+  comment and SPEC now state the verified truth.
+- **Approval default-on (node policy).** A missing
+  `SRCT_HIGH_VALUE_THRESHOLD_SAT` now gates mainnet at 10 SRCT; explicit
+  env (including `0`, the opt-out) still wins. Wired through both admission
+  paths and `GET /v1/risk/policy`.
+- **Bindings that run.** `POST /v1/policy/decide` (read-only, deny-as-200),
+  `/v1/delegation/verify`, `/v1/audit/verify`, with `NodeHttpBackend` in
+  both bindings and `sim/policy_decide_demo.py`; verified live against a
+  real node (allow, deny, approval-needed over HTTP).
+- **Crate weight, stated honestly.** `srct-policy` stays a facade (full
+  `srct-core` compile); outsiders use HTTP/bindings. 5 tests pin the seam.
+- Verification: clippy clean; exit_flow (27), state_wire pins, params/L2
+  pairing, mainnet-default matrix, api decide/verify routes, srct-policy
+  (5), Python self-test — green. README count → 1401.
+
 ### 2026-10-29 hardening round 3 (no new features)
 
 Third review pass (transfers in/out, mining end-to-end, agent/SDK workflows,

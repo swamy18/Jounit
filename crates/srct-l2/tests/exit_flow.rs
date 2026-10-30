@@ -822,6 +822,145 @@ fn exit_window_cap_refuses_then_reopens() {
     w.assert_conserved("window rollover");
 }
 
+/// One actor may not fill the window alone: the per-owner sub-cap refuses
+/// the filler by name while a different owner still queues in the same
+/// window. This is the fairness bound — without it, a filler holding the
+/// global cap open starves every other owner until rollover, at fee cost.
+#[test]
+fn exit_per_owner_subcap_refuses_filler_but_admits_others() {
+    let mut cfg = exits_on();
+    cfg.max_exit_window_sat = 1_500_000;
+    cfg.exit_window_blocks = 10;
+    cfg.max_exit_per_owner_window_sat = 600_000;
+    let mut w = world_with(cfg);
+    // The attacker queues 500k: fits both caps.
+    w.apply(&queue_tx(&w, 1, 500_000, 1_000), 5);
+    // Another 500k of their own would be 1M against a 600k share: refused
+    // by name, even though the 1.5M global cap still has room.
+    let dest = addr(&w.worker);
+    let p = ExitQueuePayload::build(&w.submitter, 2, 500_000, dest, 1_000).unwrap();
+    let err = w
+        .state
+        .apply(
+            &L2Transaction::new(L2Payload::ExitQueue(p)),
+            5,
+            &w.validators,
+            &w.verifier,
+        )
+        .expect_err("own share overflow must be refused");
+    assert!(
+        matches!(
+            err,
+            L2Error::ExitOwnerWindowFull {
+                owner_total: 1_000_000,
+                owner_cap: 600_000,
+                ..
+            }
+        ),
+        "the refusal names the owner share: {err:?}"
+    );
+    // Nothing moved for the refused queue: no record, no debit, no nonce.
+    assert_eq!(w.state.exit_count(), 1);
+    assert_eq!(w.state.exit_window_total(), 500_000);
+    // A different owner still queues inside the same window: the filler
+    // holds nobody else out.
+    let victim = ExitQueuePayload::build(&w.worker, 1, 400_000, addr(&w.submitter), 1_000).unwrap();
+    w.state
+        .apply(
+            &L2Transaction::new(L2Payload::ExitQueue(victim)),
+            5,
+            &w.validators,
+            &w.verifier,
+        )
+        .expect("other owners are unaffected by one owner's share");
+    assert_eq!(w.state.exit_count(), 2);
+    assert_eq!(w.state.exit_window_total(), 900_000);
+    w.assert_conserved("per-owner sub-cap");
+}
+
+/// The per-owner share resets when the window rolls, exactly like the
+/// global total: last window's filler queues again in the next one.
+#[test]
+fn exit_per_owner_share_resets_when_the_window_rolls() {
+    let mut cfg = exits_on();
+    cfg.max_exit_window_sat = 1_500_000;
+    cfg.exit_window_blocks = 10;
+    cfg.max_exit_per_owner_window_sat = 600_000;
+    let mut w = world_with(cfg);
+    w.apply(&queue_tx(&w, 1, 500_000, 1_000), 5);
+    let dest = addr(&w.worker);
+    let p = ExitQueuePayload::build(&w.submitter, 2, 500_000, dest, 1_000).unwrap();
+    assert!(matches!(
+        w.state.apply(
+            &L2Transaction::new(L2Payload::ExitQueue(p)),
+            5,
+            &w.validators,
+            &w.verifier,
+        ),
+        Err(L2Error::ExitOwnerWindowFull { .. })
+    ));
+    // Next window: the share is fresh, the same queue is admitted.
+    w.apply(&queue_tx(&w, 2, 500_000, 1_000), 15);
+    assert_eq!(w.state.exit_count(), 2);
+    assert_eq!(w.state.exit_window_total(), 500_000);
+    w.assert_conserved("owner share rollover");
+}
+
+/// The owner shares travel on the wire with the window they break down: a
+/// fresh encode decodes to the identical state, and conservation holds.
+#[test]
+fn exit_window_owner_shares_round_trip_on_the_wire() {
+    let mut cfg = exits_on();
+    cfg.max_exit_window_sat = 1_500_000;
+    cfg.exit_window_blocks = 10;
+    cfg.max_exit_per_owner_window_sat = 600_000;
+    let mut w = world_with(cfg);
+    w.apply(&queue_tx(&w, 1, 500_000, 1_000), 5);
+    let victim = ExitQueuePayload::build(&w.worker, 1, 400_000, addr(&w.submitter), 1_000).unwrap();
+    w.state
+        .apply(
+            &L2Transaction::new(L2Payload::ExitQueue(victim)),
+            5,
+            &w.validators,
+            &w.verifier,
+        )
+        .unwrap();
+    let bytes = w.state.encode();
+    let back = L2State::decode(&bytes).expect("a fresh encode must decode");
+    assert_eq!(back, w.state);
+    assert!(back.check_conservation());
+}
+
+/// A blob whose owner shares do not add up to the window total is tampered
+/// with, not merely odd: the breakdown is re-checked at decode.
+#[test]
+fn exit_window_owner_shares_must_agree_with_the_total() {
+    let mut cfg = exits_on();
+    cfg.max_exit_window_sat = 1_500_000;
+    cfg.exit_window_blocks = 10;
+    cfg.max_exit_per_owner_window_sat = 600_000;
+    let mut w = world_with(cfg);
+    w.apply(&queue_tx(&w, 1, 500_000, 1_000), 5);
+    let bytes = w.state.encode();
+    // The owner map is the last place the owner's address appears on the
+    // wire (accounts, exit records and the nonce map all come first; only
+    // empty maps and the vault follow in this fixture), so the final
+    // occurrence is the map entry and the 8 bytes after it are its total.
+    let owner = addr(&w.submitter);
+    let at = bytes
+        .windows(20)
+        .rposition(|s| s == owner.as_slice())
+        .expect("the owner is on the wire");
+    let mut forged = bytes.clone();
+    let total = u64::from_le_bytes(forged[at + 20..at + 28].try_into().unwrap());
+    forged[at + 20..at + 28].copy_from_slice(&(total + 1).to_le_bytes());
+    let err = L2State::decode(&forged).expect_err("a forged share must be refused");
+    assert!(
+        err.to_string().contains("disagree with the window total"),
+        "the refusal names the breakdown: {err}"
+    );
+}
+
 /// A large exit waits the extra delay on top of base maturity — same rule on
 /// the L2 queue side and (via chain params) on the L1 release side.
 #[test]

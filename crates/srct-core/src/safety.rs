@@ -208,13 +208,23 @@ impl SessionBook {
 /// Operator risk knobs (from env/config; pure struct so tests pin behavior).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RiskPolicy {
-    /// Amounts at/above this need human approval (0 = disabled).
+    /// Amounts at/above this need human approval (`0` = disabled). When the
+    /// operator sets nothing, mainnet still gates at
+    /// [`MAINNET_DEFAULT_HIGH_VALUE_THRESHOLD_SAT`]: the drain playbook must
+    /// not depend on an env var somebody forgot. Any explicit setting wins —
+    /// including `0`, the documented operator opt-out.
     pub high_value_threshold_sat: u64,
     /// Most payments per payer in the node-local store (0 = disabled).
     pub max_payments_per_payer: usize,
     /// When true, `srct/mainnet` spends are refused.
     pub test_mode: bool,
 }
+
+/// The high-value approval threshold that applies on mainnet when the
+/// operator sets nothing: 10 SRCT. A hot key moving more than this without a
+/// second key is the drain in progress, so the gate is on unless the
+/// operator turns it off on purpose.
+pub const MAINNET_DEFAULT_HIGH_VALUE_THRESHOLD_SAT: u64 = 10 * crate::params::SAT_PER_SRCT;
 
 /// Advisory verdict: `Ok`, or approval-gated. Refusals are errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,10 +242,26 @@ impl RiskPolicy {
     }
 
     pub fn from_env() -> Self {
+        Self::from_env_for_network("unknown")
+    }
+
+    /// The effective policy for one network: the operator's env wins on
+    /// every axis (an explicit `0` threshold is the documented opt-out), and
+    /// only a missing threshold falls back — to the mainnet default on
+    /// `srct/mainnet`, to disabled everywhere else. Admission paths call
+    /// this with the payment's network; the network-unknown `from_env` is
+    /// only for tools that have no payment in hand.
+    pub fn from_env_for_network(network_id: &str) -> Self {
         let threshold = std::env::var("SRCT_HIGH_VALUE_THRESHOLD_SAT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                if network_id == "srct/mainnet" {
+                    MAINNET_DEFAULT_HIGH_VALUE_THRESHOLD_SAT
+                } else {
+                    0
+                }
+            });
         let velocity = std::env::var("SRCT_MAX_PAYMENTS_PER_PAYER")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -596,6 +622,53 @@ mod tests {
             policy.check("srct/mainnet", 100, 0),
             Err(SafetyError::MainnetBlockedInTestMode)
         );
+    }
+
+    #[test]
+    fn high_value_threshold_defaults_on_for_mainnet_only() {
+        const VAR: &str = "SRCT_HIGH_VALUE_THRESHOLD_SAT";
+        // No other test in this binary reads this var, so save/scrub/restore
+        // around the assertions is race-free here.
+        let saved = std::env::var(VAR).ok();
+        std::env::remove_var(VAR);
+        // The pinned scale of the default: 10 SRCT, not a typo for 100.
+        assert_eq!(MAINNET_DEFAULT_HIGH_VALUE_THRESHOLD_SAT, 1_000_000_000);
+        // Missing env: mainnet gates at the default, everything else is off.
+        assert_eq!(
+            RiskPolicy::from_env_for_network("srct/mainnet").high_value_threshold_sat,
+            MAINNET_DEFAULT_HIGH_VALUE_THRESHOLD_SAT
+        );
+        assert_eq!(
+            RiskPolicy::from_env_for_network("srct/mini").high_value_threshold_sat,
+            0
+        );
+        assert_eq!(
+            RiskPolicy::from_env_for_network("unknown").high_value_threshold_sat,
+            0
+        );
+        assert_eq!(RiskPolicy::from_env().high_value_threshold_sat, 0);
+        // Any explicit setting wins — including the documented opt-out.
+        std::env::set_var(VAR, "12345");
+        assert_eq!(
+            RiskPolicy::from_env_for_network("srct/mainnet").high_value_threshold_sat,
+            12345
+        );
+        std::env::set_var(VAR, "0");
+        assert_eq!(
+            RiskPolicy::from_env_for_network("srct/mainnet").high_value_threshold_sat,
+            0
+        );
+        // A garbage value parses to nothing, so the fallback governs again
+        // (fail-closed, never fail-open into disabled).
+        std::env::set_var(VAR, "not-a-number");
+        assert_eq!(
+            RiskPolicy::from_env_for_network("srct/mainnet").high_value_threshold_sat,
+            MAINNET_DEFAULT_HIGH_VALUE_THRESHOLD_SAT
+        );
+        match saved {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
     }
 
     #[test]

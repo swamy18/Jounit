@@ -408,13 +408,13 @@ fn an_unsupported_version_is_refused_by_name() {
     let (state, _) = fully_populated_state();
     let mut bytes = state.encode();
     assert_eq!(bytes[0], L2_STATE_WIRE_VERSION);
-    // Current protocol bump: the wire format is version 6 (v6 adds the exit
-    // throttle: per-window cap and large-exit delay).
-    assert_eq!(L2_STATE_WIRE_VERSION, 6);
-    // Pre-bump blobs (versions 3, 4 and 5) and a future version are all
+    // Current protocol bump: the wire format is version 7 (v7 adds the
+    // per-owner exit window sub-cap to the v6 throttle).
+    assert_eq!(L2_STATE_WIRE_VERSION, 7);
+    // Pre-bump blobs (versions 3 through 6) and a future version are all
     // refused; a stale node cannot hand over state the new chain would
     // silently trust.
-    for v in [0u8, 3, 4, 5, 9] {
+    for v in [0u8, 3, 4, 5, 6, 9] {
         bytes[0] = v;
         assert!(
             L2State::decode(&bytes).is_err(),
@@ -429,9 +429,9 @@ fn an_inflated_account_count_is_refused_before_it_allocates() {
     let mut bytes = state.encode();
     // The account count sits right after the fixed header:
     // version(1) + id_len(4) + network_id(11, "srct/mini")
-    // + 8·u64 config (including the v6 exit throttle)
-    // + flag(1) + 5·u64 counters (including `exited_total`) = 121 bytes.
-    let count_at = 121;
+    // + 9·u64 config (including the v6 exit throttle and the v7 per-owner
+    // sub-cap) + flag(1) + 5·u64 counters (including `exited_total`) = 129.
+    let count_at = 129;
     bytes[count_at..count_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(L2State::decode(&bytes).is_err());
 }
@@ -441,8 +441,8 @@ fn a_tampered_counter_that_breaks_conservation_is_refused() {
     let (state, _) = fully_populated_state();
     let mut bytes = state.encode();
     // The funded_total field sits after version + network + config + flag:
-    // 1 + 4 + 11 + 64 + 1 = 81.
-    let funded_at = 81;
+    // 1 + 4 + 11 + 72 + 1 = 89.
+    let funded_at = 89;
     let current = u64::from_le_bytes(bytes[funded_at..funded_at + 8].try_into().unwrap());
     bytes[funded_at..funded_at + 8].copy_from_slice(&(current + 1).to_le_bytes());
     let err = L2State::decode(&bytes).expect_err("inflated funding must be refused");

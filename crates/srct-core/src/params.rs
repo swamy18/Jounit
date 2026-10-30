@@ -375,6 +375,16 @@ pub struct NetworkParams {
     /// Length of the exit window in blocks. Must be nonzero when
     /// `max_exit_window_sat` is nonzero (`validate` enforces the pairing).
     pub exit_window_blocks: u64,
+    /// Maximum exit principal *one owner* may queue per window, in satoshis.
+    /// The global cap alone lets a single actor fill the window and starve
+    /// every other owner until it rolls over (griefing at fee cost, since
+    /// refused queues keep their funds and accepted ones release). The
+    /// sub-cap bounds one owner's share of the window, so a filler is
+    /// refused by name while other owners still queue. Must not exceed the
+    /// global cap, and requires the window to be on (`validate` enforces
+    /// both); `0` disables the sub-cap, leaving the global cap as the only
+    /// bound (`mini`/`testnet`).
+    pub max_exit_per_owner_window_sat: u64,
     /// Exits at or above this principal wait an additional
     /// `large_exit_extra_delay_blocks` on top of maturity: large outflows
     /// give monitors and operators time to react. `0` disables the delay
@@ -548,12 +558,14 @@ impl NetworkParams {
             // bonds cost every node permanent ledger entries at no stake.
             min_bond_sat: 1_000_000,
             // Exit throttle on mainnet: at most 1,000 SRCT of exit principal
-            // per 144-block (~24h) window; exits of 100 SRCT or more wait an
-            // extra 144 blocks. Refusals delay, never destroy: funds stay
-            // put and the owner retries in the next window. `mini`/testnet
-            // leave all four at 0 (disabled) so tests exercise bare rules.
+            // per 144-block (~24h) window, no more than 100 SRCT of it from
+            // any one owner; exits of 100 SRCT or more wait an extra 144
+            // blocks. Refusals delay, never destroy: funds stay put and the
+            // owner retries in the next window. `mini`/testnet leave all five
+            // at 0 (disabled) so tests exercise bare rules.
             max_exit_window_sat: 1_000 * SAT_PER_SRCT,
             exit_window_blocks: 144,
+            max_exit_per_owner_window_sat: 100 * SAT_PER_SRCT,
             large_exit_threshold_sat: 100 * SAT_PER_SRCT,
             large_exit_extra_delay_blocks: 144,
         }
@@ -636,9 +648,10 @@ impl NetworkParams {
             pq_activation_height: 0,
             // No bond floor on mini: tests exercise dust behavior deliberately.
             min_bond_sat: 0,
-            // Exit throttle disabled on mini (all four zero): bare rules.
+            // Exit throttle disabled on mini (all five zero): bare rules.
             max_exit_window_sat: 0,
             exit_window_blocks: 0,
+            max_exit_per_owner_window_sat: 0,
             large_exit_threshold_sat: 0,
             large_exit_extra_delay_blocks: 0,
         }
@@ -708,6 +721,7 @@ impl NetworkParams {
             // Exit throttle disabled on testnet too.
             max_exit_window_sat: 0,
             exit_window_blocks: 0,
+            max_exit_per_owner_window_sat: 0,
             large_exit_threshold_sat: 0,
             large_exit_extra_delay_blocks: 0,
         }
@@ -752,6 +766,18 @@ impl NetworkParams {
         if (self.max_exit_window_sat == 0) != (self.exit_window_blocks == 0) {
             return Err(Error::Malformed(
                 "max_exit_window_sat and exit_window_blocks must be set together",
+            ));
+        }
+        // Per-owner sub-cap: a share bigger than the whole is nonsense, and a
+        // share of a window that does not exist is a half-rule.
+        if self.max_exit_per_owner_window_sat > self.max_exit_window_sat {
+            return Err(Error::Malformed(
+                "max_exit_per_owner_window_sat must not exceed max_exit_window_sat",
+            ));
+        }
+        if self.max_exit_per_owner_window_sat > 0 && self.exit_window_blocks == 0 {
+            return Err(Error::Malformed(
+                "max_exit_per_owner_window_sat needs exit_window_blocks",
             ));
         }
         if (self.large_exit_threshold_sat == 0) != (self.large_exit_extra_delay_blocks == 0) {
@@ -1110,6 +1136,34 @@ mod tests {
         let mut bad = NetworkParams::mini();
         bad.escrow_ceiling_sat = 0;
         assert!(bad.validate().is_err(), "zero ceiling is not a ceiling");
+    }
+
+    #[test]
+    fn exit_per_owner_subcap_pairing_is_enforced() {
+        // Mainnet carries the sub-cap: one owner gets a tenth of the window.
+        let main = NetworkParams::mainnet();
+        main.validate().unwrap();
+        assert_eq!(
+            main.max_exit_per_owner_window_sat,
+            100 * SAT_PER_SRCT
+        );
+        // A share bigger than the whole is nonsense.
+        let mut bad = NetworkParams::mini();
+        bad.max_exit_window_sat = 1_000;
+        bad.exit_window_blocks = 10;
+        bad.max_exit_per_owner_window_sat = 1_001;
+        assert!(bad.validate().is_err());
+        // A share of a window that does not exist is a half-rule.
+        let mut bad = NetworkParams::mini();
+        bad.max_exit_per_owner_window_sat = 100;
+        assert!(bad.validate().is_err());
+        // Equal to the whole is degenerate but coherent: the global cap is
+        // the only bound that can ever fire first.
+        let mut ok = NetworkParams::mini();
+        ok.max_exit_window_sat = 1_000;
+        ok.exit_window_blocks = 10;
+        ok.max_exit_per_owner_window_sat = 1_000;
+        ok.validate().unwrap();
     }
 
     #[test]
