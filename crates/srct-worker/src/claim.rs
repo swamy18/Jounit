@@ -98,14 +98,24 @@ pub fn claim_task<V: L2NodeView, B: L2Broadcaster>(
 }
 
 /// The lifecycle state the SDK observes for a task it believed it claimed.
+///
+/// Terminal states distinguish *how* it ended: `SettledCorrect` means the
+/// protocol paid on our work (stop here, and stop re-submitting); `Lost` is
+/// every other ending (settled against us, expired). A `Disputed` task is
+/// still live arbitration, never a settled submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimedState {
     /// Claim visible, result not yet submitted.
     InProgress,
-    /// Result accepted by the protocol (or further along over our work).
+    /// Our result submission visible, awaiting settlement.
     Submitted,
-    /// The task expired (deposit burned, §15.4) before our submission stood.
-    Expired,
+    /// Live dispute over (possibly our) work: watch, do not re-submit.
+    Disputed,
+    /// Settled `Correct` on our submission: paid, terminal.
+    SettledCorrect,
+    /// A dispute over our work was resolved against us, or the task expired:
+    /// terminal, do not re-submit.
+    Lost,
     /// Somebody else's claim won; the task is not ours to execute.
     ClaimedByOther,
 }
@@ -121,20 +131,33 @@ pub fn reconcile_claimed(
     task_id: &Hash,
 ) -> WorkerResult<ClaimedState> {
     let contract = state.task(task_id).ok_or(WorkerError::UnknownTask)?;
+    let ours = contract.worker.as_ref() == Some(wallet_address);
     match &contract.state {
         ContractState::Open => Ok(ClaimedState::ClaimedByOther),
-        ContractState::InProgress { .. } | ContractState::ResultSubmitted { .. } => {
-            if contract.worker.as_ref() == Some(wallet_address) {
-                Ok(match &contract.state {
-                    ContractState::ResultSubmitted { .. } => ClaimedState::Submitted,
-                    _ => ClaimedState::InProgress,
-                })
+        ContractState::InProgress { .. } => Ok(if ours {
+            ClaimedState::InProgress
+        } else {
+            ClaimedState::ClaimedByOther
+        }),
+        ContractState::ResultSubmitted { .. } => Ok(if ours {
+            ClaimedState::Submitted
+        } else {
+            ClaimedState::ClaimedByOther
+        }),
+        // A dispute is live arbitration, not a settled submission: reporting
+        // it as `Submitted` told the caller to stop watching exactly when
+        // the task most needed watching.
+        ContractState::Disputed(_) => Ok(ClaimedState::Disputed),
+        ContractState::Settled(o) => Ok(
+            if ours && o.verdict == srct_core::l2::Verdict::Correct && o.worker_paid > 0 {
+                ClaimedState::SettledCorrect
+            } else if ours {
+                ClaimedState::Lost
             } else {
-                Ok(ClaimedState::ClaimedByOther)
-            }
-        }
-        ContractState::Disputed(_) | ContractState::Settled(_) => Ok(ClaimedState::Submitted),
-        ContractState::Expired(_) => Ok(ClaimedState::Expired),
+                ClaimedState::ClaimedByOther
+            },
+        ),
+        ContractState::Expired(_) => Ok(ClaimedState::Lost),
     }
 }
 

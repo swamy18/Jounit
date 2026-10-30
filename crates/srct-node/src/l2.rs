@@ -57,7 +57,7 @@ use srct_core::bls::RealBls;
 use srct_core::bls_checkpoint::ValidatorSet;
 use srct_core::chain::Chain;
 use srct_core::exit::MAX_CLAIM_INPUTS;
-use srct_core::hash::{Hash, Hash512};
+use srct_core::hash::{Address, Hash, Hash512};
 use srct_core::params::NetworkParams;
 use srct_core::tx::{GAS_PER_INPUT, GAS_PER_OUTPUT, GAS_TX_BASE};
 use srct_l2::{
@@ -532,6 +532,59 @@ impl NodeL2 {
     /// figure is left queued rather than paid from someone else's deposit. That
     /// is deliberate: overpaying a release would break the exact-funding
     /// invariant and let one exit drain another.
+    /// Why each queued-but-not-crankable exit is waiting: the operator sees
+    /// `immature`, `no_exact_funding_subset_at_current_fee` (exact-sum
+    /// funding or nothing — including a fee that moved since the quote), or
+    /// `amount_overflow`, instead of a silent omission.
+    pub fn crank_pending_reasons(&self, chain: &Chain) -> Vec<(Address, u64, &'static str)> {
+        let tip = chain.height();
+        let binding = chain.finality().binding_finalized_height();
+        let depth = self.deposits.maturity_depth;
+        let base_fee = chain.expected_base_fee_for_next_block();
+        let available: Vec<(srct_core::tx::OutPoint, u64)> = chain
+            .utxo()
+            .outputs_for_address(&chain.params().l2_deposit_sink())
+            .into_iter()
+            .collect();
+        let mut out = Vec::new();
+        for watch in self.inner.pending_exits() {
+            if chain.exit_released(&watch.owner, watch.nonce) {
+                continue;
+            }
+            let record = &watch.record;
+            if !L2State::exit_is_mature(record.queued_height, tip, binding, depth) {
+                out.push((watch.owner, watch.nonce, "immature"));
+                continue;
+            }
+            let Some(principal) = record.amount_sat.checked_add(record.exit_fee_sat) else {
+                out.push((watch.owner, watch.nonce, "amount_overflow"));
+                continue;
+            };
+            let mut funded = false;
+            for n in 1..=MAX_CLAIM_INPUTS.min(available.len().max(1)) {
+                let gas = exit_claim_gas(n, record.exit_fee_sat != 0);
+                let Some(fee) = base_fee.checked_mul(gas) else {
+                    break;
+                };
+                let Some(needed) = principal.checked_add(fee) else {
+                    break;
+                };
+                if exact_subset(&available, needed, n).is_some() {
+                    funded = true;
+                    break;
+                }
+            }
+            if !funded {
+                out.push((
+                    watch.owner,
+                    watch.nonce,
+                    "no_exact_funding_subset_at_current_fee",
+                ));
+            }
+        }
+        out
+    }
+
     pub fn crank_claims(
         &self,
         chain: &Chain,

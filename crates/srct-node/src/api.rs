@@ -197,7 +197,13 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 ///
 /// Version 5 added the stream opens/settlement accounting and the session
 /// budgets (micro-payment channels + wallet safety).
-const STATE_ENVELOPE_VERSION: u8 = 7;
+///
+/// Version 8 binds the envelope to its network: the first section names the
+/// network the books were written on, and a file from another network is
+/// refused instead of merged. Books are network-scoped (payment networks,
+/// policy scopes, job ids), so loading `srct/mini` books onto `srct/mainnet`
+/// would mix scopes that must never meet.
+const STATE_ENVELOPE_VERSION: u8 = 8;
 
 /// Largest entry count any single map section in the state envelope may
 /// declare, checked before allocation. Real books are bounded by their own
@@ -553,6 +559,8 @@ impl SharedNode {
     pub fn encode_state(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(4096);
         w.u8(STATE_ENVELOPE_VERSION);
+        // v8: the network first, so a foreign file fails by name on load.
+        put_section(&mut w, self.chain.params().network_id.as_bytes());
         put_section(&mut w, &self.receipts.encode());
         put_section(&mut w, &self.payment_tracker.encode());
         put_section(
@@ -785,6 +793,26 @@ impl SharedNode {
         if version != STATE_ENVELOPE_VERSION {
             return Err(format!(
                 "state envelope version {version}, this build reads {STATE_ENVELOPE_VERSION}"
+            ));
+        }
+
+        // v8: the envelope names its network; a file from another network is
+        // refused instead of merged. The chain's params are the authority —
+        // not any field inside the file being checked. The section decode
+        // also enforces exact consumption and a sane length.
+        let stored_network = decode_section(&mut r, "network", |sr| {
+            let n = sr.remaining();
+            if n == 0 || n > 64 {
+                return Err(format!("network: {n} bytes is not a network id"));
+            }
+            let bytes = sr.fixed_slice(n).map_err(|e| format!("network: {e}"))?;
+            String::from_utf8(bytes.to_vec()).map_err(|e| format!("network: {e}"))
+        })?;
+        let mine = self.chain.params().network_id.clone();
+        if stored_network != mine {
+            return Err(format!(
+                "state envelope is for network \"{stored_network}\", this node is \"{mine}\": \
+                 refusing a foreign book instead of merging it"
             ));
         }
 
@@ -1369,6 +1397,27 @@ impl SharedNode {
                 let _ = escrow.finalize(now, activation);
             }
         }
+        // Reservations whose payment expired: the payer's line was locked
+        // for a receipt that can now never settle (an expired payment is
+        // unadmittable and unreceivable). Release the lock; the payment
+        // record itself stays, so a late receipt is refused as expired
+        // rather than resurrected.
+        let expired: Vec<Hash> = self
+            .reservations
+            .keys()
+            .copied()
+            .filter(|id| {
+                self.payment_store
+                    .get(id)
+                    .map(|p| now >= p.expires_at_height)
+                    .unwrap_or(true)
+            })
+            .collect();
+        for id in expired {
+            if let Some(reservation) = self.reservations.remove(&id) {
+                let _ = self.credit.release(&reservation);
+            }
+        }
     }
 }
 
@@ -1380,6 +1429,10 @@ pub struct ApiState {
     /// default — means no issuer is trusted and `POST /v1/credit/mint`
     /// refuses everything: credit backing is fail-closed, never implicit.
     credit_issuers: Vec<srct_core::bls_checkpoint::BlsPublicKey>,
+    /// Whether this API serves a non-loopback bind: self-serve credit
+    /// funding is refused there (the attested `credit/mint` path is the
+    /// only backing an exposed node accepts).
+    exposed: bool,
 }
 
 /// Uniform error body: a stable machine-readable code plus a detail string
@@ -1648,6 +1701,7 @@ async fn conservation(State(state): State<ApiState>) -> ApiResult {
             "l2_closed": report.l2_closed,
             "l2_funding_ok": report.l2_funding_ok(),
             "joint_sat": report.supply.joint_sat,
+            "joint_overflow": report.supply.joint_overflow,
             "joint_bound_sat": report.supply.bound_sat(),
             "l1_bound_sat": report.supply.l1_bound_sat,
             "escrow_ceiling_sat": report.supply.escrow_ceiling_sat,
@@ -2031,16 +2085,21 @@ async fn block_by_hash(State(state): State<ApiState>, Path(hash): Path<String>) 
 
 /// External-miner template (mining-stack seam).
 ///
-/// Returns an unsolved coinbase-only block paying `miner` at tip height + 1,
-/// built by [`Chain::build_template_with`]: everything is fixed except
-/// `nonce` / `extra_nonce`, which the miner grinds (both commit into the
-/// proof through the serialized header). The template is returned as binary
-/// `block_hex` plus the fields a miner needs without decoding it. Submit the
-/// solved block to `POST /v1/mine/submit`, which re-validates the proof —
-/// the miner is never trusted.
+/// Returns an unsolved block paying `miner` at tip height + 1, built by
+/// [`Chain::build_template_with`]: everything is fixed except `nonce` /
+/// `extra_nonce`, which the miner grinds (both commit into the proof through
+/// the serialized header). The template is returned as binary `block_hex`
+/// plus the fields a miner needs without decoding it. Submit the solved
+/// block to `POST /v1/mine/submit`, which re-validates the proof — the miner
+/// is never trusted.
 ///
-/// v1 serves coinbase-only templates (no mempool selection); pool
-/// transaction inclusion is the next step, not this route.
+/// Template and submit are not atomic: by the time a solution lands, the tip
+/// may have moved and the block lands as a side branch (`canonical: false`
+/// in the submit answer). External miners should re-fetch the template and
+/// compare `prev_hash` rather than grind one template forever. Mempool
+/// transactions are included like the internal miner's; L2 writes and exit
+/// claims stay with the internal miner, which also carries the L2 root the
+/// chain requires.
 #[derive(Deserialize)]
 struct MineTemplateQuery {
     miner: String,
@@ -2056,9 +2115,15 @@ async fn mine_template(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     with_shared(&state, |sh| {
+        // Same mempool selection as the internal miner (minus L2/exits,
+        // which need the L2 root only the internal path derives).
+        let body = sh
+            .chain
+            .select_from_pool_for_template(&sh.pool)
+            .map_err(|e| bad(format!("template: {e}")))?;
         let template = sh
             .chain
-            .build_template_with(miner, Vec::new(), now_ms, None)
+            .build_template_with(miner, body, now_ms, None)
             .map_err(|e| bad(format!("template: {e}")))?;
         Ok(Json(json!({
             "height": template.header.height,
@@ -2078,22 +2143,45 @@ struct MineSubmitReq {
 }
 
 async fn mine_submit(State(state): State<ApiState>, Json(req): Json<MineSubmitReq>) -> ApiResult {
+    // A block is at most 4 MiB on the wire (8M hex chars); the generic hex
+    // cap is larger, so bound this field explicitly before decoding.
+    if req.block_hex.len() > 8 * 1024 * 1024 {
+        return Err(bad("block_hex over the 8M-char cap"));
+    }
     let bytes = decode_hex_bytes(&req.block_hex, "block")?;
     let block = Block::deserialize(&bytes).map_err(|e| bad(format!("block decode: {e}")))?;
     let want = block.block_hash();
-    with_shared(&state, |sh| match sh.chain.submit(block) {
-        Ok(()) => {
-            let h = sh.chain.height();
-            Ok(Json(json!({
-                "height": h,
-                "hash": hash512_to_hex(&want),
-            })))
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    with_shared(&state, |sh| {
+        // The local-clock rule the P2P path enforces: a far-future block
+        // must not enter canon through HTTP that relay would refuse.
+        match sh.chain.submit_at(block.clone(), Some(now_ms)) {
+            Ok(()) => {
+                // The next block the node builds spends the confirmed
+                // outputs; without this the internal miner's next attempt
+                // probes (and fails) on inputs this block just spent.
+                sh.pool.evict_confirmed(&block.txs);
+                let h = sh.chain.height();
+                let tip = sh.chain.tip_hash();
+                // Template and submit are not atomic: report whether the
+                // block won fork choice, so a miner grinding a stale
+                // template sees `canonical: false` instead of a success
+                // that never pays.
+                Ok(Json(json!({
+                    "height": h,
+                    "hash": hash512_to_hex(&want),
+                    "canonical": tip == want,
+                })))
+            }
+            Err(e) => Err(fail(
+                StatusCode::BAD_REQUEST,
+                "block_refused",
+                e.to_string(),
+            )),
         }
-        Err(e) => Err(fail(
-            StatusCode::BAD_REQUEST,
-            "block_refused",
-            e.to_string(),
-        )),
     })?
 }
 
@@ -2487,6 +2575,43 @@ async fn payment_settle(
                 "settlement_does_not_pay_recipient",
                 format!(
                     "transaction pays {paid} sat to the recipient; this payment needs {amount_sat} sat"
+                ),
+            ));
+        }
+        // No double-counting: the same transaction output cannot settle two
+        // payments. Sum what this node already attributed to this txid for
+        // the same recipient, and require the tx to cover the old links
+        // plus this one. Checked math: a saturated sum would hide an
+        // over-attribution as fitting.
+        let mut committed: u64 = 0;
+        for (pid, linked) in &sh.payment_tx {
+            if *linked == txid && *pid != id {
+                if let Some(p) = sh.payment_store.get(pid) {
+                    if p.recipient == recipient {
+                        committed = committed.checked_add(p.amount_sat).ok_or_else(|| {
+                            fail(
+                                StatusCode::CONFLICT,
+                                "settlement_overlaps",
+                                "transaction outputs already fully attributed",
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+        let need = amount_sat.checked_add(committed).ok_or_else(|| {
+            fail(
+                StatusCode::CONFLICT,
+                "settlement_overlaps",
+                "transaction outputs already fully attributed",
+            )
+        })?;
+        if paid < need {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "settlement_overlaps",
+                format!(
+                    "transaction pays {paid} sat to the recipient but {committed} sat are already attributed to other payments; this payment needs {amount_sat} sat more"
                 ),
             ));
         }
@@ -3249,6 +3374,21 @@ async fn payment_submit(
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
         let id = payment.signing_hash();
+        // Stream-bound payments move the coin the voucher accounting already
+        // advanced: when the reference names a stream open on this node, the
+        // recipient must be that stream's recipient. Without this the
+        // accounting could advance (via a separate settle call) while the
+        // coin went somewhere else entirely. A reference that names no open
+        // stream is an ordinary request id and is left alone.
+        if let Some(stream) = sh.stream_store.get(&payment.reference) {
+            if payment.recipient != stream.recipient {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "stream_recipient_mismatch",
+                    "a stream-bound payment must pay the stream's recipient",
+                ));
+            }
+        }
         // A revoked policy admits nothing further, whatever else is in order —
         // and that includes a policy whose *ancestor* was revoked, which is why
         // the whole chain is checked rather than the hash the payment names.
@@ -3425,11 +3565,19 @@ async fn receipt_submit(
         receipt
             .verify(&network)
             .map_err(|e| fail(StatusCode::BAD_REQUEST, "receipt_refused", e.to_string()))?;
-        if let Some(payment) = sh.payment_store.get(&receipt.payment_id) {
-            receipt
-                .verify_binding(payment)
-                .map_err(|e| fail(StatusCode::BAD_REQUEST, "receipt_refused", e.to_string()))?;
-        }
+        // Orphan receipts are refused, not filed: a receipt naming an
+        // unrecorded payment debited nothing, and accepting it would put
+        // proof of a payment that never happened into the book.
+        let payment = sh.payment_store.get(&receipt.payment_id).ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                "unknown_payment",
+                "no recorded payment for this receipt",
+            )
+        })?;
+        receipt
+            .verify_binding(payment)
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, "receipt_refused", e.to_string()))?;
         // A re-submitted receipt is idempotent, and it is answered before any
         // debit: the second call must not debit again. A *contradicting* receipt
         // for the same payment is not a replay, it is a second claim, and the
@@ -3556,11 +3704,26 @@ async fn exit_crankable(
                 })
             })
             .collect();
+        // Queued but not crankable, with the reason each one waits: an
+        // empty crankable list with pending exits used to be silent.
+        let pending: Vec<Value> = sh
+            .l2
+            .crank_pending_reasons(&sh.chain)
+            .iter()
+            .map(|(owner, nonce, reason)| {
+                json!({
+                    "owner": address_to_hex(owner),
+                    "nonce": nonce,
+                    "reason": reason,
+                })
+            })
+            .collect();
         Ok(Json(json!({
             "claimant": address_to_hex(&claimant),
             "crankable": crankable,
             "crankable_count": crankable.len(),
             "queued": sh.l2.pending_exits().len(),
+            "pending": pending,
             "unbacked_claims": sh.l2.unbacked_claims().len(),
         })))
     })?
@@ -3589,6 +3752,17 @@ async fn credit_deposit(
     Json(req): Json<CreditDepositReq>,
 ) -> ApiResult {
     let addr = decode_address(&req.address_hex)?;
+    // Self-serve funding is a loopback-only exercise path: on an exposed
+    // bind anyone with the bearer could print node-local credit and spend
+    // it through admission. Exposed operators back credit through the
+    // issuer-signed `credit/mint` path instead.
+    if state.exposed {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "credit_refused",
+            "self-serve deposit is disabled on an exposed bind; use issuer-signed credit/mint",
+        ));
+    }
     // A zero deposit moves nothing but still creates book entries and still
     // costs a request: refused like every other zero-amount credit call, so
     // a flood of them cannot grow the book one empty row at a time.
@@ -4105,11 +4279,27 @@ async fn escrow_settle(
                     "duplicate": true,
                 })));
             }
-            return Err(fail(
-                StatusCode::CONFLICT,
-                "escrow_settled",
-                "this escrow's coin move is already bound to another exit",
-            ));
+            // A binding to a dead exit is not a settlement: when replay
+            // skipped the bound exit (fee race, nonce race) and it is neither
+            // released on chain, still queued locally, nor re-submitted in
+            // this call, the old binding is stale. Drop it and bind the new
+            // exit below, instead of locking the escrow against an exit that
+            // will never land.
+            let stale = !sh.chain.exit_released(&bound.owner, bound.nonce)
+                && !sh
+                    .l2
+                    .pending_exits()
+                    .iter()
+                    .any(|w| w.owner == bound.owner && w.nonce == bound.nonce)
+                && !sh.l2_to_include.iter().any(|t| t.txid() == bound.txid);
+            if !stale {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "escrow_settled",
+                    "this escrow's coin move is already bound to another exit",
+                ));
+            }
+            sh.escrow_exit.remove(&id);
         }
         if exit_owner != payer {
             return Err(fail(
@@ -7740,8 +7930,9 @@ pub fn spawn_with_options(
     let addr = std_listener
         .local_addr()
         .map_err(|e| format!("api listener: {e}"))?;
+    let non_empty_token = token.filter(|t| !t.is_empty());
     let cfg = ApiConfig {
-        token: token.filter(|t| !t.is_empty()),
+        token: non_empty_token.clone(),
         bind_host: listen.ip().to_string(),
         bind_loopback: listen.ip().is_loopback(),
         allowed_hosts: allowed_hosts
@@ -7757,6 +7948,7 @@ pub fn spawn_with_options(
             shared,
             peers,
             credit_issuers,
+            exposed: cfg.is_exposed(),
         },
         &cfg,
     );

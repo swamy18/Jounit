@@ -15,10 +15,12 @@ import math
 
 
 def quote_usd(amount_minor: int, sat_per_minor: int, fee_bps: int, slip_bps: int) -> tuple[int, int]:
+    # The declared fee is all-in: slippage headroom rides inside it, so
+    # sat_due == gross + fee exactly (the rule `/v1/fx/swap` enforces).
     gross = amount_minor * sat_per_minor
     fee = gross * fee_bps // 10_000
     slip = gross * slip_bps // 10_000
-    return gross + fee + slip, fee
+    return gross + fee + slip, fee + slip
 
 
 def passport_score(events: list[tuple[str, str]]) -> int:
@@ -39,10 +41,10 @@ def main() -> None:
     assert mn <= mx <= parent, "tiers must narrow"
     print(f"tiers: parent {parent}/tx -> max {mx}/tx -> min {mn}/tx")
 
-    # USD quote: $1.00 at 1000 sat/cent, 1% fee, 0.5% slippage.
+    # USD quote: $1.00 at 1000 sat/cent, 1% fee, 0.5% slippage headroom.
     due, fee = quote_usd(100, 1_000, 100, 50)
-    assert (due, fee) == (101_500, 1_000), (due, fee)
-    print(f"quote: $1.00 -> {due} sat (fee {fee})")
+    assert (due, fee) == (101_500, 1_500), (due, fee)
+    print(f"quote: $1.00 -> {due} sat (all-in fee {fee})")
 
     # Passport: 100 farmed payments, one counterparty, lose to 4 genuine ones.
     farmed = [("payment", "X")] * 100

@@ -32,7 +32,17 @@ pub struct ExecutionWork {
 
 impl ExecutionWork {
     /// Project from a live contract, or refuse when it is not claimable work.
+    /// Only `InProgress` contracts are executable — and only before their
+    /// deadline: executing an `Open` task burns electricity on work nobody
+    /// claimed, and executing past expiry burns it on work nobody can
+    /// submit. Both used to produce an attestation nobody would accept.
     pub fn from_contract(contract: &TaskContract, current_height: u64) -> WorkerResult<Self> {
+        if !matches!(contract.state, srct_l2::ContractState::InProgress { .. }) {
+            return Err(WorkerError::TaskNotAvailable("task is not in progress"));
+        }
+        if current_height > contract.deadline_height {
+            return Err(WorkerError::TaskExpired);
+        }
         let t: &ComputeTask = &contract.deliverable.0;
         Ok(ExecutionWork {
             task_id: contract.task_id,

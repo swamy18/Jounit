@@ -361,10 +361,19 @@ impl ChainL2 {
                 self.pending.retain(|p| p.deposit.id() != id);
                 self.deposits_applied += 1;
             } else if !self.pending.iter().any(|p| p.deposit.id() == id) {
-                self.pending.push(PendingDeposit {
-                    deposit: d,
-                    matures_at: d.matures_at(self.deposits.maturity_depth),
-                });
+                // Checked maturity: a wrapped `saturating_add` near u64::MAX
+                // would collapse the wait to spendable. `None` means never —
+                // the deposit stays pending rather than maturing at once.
+                match d.checked_matures_at(self.deposits.maturity_depth) {
+                    Some(matures_at) => self.pending.push(PendingDeposit {
+                        deposit: d,
+                        matures_at,
+                    }),
+                    None => self.pending.push(PendingDeposit {
+                        deposit: d,
+                        matures_at: u64::MAX,
+                    }),
+                }
             }
         } else {
             // Detected but not yet safe: visible, not spendable. Recorded

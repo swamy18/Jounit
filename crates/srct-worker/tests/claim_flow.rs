@@ -333,10 +333,10 @@ fn duplicate_submission_after_restart_fails_closed_not_silently() {
     w.claim(id).unwrap();
     w.execute_and_submit(id).unwrap();
     // The state is ResultSubmitted now: a second submit is a TaskNotAvailable,
-    // never a second broadcast.
+    // never a second broadcast (the execute gate admits InProgress only).
     assert!(matches!(
         w.execute_and_submit(id),
-        Err(WorkerError::TaskNotAvailable("ResultSubmitted"))
+        Err(WorkerError::TaskNotAvailable("task is not in progress"))
     ));
 }
 
@@ -372,7 +372,7 @@ fn expired_task_after_claim_reports_expired_and_burned_deposit() {
     advance(&core, 105);
 
     let w = client_for(&core, 2);
-    assert_eq!(w.reconcile_claim(&id).unwrap(), ClaimedState::Expired);
+    assert_eq!(w.reconcile_claim(&id).unwrap(), ClaimedState::Lost);
     let e = w.earnings().unwrap();
     assert_eq!(e.lost_sat, 100_000, "the deposit burned in full");
     assert_eq!(w.certificate(&id).unwrap(), None, "expiry never certifies");

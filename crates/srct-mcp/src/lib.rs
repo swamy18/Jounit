@@ -32,7 +32,7 @@
 //! [`McpError`] and malformed input is refused rather than partially acted on.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -288,6 +288,10 @@ impl SolarCyberUnitMcp {
             .map_err(|e| McpError::refused("request_invalid", e.to_string()))?;
         Ok(json!({
             "valid": true,
+            // Offline inspection only: cryptographically well-formed is not
+            // node-admitted. Structural checks (policy windows, revocation,
+            // balances) still run at `/v1/payment/submit`.
+            "admissible": false,
             "request_id": hash_to_hex(&parsed.request_id()),
             "payer": hex::encode(parsed.payer),
             "payer_type": role_name(parsed.payer_type),
@@ -310,6 +314,8 @@ impl SolarCyberUnitMcp {
             .map_err(|e| McpError::refused("payment_invalid", e.to_string()))?;
         Ok(json!({
             "valid": true,
+            // Offline inspection only: see `inspect_request`.
+            "admissible": false,
             "payment_id": hash_to_hex(&payment.signing_hash()),
             "payer": hex::encode(payment.payer),
             "payer_type": role_name(payment.payer_type),
@@ -334,8 +340,12 @@ impl SolarCyberUnitMcp {
         // receipt that verifies in isolation can still be for another payment.
         let mut bound = Value::Null;
         if let Some(payment_hex) = request.get("payment_hex").and_then(Value::as_str) {
-            let payment_bytes = hex::decode(payment_hex.trim_start_matches("0x"))
-                .map_err(|e| McpError::bad(format!("payment hex: {e}")))?;
+            let trimmed = payment_hex.trim().trim_start_matches("0x");
+            if trimmed.len() > MAX_HEX_FIELD_CHARS {
+                return Err(McpError::bad("payment_hex over the hex cap"));
+            }
+            let payment_bytes =
+                hex::decode(trimmed).map_err(|e| McpError::bad(format!("payment hex: {e}")))?;
             let payment = MachinePayment::deserialize(&payment_bytes)
                 .map_err(|e| McpError::bad(format!("payment: {e}")))?;
             receipt
@@ -463,10 +473,18 @@ fn u64_field(v: &Value, name: &str) -> Result<u64, McpError> {
         .ok_or_else(|| McpError::bad(format!("missing integer field `{name}`")))
 }
 
+/// Cap for one hex field in chars: the largest legitimate bundle is a few
+/// KiB, and an uncapped `hex::decode` turns a hostile tool call into a big
+/// allocation before anything validates it.
+const MAX_HEX_FIELD_CHARS: usize = 8 * 1024 * 1024;
+
 fn hex_field(v: &Value, name: &str) -> Result<Vec<u8>, McpError> {
     let s = str_field(v, name)?;
-    hex::decode(s.trim().trim_start_matches("0x"))
-        .map_err(|e| McpError::bad(format!("{name}: {e}")))
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() > MAX_HEX_FIELD_CHARS {
+        return Err(McpError::bad(format!("{name} over the hex cap")));
+    }
+    hex::decode(s).map_err(|e| McpError::bad(format!("{name}: {e}")))
 }
 
 fn bundle_from_bytes(bytes: &[u8]) -> Result<srct_core::sig::Bundle, McpError> {
@@ -495,11 +513,16 @@ fn http_json(
     path: &str,
     body: Option<&str>,
 ) -> Result<Value, McpError> {
-    let addr: SocketAddr = endpoint
+    // Hostnames resolve via the system resolver (a plain IP:port parses as
+    // before): operators behind DNS no longer hand-edit an IP in.
+    let mut addrs = endpoint
         .trim()
         .trim_start_matches("http://")
-        .parse()
+        .to_socket_addrs()
         .map_err(|e| McpError::bad(format!("endpoint `{endpoint}`: {e}")))?;
+    let addr: SocketAddr = addrs
+        .next()
+        .ok_or_else(|| McpError::bad(format!("endpoint `{endpoint}` resolves to nothing")))?;
     let body = body.unwrap_or("");
     let auth = match std::env::var("SRCT_API_TOKEN") {
         Ok(token) if !token.is_empty() => format!("Authorization: Bearer {token}\r\n"),
@@ -514,7 +537,10 @@ fn http_json(
         body.len()
     );
 
-    let mut stream = TcpStream::connect(addr)
+    // Bounded connect: the read timeout below only starts after the socket
+    // exists, so without this a black-holed endpoint hangs the tool call
+    // (and whatever agent loop called it) with no deadline at all.
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| McpError::transport(format!("connect {addr}: {e}")))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))

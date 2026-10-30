@@ -92,13 +92,8 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
 
     /// §18.5: build the claim without broadcasting.
     pub fn claim_build(&self, task_id: srct_core::hash::Hash) -> WorkerResult<ClaimPlan> {
-        claim_plan(
-            &self.wallet,
-            &self.config,
-            task_id,
-            &self.l2_state()?,
-            self.height()?,
-        )
+        let (state, height) = self.host.observe()?;
+        claim_plan(&self.wallet, &self.config, task_id, &state, height)
     }
 
     /// §18.6: run the executor over a task's work without submitting.
@@ -106,7 +101,7 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
         &self,
         task_id: srct_core::hash::Hash,
     ) -> WorkerResult<crate::executor::ExecutionOutput> {
-        let state = self.l2_state()?;
+        let (state, height) = self.host.observe()?;
         let contract = state.task(&task_id).ok_or(WorkerError::UnknownTask)?;
         if contract.worker.as_ref() != Some(&self.config.address) {
             // Executing unclaimed work burns nothing on-chain but would
@@ -114,7 +109,7 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
             // here where the cause is clear (§18.11).
             return Err(WorkerError::IdentityMismatch);
         }
-        let work = ExecutionWork::from_contract(contract, self.height()?)?;
+        let work = ExecutionWork::from_contract(contract, height)?;
         execute_task(&self.executor, &work)
     }
 
@@ -133,14 +128,8 @@ impl<V: L2NodeView, B: L2Broadcaster, E: Executor> WorkerClient<V, B, E> {
         output_bytes: &[u8],
         backend: srct_core::compute_ir::ComputeBackend,
     ) -> WorkerResult<SubmitPlan> {
-        submit_plan(
-            &self.wallet,
-            task_id,
-            output_bytes,
-            backend,
-            &self.l2_state()?,
-            self.height()?,
-        )
+        let (state, height) = self.host.observe()?;
+        submit_plan(&self.wallet, task_id, output_bytes, backend, &state, height)
     }
 
     /// §18.14: file a dispute as the challenger (build + broadcast).
@@ -279,6 +268,10 @@ pub fn earnings_of(state: &L2State, worker: &srct_core::hash::Address) -> Earnin
                     .pending_sat
                     .saturating_add(contract.payment_sat.saturating_sub(settle_fee));
             }
+            // Disputed tasks count no pending escrow: a dispute can end in
+            // a slash, so presenting the escrow as expected income
+            // overstates the position exactly when it is most at risk. The
+            // deposit stays at risk either way.
             srct_l2::ContractState::Disputed(_) => {
                 e.deposits_at_risk_sat = e
                     .deposits_at_risk_sat

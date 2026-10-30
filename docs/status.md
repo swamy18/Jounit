@@ -1730,6 +1730,52 @@ existing behavior — no new transaction types, endpoints or issuance:
   (522), `srct-miner` (47), redteam suites, `srct-node --test api`
   (47) + `agent_economy`/`micro_safety`/`x402`, L2 `credit_flow` — all green.
 
+### 2026-10-29 hardening round 3 (no new features)
+
+Third review pass (transfers in/out, mining end-to-end, agent/SDK workflows,
+CLI + API surface), same rule: fix existing behavior only. Highlights:
+
+- Transfers: orphan receipts refused at intake (404, never filed);
+  settlement double-count closed (one tx output settles one payment —
+  `settlement_overlaps`); self-serve `credit/deposit` forbidden on exposed
+  binds (issuer-signed `credit/mint` only); expired-payment credit
+  reservations released on the finality tick (no permanent lock); stale
+  escrow↔exit bindings rebind instead of deadlocking the escrow;
+  stream-bound payments must pay the stream's recipient (voucher accounting
+  and coin cannot diverge); exit crank reports *why* each queued exit waits
+  (`immature`, `no_exact_funding_subset_at_current_fee`, `amount_overflow`);
+  `send` refuses `--fee` below the consensus floor and above the payment
+  itself, and prints amount/fee/change before mining.
+- Mining: template timestamps capped at `min(now, median, now+future)` with
+  a fail-closed clock-lag refusal; external templates include mempool
+  transactions like the internal miner (minus L2/exits); submit enforces the
+  local-clock rule, evicts confirmed pool entries, caps `block_hex`, and
+  reports `canonical: false` for side branches (solo miner retries instead
+  of logging false success); pool share pin extended to `base_fee_sat` /
+  `version` / `sig_scheme`; unreachable share bars refused at job time; HBM
+  falls back to sequential grind under `batch > 1`; pool rounds mature like
+  the chain (earnings unlock at height + maturity, `void_round` cancels
+  orphans, ledger v1 → v2).
+- Worker/SDK: `execute_task` admits InProgress contracts only (no more
+  attestations on unclaimed/expired work); `reconcile_claimed` distinguishes
+  `Disputed` / `SettledCorrect` / `Lost` (a live dispute no longer reports
+  as submitted); `dispute_resolution` gains `InDispute`; dispute plans
+  precheck the window; all plan builders use atomic `observe()`; payload
+  build failures surface as `Protocol` instead of collapsing into
+  `IdentityMismatch`; MCP hex fields capped, endpoints resolve via DNS with
+  a 5s connect timeout, inspect answers carry `admissible: false`.
+- Node/CLI: unknown `--switch` is a hard error (no more silent `--no_mine`
+  typos); `--credit-issuer` parses as a valued flag; bootstrap refuses a
+  non-empty committee dir; `state.bin` envelope v7 → v8 (network-bound: a
+  foreign network's book is refused instead of merged); conservation report
+  carries `joint_overflow` (a clamped sum no longer reads as headroom);
+  list endpoints take `?limit=` (max 1000, with `total`/`truncated`).
+- Verification: clippy clean; core lib 522, L2 all suites, node api 47 +
+  agent_economy/micro_safety/x402/state_persist + all remaining integration
+  suites, miner 48, worker 49, net/store/mcp, committee/rotation, redteam —
+  green. Three tests updated to the new fail-closed rules (orphan-at-intake,
+  execute-gate message, pool maturity), none weakened.
+
 ### 2026-10-29 hardening round 2 (no new features)
 
 Second review pass (L2, P2P/net, store, node service layer, worker, MCP,

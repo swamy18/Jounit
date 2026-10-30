@@ -125,8 +125,11 @@ pub fn publish_policy_plan(
             available: have,
         });
     }
-    let payload = PolicyPayload::build_from_policy(wallet, policy, spender)
-        .map_err(|_| WorkerError::IdentityMismatch)?;
+    // Build failures carry their own L2 reason (bad policy, bad binding):
+    // collapsing them into `IdentityMismatch` lied about the cause and made
+    // deterministic refusals look retryable-adjacent. `From` surfaces them
+    // as `Protocol` (non-retryable), which is what a refused build is.
+    let payload = PolicyPayload::build_from_policy(wallet, policy, spender)?;
     let tx = L2Transaction::new(L2Payload::Policy(payload));
     Ok(PolicyPlan {
         txid: tx.txid(),
@@ -168,8 +171,7 @@ pub fn revoke_policy_plan(
             available: have,
         });
     }
-    let payload =
-        PolicyRevokePayload::build(wallet, agent_id).map_err(|_| WorkerError::IdentityMismatch)?;
+    let payload = PolicyRevokePayload::build(wallet, agent_id)?;
     let tx = L2Transaction::new(L2Payload::PolicyRevoke(payload));
     Ok(PolicyPlan {
         txid: tx.txid(),
@@ -223,8 +225,7 @@ pub fn agent_spend_plan(
         return Err(WorkerError::TaskNotAvailable("the policy is revoked"));
     }
     let payload =
-        AgentSpendPayload::build(wallet, policy_hash, nonce, recipient, amount_sat, service)
-            .map_err(|_| WorkerError::IdentityMismatch)?;
+        AgentSpendPayload::build(wallet, policy_hash, nonce, recipient, amount_sat, service)?;
     let tx = L2Transaction::new(L2Payload::AgentSpend(payload));
     Ok(AgentSpendPlan {
         txid: tx.txid(),
@@ -308,8 +309,7 @@ pub fn open_credit_plan(
         window_blocks,
         deadline_height,
         nonce,
-    )
-    .map_err(|_| WorkerError::IdentityMismatch)?;
+    )?;
     let tx = L2Transaction::new(L2Payload::CreditOpen(payload.clone()));
     Ok(CreditOpenPlan {
         txid: tx.txid(),
@@ -378,8 +378,7 @@ pub fn repay_credit_plan(
             available: have,
         });
     }
-    let payload = CreditRepayPayload::build(wallet, position_id, amount_sat)
-        .map_err(|_| WorkerError::IdentityMismatch)?;
+    let payload = CreditRepayPayload::build(wallet, position_id, amount_sat)?;
     let tx = L2Transaction::new(L2Payload::CreditRepay(payload));
     Ok(CreditRepayPlan {
         txid: tx.txid(),
@@ -430,8 +429,7 @@ pub fn add_credit_collateral_plan(
             available: have,
         });
     }
-    let payload = CreditCollateralPayload::build(wallet, position_id, amount_sat)
-        .map_err(|_| WorkerError::IdentityMismatch)?;
+    let payload = CreditCollateralPayload::build(wallet, position_id, amount_sat)?;
     let tx = L2Transaction::new(L2Payload::CreditCollateral(payload));
     Ok(CreditCollateralPlan {
         txid: tx.txid(),
@@ -482,8 +480,7 @@ pub fn default_credit_plan(
             available: have,
         });
     }
-    let payload = CreditDefaultPayload::build(wallet, position_id)
-        .map_err(|_| WorkerError::IdentityMismatch)?;
+    let payload = CreditDefaultPayload::build(wallet, position_id)?;
     let tx = L2Transaction::new(L2Payload::CreditDefault(payload));
     Ok(CreditDefaultPlan {
         txid: tx.txid(),
@@ -500,7 +497,8 @@ pub fn default_credit<V: L2NodeView, B: L2Broadcaster>(
     wallet: &Wallet,
     position_id: Hash,
 ) -> WorkerResult<CreditDefaultPlan> {
-    let plan = default_credit_plan(wallet, position_id, &host.l2_state()?, host.chain_height()?)?;
+    let (state, height) = host.observe()?;
+    let plan = default_credit_plan(wallet, position_id, &state, height)?;
     host.broadcast(&plan.tx).map_err(WorkerError::from)?;
     Ok(plan)
 }

@@ -54,10 +54,12 @@ Open a `PaymentStream` once (rate per block, expiry, hard cap). Each unit of
 work mints an off-chain voucher (`micro::voucher_spec` sizes it at exactly
 the newly accrued amount; `build_settlement` signs it). Only the last voucher
 needs the chain: a `MachinePayment` with `reference` = stream id carries the
-final amount through the ordinary submit/receipt path. The `StreamBook`
+final amount through the ordinary submit/receipt path, and the submit binds
+the recipient — a stream-bound payment must pay the stream's recipient, so
+the voucher accounting and the coin cannot diverge. The `StreamBook`
 (single writer: the node) enforces exact, ordered, in-cap settlement —
 over/ under-claims and replays are refused by name, and accounting persists
-in `state.bin` (v5) so a restart cannot double-withdraw.
+in `state.bin` (currently envelope v8) so a restart cannot double-withdraw.
 
 ```bash
 curl -X POST $NODE/v1/streams/open   -d '{"stream_hex":"..."}'

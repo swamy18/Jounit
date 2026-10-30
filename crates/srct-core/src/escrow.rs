@@ -162,6 +162,10 @@ impl ConditionalEscrow {
     /// and an id that ignored the condition would make them one. A node keyed by
     /// this id would keep one and silently drop the other, so whichever survived
     /// would be indistinguishable from the one it replaced.
+    /// Identity deliberately omits `opened_height`: the same terms opened
+    /// twice are the *same* escrow, so a retry after a refund must rotate the
+    /// nonce (or any other term) rather than reuse the id — the node refuses
+    /// a duplicate id, and a refunded entry is terminal by design.
     pub fn id(&self) -> Hash {
         sha256_dom(
             DOM_ESCROW,

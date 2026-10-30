@@ -231,6 +231,10 @@ pub struct PoolConfig {
     /// A node that never answers must time out the share, not pin the
     /// handler thread (and the miner's payout) forever.
     pub submit_timeout_secs: u64,
+    /// Blocks a round waits before its earnings become payable (100
+    /// mainnet, 10 mini/testnet): the coinbase is unspendable until then,
+    /// so payable-before-maturity would pay orphanable money.
+    pub coinbase_maturity: u64,
 }
 
 impl Default for PoolConfig {
@@ -239,6 +243,7 @@ impl Default for PoolConfig {
             max_miners: MAX_MINERS,
             min_share_difficulty: 1,
             submit_timeout_secs: 120,
+            coinbase_maturity: 100,
         }
     }
 }
@@ -327,7 +332,10 @@ impl Pool {
                 seen_order: VecDeque::new(),
                 max_miners: config.max_miners,
             }),
-            payouts: Mutex::new(RoundTracker::new(fee_bps)?),
+            payouts: Mutex::new(RoundTracker::with_maturity(
+                fee_bps,
+                config.coinbase_maturity,
+            )?),
             template_fn: Box::new(template_fn),
             submit_fn: Arc::new(submit_fn),
             share_difficulty,
@@ -352,6 +360,20 @@ impl Pool {
                 "template names puzzle {} but the pool serves {}",
                 block.header.puzzle_id, self.spec.id
             )));
+        }
+        // A share bar above the network difficulty collapses the PPLNS
+        // window to 1 (winner-takes-all on a lucky share) and refuses every
+        // honest share below it: fail the job here, not at submission.
+        if self.share_difficulty > block.header.difficulty {
+            return Err(Error::BadPuzzleSpec(format!(
+                "share difficulty {} above template difficulty {}",
+                self.share_difficulty, block.header.difficulty
+            )));
+        }
+        // The template names the current height: unlock whatever matured.
+        // Without this a round's earnings would sit in `immature` forever.
+        if let Ok(mut payouts) = self.payouts.lock() {
+            payouts.mature(block.header.height);
         }
         let mut inner = self
             .inner
@@ -384,7 +406,11 @@ impl Pool {
                 .ok_or(Error::Malformed("unknown job"))?
         };
         // Anti-theft: everything but the proof fields and timestamp must be
-        // byte-identical to the issued template.
+        // byte-identical to the issued template. `base_fee_sat`, `version`
+        // and `sig_scheme` are pinned too: all three feed the hashed
+        // preimage, so a mutated one is a different puzzle instance that
+        // could still pass the share bar and earn PPLNS weight for an
+        // invalid-fee header the node would refuse.
         let a = &template.header;
         let b = &block.header;
         if a.prev_hash != b.prev_hash
@@ -393,6 +419,9 @@ impl Pool {
             || a.difficulty != b.difficulty
             || a.puzzle_id != b.puzzle_id
             || a.epoch_id != b.epoch_id
+            || a.base_fee_sat != b.base_fee_sat
+            || a.version != b.version
+            || a.sig_scheme != b.sig_scheme
         {
             return Err(Error::Malformed("share does not match its job"));
         }
@@ -532,6 +561,9 @@ impl Pool {
                 .lock()
                 .map_err(|_| Error::Malformed("pool lock"))?;
             payouts.record_share(&miner);
+            // Unlock first (a share at height H matures older rounds), then
+            // finalize the new round into `immature`.
+            payouts.mature(block_height);
             if is_block {
                 // Twice the expected shares per block at the template's own
                 // difficulty: a share-difficulty bar above the network bar
@@ -562,6 +594,15 @@ impl Pool {
     /// Pending (unpaid) earnings for `miner` in sats.
     pub fn pending_payout(&self, miner: &Address) -> u64 {
         self.payouts.lock().map(|p| p.pending(miner)).unwrap_or(0)
+    }
+
+    /// Unlock matured rounds at `current_height` (coinbase maturity, not
+    /// wall time). Called automatically on every job and share; exposed so
+    /// tests and operators can advance a pool without traffic.
+    pub fn mature_at(&self, current_height: u64) {
+        if let Ok(mut payouts) = self.payouts.lock() {
+            payouts.mature(current_height);
+        }
     }
 
     /// The pool operator's earned fees in sats.
@@ -1186,10 +1227,13 @@ mod tests {
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let (pool, miner) = test_pool(u128::MAX, submitted.clone());
 
-        let job = pool.get_job().unwrap();
-        let err = pool.submit_job(job.job_id, miner, job.block).unwrap_err();
-        assert_eq!(err, Error::Malformed("share below pool difficulty"));
+        // Unreachable bar, refused at job time: a share difficulty above the
+        // template's network difficulty admits no shares at all, so the job
+        // is never issued instead of failing every submission.
+        let err = pool.get_job().unwrap_err();
+        assert!(matches!(err, Error::BadPuzzleSpec(_)));
         assert!(submitted.lock().unwrap().is_empty());
+        let _ = miner;
     }
 
     /// An HBM template must verify under the HBM rule, not the pool's hybrid
@@ -1296,6 +1340,10 @@ mod tests {
         // The duplicate must not have been forwarded a second time: one
         // proof, one submit.
         assert_eq!(submitted.lock().unwrap().len(), 1);
+        // Held until the coinbase matures (default 100 in tests): one
+        // share's pay, unlocked a hundred blocks later.
+        assert_eq!(pool.pending_payout(&miner), 0);
+        pool.mature_at(101);
         assert_eq!(pool.pending_payout(&miner), {
             let coinbase: u64 = submitted.lock().unwrap()[0].txs[0].outputs[0].value;
             coinbase
@@ -1336,6 +1384,9 @@ mod tests {
         pool.submit_job(job.job_id, miner, job.block).unwrap();
 
         let fee = coinbase * 1_000 / 10_000;
+        // Held until the coinbase matures (100 blocks here): not payable yet.
+        assert_eq!(pool.pending_payout(&miner), 0);
+        pool.mature_at(101);
         assert_eq!(pool.pending_payout(&miner), coinbase - fee);
         assert_eq!(pool.operator_earned(), fee);
         let round = pool.last_round().expect("a found block finalizes a round");
@@ -1412,6 +1463,7 @@ mod tests {
                 max_miners,
                 min_share_difficulty: 1,
                 submit_timeout_secs: 120,
+                coinbase_maturity: 10,
             },
             {
                 let chain = chain.clone();
@@ -1442,6 +1494,7 @@ mod tests {
                 max_miners: MAX_MINERS,
                 min_share_difficulty: MIN_OPERATIONAL_SHARE_DIFFICULTY,
                 submit_timeout_secs: 120,
+                coinbase_maturity: 10,
             },
             {
                 let chain = chain.clone();
@@ -1498,7 +1551,11 @@ mod tests {
         let job = pool.get_job().unwrap();
         let coinbase: u64 = job.block.txs[0].outputs[0].value;
         pool.submit_job(job.job_id, miner, job.block).unwrap();
+        // Payable only after maturity (default 100): mark_paid refuses the
+        // immature balance, then succeeds once unlocked.
         let txid = [0xEEu8; 64];
+        assert!(pool.mark_paid_with_txid(&miner, 10, txid).is_err());
+        pool.mature_at(101);
         let r = pool.mark_paid_with_txid(&miner, 10, txid).unwrap();
         assert_eq!(r.receipt_id, 1);
 
@@ -1579,6 +1636,7 @@ mod tests {
                 max_miners: MAX_MINERS,
                 min_share_difficulty: 1,
                 submit_timeout_secs: 1,
+                coinbase_maturity: 10,
             },
             {
                 let chain = chain.clone();

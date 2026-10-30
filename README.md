@@ -486,7 +486,7 @@ and the credit path. Full guide: [`docs/micropayments.md`](docs/micropayments.md
 | Primitive | Endpoint | What it does |
 |---|---|---|
 | Batch quotes | `POST /v1/payments/aggregate` | Same payer, N recorded payments → one `PaymentBatch` with per-recipient merged outputs. Returns gas, required fee, per-payment cost and savings vs N separate transactions. Read-only quote. |
-| Stream channels | `POST /v1/streams/open`, `POST /v1/streams/settle`, `GET /v1/streams/{id}` | Open once (rate per block, expiry, hard cap); each unit of work mints an off-chain voucher; only the final voucher settles on chain as a `MachinePayment` with `reference` = stream id. `StreamBook` enforces exact, ordered, in-cap settlement; accounting persists in `state.bin` (v7). |
+| Stream channels | `POST /v1/streams/open`, `POST /v1/streams/settle`, `GET /v1/streams/{id}` | Open once (rate per block, expiry, hard cap); each unit of work mints an off-chain voucher; only the final voucher settles on chain as a `MachinePayment` with `reference` = stream id, bound to the stream's recipient. `StreamBook` enforces exact, ordered, in-cap settlement; accounting persists in `state.bin` (v8). |
 | Sponsored intents | library `srct_core::micro::SponsoredIntent` | A sponsor signs fee coverage (`sign_sponsor_intent` / `verify_sponsor_intent`, bound to sponsor + batch hash + fee + expiry). Auditable fee-attribution record — deliberately not a consensus fee-payer, so a sponsor can cover a priced quote but never mint authority. |
 
 Benchmark (`python sim/micropayment_benchmark.py`): 10 payments to one
@@ -566,9 +566,12 @@ POST /v1/jobs/open → POST /v1/jobs/{id}/accept → POST /v1/jobs/{id}/deliver
 
 Release binds the result hash — it pays for *this* dataset, not any dataset.
 The resolve signature binds (job id, direction, result hash) to the
-arbitrator key named at open. Dispute locks are node-enforced
-(`held_escrows`, persisted in `state.bin` v7): release, settlement binding
-and the timeout auto-refund all refuse while disputed.
+arbitrator key named at open. Every step is authorized: `open` needs the
+hirer's signature over all terms, `deliver` the worker's over (job, result),
+and `loans/accept` the borrower's over (offer, amount, bond, deadline) — no
+one opens debt or jobs in someone else's name. Dispute locks are
+node-enforced (`held_escrows`, persisted in `state.bin` v8): release,
+settlement binding and the timeout auto-refund all refuse while disputed.
 `GET /v1/jobs/{id}` reports the record plus escrow state and held flag.
 `GET /v1/payments/{id}/receipt_status` reports
 `{recorded, receipt_present, settlement_tx}` — treating a payment as complete

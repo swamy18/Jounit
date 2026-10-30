@@ -239,6 +239,7 @@ impl Args {
                         | "rate-bps"
                         | "deadline"
                         | "position"
+                        | "credit-issuer"
                 );
                 if takes_value {
                     let value = raw
@@ -253,6 +254,27 @@ impl Args {
                     }
                     i += 2;
                 } else {
+                    // Boolean switches are allow-listed: a typo like
+                    // `--no_mine` or `--mine-blocks 5` used to parse as a
+                    // silent no-op switch, and the node ran without the
+                    // operator's intent (mining when they meant not to, or
+                    // vice versa). Unknown `--x` is a hard error.
+                    const SWITCHES: &[&str] = &[
+                        "allow-plaintext-wallet",
+                        "help",
+                        "list",
+                        "revoke",
+                        "default",
+                        "repay",
+                        "deposit-address",
+                        "bootstrap",
+                        "add",
+                        "new",
+                        "no-mine",
+                    ];
+                    if !SWITCHES.contains(&name) {
+                        return Err(format!("unknown switch `--{name}` (typo? see `help`)"));
+                    }
                     out.switches.push(name.to_string());
                     i += 1;
                 }
@@ -821,6 +843,10 @@ fn cmd_send(args: &Args) -> Result<(), String> {
     // number of inputs, and the input count depends on the fee, so this settles
     // by iteration rather than in one guess.
     let fee_override = args.num("fee", 0)?;
+    // An explicit `--fee` below the consensus floor builds a transaction the
+    // chain refuses (`BadFee`) — fail here with the floor stated instead of
+    // mining a block that wastes the work. The floor uses the final input
+    // count, so this is re-checked after selection below.
     let mut chosen: Vec<OutPoint> = Vec::new();
     let mut total = 0u64;
     for (op, value) in candidates {
@@ -837,10 +863,29 @@ fn cmd_send(args: &Args) -> Result<(), String> {
         chosen.push(op);
     }
     let gas = 16_000 + 1_000 * chosen.len() as u64 + 250 * 2;
+    let floor = base_fee
+        .checked_mul(gas)
+        .and_then(|f| f.checked_add(1_000))
+        .ok_or_else(|| "fee floor overflows u64; refusing to build".to_string())?;
     let fee = if fee_override > 0 {
+        if fee_override < floor {
+            return Err(format!(
+                "fee {fee_override} sat is below the consensus floor of {floor} sat \
+                 (base_fee {base_fee} * gas {gas} + 1000); raise --fee or omit it"
+            ));
+        }
+        // An explicit fee larger than the payment itself is refused: it is
+        // almost always a misplaced decimal, and the protocol minimum is
+        // already enforced by the floor above.
+        if fee_override > amount_sat {
+            return Err(format!(
+                "fee {fee_override} sat exceeds the payment of {amount_sat} sat; \
+                 refusing a transfer that costs more than it moves"
+            ));
+        }
         fee_override
     } else {
-        base_fee.saturating_mul(gas).saturating_add(1_000)
+        floor
     };
     if total < amount_sat.saturating_add(fee) {
         return Err(format!(
@@ -865,6 +910,12 @@ fn cmd_send(args: &Args) -> Result<(), String> {
         .build_tx(&chosen, outputs, fee)
         .map_err(|e| e.to_string())?;
     let txid = srct_core::hash::hash512_to_hex(&tx.txid());
+    // Show the money before it moves: amount, fee and change hit the screen
+    // while the transaction is still unsigned-in-a-block and abortable by
+    // the operator reading them — not after the block is already mined.
+    println!("amount  {} SRCT", srct(amount_sat));
+    println!("fee     {} SRCT", srct(fee));
+    println!("change  {} SRCT", srct(change));
 
     // `--relay <addr>` hands the signed transaction to a running node over the
     // real P2P protocol instead of mining it here (SPEC.md §13.14). Without it
@@ -885,8 +936,6 @@ fn cmd_send(args: &Args) -> Result<(), String> {
         relay_transaction(relay_addr, &chain, &tx)?;
         println!("txid    {txid}");
         println!("relayed to {relay_addr} (not mined here; the node's mempool holds it)");
-        println!("amount  {} SRCT", srct(amount_sat));
-        println!("fee     {} SRCT", srct(fee));
         return Ok(());
     }
 
@@ -902,8 +951,6 @@ fn cmd_send(args: &Args) -> Result<(), String> {
 
     println!("txid    {txid}");
     println!("height  {height}");
-    println!("amount  {} SRCT", srct(amount_sat));
-    println!("fee     {} SRCT", srct(fee));
     println!("burned  {} SRCT (base fee, destroyed)", srct(burned));
     print_l2_summary(&l2, &chain);
     Ok(())
@@ -1697,6 +1744,24 @@ fn cmd_validator(args: &Args) -> Result<(), String> {
                 VALIDATOR_PASSPHRASE_ENV
             ));
         };
+        // Public cold-start keys over a live committee is a slash-by-replay
+        // kit: refuse unless the directory holds no committee keys yet.
+        let existing = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                    .count()
+            })
+            .unwrap_or(0);
+        if existing > 0 {
+            return Err(format!(
+                "`validator --bootstrap` refuses a non-empty committee directory ({} key file(s) in {}): \
+                 merge or clear it by hand instead of letting bootstrap silently coexist with a live committee",
+                existing,
+                dir.display()
+            ));
+        }
         for (index, secret) in srct_core::params::mainnet_committee_secrets()
             .into_iter()
             .enumerate()

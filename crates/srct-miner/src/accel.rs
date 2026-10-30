@@ -227,10 +227,10 @@ pub fn evaluate_batch_sequential(spec: &PuzzleSpec, headers: &[Header]) -> Resul
 /// per step through one [`BatchSolver`] per thread. Search order — and hence
 /// the winning nonce on one thread — is identical either way.
 ///
-/// HBM templates ignore `batch` and grind sequentially per candidate: the
-/// memory-hard pass has no batch interface (that is what a device backend
-/// would add), and silently batching it would change nothing but the
-/// accounting.
+/// HBM templates fall back to the sequential grind regardless of `batch`:
+/// the memory-hard pass has no batch interface (that is what a device
+/// backend would add), and running chunks through no solver would report
+/// "no solution" for a puzzle that was never attempted.
 pub fn solve_header_batched(
     template: &Header,
     mode: crate::PowMode,
@@ -257,6 +257,14 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
     use std::sync::{Arc, Mutex};
 
     if batch <= 1 {
+        return crate::solve_header(template, mode, threads, max_attempts);
+    }
+    // The batched path only implements the hybrid puzzle (a `BatchSolver`
+    // exists only for `spec`): with an HBM template every chunk evaluated
+    // to `Ok(None)` until the budget ran out, reporting "no solution" for a
+    // puzzle that was never attempted. Fall back to the sequential HBM grind
+    // instead.
+    if matches!(mode, crate::PowMode::Hbm(_)) {
         return crate::solve_header(template, mode, threads, max_attempts);
     }
     if max_attempts == 0 {

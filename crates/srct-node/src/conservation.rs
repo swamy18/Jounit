@@ -50,8 +50,13 @@ pub struct JointSupply {
     /// L1 value sitting in the deposit sink: counted by `l1_live_sat` and again
     /// by `l2_held_sat` as its credited twin, so it is subtracted once.
     pub sink_held_sat: u64,
-    /// `l1_live + l2_held - sink_held`.
+    /// `l1_live + l2_held - sink_held`, or `u64::MAX` with `joint_overflow`
+    /// set when the sum does not fit: a clamped figure would read as vast
+    /// headroom, which is exactly what an inflation bug would want.
     pub joint_sat: u64,
+    /// The joint sum overflowed: itself a conservation failure, reported as
+    /// data rather than hidden by saturation.
+    pub joint_overflow: bool,
     /// `cumulative_issuance_sat` at the tip height: the most L1 may hold, by
     /// the same function `Chain::apply_block` mints against.
     pub l1_bound_sat: u64,
@@ -81,9 +86,9 @@ impl JointSupply {
 
     /// Whether the joint bound has been breached. Kept as a method so the
     /// comparison itself is unit-testable without constructing a chain that
-    /// mints.
+    /// mints. An overflowed joint sum breaches by definition.
     pub fn exceeds_bound(&self) -> bool {
-        self.joint_sat > self.bound_sat()
+        self.joint_overflow || self.joint_sat > self.bound_sat()
     }
 }
 
@@ -128,6 +133,11 @@ impl std::fmt::Display for ConservationError {
 impl std::error::Error for ConservationError {}
 
 /// Compute the terms without judging them. Read-only.
+///
+/// Checked, not saturating: this function's whole job is to *detect*
+/// inflation, and a clamped sum would hide an overflow as headroom. An
+/// overflow here is itself the finding — the report carries
+/// `joint_overflow: true` instead of a meaningless figure.
 pub fn joint_supply(chain: &Chain, l2: &NodeL2) -> JointSupply {
     let l1_live_sat = chain.utxo().total_value();
     let l2_held_sat = l2.state().conservation_total();
@@ -136,13 +146,15 @@ pub fn joint_supply(chain: &Chain, l2: &NodeL2) -> JointSupply {
         .outputs_for_address(&chain.params().l2_deposit_sink())
         .iter()
         .fold(0u64, |acc, (_, v)| acc.saturating_add(*v));
+    let joint_sat = l1_live_sat
+        .checked_add(l2_held_sat)
+        .and_then(|t| t.checked_sub(sink_held_sat));
     JointSupply {
         l1_live_sat,
         l2_held_sat,
         sink_held_sat,
-        joint_sat: l1_live_sat
-            .saturating_add(l2_held_sat)
-            .saturating_sub(sink_held_sat),
+        joint_sat: joint_sat.unwrap_or(u64::MAX),
+        joint_overflow: joint_sat.is_none(),
         l1_bound_sat: srct_core::supply::cumulative_issuance_sat(chain.params(), chain.height()),
         escrow_ceiling_sat: chain.params().escrow_ceiling_sat,
         exited_sat: l2.state().exited_total(),
@@ -345,6 +357,7 @@ mod tests {
             l2_held_sat: 0,
             sink_held_sat: 0,
             joint_sat: joint,
+            joint_overflow: false,
             l1_bound_sat: l1_bound,
             escrow_ceiling_sat: escrow_ceiling,
             exited_sat: 0,
@@ -381,6 +394,7 @@ mod tests {
                 l2_held_sat: 0,
                 sink_held_sat: 0,
                 joint_sat: joint,
+                joint_overflow: false,
                 l1_bound_sat: bound,
                 escrow_ceiling_sat: 0,
                 exited_sat: 0,

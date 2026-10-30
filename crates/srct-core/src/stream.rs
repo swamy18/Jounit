@@ -747,12 +747,6 @@ impl StreamBook {
         self.states.get(stream_id)
     }
 
-    /// Forget a stream's accounting (used when a stream is retired after full
-    /// settlement). The caller must be sure no live receipt can still arrive.
-    pub fn forget(&mut self, stream_id: &Hash) -> Option<StreamState> {
-        self.states.remove(stream_id)
-    }
-
     /// Satoshis the recipient may withdraw at `at_height`, or `None` when the
     /// stream is unknown or the accrual does not fit. Pure view: no state.
     pub fn claimable(&self, stream: &PaymentStream, at_height: u64) -> Option<u64> {

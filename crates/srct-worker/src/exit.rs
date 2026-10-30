@@ -117,14 +117,15 @@ pub fn queue_exit<V: L2NodeView, B: L2Broadcaster>(
     exit_fee_sat: u64,
     nonce: u64,
 ) -> WorkerResult<ExitPlan> {
+    let (state, height) = host.observe()?;
     let plan = queue_exit_plan(
         wallet,
         amount_sat,
         destination,
         exit_fee_sat,
         nonce,
-        &host.l2_state()?,
-        host.chain_height()?,
+        &state,
+        height,
     )?;
     host.broadcast(&plan.tx).map_err(WorkerError::from)?;
     Ok(plan)

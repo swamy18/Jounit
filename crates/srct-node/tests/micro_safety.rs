@@ -373,7 +373,9 @@ fn reconciliation_and_audit_make_retries_safe() {
         .collect();
     assert!(ids.contains(&id1) && ids.contains(&id2));
 
-    // A receipt for a payment nobody recorded is an orphan: listed, never settled.
+    // A receipt for a payment nobody recorded is refused at intake: proof
+    // of a payment that never happened must not reach the book. The orphans
+    // endpoint stays as a consistency scanner (e.g. after a state import).
     let mut orphan = ServiceReceipt {
         version: RECEIPT_VERSION,
         network_id: NET.to_string(),
@@ -394,15 +396,15 @@ fn reconciliation_and_audit_make_retries_safe() {
         sigs: Default::default(),
     };
     sign_receipt(&mut orphan, &provider).unwrap();
-    let (s, _) = post(
+    let (s, refused) = post(
         &node,
         "/v1/receipt",
         &json!({ "receipt_hex": hex::encode(orphan.serialize()) }),
     );
-    assert_eq!(s, 200);
+    assert_eq!(s, 404, "orphan receipt accepted: {refused}");
     let (s, orphans) = get(&node, "/v1/receipts/orphans");
     assert_eq!(s, 200, "orphans refused: {orphans}");
-    assert_eq!(orphans["count"], 1);
+    assert_eq!(orphans["count"], 0);
 
     // Audit ring records the whole trail and verifies.
     let (s, audit) = get(&node, "/v1/audit?limit=50");

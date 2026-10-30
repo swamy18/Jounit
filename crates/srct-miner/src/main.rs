@@ -275,6 +275,25 @@ fn mine_once(args: &Args) -> Result<(), String> {
     if s != 200 {
         return Err(format!("submit refused (http {s}): {body}"));
     }
-    println!("srct-miner: accepted height {height}: {body}");
+    // Template and submit are not atomic: a solution can land after the tip
+    // moved, in which case the node stores a side branch (`canonical:
+    // false`) that never pays. Report that honestly and cycle for a fresh
+    // template instead of logging a success that is not one.
+    let answer: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("submit not json: {e}"))?;
+    let canonical = answer
+        .get("canonical")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let chain_height = answer
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(height);
+    if !canonical {
+        return Err(format!(
+            "stale solution: chain at height {chain_height}, block is a side branch"
+        ));
+    }
+    println!("srct-miner: accepted height {chain_height}: {body}");
     Ok(())
 }

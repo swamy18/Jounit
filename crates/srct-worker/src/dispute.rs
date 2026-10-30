@@ -80,8 +80,13 @@ pub fn dispute_of_task(
 
 /// The resolution the protocol recorded for a disputed task (§18.14
 /// observation): still-open and never-disputed are distinguished explicitly.
+/// A live `Disputed` state reports `InDispute`, never `NotDisputed` — the
+/// old mapping told a caller watching a live dispute that nothing was
+/// happening, which is when attention matters most.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisputeResolution {
+    /// Live dispute: arbitration open, no verdict yet.
+    InDispute,
     /// The submitted result stands (lapse or a `Correct` settle).
     SubmittedStood,
     /// The challenger won (`Fraudulent`); the worker's deposit was slashed.
@@ -98,7 +103,7 @@ pub fn dispute_resolution(state: &L2State, task_id: &Hash) -> DisputeResolution 
     match state.task(task_id) {
         None => DisputeResolution::UnknownTask,
         Some(c) => match &c.state {
-            ContractState::Disputed(_) => DisputeResolution::NotDisputed,
+            ContractState::Disputed(_) => DisputeResolution::InDispute,
             ContractState::Settled(o) => match o.verdict {
                 srct_core::l2::Verdict::Correct => DisputeResolution::SubmittedStood,
                 srct_core::l2::Verdict::Fraudulent => DisputeResolution::ChallengerWon {
@@ -157,6 +162,16 @@ pub fn dispute_plan(
             "counter result equals the submitted result",
         ));
     }
+    // Dispute-window precheck with the state's own window: past it the
+    // protocol lapses the dispute instead of opening one, so the plan
+    // fails here with the SDK-level name instead of after signing.
+    if let ContractState::ResultSubmitted { submitted_at, .. } = &contract.state {
+        if height > submitted_at.saturating_add(state.config().dispute_window) {
+            return Err(WorkerError::TaskNotAvailable(
+                "dispute window has lapsed; file nothing",
+            ));
+        }
+    }
     let counter_attestation = {
         let mut a = ComputeAttestation {
             task_id,
@@ -206,8 +221,7 @@ pub fn file_dispute<V: L2NodeView, B: L2Broadcaster>(
     task_id: Hash,
     counter_result: Hash,
 ) -> WorkerResult<DisputePlan> {
-    let state = host.l2_state()?;
-    let height = host.chain_height()?;
+    let (state, height) = host.observe()?;
     let addr = wallet
         .address()
         .map_err(|_| WorkerError::IdentityMismatch)?;

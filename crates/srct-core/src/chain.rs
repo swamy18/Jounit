@@ -1936,6 +1936,11 @@ impl Chain {
         now_ms: u64,
         difficulty_override: Option<u128>,
     ) -> Result<Block> {
+        // The probe must see the same body `apply_block` will: stake
+        // transactions shape the coinbase/fee split through the overlay, so
+        // an unfiltered body builds a template whose coinbase the chain
+        // refuses. Same filter the internal miner applies.
+        let body = self.filter_stake_body(body);
         let parent = self.tip().clone();
         let parent_hash = parent.block_hash();
         let height = parent.header.height + 1;
@@ -1957,8 +1962,23 @@ impl Chain {
             };
             next_base_fee(&self.params, parent.header.base_fee_sat, parent_gas)
         };
-        let timestamp_ms =
-            now_ms.max(crate::difficulty::median_previous_timestamp(&history).unwrap_or(0));
+        // Capped at both ends: the consensus floor is the median of the
+        // previous timestamps, and the node-policy ceiling is now plus the
+        // future allowance — the same bound `submit_at` enforces, so a
+        // template built here is submittable by construction.
+        let median = crate::difficulty::median_previous_timestamp(&history).unwrap_or(0);
+        let ceiling = now_ms.saturating_add(self.params.future_limit_ms());
+        if ceiling < median {
+            // The local clock lags the chain: any timestamp this node could
+            // put in a block is either older than consensus allows or newer
+            // than its own policy allows. Refuse the template instead of
+            // grinding on an unsubmittable block.
+            return Err(Error::TimestampTooFuture {
+                limit: ceiling,
+                got: median,
+            });
+        }
+        let timestamp_ms = now_ms.max(median).min(ceiling);
 
         // Fee split needs a UTXO view with the body applied. Do it on a copy.
         // Claims settle first (approved P1), so they are checked and applied
@@ -2199,6 +2219,16 @@ impl Chain {
         now_ms: u64,
     ) -> Result<Block> {
         self.mine_from_pool_with_l2(pool, miner_address, now_ms, Vec::new())
+    }
+
+    /// The mempool half of pool mining, shared with the external-miner
+    /// template: the same gas-capped selection the internal miner takes,
+    /// minus L2/exit content (which needs the L2 root only the internal
+    /// path derives). A template built any other way would grind on a body
+    /// the chain applies differently.
+    pub fn select_from_pool_for_template(&self, pool: &Mempool) -> Result<Vec<Transaction>> {
+        let body = pool.select_for_block(self.params.gas_cap, self.params.max_block_bytes);
+        Ok(self.filter_stake_body(body))
     }
 
     /// [`mine_from_pool`] that also carries queued L2 transactions in the

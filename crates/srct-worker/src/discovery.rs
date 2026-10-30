@@ -116,8 +116,13 @@ pub fn available(
     //    offered plus the claim fee (financing a claim it cannot pay for would
     //    broadcast a transaction the protocol refuses for balance, which is a
     //    wasted round trip and a worse error than a filtered-out task).
-    let need = config
+    //    Checked: a saturated floor would admit an unaffordable task past the
+    //    filter, and the failure would arrive as a protocol refusal instead.
+    let Some(need) = config
         .worker_deposit_sat
-        .saturating_add(srct_core::l2::L2TxType::ClaimTask.fee_sat());
+        .checked_add(srct_core::l2::L2TxType::ClaimTask.fee_sat())
+    else {
+        return false;
+    };
     state.balance(&config.address) >= need
 }

@@ -437,6 +437,12 @@ impl Mempool {
     /// The cheap conditions from `add` run here against live state, in the
     /// order `add` uses them, so the set of refusals a caller can observe is
     /// unchanged — only admission on stale state becomes impossible.
+    ///
+    /// Note the asymmetry with `admit`: this path refuses a full pool
+    /// outright instead of evicting the lowest-fee-rate entry, because the
+    /// reservation already debited the payer and silently displacing another
+    /// transaction under it would break the accounting the phases were split
+    /// to protect. Callers that want eviction admit in one lock.
     pub fn commit_admission(
         &mut self,
         tx: &Transaction,

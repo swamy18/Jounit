@@ -56,7 +56,7 @@ pub const MAX_RECEIPTS_KEPT: usize = 10_000;
 /// Version byte of the [`RoundTracker`] persistence encoding. A build that
 /// writes a different layout writes a different value, so an old file is
 /// refused by version instead of misread field by field.
-pub const LEDGER_VERSION: u8 = 1;
+pub const LEDGER_VERSION: u8 = 2;
 
 /// One finalized round: who earned what, deterministically ordered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +125,15 @@ pub struct RoundTracker {
     log: VecDeque<Address>,
     lifetime_shares: BTreeMap<Address, u64>,
     pending: BTreeMap<Address, u64>,
+    /// Round earnings not yet spendable: `(release_height, miner -> sats)`.
+    /// A found block's coinbase cannot be spent until `coinbase_maturity`
+    /// blocks bury it, so crediting it straight to `pending` let the
+    /// operator pay real funds for a round a reorg can still orphan. Entries
+    /// move to `pending` only via [`Self::mature`].
+    immature: Vec<(u64, BTreeMap<Address, u64>)>,
+    /// Blocks a coinbase must wait before its round matures (100 mainnet,
+    /// 10 mini/testnet — set from [`PoolConfig`](super::PoolConfig)).
+    coinbase_maturity: u64,
     /// Miner money carried across rounds (rounding dust + shareless pots).
     carry_sat: u64,
     /// Pool operator's earned fees, separate from miner money.
@@ -141,6 +150,13 @@ pub struct RoundTracker {
 impl RoundTracker {
     /// `fee_bps` is the pool fee in basis points (250 = 2.5%).
     pub fn new(fee_bps: u32) -> Result<Self> {
+        Self::with_maturity(fee_bps, 100)
+    }
+
+    /// Like [`Self::new`] with an explicit coinbase maturity (100 mainnet,
+    /// 10 on mini/testnet): a round's earnings unlock that many blocks after
+    /// its height.
+    pub fn with_maturity(fee_bps: u32, coinbase_maturity: u64) -> Result<Self> {
         if fee_bps > 10_000 {
             return Err(Error::Malformed("pool fee exceeds 100%"));
         }
@@ -150,6 +166,8 @@ impl RoundTracker {
             log: VecDeque::new(),
             lifetime_shares: BTreeMap::new(),
             pending: BTreeMap::new(),
+            immature: Vec::new(),
+            coinbase_maturity,
             carry_sat: 0,
             operator_earned_sat: 0,
             rounds: Vec::new(),
@@ -157,6 +175,38 @@ impl RoundTracker {
             receipts: VecDeque::new(),
             paid_total: BTreeMap::new(),
         })
+    }
+
+    /// Move matured round earnings into `pending`. Call with the current
+    /// chain height whenever the pool observes it (job issue, share
+    /// submit): without this nothing ever unlocks.
+    pub fn mature(&mut self, current_height: u64) {
+        let mut i = 0;
+        while i < self.immature.len() {
+            if self.immature[i].0 <= current_height {
+                let (_, map) = self.immature.remove(i);
+                for (miner, pay) in map {
+                    *self.pending.entry(miner).or_insert(0) = self
+                        .pending
+                        .get(&miner)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(pay);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Drop immature earnings for `block_height`: the reorg hook. A round
+    /// whose block left canon pays nobody — keeping it would unlock orphan
+    /// money at maturity. Entries are keyed by release height
+    /// (`finalize_height + maturity`), so the orphaned one is exact.
+    pub fn void_round(&mut self, block_height: u64) {
+        self.rounds.retain(|r| r.block_height != block_height);
+        let release = block_height.saturating_add(self.coinbase_maturity);
+        self.immature.retain(|(r, _)| *r != release);
     }
 
     /// Record one accepted share for `miner` at the tail of the window.
@@ -182,6 +232,12 @@ impl RoundTracker {
     /// until it ages out. `window == 0` (or an empty log) means nobody is
     /// payable and the whole pot carries; oversized windows simply pay the
     /// whole log.
+    ///
+    /// Earnings land in `immature`, not `pending`: the coinbase is
+    /// unspendable until `coinbase_maturity` buries the block, and paying
+    /// out of `mark_paid` before that would spend money a reorg can still
+    /// take back. [`Self::mature`] unlocks them; [`Self::void_round`]
+    /// cancels them.
     pub fn finalize_block(
         &mut self,
         block_height: u64,
@@ -208,6 +264,7 @@ impl RoundTracker {
         }
         let total_shares = window as u64;
         let mut payouts = Vec::new();
+        let mut immature_map: BTreeMap<Address, u64> = BTreeMap::new();
         if total_shares > 0 {
             let mut distributed = 0u64;
             for (miner, shares) in &counts {
@@ -216,8 +273,7 @@ impl RoundTracker {
                     .saturating_div(total_shares as u128) as u64;
                 distributed = distributed.saturating_add(pay);
                 if pay > 0 {
-                    *self.pending.entry(*miner).or_insert(0) = self
-                        .pending
+                    *immature_map.entry(*miner).or_insert(0) = immature_map
                         .get(miner)
                         .copied()
                         .unwrap_or(0)
@@ -240,6 +296,12 @@ impl RoundTracker {
             payouts,
             dust_sat: self.carry_sat,
         };
+        // Held, not payable: unlocks at `mature(block_height + maturity)`,
+        // cancels at `void_round(block_height)`.
+        if !immature_map.is_empty() {
+            let release = block_height.saturating_add(self.coinbase_maturity);
+            self.immature.push((release, immature_map));
+        }
         self.rounds.push(round.clone());
         // Bound the history: pending balances already carry what is owed, so
         // dropping the oldest finalized records bounds memory without
@@ -357,6 +419,13 @@ impl RoundTracker {
             }
         }
         encode_addr_u64(&mut w, &self.paid_total);
+        // v2: immature round earnings plus the maturity they unlock under.
+        w.u64le(self.coinbase_maturity);
+        w.u32le(self.immature.len() as u32);
+        for (release, map) in &self.immature {
+            w.u64le(*release);
+            encode_addr_u64(&mut w, map);
+        }
         w.into_vec()
     }
 
@@ -453,6 +522,17 @@ impl RoundTracker {
             });
         }
         let paid_total = decode_addr_u64(&mut r, "paid_total", 1_000_000)?;
+        let coinbase_maturity = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+        let im_len = r.u32le().map_err(|e| format!("ledger: {e}"))? as usize;
+        if im_len > MAX_ROUNDS_KEPT {
+            return Err(format!("ledger: {im_len} immature rounds over the cap"));
+        }
+        let mut immature = Vec::with_capacity(im_len);
+        for _ in 0..im_len {
+            let release = r.u64le().map_err(|e| format!("ledger: {e}"))?;
+            let map = decode_addr_u64(&mut r, "immature", 1_000_000)?;
+            immature.push((release, map));
+        }
         r.expect_end()
             .map_err(|e| format!("ledger: trailing bytes ({e})"))?;
         // Receipt ids must be unique and below the counter: a file that pays
@@ -475,6 +555,8 @@ impl RoundTracker {
             log,
             lifetime_shares,
             pending,
+            immature,
+            coinbase_maturity,
             carry_sat,
             operator_earned_sat,
             rounds,
@@ -554,6 +636,9 @@ mod tests {
         assert_eq!(r.fee_sat, 10);
         assert_eq!(r.payouts, vec![(addr(1), 68), (addr(2), 22)]);
         assert_eq!(r.dust_sat, 1);
+        // Not yet payable: the round matures 100 blocks after its height.
+        assert_eq!(t.pending(&addr(1)), 0);
+        t.mature(200);
         assert_eq!(t.pending(&addr(1)), 68);
         assert_eq!(t.pending(&addr(2)), 22);
         assert_eq!(t.operator_earned(), 10);
@@ -567,6 +652,7 @@ mod tests {
         let r2 = t.finalize_block(101, 10, 1_000_000);
         assert_eq!(r2.payouts, vec![(addr(1), 6), (addr(2), 4)]);
         assert_eq!(r2.dust_sat, 0);
+        t.mature(201);
         assert_eq!(t.pending(&addr(1)), 74);
         assert_eq!(t.pending(&addr(2)), 26);
     }
@@ -586,6 +672,7 @@ mod tests {
         let r = t.finalize_block(100, 100, 10);
         assert_eq!(r.window, 10);
         assert_eq!(r.payouts, vec![(addr(1), 100)]);
+        t.mature(200);
         assert_eq!(t.pending(&addr(9)), 0);
         assert_eq!(t.pending(&addr(1)), 100);
     }
@@ -602,6 +689,7 @@ mod tests {
         // window, so a second block pays it again.
         let r2 = t.finalize_block(101, 40, 10);
         assert_eq!(r2.payouts, vec![(addr(1), 40)]);
+        t.mature(201);
         assert_eq!(t.pending(&addr(1)), 100);
     }
 
@@ -620,6 +708,9 @@ mod tests {
         let mut t = RoundTracker::new(0).unwrap();
         t.record_share(&addr(1));
         t.finalize_block(100, 100, 1_000_000);
+        // Nothing payable before maturity, so even the exact amount refuses.
+        assert!(t.mark_paid(&addr(1), 100).is_err());
+        t.mature(200);
         assert!(t.mark_paid(&addr(1), 101).is_err());
         t.mark_paid(&addr(1), 100).unwrap();
         assert_eq!(t.pending(&addr(1)), 0);
@@ -670,6 +761,7 @@ mod tests {
         let mut t = RoundTracker::new(0).unwrap();
         t.record_share(&addr(1));
         t.finalize_block(100, 100, 1_000_000);
+        t.mature(200);
         let r1 = t.mark_paid(&addr(1), 40).unwrap();
         let txid = [0xABu8; 64];
         let r2 = t.mark_paid_with_txid(&addr(1), 60, Some(txid)).unwrap();
@@ -704,6 +796,7 @@ mod tests {
         t.record_share(&addr(1));
         t.record_share(&addr(2));
         t.finalize_block(100, 101, 1_000_000);
+        t.mature(200);
         let txid = [0xCDu8; 64];
         let r = t.mark_paid_with_txid(&addr(1), 10, Some(txid)).unwrap();
         assert_eq!(r.receipt_id, 1);
@@ -722,8 +815,31 @@ mod tests {
         let mut u = u;
         u.record_share(&addr(1));
         u.finalize_block(101, 50, 1_000_000);
+        u.mature(201);
         let r2 = u.mark_paid(&addr(1), 1).unwrap();
         assert_eq!(r2.receipt_id, 2);
+    }
+
+    #[test]
+    fn earnings_unlock_only_at_maturity_and_void_cancels() {
+        // A found block's coinbase is unspendable until maturity: payable
+        // only at height + maturity, never before.
+        let mut t = RoundTracker::new(0).unwrap();
+        t.record_share(&addr(1));
+        t.finalize_block(100, 100, 1_000_000);
+        assert_eq!(t.pending(&addr(1)), 0);
+        t.mature(199);
+        assert_eq!(t.pending(&addr(1)), 0);
+        t.mature(200);
+        assert_eq!(t.pending(&addr(1)), 100);
+        // A reorg that orphans the block cancels the unlock: void first,
+        // then even maturity pays nothing.
+        let mut u = RoundTracker::new(0).unwrap();
+        u.record_share(&addr(1));
+        u.finalize_block(100, 100, 1_000_000);
+        u.void_round(100);
+        u.mature(200);
+        assert_eq!(u.pending(&addr(1)), 0);
     }
 
     #[test]
@@ -748,6 +864,7 @@ mod tests {
         let mut t = RoundTracker::new(100).unwrap();
         t.record_share(&addr(3));
         t.finalize_block(7, 90, 1_000_000);
+        t.mature(107);
         t.mark_paid(&addr(3), 5).unwrap();
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pplns-ledger-test-{}.bin", std::process::id()));
