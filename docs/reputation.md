@@ -53,6 +53,11 @@ They nest (min under max under the root) because delegation names one child
 per parent; revoking the root stops the whole tree, and a short expiry makes
 a temporary spending key without any revocation round-trip.
 
+The ancestry itself travels: `DelegationProof` is the root-first chain of
+signed policies any service verifies (`delegation.verify`), so a tiered
+agent proves its whole lineage to whoever it pays. Interface:
+[`portable-policy.md`](portable-policy.md).
+
 ```bash
 curl -X POST $NODE/v1/wallet/tier -d '{"parent_policy_hex":"...","parent_sigs_hex":"...","parent_keys_hex":"...","tier_policy_hex":"...","tier_sigs_hex":"...","tier_keys_hex":"..."}'
 curl $NODE/v1/wallet/tiers/<agent_hex>   # tiers under an agent id

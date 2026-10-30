@@ -478,6 +478,27 @@ Every refusal is a named error, and the ambiguous cases all fail closed:
 human balances live in the same UTXO set under the same issuance schedule. There
 is no separate "machine token".
 
+**Portable grants.** A `SignedPolicy` is the policy plus the owner's signature
+over it — the unit that travels. Anyone holding the bytes (another chain, an
+x402 facilitator on Base, an insurer's auditor) verifies the grant with no
+node, no chain state and no private key. A `DelegationProof` is the root-first
+chain of signed policies, so a service sees one proof that the owner authorized
+this agent, not a pile of claims. Full interface:
+[`docs/portable-policy.md`](docs/portable-policy.md).
+
+**Short-lived, exact-transaction grants.** `BoundAuthorization` turns the
+advisory approval into an enforced one: the owner signs the grant hash, the
+expiry and the *exact transaction hash* together, with a 30-block lifetime cap.
+A stolen authorization re-aimed at another payment, or replayed past its
+window, is refused by name — at verification and at admission
+(`service::admit_bound_payment`).
+
+**Chain-agnostic engine.** The `srct-policy` crate is the policy layer's
+cross-chain face: input a `PaymentIntent`, get back `allow`, `deny` or
+`approval-needed` — the same decision the node reaches, with no consensus
+imports. TypeScript (`bindings/typescript/srct_policy.ts`) and Python
+(`bindings/python/srct_policy.py`) bindings speak the same JSON.
+
 **Payments.** `MachinePayment` is the canonical format. `ReceiptBook` records
 deterministic service receipts and refuses a receipt that conflicts with an
 existing one for the same payment. `PaymentTracker` is an exact-payment replay
@@ -510,9 +531,15 @@ checked for wraparound. Settlement rides the ordinary payment path with the
 stream id as the reference, so there is no new transaction type.
 
 **MCP.** `srct-mcp` is a keyless MCP surface over agent identity, payments,
-receipts and reputation, and over the agent authority and credit layer:
-`inspect.policy`, `inspect.agent_spend` and `inspect.credit` read the terms an
-agent is about to sign and the hash to sign.
+receipts and reputation, over the agent authority and credit layer — and an
+**agent wallet guard**: `wallet.guard` runs the budget plus a short expiry
+before any key is used (allow / deny / approval-needed), `policy.decide`
+answers the engine statelessly, `policy.export`/`policy.verify` and
+`delegation.prove`/`delegation.verify` move portable grants across rails,
+`auth.bind`/`auth.verify_bound` enforce the short-lived exact-transaction
+grant, and `audit.verify` checks an exported audit chain. `inspect.policy`,
+`inspect.agent_spend` and `inspect.credit` read the terms an agent is about
+to sign and the hash to sign.
 
 ### Consensus state vs. service layer
 
@@ -554,10 +581,12 @@ Agent ──GET + PAYMENT-SIGNATURE──▶ verify → admit → 200 + PAYMENT-
   `POST /v1/payment/submit`).
 - Client budget (`X402Budget { max_amount_sat, allowed_recipients,
   allowed_services }`) is enforced *before* signing — a server asking for
-  more is refused locally.
+  more is refused locally. `check_guarded` adds the short window: the spend
+  must land before its expiry, and the window is capped at 30 blocks.
 - `scheme` is `exact` only; `network` is CAIP-2 `srct:<reference>`
-  (`srct_core::x402::srct_network_caip2` / `parse_srct_network`); `amount` is
-  a decimal satoshi string.
+  (`srct_core::x402::srct_network_caip2` / `parse_srct_network`) or, beside
+  SRCT, an EVM rail (`eip155:8453` Base, `eip155:84532` Base Sepolia —
+  advertised, never settled by this node); `amount` is a decimal satoshi string.
 
 Full mapping, curl flow and limits: [`docs/x402.md`](docs/x402.md). Demo:
 `python sim/x402_paid_api_demo.py`.
@@ -608,7 +637,9 @@ The wallet around them is safer than a normal crypto wallet by construction
 6. **Audit trail** — every grant, admission, refusal, revocation, stream and
    receipt appends to a bounded hash-chained `AuditLog`
    (`GET /v1/audit` reports `chain_valid`; `GET /v1/risk/policy` exports the
-   live envelope).
+   live envelope). The chain exports as auditor/insurer-readable JSON
+   (`AuditLog::export_json`, re-checked by `verify_export_json`, MCP
+   `audit.verify`).
 
 ---
 
@@ -1148,18 +1179,21 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-node/` | CLI and node daemon. |
 | `crates/srct-miner/` | Standalone CPU miner: template grinder, stratum-lite pool server with PPLNS payouts, universal compute backends. |
 | `crates/srct-worker/` | Worker-side SDK. Client only, no consensus. |
-| `crates/srct-mcp/` | Keyless MCP surface over agent identity and payments. |
+| `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
+| `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
-| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `x402.md`, `micropayments.md`, `wallet-safety.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
+| `docs/` | Design records, verification status and readiness reports — plus per-feature guides: `portable-policy.md`, `x402.md`, `micropayments.md`, `wallet-safety.md`, `reputation.md`, `agent-jobs.md`, `usd-settlement.md`, `ramps.md`, `lending.md`. |
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
-Eight crates in one workspace. **All consensus logic lives in `srct-core`**, which
+Nine crates in one workspace. **All consensus logic lives in `srct-core`**, which
 has no I/O, no clock and no network. The service-layer feature modules added
 most recently live beside it without touching consensus: `x402.rs` (x402
-adapter), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
-risk guards, audit log), `passport.rs` + `tiers.rs` (portable reputation,
+adapter, budget guard, Base rail options), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
+risk guards, audit log + export), `portable.rs` (signed policies, delegation
+proofs, short-lived bound grants, intent→decision seam),
+`passport.rs` + `tiers.rs` (portable reputation,
 tiered wallets), `jobs.rs` (agent job escrow), `fx.rs` (USD quotes),
 `ramp.rs` (entry/exit registry), `lending.rs` (loan marketplace). The `mini`
 profile is the same code with different parameters — never a second
@@ -1170,7 +1204,8 @@ Key documents: [`docs/decisions.md`](docs/decisions.md) for design decisions,
 [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md) for what blocks launch,
 [`docs/monetary-policy.md`](docs/monetary-policy.md) for the supply analysis,
 and the feature guides listed in the `docs/` row above
-([x402](docs/x402.md), [micro-payments](docs/micropayments.md),
+([portable policy](docs/portable-policy.md),
+[x402](docs/x402.md), [micro-payments](docs/micropayments.md),
 [wallet safety](docs/wallet-safety.md), [reputation](docs/reputation.md),
 [jobs](docs/agent-jobs.md), [USD settlement](docs/usd-settlement.md),
 [ramps](docs/ramps.md), [lending](docs/lending.md)).
@@ -1326,7 +1361,7 @@ digest-checked file with a fail-closed load (a corrupt file refuses to start)
 ## Testing
 
 ```sh
-cargo test --workspace                                   # 1374 passed, 0 failed, 1 ignored
+cargo test --workspace                                   # 1388 passed, 0 failed, 1 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 python sim/verify_vectors.py --check                     # consensus vectors
@@ -1340,6 +1375,8 @@ Targeted suites for the fast loops:
 ```sh
 cargo test -p srct-core --test x402           # x402 challenge/budget/authorize/pay/admit roundtrip
 cargo test -p srct-node --test x402           # 402 → verify → settle → retry over real HTTP
+cargo test -p srct-policy                     # chain-agnostic decide/verify JSON seam
+cargo test -p srct-mcp                        # keyless wallet guard, portable prove/verify, bound grants
 cargo test -p srct-node --test micro_safety   # batch quotes, streams, sponsor intents, session/risk/audit
 cargo test -p srct-node --test agent_economy  # passport, tiers, jobs, FX quotes, ramps, lending marketplace
 cargo test -p srct-core --lib arbitration::    # fraud-arbitration votes

@@ -32,6 +32,13 @@ developer guide to the safety layer.
    → `duplicate`; different receipt for the same payment → `receipt_conflict`
    409), strictly increasing policy nonces. A network timeout can be retried,
    never rebuilt: check `GET /v1/payments/unsettled` first.
+5. **Pre-sign wallet guard** (`x402::X402Budget::check_guarded`): the budget
+   (amount, recipient/service allow-lists) *plus a short window* — the spend
+   must land before its expiry, and the window is capped at 30 blocks
+   (`MAX_GUARD_LIFETIME_BLOCKS`). Runs before any key is used and returns the
+   exact grant the agent may sign; over-budget, stale or over-long windows
+   refuse before signing, never after. MCP: `wallet.guard`
+   (allow / deny / approval-needed).
 5. **Receipts + reconciliation**: every admission holds a credit reservation
    until its receipt settles it; reservations release on any failure path.
    `GET /v1/payments/unsettled` lists recorded-but-unbound payments (retry
@@ -77,6 +84,24 @@ curl "$NODE/v1/risk/policy"       # thresholds, velocity, test mode, session env
 curl "$NODE/v1/payments/unsettled"
 curl "$NODE/v1/receipts/orphans"
 ```
+
+For auditors and insurers the chain exports as self-verifying JSON
+(`AuditLog::export_json` — entries with hex hashes plus the tip;
+`verify_export_json` re-checks links, entry hashes, order from genesis, and
+the tip; MCP `audit.verify`). An export that parses but does not verify is
+refused — verification travels with the data, not with trust in the node.
+
+## Short-lived enforced grants
+
+High-value approval (`human_approval_required`) gates the amount. Bound
+grants gate the *grant itself*: `BoundAuthorization` has the owner sign the
+grant hash, the expiry and the exact transaction hash together
+(`srct/bound-auth/v1`), with a 30-block lifetime cap. The agent builds the
+payment, the owner signs the binding for that payment's hash with a near
+expiry, and admission (`service::admit_bound_payment`, MCP
+`auth.bind` / `auth.verify_bound`) refuses anything re-aimed at another
+transaction or replayed past its window. A stolen authorization settles
+nothing.
 
 ## High-risk flow (recommended)
 

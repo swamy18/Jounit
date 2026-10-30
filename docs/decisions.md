@@ -1749,3 +1749,49 @@ who may approve, exactly like they may disagree on any local book.
 `state_wire` version pin 5 → 6; agent `verify_authorization_for_policy`
 liveness matrix; 3 node-lib approval tests (missing/unlisted/self vs
 listed approver).
+
+## Decision 30 - Portable policy, verifiable delegation, enforced short-lived grants
+
+**Status: APPROVED 2026-10-30, IMPLEMENTED 2026-10-30.** The policy layer
+stays pure and non-consensus, but its answers now travel: one signed format
+verifiable on any chain or rail, one proof of delegated authority, and an
+approval that is enforced rather than advisory. Three library pieces, one new
+crate, one MCP surface — no consensus rule:
+
+1. **Portable grants (service layer).** `SignedPolicy` (policy + owner
+   signature) and `DelegationProof` (root-first signed chain, every link
+   verified, every narrowing link checked, root-first) in
+   `srct-core::portable`. Verification needs only the bytes — no node, no
+   state, no key. Canonical codec plus JSON with routing fields that parsing
+   re-checks.
+2. **Short-lived exact-transaction grants (enforced).** `BoundAuthorization`:
+   the owner signs grant + expiry + exact transaction hash
+   (`srct/bound-auth/v1`), 30-block lifetime cap (`MAX_BOUND_LIFETIME_BLOCKS`)
+   enforced at issuance and verification. `service::admit_bound_payment`
+   verifies the binding before the standard admission runs, so a stolen
+   authorization re-aimed at another payment settles nothing. The node wires
+   this into `payment_submit` and both x402 money paths next; the gate exists
+   and is tested now.
+3. **Chain-agnostic engine crate.** `crates/srct-policy` (no consensus
+   imports): `decide` (portable policy JSON + intent JSON → allow / deny /
+   approval-needed), `verify_proof`, `verify_audit`, with TypeScript and
+   Python bindings that codec the same JSON and never re-implement a rule.
+   The x402 budget guard (`X402Budget::check_guarded`: budget + short window
+   before any key) and Base/Base-Sepolia rail options ride the same seam;
+   the node settles SRCT options only.
+4. **Wallet guard surface.** 9 keyless `srct-mcp` ops (`wallet.guard`,
+   `policy.decide/export/verify`, `delegation.prove/verify`,
+   `auth.bind/verify_bound`, `audit.verify`), documented in
+   `docs/portable-policy.md`; audit chains export as auditor-readable JSON
+   (`AuditLog::export_json` / `verify_export_json`).
+
+**What this does not change.** No block, transaction, UTXO, supply or
+finality rule; no new L2 transaction type; consensus still refuses
+policy violations the way it refuses double-spends, and the service layer
+still holds no key. A foreign rail vendors `srct-policy` and gets the same
+decisions the node gets.
+
+**Tests.** 5 portable unit tests (sign/verify anywhere, wrong-owner refusal,
+proof narrowing, engine seam, bound expiry/tx-exactness), audit
+export/tamper tests, x402 guard/lifetime/Base-route tests,
+`srct-policy::decide` JSON tests, 6 MCP guard/prove/bind/audit tests.

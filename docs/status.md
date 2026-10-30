@@ -1809,6 +1809,44 @@ five code claims held up (one partial). Fixed as follows:
 - Verification: clippy clean; bond_stake 18/18 (incl. new floor test),
   external_miner, node bin, full round-3 suites re-green.
 
+### 2026-10-30 portable policy layer (grants that travel)
+
+The policy layer answers *may this agent spend?* — this commit answers how
+that answer travels. All service layer, no consensus change:
+
+- **Signed policies** (`srct-core/src/portable.rs::SignedPolicy`): a grant
+  plus the owner's signature over it, verifiable on any chain or rail with no
+  node, no chain state and no private key. Canonical bytes + JSON with
+  routing fields that parsing re-checks (a document that routes one way and
+  verifies another is refused).
+- **Verifiable delegation** (`DelegationProof`): the root-first chain of
+  signed policies — every signature verifies, every link narrows
+  (`assert_chain`), the chain starts at a root. One proof that the owner
+  authorized this agent.
+- **Short-lived enforced grants** (`BoundAuthorization`): the owner signs the
+  grant hash, the expiry and the exact transaction hash together
+  (`srct/bound-auth/v1`), 30-block lifetime cap enforced at issuance and
+  verification. Re-aimed or expired bindings refuse by name; admission via
+  `service::admit_bound_payment` verifies the binding before the standard
+  path runs.
+- **Chain-agnostic seam** (`PaymentIntent` → `PolicyDecision`: allow, deny,
+  approval-needed) in a new `crates/srct-policy` crate with no consensus
+  imports, plus TypeScript/Python bindings that speak the same JSON without
+  re-implementing any rule.
+- **Wallet guard**: `X402Budget::check_guarded` (budget + short window before
+  any key is used), Base/Base-Sepolia EVM route options advertised beside
+  SRCT on x402 challenges (settled externally, never by this node), and 9 new
+  keyless `srct-mcp` ops (`wallet.guard`, `policy.decide/export/verify`,
+  `delegation.prove/verify`, `auth.bind/verify_bound`, `audit.verify`).
+- **Audit export**: `AuditLog::export_json` emits the hash-chained log for
+  auditors/insurers; `verify_export_json` re-checks links, entry hashes,
+  order and tip.
+- Verification: clippy clean; 14 new tests (5 portable, audit export, x402
+  guard, `srct-policy` decide, 6 MCP guard/prove/bind/audit); core lib (530),
+  node api (47), x402 roundtrips, bridge/agent_policy/redteam_delegation,
+  L2 policy_flow, miner, committee_rotation — green. README count
+  1374 → 1388. Interface specified in `docs/portable-policy.md`.
+
 ### 2026-10-29 hardening round 3 (no new features)
 
 Third review pass (transfers in/out, mining end-to-end, agent/SDK workflows,

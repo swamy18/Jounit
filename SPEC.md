@@ -3303,6 +3303,20 @@ named spender may exercise a grant; a revoked grant authorises nothing; a
 revoked parent kills its descendant; a widening grant is refused; the state
 encoding round-trips the grants; and two nodes replaying the same transactions
 agree on the root.
+
+### 21.10 Portable policy surface (off-chain, non-consensus)
+
+The grants of §21.5–§21.9 settle on this chain, but their *authority* is
+portable and specified in `docs/portable-policy.md` (Decision 30), not here:
+a `SignedPolicy` (grant + owner signature, verifiable with the bytes alone),
+a `DelegationProof` (the root-first signed chain, every link verified and
+every narrowing link checked), and a `BoundAuthorization` (the owner signs
+grant + expiry + exact transaction hash, 30-block lifetime cap) admitted via
+`service::admit_bound_payment`. The chain-agnostic engine crate
+`crates/srct-policy` decides `PaymentIntent` → allow / deny /
+approval-needed with no consensus imports. None of this moves a coin on its
+own: settlement still requires a §21 spend the state machine admits.
+
 ---
 
 ## 22. Credit positions on chain (Phase 7)
