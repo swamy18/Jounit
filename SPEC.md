@@ -3251,6 +3251,14 @@ The counters the chain keeps are `window_start_height`, `spent_in_window_sat`,
 `total_spent_sat`, `last_nonce` and `spends`. Without them a per-window cap is
 a suggestion and a nonce is a formality.
 
+**Offline verifiers check liveness, not just the signature.** An
+authorization carries no expiry itself — it borrows its window from the
+grant it names. Any service that verifies offline (a receipt check, a
+delivery handoff, an x402 retry) must run the grant check too:
+owner match, signature valid, grant not revoked, height inside
+`[not_before_height, expires_at_height)`. A stale grant verifies as bytes
+and must not verify as authority (`verify_authorization_for_policy`).
+
 ### 21.6 Commitment
 
 A published grant is a leaf under the Layer-2 state root, with its own domain

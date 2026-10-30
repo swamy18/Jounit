@@ -1716,3 +1716,36 @@ follow-up work, not part of this decision.
 `m5_node_finality::mainnet_settlement_rotates_to_the_bonded_committee`
 (post-bond 1-of-1 bonded settle applies; pre-bond history replays
 identically; bootstrap-only post-bond settle refused with `BadQuorum`).
+
+## Decision 29 - Exit throttle and enforced high-value approval
+
+**Status: APPROVED 2026-10-30, IMPLEMENTED 2026-10-30.** Incident-driven
+hardening (hot-wallet drain playbook), two consensus-adjacent rules and one
+node policy:
+
+1. **Exit window cap (consensus).** At most `max_exit_window_sat` of exit
+   principal per `exit_window_blocks` (mainnet: 1,000 SRCT per 144 blocks;
+   `0` disables on mini/testnet). Over-cap queues refuse with
+   `ExitWindowFull` naming the retry height; funds stay put. Both L2 queue
+   accounting and the L1 release path share the rule, and windows rebuild
+   from replay so reorgs need no undo bookkeeping.
+2. **Large-exit extra delay (consensus).** Exits at or above
+   `large_exit_threshold_sat` wait `large_exit_extra_delay_blocks` on top
+   of base maturity (mainnet: 100 SRCT → +144 blocks). L2 and L1 compute the
+   same delay from the same inputs. L2 wire v5 → v6.
+3. **Human approval enforced (node policy, not consensus).** At or above
+   `SRCT_HIGH_VALUE_THRESHOLD_SAT` the node answers `403
+   human_approval_required` until a key in `SRCT_HIGH_VALUE_APPROVERS`
+   co-signs the payment hash; the payer's own key does not count. Applies to
+   `payment_submit` and both x402 money paths. Threshold `0` keeps
+   everything off.
+
+**What this does not change.** No fee, issuance or conservation rule; a
+refused queue or payment loses nothing and retries later. The approver set
+is operator config, not chain state — nodes may legitimately disagree on
+who may approve, exactly like they may disagree on any local book.
+
+**Tests.** `exit_flow` window cap + rollover and large-exit delay;
+`state_wire` version pin 5 → 6; agent `verify_authorization_for_policy`
+liveness matrix; 3 node-lib approval tests (missing/unlisted/self vs
+listed approver).
