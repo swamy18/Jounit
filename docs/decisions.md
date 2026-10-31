@@ -1875,3 +1875,18 @@ inner path gates like submit. Four real gaps, each fixed with its test:
 **Tests.** `dropped` counting/export/compat + `/v1/audit` pin
 (`micro_safety`), routing-tamper parse refusals (policy + proof), engine
 cross-network deny, wrapper pass-through (MCP/crate/endpoint suites green).
+
+## Decision 33 — Orphan resolve re-checks the local clock
+
+**Status: APPROVED 2026-10-31, IMPLEMENTED 2026-10-31.** A 51%/time-warp
+review pass found the intake gate sound — far-future blocks are refused
+before they can orphan, and a held orphan only ages toward acceptance —
+but resolution re-submitted with the replay-shaped `submit` (no clock),
+relying on intake alone. A backward clock step between intake and resolve
+would have admitted what a fresh submission refuses, and the retarget would
+have read a solve time the clock policy had already rejected.
+`resolve_orphans` now carries `now_ms` through and re-submits with the same
+gate as intake; a regression test pins both directions (refused under a
+stepped-back clock, admitted under the intake clock). No consensus change:
+the clock policy was and stays node-local; replay and historical paths still
+pass `None`.

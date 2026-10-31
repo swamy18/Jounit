@@ -1888,6 +1888,20 @@ through `risk_gate`. Clippy + fmt clean; core lib (534), node api (49),
 micro_safety, mcp (19), x402/agent_policy/bridge/redteam — green. README
 count → 1403.
 
+### 2026-10-31 time-warp review (Decision 33)
+
+A 51%-attack review pass over consensus, finality, difficulty, slashing,
+mempool, networking, L2 and supply: reorg-across-finality refused, binding
+checkpoints with quorum + conflict-as-evidence, LWMA clamps + median-time +
+one-block-time future bound, unbond/vesting delays, bounded mempool with
+cascade eviction, rate-limited + ban-scored networking, L2 replay-not-persist,
+integral-bound mint, bounded EIP-1559 fees, gated credit mint. One gap:
+orphan resolution re-submitted clock-blind (`submit`), relying on intake
+alone — a backward clock step could smuggle a far-future timestamp into the
+retarget. Resolve now carries `now_ms` with a regression test pinning both
+directions. No consensus change. srct-net (36) green, fmt + clippy clean.
+README count → 1404.
+
 ### 2026-10-29 hardening round 3 (no new features)
 
 Third review pass (transfers in/out, mining end-to-end, agent/SDK workflows,

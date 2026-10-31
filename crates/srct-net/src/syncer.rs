@@ -323,8 +323,12 @@ impl SyncManager {
                 let extended_tip = current_tip != prev_tip;
                 let mut resolved = Vec::new();
 
-                // Recursively resolve any orphans waiting for this block
-                self.resolve_orphans(block_hash, chain, &mut resolved);
+                // Recursively resolve any orphans waiting for this block.
+                // The clock travels with them: a timestamp that was inside
+                // the future allowance at intake is re-checked at resolve,
+                // so a backward clock step between the two cannot smuggle a
+                // far-future block past the guard the intake applied.
+                self.resolve_orphans(block_hash, chain, now_ms, &mut resolved);
 
                 SyncResult::Accepted {
                     extended_tip,
@@ -369,14 +373,23 @@ impl SyncManager {
         self.orphan_count += 1;
     }
 
-    fn resolve_orphans(&mut self, parent: Hash512, chain: &mut Chain, resolved: &mut Vec<Hash512>) {
+    fn resolve_orphans(
+        &mut self,
+        parent: Hash512,
+        chain: &mut Chain,
+        now_ms: Option<u64>,
+        resolved: &mut Vec<Hash512>,
+    ) {
         if let Some(children) = self.orphans_by_parent.remove(&parent) {
             self.orphan_count = self.orphan_count.saturating_sub(children.len());
             for child in children {
                 let child_hash = child.block_hash();
-                if chain.submit(child.clone()).is_ok() {
+                // Same gate as intake (`submit_at` with the live clock), not
+                // the replay-shaped `submit`: a resolve that skipped the
+                // clock would admit what a fresh submission refuses.
+                if chain.submit_at(child.clone(), now_ms).is_ok() {
                     resolved.push(child_hash);
-                    self.resolve_orphans(child_hash, chain, resolved);
+                    self.resolve_orphans(child_hash, chain, now_ms, resolved);
                 }
             }
         }
@@ -537,5 +550,76 @@ mod tests {
             syncer.handle_block(block, &mut chain, None);
         }
         assert!(syncer.orphan_count() <= ORPHAN_POOL_MAX);
+    }
+
+    /// The local-clock guard travels with an orphan to resolution. A block
+    /// inside the future allowance orphans normally when its parent is
+    /// unknown; if the clock steps backward before the parent arrives, the
+    /// resolve must refuse it — admitting it would smuggle a far-future
+    /// timestamp past the guard the intake applied, and the retarget would
+    /// read a solve time the clock policy had already rejected.
+    #[test]
+    fn orphan_resolution_rechecks_the_local_clock() {
+        let params = NetworkParams::mini();
+        let limit = params.future_limit_ms();
+        let addr = [3u8; 20];
+        let base = srct_core::block::GENESIS_TIMESTAMP_MS + 1;
+
+        // Parent at `base`, child 100 ms inside the allowance.
+        let mut foreign = Chain::new(params.clone()).unwrap();
+        let parent = foreign.mine_block(addr, vec![], base).unwrap();
+        foreign.submit(parent.clone()).unwrap();
+        let child = foreign
+            .mine_block(addr, vec![], base + limit - 100)
+            .unwrap();
+        assert!(limit > 100, "the test needs a non-trivial allowance");
+
+        // Child first, clock at intake: inside the allowance, parent unknown
+        // → stored as an orphan, not refused.
+        let mut chain = Chain::new(params).unwrap();
+        let mut syncer = SyncManager::new();
+        assert!(
+            matches!(
+                syncer.handle_block(child.clone(), &mut chain, Some(base + 1)),
+                SyncResult::Orphan { .. }
+            ),
+            "a timely orphan must wait, not refuse"
+        );
+        assert_eq!(syncer.orphan_count(), 1);
+
+        // The parent arrives after the clock stepped backward past the
+        // child's timestamp minus the allowance: the parent is fine, but
+        // resolving the child under this clock must refuse it.
+        let skewed = base + limit - 100 - limit - 1;
+        assert!(
+            matches!(
+                syncer.handle_block(parent.clone(), &mut chain, Some(skewed)),
+                SyncResult::Accepted { .. }
+            ),
+            "the parent itself is timely under the skewed clock"
+        );
+        assert_eq!(chain.height(), 1, "only the parent may land");
+        assert_eq!(
+            syncer.orphan_count(),
+            0,
+            "the refused child is dropped, not kept"
+        );
+        assert!(
+            chain.block_by_hash(&child.block_hash()).is_none(),
+            "a far-future-via-skew block must not enter canon through orphans"
+        );
+
+        // Positive control: the same orphan resolves under the intake clock.
+        let mut chain2 = Chain::new(NetworkParams::mini()).unwrap();
+        let mut syncer2 = SyncManager::new();
+        assert!(matches!(
+            syncer2.handle_block(child.clone(), &mut chain2, Some(base + 1)),
+            SyncResult::Orphan { .. }
+        ));
+        assert!(matches!(
+            syncer2.handle_block(parent, &mut chain2, Some(base + 1)),
+            SyncResult::Accepted { .. }
+        ));
+        assert_eq!(chain2.height(), 2, "a timely orphan still resolves");
     }
 }
