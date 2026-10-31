@@ -18,11 +18,12 @@ and redistribute.
 - [Glossary](#glossary)
 - [Honest limits](#honest-limits)
 - [Quick start](#quick-start)
+- [Machines and agents](#machines-and-agents)
+  - [Portable policy interface](docs/portable-policy.md)
 - [Mining](#mining)
 - [Supply](#supply)
 - [What the chain is for](#what-the-chain-is-for)
 - [Use cases](#use-cases)
-- [Machines, agents and robots](#machines-agents-and-robots)
 - [Agent payments (x402)](#agent-payments-x402)
 - [Micro-payments and wallet safety](#micro-payments-and-wallet-safety)
 - [Agent economy](#agent-economy)
@@ -35,55 +36,32 @@ and redistribute.
 - [Commands](#commands)
 - [Testing](#testing)
 - [License](#license)
+- [Security](#security)
 
 ---
 
 ## What this is
 
-The principle every blockchain shares is *solving is hard, verifying is easy*.
-Bitcoin's solution is pure hashing, which leaves GPUs idle and ties no energy to
-anything useful.
+The product is the policy engine; SRCT is its reference chain. A spend
+policy answers exactly one question — *may this agent, at this height,
+spend this much to this recipient?* — and the chain enforces the answer at
+admission the way it refuses a double-spend: no policy-aware base layer, no
+guarantee. The same engine decides identically anywhere: the grant travels
+as a signed portable format any rail verifies, and `srct-policy` (plus
+`POST /v1/policy/decide`) gives the same allow / deny / approval-needed off
+chain as on it. A decision is not a settlement — spending SRCT still
+requires SRCT admission. Start at [Machines and agents](#machines-and-agents).
 
-Solar Cyber Unit keeps the principle and changes the work. Mining runs three stages
-(`hybrid-v1`, `puzzle_id = 1` — the active mining puzzle on every profile):
-
-1. **A SHA-256 hash chain** — carries the security. This is what a quantum
-   adversary has to break.
-2. **An integer-only neural-network-shaped stage** — matrix/vector integer ops of
-   the kind AI accelerators execute natively, so that hardware is not idle.
-   Stated plainly: the weights derive from the epoch id by SHA-256 — no
-   training and no inference happens here, and no model is produced. What it
-   buys is hardware diversity (hash throughput, matrix units and memory
-   bandwidth pull in different directions, so no single chip dominates), not
-   useful AI output.
-3. **A final hash** — binds both into the value that must fall below the target.
-
-A second puzzle, `hbm-v1` (`puzzle_id = 2`), is designed and registered in
-code but is **not** the active mining puzzle — the chain rests on §5 alone
-(Decision 22). The memory-hard HBM path is the upgrade route for when ASIC
-pressure appears, not a second live puzzle.
-
-Two properties keep the neural stage a cost model rather than a liability:
-
-- **Capped share.** The network must account for 30–50% of modelled work. A
-  registry entry outside that band is rejected outright, so it can never become
-  the weak link.
-- **No floating point, anywhere.** Weights derive from the epoch id by SHA-256,
-  the forward pass accumulates in `i64` and wraps to `i32`, and every integer is
-  explicit. Two implementations on two machines produce identical digests — which
-  is tested against an independent Python reference, not assumed.
-
-Because weights come from the epoch id, no miner can precompute them before an
-epoch starts.
-
-Mining is hardware-universal by construction, not GPU-only. There are no
-floats anywhere in the PoW, so CPU, GPU, NPU, TPU, photonic chips and domestic
-accelerators all compute bit-identical results. The `srct-miner` crate exposes
-one `ComputeBackend` contract with two in-tree implementations — the reference
-`CpuBackend` and an independently written `PortableBackend` that silicon
-vendors port — pinned equal by differential tests. The three stages also pull
-in different directions (hash throughput, matrix-vector units, memory
-bandwidth), so no single exotic chip dominates all of them.
+Mining keeps the principle every blockchain shares — *solving is hard,
+verifying is easy* — and changes the work. It runs three stages
+(`hybrid-v1`, `puzzle_id = 1`, the active mining puzzle on every profile):
+a SHA-256 hash chain (carries the security), an integer-only
+neural-network-shaped stage (epoch-derived weights, no training and no
+inference — what it buys is hardware diversity, not AI output), and a final
+hash binding both into the value that must fall below the target. Capped
+share (30–50% of modelled work) and no floating point anywhere keep the
+neural stage a cost model rather than a liability. Full detail:
+[Mining](#mining).
 
 ---
 
@@ -92,11 +70,14 @@ bandwidth), so no single exotic chip dominates all of them.
 The honest question: x402 payments, spend policies and escrow could live on an
 existing chain or on stablecoin rails. Three reasons they don't here:
 
-1. **Policies are enforced at admission, by consensus.** A spend policy on
-   another chain is a contract the base layer does not know about — it can
-   advise, not refuse. Here `check_tx` refuses a payment that violates its
-   policy the same way it refuses a double-spend: no policy-aware base layer,
-   no guarantee.
+1. **Policies are enforced at admission, by consensus — on SRCT, the
+   reference chain.** A spend policy on another chain is a contract the base
+   layer does not know about — it can advise, not refuse. Here `check_tx`
+   refuses a payment that violates its policy the same way it refuses a
+   double-spend. The *decisions* travel: portable grants, the `srct-policy`
+   engine and `POST /v1/policy/decide` let any rail ask the same question —
+   but spending SRCT still requires SRCT admission. No policy-aware base
+   layer, no guarantee.
 2. **The task economy settles in the native coin.** Escrow, slashing, bonds and
    fee burns are chain state, not contract balances — a dispute payout cannot
    be frozen by a token issuer and does not depend on a bridge.
@@ -158,6 +139,17 @@ trusting any number in it:
   bond rotates authority. Serving mainnet with them requires the explicit
   `--allow-bootstrap-committee` flag, and replacing them with bonded keys is
   the operator's first job.
+- **Bindings need a node.** The TypeScript/Python bindings are codecs, not
+  verifiers — allow/deny answers come from a node (`/v1/policy/decide` and
+  friends) or the Rust engine, never from the binding alone. No node, no
+  decisions.
+- **`srct-policy` is a facade, not a slim dependency.** Vendoring the crate
+  still compiles all of `srct-core` (BLS, ML-DSA and all) — see the weight
+  note in the crate docs. Outsiders wanting answers without Rust use HTTP
+  or the bindings against a node URL.
+- **The exit window is shared, and one share is capped.** Mainnet lets one
+  owner queue 100 SRCT per 144-block window: a genuinely large exit waits
+  across windows. Refusals delay, never destroy — but plan around it.
 
 ---
 
@@ -194,6 +186,18 @@ export SRCT_WALLET_PASSPHRASE=change-me
 supply, bond ledger and binding-finalized point against stored state. It is the
 check worth running after any change.
 
+Ask the engine before you spend — no wallet, no chain state needed:
+
+```sh
+# Offline: the codec self-test (intents, decisions, document shapes).
+python sim/policy_decide_demo.py --self-test
+
+# Against a node (serve with --api-listen first; policy.json via MCP policy.export).
+python sim/policy_decide_demo.py --node http://127.0.0.1:8080 --policy policy.json \
+  --agent-id <hex> --recipient <hex> --amount-sat 400 --threshold-sat 100
+# → decision: allow | needs_approval | deny (with reason)
+```
+
 Run `srct-node help` for the full command list; every command accepts `--help`.
 
 To stand up a local multi-node network (deterministic genesis, separate data
@@ -204,6 +208,118 @@ scripts/start-network --nodes 3          # init, serve, wait until all share a t
 scripts/stop-network                     # graceful stop via pid files
 scripts/reset-network                    # stop and delete the data root
 ```
+
+---
+
+## Machines and agents
+
+There is a full policy layer for software acting on someone's behalf. It lives in
+`srct-core/src/agent.rs` and is **pure and deterministic** — no clock, no
+randomness, no I/O — so a wallet and a service reaching the same inputs reach the
+same answer.
+
+**Agent identity.** `derive_agent_id(network_id, role, owner)` gives a stable
+identifier for an actor. Three roles exist: `Human` (a wallet), `Machine` (a
+device spending under a policy), and `Service` (an identity that *receives*
+payments). The ID is network-bound, so the same device has different IDs on
+different chains.
+
+**Spending policies.** A `SpendPolicy` is owner-signed and answers exactly one
+question: *may this agent, at this height, spend this much to this recipient?*
+Every refusal is a named error, and the ambiguous cases all fail closed:
+
+- **an empty recipient list** authorizes nothing — not "anything";
+- **an empty service list** authorizes no service-tagged payment;
+- **a nonce must strictly increase**, so an authorization cannot be replayed;
+- a height below the policy's own window start refuses — time does not run
+  backwards inside a policy;
+- cumulative spend is bounded **per window**, and the window rolls over rather
+  than accumulating forever.
+
+**No second currency.** The `owner` field is an ordinary address, so machine and
+human balances live in the same UTXO set under the same issuance schedule. There
+is no separate "machine token".
+
+**Portable grants.** A `SignedPolicy` is the policy plus the owner's signature
+over it — the unit that travels. Anyone holding the bytes (another chain, an
+x402 facilitator on Base, an insurer's auditor) verifies the grant with no
+node, no chain state and no private key. A `DelegationProof` is the root-first
+chain of signed policies, so a service sees one proof that the owner authorized
+this agent, not a pile of claims. Full interface:
+[`docs/portable-policy.md`](docs/portable-policy.md).
+
+**Short-lived, exact-transaction grants.** `BoundAuthorization` turns the
+advisory approval into an enforced one: the owner signs the grant hash, the
+expiry and the *exact transaction hash* together, with a 30-block lifetime cap.
+A stolen authorization re-aimed at another payment, or replayed past its
+window, is refused by name — at verification and at admission
+(`service::admit_bound_payment`).
+
+**Chain-agnostic engine.** The `srct-policy` crate is the policy layer's
+cross-chain face: input a `PaymentIntent`, get back `allow`, `deny` or
+`approval-needed` — the same decision the node reaches, with no consensus
+imports. TypeScript (`bindings/typescript/srct_policy.ts`) and Python
+(`bindings/python/srct_policy.py`) bindings speak the same JSON. Honest
+weight note: the crate still compiles all of `srct-core` — outsiders wanting
+answers without Rust use HTTP (`POST /v1/policy/decide`) or the bindings
+against a node URL.
+
+**Payments.** `MachinePayment` is the canonical format. `ReceiptBook` records
+deterministic service receipts and refuses a receipt that conflicts with an
+existing one for the same payment. `PaymentTracker` is an exact-payment replay
+guard. A settled payment also carries its proof: `POST /v1/payment/{id}/settle`
+binds the Layer 1 transaction that paid it (a tx that does not pay the recipient
+is refused), `GET /v1/payment/{id}` reports the link as `settlement`, and the
+link persists across restarts.
+
+**Reputation.** A bounded accumulator per identity, driven by a **fixed weight
+table in code, not data**:
+
+| Event | Weight |
+|---|---|
+| Service completed | +1 |
+| Payment completed | +1 |
+| Verified work | +2 |
+| Dispute won | +1 |
+| **Dispute lost** | **−3** |
+
+An event carries no amount, no weight and no signature of its own — the weights
+are not forgeable by producing a differently-shaped event. Losing a dispute costs
+three times what winning one earns, so baseless challenges are expensive. It is
+**not mintable**: nothing here creates a token.
+
+**Streaming micro-payments.** `PaymentStream` is pay-as-you-use: a payer-signed
+rate per block, a window, a hard cap, a recipient, and the governing policy for
+non-human payers. Settlement receipts are payer-signed and the `StreamBook` is
+fail-closed — exact amounts, strictly ordered, non-future settlements, accrual
+checked for wraparound. Settlement rides the ordinary payment path with the
+stream id as the reference, so there is no new transaction type.
+
+**MCP.** `srct-mcp` is a keyless MCP surface over agent identity, payments,
+receipts and reputation, over the agent authority and credit layer — and an
+**agent wallet guard**: `wallet.guard` runs the budget plus a short expiry
+before any key is used (allow / deny / approval-needed), `policy.decide`
+answers the engine statelessly, `policy.export`/`policy.verify` and
+`delegation.prove`/`delegation.verify` move portable grants across rails,
+`auth.bind`/`auth.verify_bound` enforce the short-lived exact-transaction
+grant, and `audit.verify` checks an exported audit chain. `inspect.policy`,
+`inspect.agent_spend` and `inspect.credit` read the terms an agent is about
+to sign and the hash to sign.
+
+### Consensus state vs. service layer
+
+The spending-policy layer is consensus state (SPEC.md §21). A grant is published
+on chain, the owner's signature binds it to a named spender and a named agent,
+the caps, allow-lists and nonce are enforced against state the chain keeps, and
+revoking a grant kills every descendant of it. The same is true of credit
+(SPEC.md §22): a loan is a chain fact with the lender's signature over its terms,
+principal really moves, and the collateral answers for the debt.
+
+The *service layer* surrounding them is still node-local: the payment book, the
+receipt book, the credit gate used for admission and the authorisation helper the
+API issues offline. Those are operational bookkeeping, not sources of spendable
+balance — they persist to disk so they survive restart, but consensus never
+depends on them.
 
 ---
 
@@ -266,55 +382,8 @@ well (multithreaded, `--threads N` with `0` = one per CPU and a cap of 1024,
 The `--miner` address need not belong to any wallet on the node — it is just
 where the coinbase pays out.
 
-### Seed node on a small box (24×7)
-
-A seed node keeps the network alive while mining happens elsewhere. It needs
-almost nothing — 512 MB RAM and a few GB of persistent disk are enough —
-because it relays and validates but never grinds. Run it relay-only:
-
-```sh
-./target/release/srct-node serve --network mainnet --data-dir ./chain \
-  --no-mine --listen 0.0.0.0:9833
-```
-
-Three things matter here: `--no-mine` (no CPU burn), `--data-dir` on a disk
-that survives restarts (lose it and the node resyncs from genesis), and port
-`9833` reachable from the internet so other nodes can dial in. Point
-`srct-miner --node` at this box's API port and your laptop keeps mining while
-the box keeps the chain.
-
-### Option C — mine through a pool
-
-Pools speak stratum-lite JSON-lines over TCP: `getjob` hands each miner an
-unsolved template, `submit` returns shares. Jobs are single-use, one solved
-proof counts as one share pool-wide (no double-billing across jobs),
-submissions are pinned to the job (same transactions, difficulty and history
-— swapping the coinbase invalidates the share), weak proofs count as shares
-for accounting while only full-difficulty proofs go to the chain as blocks.
-Rewards split over the last N shares (PPLNS, N ≈ two blocks' worth — every
-share is worth the same no matter when it landed, so pool hopping has no
-timing edge) minus the pool fee, rounding dust
-carries to the next round instead of leaking to the operator, and every payout
-is recorded before it is paid. Pool accounting never mints: only the consensus
-coinbase creates coins.
-
-### What hardware mines
-
-Anything. The PoW is integer-only — no floats anywhere — so CPU, GPU, NPU,
-TPU, photonic chips and domestic accelerators all compute bit-identical
-results, and the three stages pull in different directions (hash throughput,
-matrix-vector units, memory bandwidth), so no single exotic chip dominates.
-`srct-miner` exposes one `ComputeBackend` contract with two in-tree backends:
-
-| Flag | Backend | Meaning |
-|---|---|---|
-| `--backend cpu` | `CpuBackend` | Reference implementation. Default. |
-| `--backend portable` | `PortableBackend` | Independently written implementation; differential-tested equal to the reference on every candidate. The template silicon vendors port. |
-| `--backend auto` | — | Same as `cpu` today; picks the best available backend. Also via `SRCT_MINER_BACKEND`. |
-
-A new chip joins by implementing the same contract and passing the
-differential test — never by forking consensus. (SPEC §5.3 names the exact
-kernel surface; SPEC §13.1/§19.2 specify the template and pool protocols.)
+Seed boxes, the pool protocol, hardware backends and the `hbm-v1` upgrade
+route: [`docs/mining.md`](docs/mining.md).
 
 ---
 
@@ -449,115 +518,6 @@ delegation of computation, with the blockchain as the escrow and the arbiter.
 
 ---
 
-## Machines, agents and robots
-
-There is a full policy layer for software acting on someone's behalf. It lives in
-`srct-core/src/agent.rs` and is **pure and deterministic** — no clock, no
-randomness, no I/O — so a wallet and a service reaching the same inputs reach the
-same answer.
-
-**Agent identity.** `derive_agent_id(network_id, role, owner)` gives a stable
-identifier for an actor. Three roles exist: `Human` (a wallet), `Machine` (a
-device spending under a policy), and `Service` (an identity that *receives*
-payments). The ID is network-bound, so the same device has different IDs on
-different chains.
-
-**Spending policies.** A `SpendPolicy` is owner-signed and answers exactly one
-question: *may this agent, at this height, spend this much to this recipient?*
-Every refusal is a named error, and the ambiguous cases all fail closed:
-
-- an **empty recipient list** authorizes nothing — not "anything";
-- an **empty service list** authorizes no service-tagged payment;
-- a **nonce must strictly increase**, so an authorization cannot be replayed;
-- a height below the policy's own window start refuses — time does not run
-  backwards inside a policy;
-- cumulative spend is bounded **per window**, and the window rolls over rather
-  than accumulating forever.
-
-**No second currency.** The `owner` field is an ordinary address, so machine and
-human balances live in the same UTXO set under the same issuance schedule. There
-is no separate "machine token".
-
-**Portable grants.** A `SignedPolicy` is the policy plus the owner's signature
-over it — the unit that travels. Anyone holding the bytes (another chain, an
-x402 facilitator on Base, an insurer's auditor) verifies the grant with no
-node, no chain state and no private key. A `DelegationProof` is the root-first
-chain of signed policies, so a service sees one proof that the owner authorized
-this agent, not a pile of claims. Full interface:
-[`docs/portable-policy.md`](docs/portable-policy.md).
-
-**Short-lived, exact-transaction grants.** `BoundAuthorization` turns the
-advisory approval into an enforced one: the owner signs the grant hash, the
-expiry and the *exact transaction hash* together, with a 30-block lifetime cap.
-A stolen authorization re-aimed at another payment, or replayed past its
-window, is refused by name — at verification and at admission
-(`service::admit_bound_payment`).
-
-**Chain-agnostic engine.** The `srct-policy` crate is the policy layer's
-cross-chain face: input a `PaymentIntent`, get back `allow`, `deny` or
-`approval-needed` — the same decision the node reaches, with no consensus
-imports. TypeScript (`bindings/typescript/srct_policy.ts`) and Python
-(`bindings/python/srct_policy.py`) bindings speak the same JSON.
-
-**Payments.** `MachinePayment` is the canonical format. `ReceiptBook` records
-deterministic service receipts and refuses a receipt that conflicts with an
-existing one for the same payment. `PaymentTracker` is an exact-payment replay
-guard. A settled payment also carries its proof: `POST /v1/payment/{id}/settle`
-binds the Layer 1 transaction that paid it (a tx that does not pay the recipient
-is refused), `GET /v1/payment/{id}` reports the link as `settlement`, and the
-link persists across restarts.
-
-**Reputation.** A bounded accumulator per identity, driven by a **fixed weight
-table in code, not data**:
-
-| Event | Weight |
-|---|---|
-| Service completed | +1 |
-| Payment completed | +1 |
-| Verified work | +2 |
-| Dispute won | +1 |
-| **Dispute lost** | **−3** |
-
-An event carries no amount, no weight and no signature of its own — the weights
-are not forgeable by producing a differently-shaped event. Losing a dispute costs
-three times what winning one earns, so baseless challenges are expensive. It is
-**not mintable**: nothing here creates a token.
-
-**Streaming micro-payments.** `PaymentStream` is pay-as-you-use: a payer-signed
-rate per block, a window, a hard cap, a recipient, and the governing policy for
-non-human payers. Settlement receipts are payer-signed and the `StreamBook` is
-fail-closed — exact amounts, strictly ordered, non-future settlements, accrual
-checked for wraparound. Settlement rides the ordinary payment path with the
-stream id as the reference, so there is no new transaction type.
-
-**MCP.** `srct-mcp` is a keyless MCP surface over agent identity, payments,
-receipts and reputation, over the agent authority and credit layer — and an
-**agent wallet guard**: `wallet.guard` runs the budget plus a short expiry
-before any key is used (allow / deny / approval-needed), `policy.decide`
-answers the engine statelessly, `policy.export`/`policy.verify` and
-`delegation.prove`/`delegation.verify` move portable grants across rails,
-`auth.bind`/`auth.verify_bound` enforce the short-lived exact-transaction
-grant, and `audit.verify` checks an exported audit chain. `inspect.policy`,
-`inspect.agent_spend` and `inspect.credit` read the terms an agent is about
-to sign and the hash to sign.
-
-### Consensus state vs. service layer
-
-The spending-policy layer is consensus state (SPEC.md §21). A grant is published
-on chain, the owner's signature binds it to a named spender and a named agent,
-the caps, allow-lists and nonce are enforced against state the chain keeps, and
-revoking a grant kills every descendant of it. The same is true of credit
-(SPEC.md §22): a loan is a chain fact with the lender's signature over its terms,
-the principal really moves, and the collateral answers for the debt.
-
-The *service layer* surrounding them is still node-local: the payment book, the
-receipt book, the credit gate used for admission and the authorisation helper the
-API issues offline. Those are operational bookkeeping, not sources of spendable
-balance — they persist to disk so they survive restart, but consensus never
-depends on them.
-
----
-
 ## Agent payments (x402)
 
 SRCT speaks the x402 challenge/response shape with no second payment system.
@@ -584,9 +544,9 @@ Agent ──GET + PAYMENT-SIGNATURE──▶ verify → admit → 200 + PAYMENT-
   more is refused locally. `check_guarded` adds the short window: the spend
   must land before its expiry, and the window is capped at 30 blocks.
 - `scheme` is `exact` only; `network` is CAIP-2 `srct:<reference>`
-  (`srct_core::x402::srct_network_caip2` / `parse_srct_network`) or, beside
-  SRCT, an EVM rail (`eip155:8453` Base, `eip155:84532` Base Sepolia —
-  advertised, never settled by this node); `amount` is a decimal satoshi string.
+(`srct_core::x402::srct_network_caip2` / `parse_srct_network`) or, beside
+SRCT, an EVM rail (`eip155:8453` Base, `eip155:84532` Base Sepolia —
+advertised, never settled by this node); `amount` is a decimal satoshi string.
 
 Full mapping, curl flow and limits: [`docs/x402.md`](docs/x402.md). Demo:
 `python sim/x402_paid_api_demo.py`.
@@ -857,10 +817,9 @@ rollover, at fee cost); the per-owner sub-cap refuses the filler by name
 (`ExitOwnerWindowFull`) while other owners still queue, and resets on
 rollover. Refusals delay, never destroy.
 
-**Anyone can crank.** Consensus has always been permissionless here, but until
-recently the only way to obtain a claim was to be the node's own miner.
-`GET /v1/exit/crankable?claimant=<address>` hands the settleable claims to any
-third party, so a non-miner can build a block with them. An escrow settlement
+**Anyone can crank.** Consensus is permissionless, and claims are not
+miner-only: `GET /v1/exit/crankable?claimant=<address>` hands the settleable
+claims to any third party, so a non-miner can build a block with them. An escrow settlement
 rides this same path — `POST /v1/escrow/{id}/settle` queues the release's exit
 and the crank pays it, with no separate escrow coin.
 
@@ -921,220 +880,14 @@ Layer 2 supports agent-to-agent lending as on-chain state. The principal, the
 collateral, and the debt are real coins in the UTXO set — consensus state, not
 accounting entries. A loan is a four-step lifecycle: **open**, **repay**, and
 either **repay-in-full** or **default**. Collateral may also be **added** to an
-open position at any time before it settles.
-
-### Transaction types
-
-| Type | Wire | Actor | Fee | Purpose |
-|---|---|---|---|---|
-| `CreditOpen` | `0x19` | Lender | 2 000 sat | Open a position |
-| `CreditCollateral` | `0x1A` | Borrower | 2 000 sat | Add collateral |
-| `CreditRepay` | `0x1B` | Borrower | 2 000 sat | Repay (interest first) |
-| `CreditDefault` | `0x1C` | Anyone | 2 000 sat | Settle an overdue position |
-
-Every credit transaction pays a flat 2 000 sat fee
-(`FEE_TX_CREDIT_OPEN_SAT` / `_COLLATERAL_SAT` / `_REPAY_SAT` / `_DEFAULT_SAT` in
-`params.rs`), the same tier as exit-queue transactions. The fee splits with `split_flat_fee`:
-half is burned, half enters the PSCB reserve, and the miner tip is zero — an L2
-fee is not paid to the block producer. Burnt gets the odd satoshi on ties
-(`ceil(fee / 2)` → burn, `floor(fee / 2)` → PSCB).
-
-### Terms and limits
-
-- **Full collateralization.** The default `CreditTerms` require the collareral to
-  equal the borrowed principal: `base_collateral_bps = 10 000` (100%),
-  `max_discount_bps = 2_000`, `min_collateral_bps = 8_000`. With no bond posted
-  the discount is zero, so `required = max(100% − 0%, 80%) = 100%`. The collateral
-  must be the borrower's own money, checked **before** the principal arrives, so
-  a position can never outrun its backing.
-- **No zero-collateral term sets.** A `CreditTerms` with `min_collateral_bps ==
-  0` is refused by name where the arithmetic lives (`required_collateral`),
-  not left to callers to remember — there is no path to a zero-collateral
-  line.
-- **Interest rate cap.** A position may charge at most
-  `MAX_CREDIT_RATE_BPS_PER_WINDOW = 1_000` (10%) per window. A rate above that is
-  refused rather than clamped.
-- **Position ID.** Derived as a domain-separated hash over the lender, borrower,
-  principal, collateral, rate, window, deadline and nonce —
-  `SHA256(DOM_L2_CREDIT_POSITION ‖ lender ‖ borrower ‖ amount ‖ collateral ‖
-  rate ‖ window ‖ deadline ‖ nonce)` — so a lender cannot be shown terms they did
-  not sign, and two identical loans become two distinct positions via the nonce.
-
-### How a loan opens
-
-1. The **lender** builds and signs a `CreditOpenPayload` with the borrower's
-   address, principal amount, collateral amount, interest rate, window length,
-   deadline height and a per-lender nonce. The payload is sealed by a hybrid
-   ECDSA + Schnorr `Auth` bundle (`CreditOpenPayload::build`).
-2. The transaction is submitted (via `srct-node credit` on the CLI, or by
-   serializing the `L2Transaction` to hex and POSTing it to
-   `/v1/l2/broadcast`). Consensus checks: the lender has `principal + fee`, the
-   borrower has `collateral`, the derived position ID is new, and the terms pass
-   the rules above.
-3. Funds move atomically inside `apply_credit_open` (`state.rs`):
-   - Lender's balance decreases by `principal + fee`.
-   - Borrower's balance increases by `principal`.
-   - Borrower's `collateral` is locked into `credit_locked` (part of the
-     conservation sum — spendable by no one until the position settles).
-   - The fee splits into burn and PSCB.
-4. A `CreditPosition` is created in on-chain L2 state:
-
-   | Field | Set to |
-   |---|---|
-   | `lender` | the signing lender's address |
-   | `borrower` | as specified in the payload |
-   | `principal_sat` | the loan amount |
-   | `outstanding_sat` | equals `principal_sat` |
-   | `interest_paid_sat` | 0 |
-   | `collateral_sat` | the posted collateral |
-   | `rate_bps_per_window` | as specified (≤ 1 000) |
-   | `window_blocks` | as specified |
-   | `opened_height` | the block that applies it |
-   | `deadline_height` | as specified (must be future) |
-   | `interest_settled_height` | same as `opened_height` |
-   | `state` | `Open` |
-
-### Interest
-
-Interest is **simple**, charged **once per whole window** on the **outstanding
-principal**, computed by `ChargeSchedule::accrued_interest`
-(`credit.rs`):
-
-```
-windows = (height − interest_settled_height) / window_blocks
-interest = principal × rate_bps_per_window × windows / 10 000
-```
-
-- Fractional windows do not accrue — the total depends on whole elapsed windows,
-  not on rounding order, so two nodes compute identical figures from identical
-  heights.
-- The triple product is checked in `u128`; a value that overflows `u128` is a
-  refusal (`CreditInterestOverflow`), never a wrap or a silent clamp.
-- `interest_settled_height` advances on each repayment, so two repayments in the
-  same window charge for that window only once.
-- **The lender receives all accrued interest.** The protocol never retains
-  interest for itself; it flows to the lender together with principal
-  repayments.
-
-### How repayment works
-
-The borrower repays against the debt, **interest first then principal**
-(`apply_credit_repay`, `state.rs`):
-
-1. Debt = `outstanding_sat + accrued_interest(outstanding_sat,
-   interest_settled_height, height)`.
-2. The repayment splits:
-   `interest_paid = min(amount, interest_due)`,
-   `principal_paid = amount − interest_paid`.
-3. Funds move:
-   - Borrower's balance decreases by `repayment + fee`.
-   - **Lender's balance increases by `repayment`** — the full amount, interest and
-     principal alike.
-   - Fee splits into burn and PSCB.
-4. The position updates: `outstanding_sat` decreases by `principal_paid`,
-   `interest_paid_sat` increases by `interest_paid`, `interest_settled_height`
-   advances to the current height.
-5. **Overpayment is refused**, not clipped: if `repayment > debt`, the
-   transaction returns `CreditRepaymentExceedsDebt` and changes nothing. Send
-   exactly the right amount — the borrower may repay in multiple instalments
-   across multiple transactions.
-6. When `outstanding_sat` reaches zero:
-   - `state` becomes `Repaid`.
-   - The locked collateral is released: `credit_locked` decreases by the full
-     collateral amount, and the **collateral returns to the borrower's balance**.
-   - The position is closed and cannot be repaid or defaulted again
-     (`CreditPositionClosed`).
-
-Only the borrower named in the position may repay; a mismatched actor gets a
-`CreditBinding` error.
-
-### Adding collateral
-
-`CreditCollateral` (`0x1A`) lets a borrower lock more collateral into an open
-position, signed by the borrower. Consensus checks the position exists, is `Open`,
-and that the borrower matches. The collateral leaves the borrower's balance and
-enters `credit_locked`, increasing `position.collateral_sat`. This is useful when
-rates or prices move unfavorably after a loan opens. A borrower may add collateral
-any time before the position settles.
-
-### How default works
-
-Default is **permissionless** — any agent may trigger it — but only at or after the
-deadline. `apply_credit_default` (`state.rs`) enforces `height >=
-deadline_height`; defaulting sooner is refused with `CreditNotDue`. The steps:
-
-1. The trigger pays the 2 000 sat fee (burn/PSCB split).
-2. Debt is computed as above: `outstanding_sat + accrued_interest`.
-3. The collateral is released from `credit_locked`.
-4. Settlement:
-   - `take = min(collateral, debt)` — the collateral covers as much of the debt
-     as it can.
-   - **Lender receives `take`** — principal and interest that the collateral
-     covers.
-   - **Borrower receives `excess = collateral − take`** — any surplus beyond the
-     debt.
-   - `shortfall = debt − take` — if collateral is insufficient, the **lender
-     absorbs the shortfall**. The protocol never mints money to cover a loss.
-5. `state` becomes `Defaulted`. A defaulted position cannot be defaulted or
-   repaid again.
-
-The settlement is deterministic: every node replays the same `accrued_interest`
-and `min(collateral, debt)` arithmetic, so the split between lender and borrower
-is identical on every node.
-
-### Tracking positions
-
-Each position is a committed entry in on-chain L2 state, included in the state
-root with leaf tag `CREDIT_LEAF_TAG = 0x06` (`state_root.rs`). The fields exposed
-via the API:
-
-| Field | Meaning |
-|---|---|
-| `position_id` | Derived ID |
-| `lender` | Lender's address (always the original counterparty) |
-| `borrower` | Borrower's address |
-| `principal_sat` | Original loan amount |
-| `outstanding_sat` | Principal not yet repaid |
-| `interest_paid_sat` | Total interest paid to the lender so far |
-| `collateral_sat` | Collateral still locked |
-| `rate_bps_per_window` | Interest rate per window |
-| `window_blocks` | Window length in blocks |
-| `opened_height` | Block the position was created |
-| `deadline_height` | Block the debt is due by |
-| `state` | `Open`, `Repaid`, or `Defaulted` |
-
-```
-GET /v1/credit/positions              # list all positions (paginated)
-GET /v1/credit/positions/{id}       # one position by ID
-```
-
-The on-chain `outstanding_sat` is the source of truth for how much the borrower
-still owes. At any height the debt is `outstanding_sat + accrued_interest(...)`;
-`GET /v1/conservation` reports the `credit_locked` total so the whole collateral
-pool can be audited.
-
-### Wallet fund flow
-
-Lending is built on the UTXO layer. The four operations move real coins between
-wallet balances and the `credit_locked` pool:
-
-| Operation | From | To | Amount |
-|---|---|---|---|
-| Open | Lender's wallet | Borrower's wallet | `principal` |
-| Open | Borrower's wallet | `credit_locked` | `collateral` |
-| Open | Lender's wallet | burn + PSCB | `fee` (2 000 sat) |
-| Add collateral | Borrower's wallet | `credit_locked` | added collateral |
-| Add collateral | Borrower's wallet | burn + PSCB | `fee` (2 000 sat) |
-| Repay | Borrower's wallet | Lender's wallet | `repayment` (interest + principal) |
-| Repay | Borrower's wallet | burn + PSCB | `fee` (2 000 sat) |
-| Repay (full) | `credit_locked` | Borrower's wallet | `collateral` (returned) |
-| Default | `credit_locked` | Lender's wallet | `take = min(collateral, debt)` |
-| Default | `credit_locked` | Borrower's wallet | `excess = collateral − take` |
-| Default | Trigger's wallet | burn + PSCB | `fee` (2 000 sat) |
-
-The lender is always the original counterparty named in the position —
-repayments and defaults always pay that address, never a pool or a different
-lender.
+open position at any time before it settles. Full-collateral terms by default
+(100%), interest capped at 10% per window and charged per whole window,
+repayment applies interest first, overpayment is refused rather than clipped,
+anyone may default an overdue position, and the loss order is collateral,
+then bond, then lender — the protocol never mints to cover a shortfall.
+Full mechanics (wire types, terms, fee split, interest arithmetic,
+settlement order, position tracking, fund flow):
+[`docs/lending.md`](docs/lending.md#the-consensus-primitive-underneath).
 
 ### CLI
 
@@ -1189,7 +942,7 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `crates/srct-miner/` | Standalone CPU miner: template grinder, stratum-lite pool server with PPLNS payouts, universal compute backends. |
 | `crates/srct-worker/` | Worker-side SDK. Client only, no consensus. |
 | `crates/srct-mcp/` | Keyless MCP surface over agent identity, payments — and the agent wallet guard. |
-| `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports. |
+| `crates/srct-policy/` | Chain-agnostic policy engine: portable grants, delegation proofs, bound grants, JSON decisions + TS/Python bindings. No consensus imports — but still compiles all of `srct-core` (see crate docs); outsiders use HTTP or the bindings. |
 | `fuzz/` | 17 cargo-fuzz targets over the attacker-controlled boundaries. |
 | `sim/` | Independent Python reference, attack simulations, and feature demos (`x402_paid_api_demo.py`, `micropayment_benchmark.py`, `agent_economy_demo.py`). |
 | `tests/vectors/` | Consensus vectors. Generated from source, never hand-edited. |
@@ -1197,8 +950,8 @@ not expose it directly, but the worker SDK does (`add_credit_collateral`).
 | `paper/` | The Solar Cyber Unit protocol paper (LaTeX + PDF). |
 
 Nine crates in one workspace. **All consensus logic lives in `srct-core`**, which
-has no I/O, no clock and no network. The service-layer feature modules added
-most recently live beside it without touching consensus: `x402.rs` (x402
+has no I/O, no clock and no network. The service-layer feature modules
+live beside it without touching consensus: `x402.rs` (x402
 adapter, budget guard, Base rail options), `micro.rs` (batch/stream/sponsored), `safety.rs` (session budgets,
 risk guards, audit log + export), `portable.rs` (signed policies, delegation
 proofs, short-lived bound grants, intent→decision seam),
@@ -1282,6 +1035,7 @@ srct-node <COMMAND> [OPTIONS]
 ```
 srct-miner --node 127.0.0.1:PORT --miner <20-byte-hex> [--threads N] [--batch N] [--backend cpu|portable|auto]
 ```
+
 Full mining guide — three ways to mine, where rewards go, hardware backends,
 pool protocol — is in [Mining](#mining) above; the node endpoints
 (`GET /v1/mine/template`, `POST /v1/mine/submit`) are specified in SPEC §19.2.
@@ -1331,7 +1085,8 @@ Common options: `--network <mainnet|testnet|mini>` (default `mini`) and
 ADDR gossip, so bootnodes plus `peers.json` are the only peer sources).
 `--credit-issuer` lists the BLS keys trusted to sign credit attestations for
 `POST /v1/credit/mint` (comma-separated 48-byte hex keys; with none listed,
-every mint is refused). `send --amount` takes SRCT (`--amount-sat` takes satoshis); printed balances
+every mint is refused).
+`send --amount` takes SRCT (`--amount-sat` takes satoshis); printed balances
 are in SRCT.
 
 The API defaults to loopback and needs no credentials. Binding anything
@@ -1456,7 +1211,7 @@ persons to whom it is furnished to do so, including commercially.
 
 [`SECURITY.md`](SECURITY.md) is the disclosure policy: what counts as a
 vulnerability, the severity model, the 90-day window, and the intake channel
-(GitHub Security Advisory, or `security@Solar Cyber Unit.org`). Do not open a public
+(GitHub Security Advisory, or `security@solarcyberunit.org`). Do not open a public
 issue for a security defect.
 
 ---

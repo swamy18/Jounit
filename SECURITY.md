@@ -11,7 +11,7 @@ Use one of these channels, in this order:
 1. **GitHub Security Advisory** — the "Report a vulnerability" button on this
    repository. This is the intended intake: it is private between you and the
    maintainers until a fix ships.
-2. **Email** — `security@Solar Cyber Unit.org`.
+2. **Email** — `security@solarcyberunit.org`.
 
 Include: the affected crate and file, the version or commit, a description of
 the impact, and a reproduction (a failing test is ideal — the repository's
@@ -19,7 +19,7 @@ the impact, and a reproduction (a failing test is ideal — the repository's
 
 ### Encryption
 
-`security@Solar Cyber Unit.org` is currently served **without a published PGP key**. Until
+`security@solarcyberunit.org` is currently served **without a published PGP key**. Until
 a key is published here, encrypting the report is not possible, and the
 maintainers acknowledge this as an open gap in the disclosure channel rather
 than a settled part of it. Until a key exists:
