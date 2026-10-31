@@ -1143,10 +1143,7 @@ mod tests {
         // Mainnet carries the sub-cap: one owner gets a tenth of the window.
         let main = NetworkParams::mainnet();
         main.validate().unwrap();
-        assert_eq!(
-            main.max_exit_per_owner_window_sat,
-            100 * SAT_PER_SRCT
-        );
+        assert_eq!(main.max_exit_per_owner_window_sat, 100 * SAT_PER_SRCT);
         // A share bigger than the whole is nonsense.
         let mut bad = NetworkParams::mini();
         bad.max_exit_window_sat = 1_000;

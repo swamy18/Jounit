@@ -66,10 +66,7 @@ pub enum PortableError {
     /// Two bound objects disagree (wrong owner, wrong grant, wrong tx, ...).
     Binding(&'static str),
     /// The bound grant is spent past its expiry.
-    Expired {
-        expires_at_height: u64,
-        height: u64,
-    },
+    Expired { expires_at_height: u64, height: u64 },
     /// The bound grant lives longer than [`MAX_BOUND_LIFETIME_BLOCKS`].
     LifetimeTooLong { lifetime: u64, max: u64 },
 }
@@ -127,8 +124,7 @@ impl From<crate::error::Error> for PortableError {
 }
 
 fn decode_hex_field(raw: &str, what: &'static str) -> Result<Vec<u8>, PortableError> {
-    hex::decode(raw.trim().trim_start_matches("0x"))
-        .map_err(|_| PortableError::Malformed(what))
+    hex::decode(raw.trim().trim_start_matches("0x")).map_err(|_| PortableError::Malformed(what))
 }
 
 // ---------------------------------------------------------------------------
@@ -196,9 +192,7 @@ impl SignedPolicy {
     /// Decode what [`SignedPolicy::serialize`] wrote. Bounded and fail-closed.
     pub fn deserialize(bytes: &[u8]) -> Result<Self, PortableError> {
         let mut r = Reader::new(bytes);
-        let version = r
-            .u8()
-            .map_err(|_| PortableError::Malformed("version"))?;
+        let version = r.u8().map_err(|_| PortableError::Malformed("version"))?;
         if version != PORTABLE_POLICY_VERSION {
             return Err(PortableError::UnsupportedVersion(version));
         }
@@ -569,7 +563,14 @@ impl BoundAuthorization {
         let auth_sigs = self.auth_sigs.to_bytes();
         let auth_keys = self.auth_keys.to_bytes();
         let mut w = Writer::with_capacity(
-            1 + 4 + auth.len() + 8 + 32 + sigs.len() + keys.len() + auth_sigs.len() + auth_keys.len(),
+            1 + 4
+                + auth.len()
+                + 8
+                + 32
+                + sigs.len()
+                + keys.len()
+                + auth_sigs.len()
+                + auth_keys.len(),
         );
         w.u8(self.version)
             .u32le(auth.len() as u32)
@@ -586,9 +587,7 @@ impl BoundAuthorization {
     /// Decode what [`BoundAuthorization::serialize`] wrote.
     pub fn deserialize(bytes: &[u8]) -> Result<Self, PortableError> {
         let mut r = Reader::new(bytes);
-        let version = r
-            .u8()
-            .map_err(|_| PortableError::Malformed("version"))?;
+        let version = r.u8().map_err(|_| PortableError::Malformed("version"))?;
         if version != PORTABLE_POLICY_VERSION {
             return Err(PortableError::UnsupportedVersion(version));
         }
@@ -599,9 +598,7 @@ impl BoundAuthorization {
             .fixed_slice(len)
             .map_err(|_| PortableError::Malformed("auth bytes"))?;
         let auth = Authorization::deserialize(auth_bytes)?;
-        let expires_at_height = r
-            .u64le()
-            .map_err(|_| PortableError::Malformed("expiry"))?;
+        let expires_at_height = r.u64le().map_err(|_| PortableError::Malformed("expiry"))?;
         let bound_tx: Hash = r
             .fixed()
             .map_err(|_| PortableError::Malformed("bound tx"))?;
@@ -718,9 +715,8 @@ impl PaymentIntent {
         let agent_id: AgentId = decode_hex_field(&self.agent_id, "agent id hex")?
             .try_into()
             .map_err(|_| PortableError::Malformed("agent id length"))?;
-        let recipient: Address =
-            address_from_hex(self.recipient.trim())
-                .map_err(|_| PortableError::Malformed("recipient hex"))?;
+        let recipient: Address = address_from_hex(self.recipient.trim())
+            .map_err(|_| PortableError::Malformed("recipient hex"))?;
         let service: Option<[u8; 32]> = match &self.service {
             None => None,
             Some(s) => Some(
@@ -976,7 +972,10 @@ mod tests {
             evaluate_policy(&policy, &base, 100, Some(10_000)),
             PolicyDecision::Allow
         );
-        let over = DecodedIntent { amount_sat: 50_000, ..base };
+        let over = DecodedIntent {
+            amount_sat: 50_000,
+            ..base
+        };
         assert!(matches!(
             evaluate_policy(&policy, &over, 100, None),
             PolicyDecision::Deny { .. }

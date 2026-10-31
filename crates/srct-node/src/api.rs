@@ -3127,15 +3127,16 @@ async fn policy_decide(
                 .map_err(|e| bad(format!("policy: {e}")))?
         }
         None => {
-            let (hex_str, sigs_hex, keys_hex) =
-                match (&req.policy_hex, &req.policy_sigs_hex, &req.policy_keys_hex) {
-                    (Some(h), Some(s), Some(k)) => (h, s, k),
-                    _ => {
-                        return Err(bad(
-                            "supply policy_portable_json or policy_hex + policy_sigs_hex + policy_keys_hex",
-                        ))
-                    }
-                };
+            let (hex_str, sigs_hex, keys_hex) = match (
+                &req.policy_hex,
+                &req.policy_sigs_hex,
+                &req.policy_keys_hex,
+            ) {
+                (Some(h), Some(s), Some(k)) => (h, s, k),
+                _ => return Err(bad(
+                    "supply policy_portable_json or policy_hex + policy_sigs_hex + policy_keys_hex",
+                )),
+            };
             let policy = decode_owned_policy(
                 hex_str,
                 "policy",
@@ -3149,9 +3150,7 @@ async fn policy_decide(
     };
     // Both input shapes verified on the way in; re-check anyway — decide
     // must never answer from an unverified grant.
-    signed
-        .verify()
-        .map_err(|e| bad(format!("policy: {e}")))?;
+    signed.verify().map_err(|e| bad(format!("policy: {e}")))?;
     with_shared(&state, |sh| {
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
@@ -3178,9 +3177,7 @@ async fn policy_decide(
             nonce: 0,
             network_id: network.clone(),
         };
-        let decoded = intent
-            .decoded()
-            .map_err(|e| bad(format!("intent: {e}")))?;
+        let decoded = intent.decoded().map_err(|e| bad(format!("intent: {e}")))?;
         let (decision, reason) = match srct_core::portable::evaluate_policy(
             &signed.policy,
             &decoded,

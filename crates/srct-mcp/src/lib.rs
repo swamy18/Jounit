@@ -226,8 +226,7 @@ impl SolarCyberUnitMcp {
         let height = u64_field(request, "height")?;
         let expires_at_height = u64_field(request, "expires_at_height")?;
 
-        match budget.check_guarded(amount_sat, &recipient, &service, height, expires_at_height)
-        {
+        match budget.check_guarded(amount_sat, &recipient, &service, height, expires_at_height) {
             Ok(grant) => {
                 if let Some(threshold) = request
                     .get("approval_threshold_sat")
@@ -291,10 +290,9 @@ impl SolarCyberUnitMcp {
             .and_then(Value::as_u64);
         match srct_core::portable::evaluate_policy(&policy, &decoded, height, threshold) {
             srct_core::portable::PolicyDecision::Allow => Ok(json!({"decision": "allow"})),
-            srct_core::portable::PolicyDecision::Deny { reason } => Err(McpError::refused(
-                "policy_refused",
-                reason,
-            )),
+            srct_core::portable::PolicyDecision::Deny { reason } => {
+                Err(McpError::refused("policy_refused", reason))
+            }
             srct_core::portable::PolicyDecision::NeedsApproval { reason } => Ok(json!({
                 "decision": "needs_approval",
                 "reason": reason,
@@ -336,14 +334,13 @@ impl SolarCyberUnitMcp {
             || policies.is_empty()
             || policies.len() > srct_core::delegation::MAX_DELEGATION_DEPTH
         {
-            return Err(McpError::bad("parallel link arrays must be non-empty and equal"));
+            return Err(McpError::bad(
+                "parallel link arrays must be non-empty and equal",
+            ));
         }
         let mut links = Vec::with_capacity(policies.len());
-        for (((policy_bytes, sigs_bytes), keys_bytes), i) in policies
-            .iter()
-            .zip(sigs.iter())
-            .zip(keys.iter())
-            .zip(0..)
+        for (((policy_bytes, sigs_bytes), keys_bytes), i) in
+            policies.iter().zip(sigs.iter()).zip(keys.iter()).zip(0..)
         {
             let policy = SpendPolicy::deserialize(policy_bytes)
                 .map_err(|e| McpError::bad(format!("policy[{i}]: {e}")))?;
@@ -748,8 +745,7 @@ fn budget_from(v: &Value) -> Result<srct_core::x402::X402Budget, McpError> {
                 .as_str()
                 .ok_or_else(|| McpError::bad("recipient entry must be a string"))?;
             allowed_recipients.push(
-                address_from_hex(s.trim())
-                    .map_err(|e| McpError::bad(format!("recipient: {e}")))?,
+                address_from_hex(s.trim()).map_err(|e| McpError::bad(format!("recipient: {e}")))?,
             );
         }
     }
@@ -762,12 +758,8 @@ fn budget_from(v: &Value) -> Result<srct_core::x402::X402Budget, McpError> {
             let s = item
                 .as_str()
                 .ok_or_else(|| McpError::bad("service entry must be a string"))?;
-            let raw = s
-                .trim()
-                .trim_start_matches("0x")
-                .to_string();
-            let bytes = hex::decode(&raw)
-                .map_err(|e| McpError::bad(format!("service: {e}")))?;
+            let raw = s.trim().trim_start_matches("0x").to_string();
+            let bytes = hex::decode(&raw).map_err(|e| McpError::bad(format!("service: {e}")))?;
             let tag: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| McpError::bad("service tag must be 32 bytes"))?;
@@ -829,11 +821,7 @@ fn signed_policy_from(v: &Value) -> Result<srct_core::portable::SignedPolicy, Mc
     let keys_bytes = hex_field(v, "keys_hex")?;
     let sigs = bundle_from_bytes(&sigs_bytes)?;
     let keys = bundle_from_bytes(&keys_bytes)?;
-    let signed = srct_core::portable::SignedPolicy {
-        policy,
-        sigs,
-        keys,
-    };
+    let signed = srct_core::portable::SignedPolicy { policy, sigs, keys };
     signed
         .verify()
         .map_err(|e| McpError::refused("policy_invalid", e.to_string()))?;

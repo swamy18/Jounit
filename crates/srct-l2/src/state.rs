@@ -859,8 +859,7 @@ impl L2State {
         // (refused queues keep their funds, accepted ones release). The
         // per-owner sub-cap bounds one owner's share of the window, so a
         // filler is refused by name while other owners still queue.
-        let window_on =
-            self.config.max_exit_window_sat > 0 && self.config.exit_window_blocks > 0;
+        let window_on = self.config.max_exit_window_sat > 0 && self.config.exit_window_blocks > 0;
         let rolled = window_on
             && (self.exit_window_start == 0
                 || height
@@ -2225,7 +2224,7 @@ impl L2State {
 /// state (Decision 26). Pre-bump blobs are refused rather than guessed at,
 /// because a state that cannot describe a committed policy or credit position
 /// would silently diverge from the chain.
-    pub const L2_STATE_WIRE_VERSION: u8 = 7;
+pub const L2_STATE_WIRE_VERSION: u8 = 7;
 
 /// Smallest possible encoded account entry: `20` address + `8` balance.
 const WIRE_ACCOUNT_MIN: usize = 28;
@@ -2569,8 +2568,12 @@ impl L2State {
         // they break down — a blob whose breakdown disagrees with its total
         // is tampered with, not merely odd.
         let declared_owners = r.u64le().map_err(|_| codec_err("exit owner count"))?;
-        let n_owners =
-            bounded_count(&r, declared_owners, WIRE_OWNER_MIN, "exit owner count exceeds buffer")?;
+        let n_owners = bounded_count(
+            &r,
+            declared_owners,
+            WIRE_OWNER_MIN,
+            "exit owner count exceeds buffer",
+        )?;
         let mut exit_window_owner = BTreeMap::new();
         let mut owner_sum = 0u64;
         for _ in 0..n_owners {

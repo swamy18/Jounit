@@ -499,8 +499,8 @@ impl AuditLog {
             if e.detail.len() > 512 {
                 return Err(SafetyError::Malformed("audit detail too long"));
             }
-            let prev_hash =
-                hash_from_hex(e.prev_hash.trim()).map_err(|_| SafetyError::Malformed("prev hash"))?;
+            let prev_hash = hash_from_hex(e.prev_hash.trim())
+                .map_err(|_| SafetyError::Malformed("prev hash"))?;
             let hash =
                 hash_from_hex(e.hash.trim()).map_err(|_| SafetyError::Malformed("entry hash"))?;
             if prev_hash != prev {

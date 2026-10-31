@@ -63,7 +63,12 @@ pub fn decide(
         ));
     }
     let decoded = intent.decoded().map_err(|e| e.to_string())?;
-    let decision = evaluate_policy(&signed.policy, &decoded, intent.height, approval_threshold_sat);
+    let decision = evaluate_policy(
+        &signed.policy,
+        &decoded,
+        intent.height,
+        approval_threshold_sat,
+    );
     serde_json::to_string(&decision).map_err(|_| "decision json".to_string())
 }
 
@@ -86,7 +91,9 @@ pub fn verify_audit(audit_json: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use srct_core::agent::{derive_agent_id, derive_sub_agent_id, AgentRole, SpendPolicy, POLICY_VERSION};
+    use srct_core::agent::{
+        derive_agent_id, derive_sub_agent_id, AgentRole, SpendPolicy, POLICY_VERSION,
+    };
     use srct_core::l2::Auth;
     use srct_core::wallet::Wallet;
 
@@ -139,9 +146,17 @@ mod tests {
         }
     }
 
-    fn decide_parsed(policy_json: &str, intent: &PaymentIntent, threshold: Option<u64>) -> PolicyDecision {
-        let out = decide(policy_json, &serde_json::to_string(intent).unwrap(), threshold)
-            .expect("a well-formed pair must answer");
+    fn decide_parsed(
+        policy_json: &str,
+        intent: &PaymentIntent,
+        threshold: Option<u64>,
+    ) -> PolicyDecision {
+        let out = decide(
+            policy_json,
+            &serde_json::to_string(intent).unwrap(),
+            threshold,
+        )
+        .expect("a well-formed pair must answer");
         serde_json::from_str(&out).expect("the answer is decision JSON")
     }
 
@@ -160,7 +175,10 @@ mod tests {
         assert!(matches!(denied, PolicyDecision::Deny { .. }), "{denied:?}");
         // Inside the cap but above the threshold is gated, not refused.
         let gated = decide_parsed(&policy_json, &intent_for(&policy, 500), Some(100));
-        assert!(matches!(gated, PolicyDecision::NeedsApproval { .. }), "{gated:?}");
+        assert!(
+            matches!(gated, PolicyDecision::NeedsApproval { .. }),
+            "{gated:?}"
+        );
         // A stranger recipient is a deny.
         let mut stranger = intent_for(&policy, 10);
         stranger.recipient = srct_core::hash::address_to_hex(&[9u8; 20]);
@@ -186,13 +204,22 @@ mod tests {
         // A policy for another network never reaches the engine.
         let mut foreign = intent_for(&policy, 10);
         foreign.network_id = "srct/elsewhere".to_string();
-        let err = decide(&policy_json, &serde_json::to_string(&foreign).unwrap(), None)
-            .expect_err("cross-network intents must be refused");
+        let err = decide(
+            &policy_json,
+            &serde_json::to_string(&foreign).unwrap(),
+            None,
+        )
+        .expect_err("cross-network intents must be refused");
         assert!(err.contains("srct/testnet"), "{err}");
         // A routing-confused document (hashes rewritten) is refused at parse.
         let mut doc: serde_json::Value = serde_json::from_str(&policy_json).unwrap();
         doc["policy_hash"] = serde_json::Value::String("ab".repeat(32));
-        assert!(decide(&doc.to_string(), &serde_json::to_string(&intent_for(&policy, 10)).unwrap(), None).is_err());
+        assert!(decide(
+            &doc.to_string(),
+            &serde_json::to_string(&intent_for(&policy, 10)).unwrap(),
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -238,8 +265,10 @@ mod tests {
     #[test]
     fn verify_audit_counts_entries_and_refuses_rewritten_history() {
         let mut log = AuditLog::default();
-        log.push("authorize", None, Some(500), "grant".to_string()).unwrap();
-        log.push("payment", Some([1u8; 32]), Some(500), "submit".to_string()).unwrap();
+        log.push("authorize", None, Some(500), "grant".to_string())
+            .unwrap();
+        log.push("payment", Some([1u8; 32]), Some(500), "submit".to_string())
+            .unwrap();
         assert_eq!(verify_audit(&log.export_json()).unwrap(), 2);
         let mut forged = log.export();
         forged.entries[0].detail = "forged".to_string();
@@ -270,7 +299,9 @@ mod tests {
             PolicyDecision::Allow
         );
         // And both refuse the same over-budget payment, each by name.
-        assert!(budget.check_guarded(700, &[1u8; 20], &None, 100, 110).is_err());
+        assert!(budget
+            .check_guarded(700, &[1u8; 20], &None, 100, 110)
+            .is_err());
         let denied = decide_parsed(&policy_json, &intent_for(&policy, 50_000), None);
         assert!(matches!(denied, PolicyDecision::Deny { .. }), "{denied:?}");
     }

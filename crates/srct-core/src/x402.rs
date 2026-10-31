@@ -74,7 +74,10 @@ pub enum X402Error {
     UnsupportedScheme(String),
     UnknownNetwork(String),
     ZeroAmount,
-    AmountTooLarge { amount: u64, max: u64 },
+    AmountTooLarge {
+        amount: u64,
+        max: u64,
+    },
     RecipientNotAllowed,
     ServiceNotAllowed,
     BudgetExceeded(String),
@@ -84,7 +87,10 @@ pub enum X402Error {
         height: u64,
     },
     /// The guarded window outlives [`MAX_GUARD_LIFETIME_BLOCKS`].
-    LifetimeTooLong { lifetime: u64, max: u64 },
+    LifetimeTooLong {
+        lifetime: u64,
+        max: u64,
+    },
 }
 
 impl std::fmt::Display for X402Error {
@@ -663,7 +669,8 @@ mod tests {
     }
 
     #[test]
-    fn budget_refuses_overrun_and_allowlist() {        let budget = X402Budget {
+    fn budget_refuses_overrun_and_allowlist() {
+        let budget = X402Budget {
             max_amount_sat: 600,
             allowed_recipients: vec![[1u8; 20]],
             allowed_services: vec![[2u8; 32]],
@@ -701,7 +708,13 @@ mod tests {
         ));
         // A window longer than the cap refuses at guard time, not at signing.
         assert!(matches!(
-            budget.check_guarded(500, &[1u8; 20], &None, 100, 100 + MAX_GUARD_LIFETIME_BLOCKS + 1),
+            budget.check_guarded(
+                500,
+                &[1u8; 20],
+                &None,
+                100,
+                100 + MAX_GUARD_LIFETIME_BLOCKS + 1
+            ),
             Err(X402Error::LifetimeTooLong { .. })
         ));
         // Over-budget still refuses first.

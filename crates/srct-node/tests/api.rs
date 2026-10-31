@@ -855,8 +855,7 @@ fn policy_decide_answers_without_committing() {
     assert_eq!(s, 200, "{out}");
     assert_eq!(out["decision"], "needs_approval");
     // The portable shape decides the same grant, verified on parse.
-    let signed =
-        srct_core::portable::SignedPolicy::issue(&payer, &policy).expect("owner signs");
+    let signed = srct_core::portable::SignedPolicy::issue(&payer, &policy).expect("owner signs");
     let (s, out) = post(
         &node,
         "/v1/policy/decide",
@@ -894,8 +893,7 @@ fn policy_decide_answers_without_committing() {
     let owner_addr = payer.address().unwrap();
     let mut testnet_policy = machine_policy(&payer, &provider, service);
     testnet_policy.network_id = "srct/testnet".to_string();
-    testnet_policy.agent_id =
-        derive_agent_id("srct/testnet", AgentRole::Machine, &owner_addr);
+    testnet_policy.agent_id = derive_agent_id("srct/testnet", AgentRole::Machine, &owner_addr);
     let (s, body) = post(
         &node,
         "/v1/policy/decide",

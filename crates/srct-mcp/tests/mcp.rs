@@ -495,7 +495,10 @@ fn the_guard_ops_are_advertised() {
         "auth.verify_bound",
         "audit.verify",
     ] {
-        assert!(mcp.capabilities().contains(&expected), "{expected} must be advertised");
+        assert!(
+            mcp.capabilities().contains(&expected),
+            "{expected} must be advertised"
+        );
     }
 }
 
@@ -632,8 +635,7 @@ fn auth_bind_and_verify_bound_enforce_expiry_and_tx() {
     let f = fixture();
     let payer = wallet(1);
     let mut book = PolicyBook::default();
-    let auth =
-        authorize_request(&mut book, &f.policy, NET, &f.request, HEIGHT, 1).expect("grant");
+    let auth = authorize_request(&mut book, &f.policy, NET, &f.request, HEIGHT, 1).expect("grant");
     let payment = build_signed_payment(
         &payer,
         &auth,
@@ -666,10 +668,7 @@ fn auth_bind_and_verify_bound_enforce_expiry_and_tx() {
             "tx_hash_hex": hash_to_hex(&payment.signing_hash()),
         }))
         .expect("bind names the hash");
-    assert_eq!(
-        bind_out["binding_hash"],
-        hash_to_hex(&bound.signing_hash())
-    );
+    assert_eq!(bind_out["binding_hash"], hash_to_hex(&bound.signing_hash()));
 
     // The bound grant verifies against the exact payment inside its window.
     let ok = mcp
