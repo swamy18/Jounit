@@ -349,6 +349,12 @@ pub struct AuditLog {
     max_entries: usize,
     next_seq: u64,
     tip: Hash,
+    /// Entries refused after the ring filled. The ring never evicts — history
+    /// the operator has not exported is never silently rewritten — but a full
+    /// ring must still refuse new writes, and a refusal nobody counts is a
+    /// blind spot in a security control. This counter is the signal: it is
+    /// reported by `/v1/audit` and carried (not proven) by the export.
+    dropped: u64,
 }
 
 impl Default for AuditLog {
@@ -364,6 +370,7 @@ impl AuditLog {
             max_entries,
             next_seq: 0,
             tip: [0u8; 32],
+            dropped: 0,
         }
     }
 
@@ -375,8 +382,16 @@ impl AuditLog {
         self.entries.is_empty()
     }
 
+    /// Entries refused after the ring filled. Nonzero means the operator is
+    /// flying partially blind: export and raise the cap (or restart the
+    /// ring deliberately), because new activity is no longer being recorded.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
     /// Append one entry, hash-chained to the tip. Refuses when full rather
-    /// than silently dropping history the operator has not exported.
+    /// than silently dropping history the operator has not exported — and
+    /// counts the refusal, so a full ring is visible, not silent.
     pub fn push(
         &mut self,
         kind: &'static str,
@@ -388,6 +403,7 @@ impl AuditLog {
             return Err(SafetyError::Malformed("audit detail too long"));
         }
         if self.entries.len() >= self.max_entries {
+            self.dropped = self.dropped.saturating_add(1);
             return Err(SafetyError::AuditFull {
                 cap: self.max_entries,
             });
@@ -452,16 +468,22 @@ pub struct AuditExportEntry {
 }
 
 /// The whole export: the entries in order plus the tip, so the reader knows
-/// what "complete" means.
+/// what "complete" means. `dropped` is the ring's own count of entries it
+/// refused after filling: reported, not proven — the chain check covers the
+/// entries and the tip, and a nonzero `dropped` tells the auditor the record
+/// is partial. `#[serde(default)]` keeps pre-counter exports readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditExport {
     pub entries: Vec<AuditExportEntry>,
     pub tip: String,
+    #[serde(default)]
+    pub dropped: u64,
 }
 
 impl AuditLog {
     /// Export the in-memory ring as auditor-readable JSON. The entries carry
-    /// their hashes, so the reader re-verifies rather than trusts.
+    /// their hashes, so the reader re-verifies rather than trusts. The
+    /// `dropped` count travels alongside: a partial record must say so.
     pub fn export(&self) -> AuditExport {
         AuditExport {
             entries: self
@@ -478,6 +500,7 @@ impl AuditLog {
                 })
                 .collect(),
             tip: hash_to_hex(&self.tip),
+            dropped: self.dropped,
         }
     }
 
@@ -488,7 +511,9 @@ impl AuditLog {
 
     /// Verify an export: chain links, entry hashes, ordering from genesis, and
     /// the tip. Returns the entry count. Refuses the first broken link by name
-    /// — an auditor must never have to guess which entry failed.
+    /// — an auditor must never have to guess which entry failed. The `dropped`
+    /// count is reported, not proven: it is the ring's own admission of
+    /// partiality, and the chain check covers everything else.
     pub fn verify_export(export: &AuditExport) -> Result<usize, SafetyError> {
         let genesis = [0u8; 32];
         let mut prev = genesis;
@@ -699,6 +724,29 @@ mod tests {
         let mut short = log.export();
         short.tip = hash_to_hex(&[0u8; 32]);
         assert!(AuditLog::verify_export(&short).is_err());
+    }
+
+    #[test]
+    fn a_full_ring_counts_its_drops_and_says_so_on_export() {
+        let mut log = AuditLog::with_capacity(2);
+        log.push("a", None, None, "one".to_string()).unwrap();
+        log.push("b", None, None, "two".to_string()).unwrap();
+        assert_eq!(log.dropped(), 0);
+        // The ring refuses rather than evicts — and now counts the refusal.
+        assert!(log.push("c", None, None, "three".to_string()).is_err());
+        assert!(log.push("d", None, None, "four".to_string()).is_err());
+        assert_eq!(log.dropped(), 2);
+        // The kept history still verifies; the export admits its partiality.
+        log.verify_chain().unwrap();
+        let export = log.export();
+        assert_eq!(export.dropped, 2);
+        assert_eq!(AuditLog::verify_export(&export).unwrap(), 2);
+        // Pre-counter exports (no `dropped` field) still parse and verify.
+        let old: serde_json::Value = serde_json::from_str(&log.export_json()).unwrap();
+        let mut old_doc = old.as_object().unwrap().clone();
+        old_doc.remove("dropped");
+        let old_json = serde_json::Value::Object(old_doc).to_string();
+        assert_eq!(AuditLog::verify_export_json(&old_json).unwrap(), 2);
     }
 
     #[test]

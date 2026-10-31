@@ -3155,19 +3155,9 @@ async fn policy_decide(
         let network = sh.chain.params().network_id.clone();
         let height = sh.chain.height();
         // A query answers; only malformed input is an error. A deny is a
-        // 200 with the reason, so bindings parse every answer uniformly and
-        // a "no" is never mistaken for a transport failure.
-        if signed.policy.network_id != network {
-            return Ok(Json(json!({
-                "decision": "deny",
-                "reason": format!(
-                    "policy is for network {}, this node is {network}",
-                    signed.policy.network_id
-                ),
-                "network_id": network,
-                "height": height,
-            })));
-        }
+        // 200 with the reason — the query was answered, and the answer is
+        // no; a "no" is never mistaken for a transport failure. The network
+        // binding lives in the engine, not here.
         let intent = srct_core::portable::PaymentIntent {
             agent_id: req.agent_id_hex,
             recipient: req.recipient_hex,
@@ -3181,6 +3171,7 @@ async fn policy_decide(
         let (decision, reason) = match srct_core::portable::evaluate_policy(
             &signed.policy,
             &decoded,
+            &network,
             height,
             req.approval_threshold_sat,
         ) {
@@ -5916,6 +5907,7 @@ async fn audit_list(
         Ok(Json(json!({
             "chain_valid": valid,
             "count": entries.len(),
+            "dropped": sh.audit.dropped(),
             "entries": entries,
         })))
     })?

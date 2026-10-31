@@ -261,15 +261,8 @@ impl SolarCyberUnitMcp {
         let policy_bytes = hex_field(request, "policy_hex")?;
         let policy = SpendPolicy::deserialize(&policy_bytes)
             .map_err(|e| McpError::bad(format!("policy: {e}")))?;
-        if policy.network_id != network_id {
-            return Err(McpError::refused(
-                "policy_refused",
-                format!(
-                    "policy is for network {}, request for {network_id}",
-                    policy.network_id
-                ),
-            ));
-        }
+        // No local network check: the engine owns the binding below, so no
+        // caller — here or on any rail — can forget it.
         let intent = srct_core::portable::PaymentIntent {
             agent_id: str_field(request, "agent_id_hex")?.to_string(),
             recipient: str_field(request, "recipient_hex")?.to_string(),
@@ -288,7 +281,8 @@ impl SolarCyberUnitMcp {
         let threshold = request
             .get("approval_threshold_sat")
             .and_then(Value::as_u64);
-        match srct_core::portable::evaluate_policy(&policy, &decoded, height, threshold) {
+        match srct_core::portable::evaluate_policy(&policy, &decoded, network_id, height, threshold)
+        {
             srct_core::portable::PolicyDecision::Allow => Ok(json!({"decision": "allow"})),
             srct_core::portable::PolicyDecision::Deny { reason } => {
                 Err(McpError::refused("policy_refused", reason))

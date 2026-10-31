@@ -17,7 +17,9 @@ byte codecs (`serialize`/`deserialize`) are the same bytes the owner signed.
 revocation flag) + `sigs_hex`/`keys_hex` (the owner's signature over
 `policy.signing_hash()`). Denormalized `policy_hash`/`owner`/`agent_id`/
 `network_id` let a rail route before it decodes — and parsing re-checks them,
-so a document that routes one way and verifies another is refused.
+so a document that routes one way and verifies another is refused. The
+network binding is clause one of `evaluate_policy` itself, so no caller of
+the seam can forget it.
 
 ```bash
 # MCP: export a signed grant (verified on the way out)
@@ -76,7 +78,9 @@ so every rail decides what the node decides.
 
 `AuditLog::export_json()` emits the hash-chained entries with hex hashes;
 `verify_export_json` re-checks links, entry hashes, order from genesis, and
-the tip. An auditor verifies rather than trusts.
+the tip. An auditor verifies rather than trusts. A `dropped` count travels
+alongside (the ring's own admission of partiality — reported, not proven);
+`GET /v1/audit` reports it too.
 
 ```bash
 {"op":"audit.verify","audit_json":"{...}"}   # → {"valid": true, "entries": N}

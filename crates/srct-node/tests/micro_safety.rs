@@ -410,6 +410,7 @@ fn reconciliation_and_audit_make_retries_safe() {
     let (s, audit) = get(&node, "/v1/audit?limit=50");
     assert_eq!(s, 200, "audit refused: {audit}");
     assert_eq!(audit["chain_valid"], true);
+    assert_eq!(audit["dropped"], 0);
     let kinds: Vec<String> = audit["entries"]
         .as_array()
         .unwrap()

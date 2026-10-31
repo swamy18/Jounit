@@ -1842,3 +1842,36 @@ findings, each verified against the code, each fixed with its test:
 (`state_wire` + offsets), mainnet-default matrix (`safety`) + mini endpoint
 shape (`micro_safety`), decide/verify routes over real HTTP (`api`), 5
 `srct-policy` tests, Python demo self-test, clippy clean.
+
+## Decision 32 — Security review: audit visibility, routing confusion, engine-owned network
+
+**Status: APPROVED 2026-10-31, IMPLEMENTED 2026-10-31.** A review pass over
+policy, wallet and security code. Most of it held — signatures validate
+before verifying (empty bundles, high-S, lengths all refused), nonces are
+strict, windows roll forward with overflow checks, delegation pins
+owner/network/role/link/derivation, requests bind signer to payer, the x402
+inner path gates like submit. Four real gaps, each fixed with its test:
+
+1. **Silent audit loss.** A full ring refused writes (`AuditFull`) but the
+   operator had no signal: `audit_push` ignores the refusal and the export
+   said nothing. The ring now counts `dropped`, reported by `GET /v1/audit`
+   and carried (not proven — stated as the ring's own admission) by the
+   export; old exports without the field still verify via `#[serde(default)]`.
+2. **Routing-field confusion.** Portable JSON carried `agent_id`,
+   `network_id` (policy) and `leaf_agent` (proof) that parsing never
+   re-checked against the decoded grant — a document could route one way
+   and verify another. All routing fields are now cross-checked at parse.
+3. **Network binding lived in wrappers, not the engine.** `evaluate_policy`
+   never checked the rail; each caller re-checked. The check is now clause
+   one of the engine (`policy is for network X, asked on Y` denies), and
+   the MCP/crate/HTTP wrappers pass through instead of duplicating.
+4. **Correction, not code:** Decision 29's "L1 release path shares the rule"
+   was already corrected in Decision 31 after contact with `check_claim`;
+   this pass re-verified it while mapping every money path through
+   `risk_gate`: submit and settle share `admit_machine_payment_inner`
+   (which gates), escrow release gates, stream settlement moves no coin
+   outside `payment_submit`.
+
+**Tests.** `dropped` counting/export/compat + `/v1/audit` pin
+(`micro_safety`), routing-tamper parse refusals (policy + proof), engine
+cross-network deny, wrapper pass-through (MCP/crate/endpoint suites green).

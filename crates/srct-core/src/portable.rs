@@ -254,9 +254,12 @@ impl SignedPolicy {
         let signed = SignedPolicy { policy, sigs, keys };
         // The denormalized routing fields must describe the decoded grant: a
         // document that routes one way and verifies another is a confusion
-        // attack, not a grant.
+        // attack, not a grant. Hash and owner were the original two; agent
+        // and network ride the same route decision, so they are checked too.
         if hash_to_hex(&signed.policy.hash()) != doc.policy_hash.to_lowercase()
             || address_to_hex(&signed.policy.owner) != doc.owner.to_lowercase()
+            || hex::encode(signed.policy.agent_id) != doc.agent_id.to_lowercase()
+            || signed.policy.network_id != doc.network_id
         {
             return Err(PortableError::Binding(
                 "portable document hashes do not match the grant",
@@ -379,6 +382,7 @@ impl DelegationProof {
         let proof = DelegationProof::new(links)?;
         if address_to_hex(proof.root_owner()) != doc.root_owner.to_lowercase()
             || hash_to_hex(&proof.leaf().hash()) != doc.leaf_policy_hash.to_lowercase()
+            || hex::encode(proof.leaf().agent_id) != doc.leaf_agent.to_lowercase()
         {
             return Err(PortableError::Binding(
                 "proof routing fields do not match the links",
@@ -760,16 +764,26 @@ impl PolicyDecision {
 }
 
 /// Stateless pre-check of every clause that needs no committed state:
-/// structure, network, agent, kill switch, window, amount, allow-lists, and an
+/// network binding first (a grant for another rail is not a grant here),
+/// then structure, agent, kill switch, window, amount, allow-lists, and an
 /// optional high-value approval threshold. Stateful clauses (nonce freshness,
 /// tumbling-window spend) stay in `PolicyBook::authorize` — this never commits,
 /// so calling it twice decides twice with no side effect.
 pub fn evaluate_policy(
     policy: &SpendPolicy,
     intent: &DecodedIntent,
+    network_id: &str,
     height: u64,
     approval_threshold_sat: Option<u64>,
 ) -> PolicyDecision {
+    if policy.network_id != network_id {
+        return PolicyDecision::Deny {
+            reason: format!(
+                "policy is for network {}, asked on {network_id}",
+                policy.network_id
+            ),
+        };
+    }
     if let Err(e) = policy.validate() {
         return PolicyDecision::Deny {
             reason: e.to_string(),
@@ -898,6 +912,31 @@ mod tests {
     }
 
     #[test]
+    fn portable_routing_fields_must_match_the_grant() {
+        let w = owner_wallet();
+        let owner = w.address().unwrap();
+        let signed = SignedPolicy::issue(&w, &root_policy(&owner)).unwrap();
+        let json = signed.to_json();
+        // Rewriting any routing field the grant did not earn is a confusion
+        // attack, not a grant: parse refuses it before verify ever runs.
+        for (field, value) in [
+            ("agent_id", "ab".repeat(20)),
+            ("network_id", "srct/elsewhere".to_string()),
+            ("owner", address_to_hex(&owner_wallet().address().unwrap())),
+            ("policy_hash", "ab".repeat(32)),
+        ] {
+            let mut doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+            doc[field] = serde_json::Value::String(value);
+            assert!(
+                SignedPolicy::from_json(&doc.to_string()).is_err(),
+                "rewritten {field} must be refused"
+            );
+        }
+        // The honest document still parses and verifies.
+        SignedPolicy::from_json(&json).unwrap();
+    }
+
+    #[test]
     fn a_signed_policy_with_another_owners_keys_is_refused() {
         let w = owner_wallet();
         let owner = w.address().unwrap();
@@ -943,6 +982,10 @@ mod tests {
         proof.verify().unwrap();
         let back = DelegationProof::from_json(&proof.to_json()).unwrap();
         assert_eq!(back.leaf().hash(), proof.leaf().hash());
+        // A rewritten leaf agent routes one way and verifies another.
+        let mut doc: serde_json::Value = serde_json::from_str(&proof.to_json()).unwrap();
+        doc["leaf_agent"] = serde_json::Value::String("ab".repeat(20));
+        assert!(DelegationProof::from_json(&doc.to_string()).is_err());
 
         // A widened leaf keeps a valid signature but breaks the narrowing rule.
         // (Widened on cumulative: still standalone-valid, so it reaches the
@@ -969,7 +1012,7 @@ mod tests {
             amount_sat: 500,
         };
         assert_eq!(
-            evaluate_policy(&policy, &base, 100, Some(10_000)),
+            evaluate_policy(&policy, &base, NET, 100, Some(10_000)),
             PolicyDecision::Allow
         );
         let over = DecodedIntent {
@@ -977,11 +1020,11 @@ mod tests {
             ..base
         };
         assert!(matches!(
-            evaluate_policy(&policy, &over, 100, None),
+            evaluate_policy(&policy, &over, NET, 100, None),
             PolicyDecision::Deny { .. }
         ));
         assert!(matches!(
-            evaluate_policy(&policy, &base, 100, Some(100)),
+            evaluate_policy(&policy, &base, NET, 100, Some(100)),
             PolicyDecision::NeedsApproval { .. }
         ));
         let stranger = DecodedIntent {
@@ -990,9 +1033,17 @@ mod tests {
             ..base
         };
         assert!(matches!(
-            evaluate_policy(&policy, &stranger, 100, None),
+            evaluate_policy(&policy, &stranger, NET, 100, None),
             PolicyDecision::Deny { .. }
         ));
+        // A grant for another rail is not a grant here: the engine owns the
+        // network binding, so no caller can forget it.
+        let foreign = DecodedIntent { ..base };
+        let denied = evaluate_policy(&policy, &foreign, "srct/elsewhere", 100, None);
+        assert!(
+            matches!(&denied, PolicyDecision::Deny { reason } if reason.contains("srct/testnet")),
+            "{denied:?}"
+        );
     }
 
     #[test]

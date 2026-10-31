@@ -1875,6 +1875,19 @@ its test (Decision 31):
   pairing, mainnet-default matrix, api decide/verify routes, srct-policy
   (5), Python self-test — green. README count → 1401.
 
+### 2026-10-31 security review (Decision 32)
+
+A read-through of policy, wallet and security code. Most held (sig
+validate-first, strict nonces, overflow-checked windows, delegation
+owner/network/role/link checks, signer==payer binding, x402 inner path
+gates like submit). Four gaps fixed: audit `dropped` counter (`/v1/audit` +
+export, old exports still verify), portable routing-field cross-checks
+(`agent_id`/`network_id`/`leaf_agent`), engine-owned network binding
+(wrappers pass through), and a re-verification that every money path runs
+through `risk_gate`. Clippy + fmt clean; core lib (534), node api (49),
+micro_safety, mcp (19), x402/agent_policy/bridge/redteam — green. README
+count → 1403.
+
 ### 2026-10-29 hardening round 3 (no new features)
 
 Third review pass (transfers in/out, mining end-to-end, agent/SDK workflows,

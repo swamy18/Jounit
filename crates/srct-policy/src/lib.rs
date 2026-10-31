@@ -56,16 +56,14 @@ pub fn decide(
     let signed = SignedPolicy::from_json(policy_portable_json).map_err(|e| e.to_string())?;
     let intent: PaymentIntent =
         serde_json::from_str(intent_json).map_err(|_| "malformed intent json".to_string())?;
-    if signed.policy.network_id != intent.network_id {
-        return Err(format!(
-            "policy is for network {}, intent for {}",
-            signed.policy.network_id, intent.network_id
-        ));
-    }
     let decoded = intent.decoded().map_err(|e| e.to_string())?;
+    // The engine owns the network binding: a grant for another rail is a
+    // deny, not a transport error — the question was answered, and the
+    // answer is no.
     let decision = evaluate_policy(
         &signed.policy,
         &decoded,
+        &intent.network_id,
         intent.height,
         approval_threshold_sat,
     );
@@ -201,16 +199,20 @@ mod tests {
         assert!(decide("not json", "{}", None).is_err());
         // Valid JSON, wrong shape.
         assert!(decide(&policy_json, r#"{"amount_sat": 1}"#, None).is_err());
-        // A policy for another network never reaches the engine.
+        // A grant for another rail is a deny, not a transport error.
         let mut foreign = intent_for(&policy, 10);
         foreign.network_id = "srct/elsewhere".to_string();
-        let err = decide(
+        let out = decide(
             &policy_json,
             &serde_json::to_string(&foreign).unwrap(),
             None,
         )
-        .expect_err("cross-network intents must be refused");
-        assert!(err.contains("srct/testnet"), "{err}");
+        .expect("cross-network intents are answered, not refused");
+        let decision: PolicyDecision = serde_json::from_str(&out).unwrap();
+        assert!(
+            matches!(&decision, PolicyDecision::Deny { reason } if reason.contains("srct/testnet")),
+            "{decision:?}"
+        );
         // A routing-confused document (hashes rewritten) is refused at parse.
         let mut doc: serde_json::Value = serde_json::from_str(&policy_json).unwrap();
         doc["policy_hash"] = serde_json::Value::String("ab".repeat(32));
