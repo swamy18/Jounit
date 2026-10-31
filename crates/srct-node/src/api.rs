@@ -884,7 +884,9 @@ impl SharedNode {
             for _ in 0..count {
                 let payment: Hash = sr.fixed().map_err(|e| format!("payment_tx: {e}"))?;
                 let txid: Hash512 = sr.fixed().map_err(|e| format!("payment_tx: {e}"))?;
-                map.insert(payment, txid);
+                if map.insert(payment, txid).is_some() {
+                    return Err("payment_tx: duplicate key".into());
+                }
             }
             Ok(map)
         })?;
@@ -901,7 +903,12 @@ impl SharedNode {
                 let txid: Hash512 = sr.fixed().map_err(|e| format!("escrow_exit: {e}"))?;
                 let owner: Address = sr.fixed().map_err(|e| format!("escrow_exit: {e}"))?;
                 let nonce = sr.u64le().map_err(|e| format!("escrow_exit: {e}"))?;
-                map.insert(id, EscrowExitBinding { txid, owner, nonce });
+                if map
+                    .insert(id, EscrowExitBinding { txid, owner, nonce })
+                    .is_some()
+                {
+                    return Err("escrow_exit: duplicate key".into());
+                }
             }
             Ok(map)
         })?;
@@ -916,7 +923,9 @@ impl SharedNode {
             for _ in 0..count {
                 let id: Hash = sr.fixed().map_err(|e| format!("attestations_used: {e}"))?;
                 let expires = sr.u64le().map_err(|e| format!("attestations_used: {e}"))?;
-                map.insert(id, expires);
+                if map.insert(id, expires).is_some() {
+                    return Err("attestations_used: duplicate key".into());
+                }
             }
             Ok(map)
         })?;

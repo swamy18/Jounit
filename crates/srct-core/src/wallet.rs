@@ -163,6 +163,9 @@ impl Wallet {
         if inputs.is_empty() {
             return Err(Error::BadKey("transaction needs at least one input"));
         }
+        if outputs.is_empty() {
+            return Err(Error::BadKey("transaction needs at least one output"));
+        }
         let mut tx = Transaction::standard(
             inputs.iter().map(Input::unsigned).collect::<Vec<_>>(),
             outputs,

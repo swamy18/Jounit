@@ -730,7 +730,7 @@ impl Pool {
             return Err(Error::Malformed("pool state job counter"));
         }
         let n_stats = r.u32le().map_err(|_| Error::Malformed("pool state"))? as usize;
-        if n_stats > MAX_MINERS + 1 {
+        if n_stats > MAX_MINERS {
             return Err(Error::Malformed("pool state miners over the cap"));
         }
         let mut stats = HashMap::with_capacity(n_stats);
@@ -781,6 +781,9 @@ impl Pool {
                 .inner
                 .lock()
                 .map_err(|_| Error::Malformed("pool lock"))?;
+            if stats.len() > inner.max_miners {
+                return Err(Error::Malformed("pool state miners over pool cap"));
+            }
             inner.stats = stats;
             inner.seen = seen;
             inner.seen_order = seen_order;

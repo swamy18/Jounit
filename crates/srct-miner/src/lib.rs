@@ -230,7 +230,11 @@ pub fn solve_header(
     match header {
         Some(header) => Ok(Some(MineSolution {
             header,
-            attempts: attempts.load(Ordering::Relaxed),
+            // Threads that already passed the budget check still increment
+            // the counter once before observing exhaustion, so the raw
+            // total can exceed `max_attempts` by up to the thread count.
+            // Clamp: the caller budgeted `max_attempts` candidates.
+            attempts: attempts.load(Ordering::Relaxed).min(max_attempts),
         })),
         None => Ok(None),
     }

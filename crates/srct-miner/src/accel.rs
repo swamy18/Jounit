@@ -448,7 +448,9 @@ pub fn solve_header_batched_with<B: ComputeBackend + Clone + Send>(
     match header {
         Some(header) => Ok(Some(crate::MineSolution {
             header,
-            attempts: attempts.load(Ordering::Relaxed),
+            // Same overcount guard as `solve_header`: in-flight threads
+            // increment once past the budget before observing it.
+            attempts: attempts.load(Ordering::Relaxed).min(max_attempts),
         })),
         None => Ok(None),
     }
